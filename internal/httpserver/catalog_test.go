@@ -20,7 +20,7 @@ func TestWebCatalogRoundTrip(t *testing.T) {
 
 	post(t, h, "/v1/hosts/register", `{"id":"runner-1","kind":"permanent"}`, http.StatusOK)
 	post(t, h, "/v1/hosts/runner-1/heartbeat", `{"fetch_failed":true,"tools":[{"name":"iazio-harness","path":"/bin/iazio-harness","version":"1.2.3+abc","status":"OK"}]}`, http.StatusOK)
-	post(t, h, "/v1/repos", `{"HostID":"runner-1","WorktreePath":"/repos/app","DocsHubPath":"/repos/docs-hub","CloneURL":"https://example.test/app.git","Queue":"OPEN","Lock":"IDLE"}`, http.StatusOK)
+	post(t, h, "/v1/repos", `{"host_id":"runner-1","worktree_path":"/repos/app","docs_hub_path":"/repos/docs-hub","clone_url":"https://example.test/app.git","queue":"OPEN","lock":"IDLE"}`, http.StatusOK)
 
 	rr := post(t, h, "/v1/ideas/import-gemini", `{"share_url":"https://gemini.google.com/share/abc"}`, http.StatusCreated)
 	if !strings.Contains(rr.Body.String(), `"status":"NEW"`) || strings.Contains(rr.Body.String(), `"ID"`) {
@@ -86,6 +86,7 @@ func TestFinishedJobDoesNotOpenStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Engine.AppendLog(job.ID, control.LogChunk{Type: "OUTPUT_CHUNK", Text: "hello"})
+	post(t, s.Handler(), "/v1/jobs/"+job.ID+"/chunks", `{"type":"OUTPUT_CHUNK","stream":"stdout","text":"hello"}`, http.StatusAccepted)
 	body := get(t, s.Handler(), "/v1/jobs/"+job.ID+"/logs", http.StatusOK)
 	if !strings.Contains(body, "hello") {
 		t.Fatalf("logs: %s", body)

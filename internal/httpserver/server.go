@@ -39,6 +39,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/jobs/{id}/cancel", s.cancel)
 	mux.HandleFunc("POST /v1/jobs/{id}/force-pause", s.forcePauseJob)
 	mux.HandleFunc("POST /v1/jobs/{id}/retry-correlation", s.retryCorrelation)
+	mux.HandleFunc("POST /v1/jobs/{id}/chunks", s.appendChunk)
 	mux.HandleFunc("GET /v1/jobs/{id}/logs", s.jobLogs)
 	mux.HandleFunc("GET /v1/jobs/{id}/stream", s.jobStream)
 	mux.HandleFunc("POST /v1/hosts/register", s.register)
@@ -171,16 +172,37 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) upsertRepo(w http.ResponseWriter, r *http.Request) {
-	var repo control.Repo
-	if err := json.NewDecoder(r.Body).Decode(&repo); err != nil {
+	var raw map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
+	}
+	repo := control.Repo{
+		HostID:        firstString(raw, "host_id", "HostID"),
+		WorktreePath:  firstString(raw, "worktree_path", "WorktreePath"),
+		DocsHubPath:   firstString(raw, "docs_hub_path", "DocsHubPath"),
+		CloneURL:      firstString(raw, "clone_url", "CloneURL"),
+		DefaultBranch: firstString(raw, "default_branch", "DefaultBranch"),
+		Queue:         firstString(raw, "queue", "Queue"),
+		Lock:          firstString(raw, "lock", "Lock"),
+		Reason:        firstString(raw, "reason", "Reason"),
 	}
 	if err := s.Engine.UpsertRepo(repo); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "registered"})
+}
+
+func firstString(raw map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if v, ok := raw[key]; ok && v != nil {
+			if s, ok := v.(string); ok {
+				return s
+			}
+		}
+	}
+	return ""
 }
 
 func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
@@ -495,6 +517,20 @@ func (s *Server) retryCorrelation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "PENDING_CORRELATION"})
+}
+
+func (s *Server) appendChunk(w http.ResponseWriter, r *http.Request) {
+	var raw struct {
+		Type   string `json:"type"`
+		Stream string `json:"stream"`
+		Text   string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	s.Engine.AppendLog(r.PathValue("id"), control.LogChunk{Type: raw.Type, Stream: raw.Stream, Text: raw.Text})
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "stored"})
 }
 
 func (s *Server) jobLogs(w http.ResponseWriter, r *http.Request) {

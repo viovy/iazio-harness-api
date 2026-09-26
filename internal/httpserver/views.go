@@ -134,6 +134,7 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 		"path":              d.Repo.WorktreePath,
 		"queue":             d.Repo.Queue,
 		"lock":              d.Repo.Lock,
+		"reason":            d.Repo.Reason,
 		"fetch_failed":      d.FetchFailed,
 		"porcelain":         d.Repo.Porcelain,
 		"docs_hub_path":     d.Repo.DocsHubPath,
