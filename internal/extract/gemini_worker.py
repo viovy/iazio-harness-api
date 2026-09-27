@@ -7,6 +7,7 @@ runs in a finally block.
 """
 
 import os
+import signal
 import sys
 
 DEADLINE_S = 45
@@ -27,15 +28,24 @@ def main() -> int:
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
-    driver = webdriver.Chrome(options=opts)
+    driver = None
+
+    def _deadline(_signum, _frame):
+        raise TimeoutError("extract deadline")
+
+    signal.signal(signal.SIGALRM, _deadline)
+    signal.alarm(DEADLINE_S)
     try:
+        driver = webdriver.Chrome(options=opts)
         driver.set_page_load_timeout(DEADLINE_S)
         driver.get(url)
         text = driver.find_element("tag name", "body").text
         sys.stdout.write(text)
         return 0
     finally:
-        driver.quit()
+        signal.alarm(0)
+        if driver is not None:
+            driver.quit()
 
 
 if __name__ == "__main__":

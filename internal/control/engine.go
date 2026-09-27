@@ -2,6 +2,7 @@ package control
 
 import (
 	"errors"
+	"strings"
 	"sync"
 	"time"
 )
@@ -73,6 +74,8 @@ type Schedule struct {
 	MaxExecutionDuration time.Duration
 	EnvKeys              []string
 	Status               string
+	PromptTitle          string
+	Engine               string
 }
 
 // Job is one leased execution.
@@ -100,14 +103,57 @@ type Repo struct {
 	Lock            string
 	Reason          string
 	HealingAttempts int
+	Porcelain       string
+	DiscardPending  bool
+}
+
+// Tool is one binary from the latest heartbeat.
+type Tool struct {
+	Name    string
+	Path    string
+	Version string
+	Status  string
+}
+
+// HistoryRow is one finished execution on a repo page.
+type HistoryRow struct {
+	JobID           string
+	PromptTitle     string
+	Engine          string
+	Clean           bool
+	ASEComplete     bool
+	ConversationIDs []string
+}
+
+// LogChunk is one stripped output event.
+type LogChunk struct {
+	Seq          int
+	Type         string
+	Stream       string
+	Text         string
+	Head         string
+	Tail         string
+	DroppedBytes int
+	SilentForMs  int
+}
+
+// RepoRequest is a checkout the browser asked the agent to register.
+type RepoRequest struct {
+	HostID   string
+	Mode     string
+	Path     string
+	CloneURL string
 }
 
 // Host is a registered supervisor.
 type Host struct {
-	ID       string
-	Kind     string
-	Presence string
-	LastSeen time.Time
+	ID          string
+	Name        string
+	Kind        string
+	Presence    string
+	LastSeen    time.Time
+	FetchFailed bool
+	Tools       []Tool
 }
 
 // Engine is the in-process control plane.
@@ -125,6 +171,10 @@ type Engine struct {
 	cloneLease map[string]string
 	hubLease   string
 	runningRev map[string]bool
+	history    map[string][]HistoryRow
+	requests   []RepoRequest
+	logs       map[string][]LogChunk
+	subs       map[string][]chan LogChunk
 }
 
 // NewEngine returns an empty control plane.
@@ -142,6 +192,9 @@ func NewEngine(now func() time.Time) *Engine {
 		hosts:      map[string]*Host{},
 		cloneLease: map[string]string{},
 		runningRev: map[string]bool{},
+		history:    map[string][]HistoryRow{},
+		logs:       map[string][]LogChunk{},
+		subs:       map[string][]chan LogChunk{},
 	}
 }
 
@@ -329,7 +382,7 @@ func (e *Engine) RegisterHost(id, kind string) Host {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	h := &Host{ID: id, Kind: kind, Presence: "ONLINE", LastSeen: e.now()}
+	h := &Host{ID: id, Name: id, Kind: kind, Presence: "ONLINE", LastSeen: e.now()}
 	e.hosts[id] = h
 	return *h
 }
@@ -378,6 +431,11 @@ func (e *Engine) ApplyPreflight(host, path string, p Preflight) Halt {
 	repo := e.repos[repoKey(host, path)]
 	if repo == nil {
 		return h
+	}
+	if strings.TrimSpace(p.WorkPorcelain) != "" {
+		repo.Porcelain = p.WorkPorcelain
+	} else if strings.TrimSpace(p.HubPorcelain) != "" {
+		repo.Porcelain = p.HubPorcelain
 	}
 	if h.Reason == "" {
 		repo.Lock = LockRunning
@@ -450,6 +508,11 @@ func (e *Engine) ApplyFinish(host, path string, jobID string, in FinishInput) Fi
 			if sch.CloneURL != "" {
 				delete(e.cloneLease, sch.CloneURL)
 			}
+			clean := strings.TrimSpace(in.WorkPorcelain) == "" && strings.TrimSpace(in.HubPorcelain) == "" && in.HubAhead == 0
+			e.history[repoKey(host, path)] = append(e.history[repoKey(host, path)], HistoryRow{
+				JobID: jobID, PromptTitle: sch.PromptTitle, Engine: sch.Engine,
+				Clean: clean, ASEComplete: in.ASEComplete,
+			})
 		}
 	}
 	return d
@@ -589,6 +652,32 @@ func (e *Engine) GetRepo(host, path string) (Repo, bool) {
 		return Repo{}, false
 	}
 	return *r, true
+}
+
+// PollHost leases the next queued schedule for the host.
+// The bool is false when nothing is waiting.
+func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, sch := range e.schedules {
+		if sch.HostID != host || sch.Status != "QUEUED" {
+			continue
+		}
+		sch.Status = "RUNNING"
+		id := e.next("job-")
+		job := &Job{
+			ID: id, ScheduleID: sch.ID, Kind: sch.Kind, Status: "RUNNING",
+			LeaseHolder: host, LeaseExpiry: e.now().Add(LeaseInterval),
+		}
+		e.jobs[id] = job
+		docs := ""
+		if repo := e.repos[repoKey(host, sch.WorktreePath)]; repo != nil {
+			repo.Lock = LockRunning
+			docs = repo.DocsHubPath
+		}
+		return *job, *sch, docs, true
+	}
+	return Job{}, Schedule{}, "", false
 }
 
 // GetIdea returns a copy of the idea.
