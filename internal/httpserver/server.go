@@ -17,6 +17,8 @@ type Server struct {
 	Engine *control.Engine
 	// Extract runs the share-page worker. Tests replace it.
 	Extract func(shareURL string) (title, transcript string, err error)
+	// SaveIdea persists an idea when a database is configured.
+	SaveIdea func(idea control.Idea)
 }
 
 // Handler returns the HTTP routes.
@@ -46,6 +48,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/hosts", s.listHosts)
 	mux.HandleFunc("GET /v1/hosts/{id}", s.hostDetail)
 	mux.HandleFunc("POST /v1/hosts/{id}/heartbeat", s.heartbeat)
+	mux.HandleFunc("POST /v1/hosts/{id}/poll", s.pollHost)
 	mux.HandleFunc("GET /v1/hosts/{host}/repos", s.repoDetail)
 	mux.HandleFunc("DELETE /v1/hosts/{host}/repos", s.unregisterRepo)
 	mux.HandleFunc("POST /v1/hosts/{host}/repo-requests", s.repoRequest)
@@ -95,6 +98,9 @@ func (s *Server) importGemini(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
+	}
+	if s.SaveIdea != nil {
+		s.SaveIdea(idea)
 	}
 	writeJSON(w, http.StatusCreated, ideaView(idea))
 }
@@ -388,6 +394,18 @@ func (s *Server) hostDetail(w http.ResponseWriter, r *http.Request) {
 		"host":  hostView(detail.Host, paused),
 		"repos": repos,
 		"tools": tools,
+	})
+}
+
+func (s *Server) pollHost(w http.ResponseWriter, r *http.Request) {
+	job, sch, docs, ok := s.Engine.PollHost(r.PathValue("id"))
+	if !ok {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"id": job.ID, "kind": job.Kind,
+		"worktree_path": sch.WorktreePath, "docs_hub_path": docs,
 	})
 }
 

@@ -654,6 +654,32 @@ func (e *Engine) GetRepo(host, path string) (Repo, bool) {
 	return *r, true
 }
 
+// PollHost leases the next queued schedule for the host.
+// The bool is false when nothing is waiting.
+func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, sch := range e.schedules {
+		if sch.HostID != host || sch.Status != "QUEUED" {
+			continue
+		}
+		sch.Status = "RUNNING"
+		id := e.next("job-")
+		job := &Job{
+			ID: id, ScheduleID: sch.ID, Kind: sch.Kind, Status: "RUNNING",
+			LeaseHolder: host, LeaseExpiry: e.now().Add(LeaseInterval),
+		}
+		e.jobs[id] = job
+		docs := ""
+		if repo := e.repos[repoKey(host, sch.WorktreePath)]; repo != nil {
+			repo.Lock = LockRunning
+			docs = repo.DocsHubPath
+		}
+		return *job, *sch, docs, true
+	}
+	return Job{}, Schedule{}, "", false
+}
+
 // GetIdea returns a copy of the idea.
 func (e *Engine) GetIdea(id string) (Idea, bool) {
 	e.mu.Lock()
