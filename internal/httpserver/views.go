@@ -56,6 +56,10 @@ func hostView(h control.Host, paused int) map[string]any {
 	if !h.LastSeen.IsZero() {
 		beat = h.LastSeen.UTC().Format(time.RFC3339)
 	}
+	tools := make([]map[string]any, 0, len(h.Tools))
+	for _, tool := range h.Tools {
+		tools = append(tools, toolView(tool))
+	}
 	return map[string]any{
 		"id":             h.ID,
 		"name":           name,
@@ -64,6 +68,7 @@ func hostView(h control.Host, paused int) map[string]any {
 		"last_heartbeat": beat,
 		"repos_paused":   paused,
 		"fetch_failed":   h.FetchFailed,
+		"tools":          tools,
 	}
 }
 
