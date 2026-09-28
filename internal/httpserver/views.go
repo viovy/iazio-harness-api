@@ -144,3 +144,22 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 		"history":           history,
 	}
 }
+
+func jobDetailView(j control.JobDetail) map[string]any {
+	return map[string]any{
+		"id":                             j.ID,
+		"schedule_id":                    j.ScheduleID,
+		"kind":                           j.Kind,
+		"status":                         j.Status,
+		"engine":                         j.Engine,
+		"prompt":                         j.Prompt,
+		"story_id":                       j.StoryID,
+		"source_idea_id":                 j.SourceIdeaID,
+		"transcript":                     j.Transcript,
+		"worktree_path":                 j.WorktreePath,
+		"docs_hub_path":                  j.DocsHubPath,
+		"env_vars":                      j.EnvVars,
+		"max_execution_duration_seconds": j.MaxExecutionDurationSeconds,
+	}
+}
+

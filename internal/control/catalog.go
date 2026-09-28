@@ -168,8 +168,8 @@ func (e *Engine) GetRepoDetail(host, path string) (RepoDetail, bool) {
 	return detail, true
 }
 
-// ExecutePrompt creates a schedule. Environment values are dropped; only keys are kept.
-func (e *Engine) ExecutePrompt(promptID, host, path string, iterations int, envKeys []string) (Schedule, error) {
+// ExecutePrompt creates a schedule. Environment keys are extracted for display; values are passed to the child process.
+func (e *Engine) ExecutePrompt(promptID, host, path string, iterations int, envVars map[string]string) (Schedule, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	p, ok := e.prompts[promptID]
@@ -188,11 +188,22 @@ func (e *Engine) ExecutePrompt(promptID, host, path string, iterations int, envK
 	if iterations < 1 {
 		iterations = 1
 	}
+	var envKeys []string
+	var envCopy map[string]string
+	if len(envVars) > 0 {
+		envCopy = make(map[string]string, len(envVars))
+		for k, v := range envVars {
+			envKeys = append(envKeys, k)
+			envCopy[k] = v
+		}
+	} else {
+		envKeys = []string{}
+	}
 	sid := e.next("sch-")
 	sch := &Schedule{
 		ID: sid, PromptID: promptID, Revision: p.Revision, HostID: host, WorktreePath: path,
 		Kind: KindOrdinary, IterationsTotal: iterations, IterationsRemaining: iterations,
-		MaxExecutionDuration: DefaultMaxExec, EnvKeys: append([]string(nil), envKeys...),
+		MaxExecutionDuration: DefaultMaxExec, EnvKeys: envKeys, EnvVars: envCopy,
 		Status: "QUEUED", PromptTitle: p.Title, Engine: p.Engine,
 	}
 	e.schedules[sid] = sch

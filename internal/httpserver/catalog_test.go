@@ -146,3 +146,63 @@ func get(t *testing.T, h http.Handler, path string, want int) string {
 	}
 	return rr.Body.String()
 }
+
+func TestGetJobEndpoint(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	h := s.Handler()
+
+	s.Engine.RegisterHost("runner-1", "permanent")
+	_ = s.Engine.UpsertRepo(control.Repo{
+		HostID: "runner-1", WorktreePath: "/repos/app", DocsHubPath: "/repos/docs-hub",
+		CloneURL: "https://example.test/app.git", Queue: "OPEN", Lock: "IDLE",
+	})
+	p := s.Engine.PutPrompt(control.Prompt{
+		Title: "ASE", Body: "run {{.StoryID}}", Engine: "agent", Status: "READY", StoryID: "STORY-123",
+	})
+	_, err := s.Engine.ExecutePrompt(p.ID, "runner-1", "/repos/app", 1, map[string]string{"ENV_A": "VAL_A"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	job, _, _, ok := s.Engine.PollHost("runner-1")
+	if !ok {
+		t.Fatal("expected polled job")
+	}
+
+	res := get(t, h, "/v1/jobs/"+job.ID, http.StatusOK)
+	var detail map[string]any
+	if err := json.Unmarshal([]byte(res), &detail); err != nil {
+		t.Fatal(err)
+	}
+	if detail["id"] != job.ID {
+		t.Fatalf("unexpected id: %v", detail["id"])
+	}
+	if detail["engine"] != "agent" {
+		t.Fatalf("unexpected engine: %v", detail["engine"])
+	}
+	if detail["prompt"] != "run {{.StoryID}}" {
+		t.Fatalf("unexpected prompt: %v", detail["prompt"])
+	}
+	if detail["story_id"] != "STORY-123" {
+		t.Fatalf("unexpected story_id: %v", detail["story_id"])
+	}
+	if detail["worktree_path"] != "/repos/app" {
+		t.Fatalf("unexpected worktree_path: %v", detail["worktree_path"])
+	}
+	if detail["docs_hub_path"] != "/repos/docs-hub" {
+		t.Fatalf("unexpected docs_hub_path: %v", detail["docs_hub_path"])
+	}
+	envVars, ok := detail["env_vars"].(map[string]any)
+	if !ok || envVars["ENV_A"] != "VAL_A" {
+		t.Fatalf("unexpected env_vars: %v", detail["env_vars"])
+	}
+
+	// Missing job returns 404
+	req := httptest.NewRequest(http.MethodGet, "/v1/jobs/non-existent", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing job, got %d", rr.Code)
+	}
+}
+

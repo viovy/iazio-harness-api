@@ -73,9 +73,27 @@ type Schedule struct {
 	IterationsRemaining  int
 	MaxExecutionDuration time.Duration
 	EnvKeys              []string
+	EnvVars              map[string]string
 	Status               string
 	PromptTitle          string
 	Engine               string
+}
+
+// JobDetail carries the execution payload for iazio-harness.
+type JobDetail struct {
+	ID                          string            `json:"id"`
+	ScheduleID                  string            `json:"schedule_id"`
+	Kind                        string            `json:"kind"`
+	Status                      string            `json:"status"`
+	Engine                      string            `json:"engine"`
+	Prompt                      string            `json:"prompt"`
+	StoryID                     string            `json:"story_id"`
+	SourceIdeaID                string            `json:"source_idea_id"`
+	Transcript                  string            `json:"transcript,omitempty"`
+	WorktreePath                string            `json:"worktree_path"`
+	DocsHubPath                 string            `json:"docs_hub_path"`
+	EnvVars                     map[string]string `json:"env_vars,omitempty"`
+	MaxExecutionDurationSeconds int               `json:"max_execution_duration_seconds"`
 }
 
 // Job is one leased execution.
@@ -690,3 +708,62 @@ func (e *Engine) GetIdea(id string) (Idea, bool) {
 	}
 	return *it, true
 }
+
+// GetJob returns execution details for the harness child.
+func (e *Engine) GetJob(id string) (JobDetail, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	job, ok := e.jobs[id]
+	if !ok {
+		return JobDetail{}, false
+	}
+	detail := JobDetail{
+		ID:         job.ID,
+		ScheduleID: job.ScheduleID,
+		Kind:       job.Kind,
+		Status:     job.Status,
+	}
+	sch := e.schedules[job.ScheduleID]
+	if sch != nil {
+		detail.Engine = sch.Engine
+		detail.WorktreePath = sch.WorktreePath
+		detail.EnvVars = sch.EnvVars
+		detail.MaxExecutionDurationSeconds = int(sch.MaxExecutionDuration.Seconds())
+		if p, ok := e.prompts[sch.PromptID]; ok {
+			detail.Prompt = p.Body
+			detail.StoryID = p.StoryID
+			detail.SourceIdeaID = p.SourceIdeaID
+			if detail.Engine == "" {
+				detail.Engine = p.Engine
+			}
+		}
+		if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
+			detail.DocsHubPath = repo.DocsHubPath
+		}
+	}
+	if detail.Engine == "" {
+		detail.Engine = "agent"
+	}
+	if detail.MaxExecutionDurationSeconds == 0 {
+		detail.MaxExecutionDurationSeconds = int(DefaultMaxExec.Seconds())
+	}
+	if detail.Kind == KindRefinement {
+		for _, it := range e.ideas {
+			if it.Status == IdeaRefining || (detail.SourceIdeaID != "" && it.ID == detail.SourceIdeaID) {
+				detail.Transcript = it.Transcript
+				if detail.StoryID == "" {
+					detail.StoryID = it.StoryID
+				}
+				if detail.SourceIdeaID == "" {
+					detail.SourceIdeaID = it.ID
+				}
+				break
+			}
+		}
+		if detail.Prompt == "" {
+			detail.Prompt = "Refine idea transcript at {{.SourceTranscriptPath}} into story {{.StoryID}}"
+		}
+	}
+	return detail, true
+}
+

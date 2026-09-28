@@ -37,6 +37,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /v1/prompts/{id}", s.updatePrompt)
 	mux.HandleFunc("DELETE /v1/prompts/{id}", s.deletePrompt)
 	mux.HandleFunc("POST /v1/prompts/{id}/execute", s.executePrompt)
+	mux.HandleFunc("GET /v1/jobs/{id}", s.getJob)
+	mux.HandleFunc("POST /v1/jobs/{id}/exit", s.postExit)
 	mux.HandleFunc("POST /v1/jobs/{id}/story-draft", s.storyDraft)
 	mux.HandleFunc("POST /v1/jobs/{id}/cancel", s.cancel)
 	mux.HandleFunc("POST /v1/jobs/{id}/force-pause", s.forcePauseJob)
@@ -347,11 +349,7 @@ func (s *Server) executePrompt(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	keys := make([]string, 0, len(raw.Env))
-	for k := range raw.Env {
-		keys = append(keys, k)
-	}
-	sch, err := s.Engine.ExecutePrompt(r.PathValue("id"), raw.HostID, raw.RepoPath, raw.Iterations, keys)
+	sch, err := s.Engine.ExecutePrompt(r.PathValue("id"), raw.HostID, raw.RepoPath, raw.Iterations, raw.Env)
 	if err != nil {
 		code := http.StatusConflict
 		if errors.Is(err, control.ErrNotFound) {
@@ -361,6 +359,27 @@ func (s *Server) executePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, scheduleView(sch))
+}
+
+func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
+	job, ok := s.Engine.GetJob(r.PathValue("id"))
+	if !ok {
+		writeErr(w, http.StatusNotFound, control.ErrNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, jobDetailView(job))
+}
+
+func (s *Server) postExit(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ExitCode int `json:"exit_code"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := s.Engine.PostExit(r.PathValue("id"), body.ExitCode); err != nil {
+		writeErr(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) listHosts(w http.ResponseWriter, _ *http.Request) {
