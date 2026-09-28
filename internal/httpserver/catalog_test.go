@@ -20,6 +20,10 @@ func TestWebCatalogRoundTrip(t *testing.T) {
 
 	post(t, h, "/v1/hosts/register", `{"id":"runner-1","kind":"permanent"}`, http.StatusOK)
 	post(t, h, "/v1/hosts/runner-1/heartbeat", `{"fetch_failed":true,"tools":[{"name":"iazio-harness","path":"/bin/iazio-harness","version":"1.2.3+abc","status":"OK"}]}`, http.StatusOK)
+	hostsBody := get(t, h, "/v1/hosts", http.StatusOK)
+	if !strings.Contains(hostsBody, "iazio-harness") || !strings.Contains(hostsBody, "1.2.3+abc") {
+		t.Fatalf("expected tools in /v1/hosts: %s", hostsBody)
+	}
 	post(t, h, "/v1/repos", `{"host_id":"runner-1","worktree_path":"/repos/app","docs_hub_path":"/repos/docs-hub","clone_url":"https://example.test/app.git","queue":"OPEN","lock":"IDLE"}`, http.StatusOK)
 
 	rr := post(t, h, "/v1/ideas/import-gemini", `{"share_url":"https://gemini.google.com/share/abc"}`, http.StatusCreated)
