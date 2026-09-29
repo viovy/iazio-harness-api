@@ -269,7 +269,7 @@ func (e *Engine) UnregisterRepo(host, path string) error {
 	return nil
 }
 
-// RequestCheckout records a path the agent must register. It does not clone.
+// RequestCheckout records a path the agent must register and registers the repository into the catalog.
 func (e *Engine) RequestCheckout(req RepoRequest) error {
 	if req.HostID == "" || req.Path == "" {
 		return ErrNotFound
@@ -283,6 +283,17 @@ func (e *Engine) RequestCheckout(req RepoRequest) error {
 		return ErrNotFound
 	}
 	e.requests = append(e.requests, req)
+	key := repoKey(req.HostID, req.Path)
+	if _, exists := e.repos[key]; !exists {
+		e.repos[key] = &Repo{
+			HostID:        req.HostID,
+			WorktreePath:  req.Path,
+			CloneURL:      req.CloneURL,
+			DefaultBranch: "main",
+			Queue:         QueueOpen,
+			Lock:          LockIdle,
+		}
+	}
 	return nil
 }
 
