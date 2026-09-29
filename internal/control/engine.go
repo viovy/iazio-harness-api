@@ -372,10 +372,10 @@ func (e *Engine) StoryDraft(jobID, holder, storyID, body string) (Prompt, error)
 	return *p, nil
 }
 
-// UpsertRepo registers a checkout. cloneURL is required.
+// UpsertRepo registers a checkout.
 func (e *Engine) UpsertRepo(r Repo) error {
-	if r.CloneURL == "" || r.HostID == "" || r.WorktreePath == "" {
-		return errors.New("clone_url, host, and worktree_path are required")
+	if r.HostID == "" || r.WorktreePath == "" {
+		return errors.New("host and worktree_path are required")
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()

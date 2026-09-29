@@ -210,3 +210,38 @@ func TestGetJobEndpoint(t *testing.T) {
 	}
 }
 
+func TestRepoRequestsAndUpsert(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	s.Engine.RegisterHost("host-test", "permanent")
+	h := s.Handler()
+
+	// 1. Post repo-request with existing-checkout
+	post(t, h, "/v1/hosts/host-test/repo-requests", `{"mode":"existing-checkout","path":"/repos/existing-1"}`, http.StatusAccepted)
+
+	// Verify hostDetail now returns this repo
+	hostRes := get(t, h, "/v1/hosts/host-test", http.StatusOK)
+	var hostDetail map[string]any
+	if err := json.Unmarshal([]byte(hostRes), &hostDetail); err != nil {
+		t.Fatal(err)
+	}
+	repos, ok := hostDetail["repos"].([]any)
+	if !ok || len(repos) != 1 {
+		t.Fatalf("expected 1 repo in hostDetail, got: %v", hostDetail["repos"])
+	}
+	r0 := repos[0].(map[string]any)
+	if r0["path"] != "/repos/existing-1" {
+		t.Fatalf("unexpected repo path: %v", r0["path"])
+	}
+
+	// 2. Post /v1/repos without clone_url (existing local checkout)
+	post(t, h, "/v1/repos", `{"host_id":"host-test","worktree_path":"/repos/existing-2"}`, http.StatusOK)
+	hostRes = get(t, h, "/v1/hosts/host-test", http.StatusOK)
+	if err := json.Unmarshal([]byte(hostRes), &hostDetail); err != nil {
+		t.Fatal(err)
+	}
+	repos = hostDetail["repos"].([]any)
+	if len(repos) != 2 {
+		t.Fatalf("expected 2 repos in hostDetail, got: %v", repos)
+	}
+}
+
