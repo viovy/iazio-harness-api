@@ -160,3 +160,73 @@ func TestCancelFreezeAndEphemeral(t *testing.T) {
 		t.Fatal("archived id must not revive")
 	}
 }
+
+func TestRepoQueueDecrementsAndClearsOnFinish(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app", CloneURL: "https://example.test/app.git"}); err != nil {
+		t.Fatal(err)
+	}
+	p := e.PutPrompt(Prompt{Title: "Task prompt", Body: "do task", Status: "READY"})
+
+	// 1. Create a schedule with 2 iterations
+	sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Repo detail queue must have 1 schedule with iterations 2
+	detail, ok := e.GetRepoDetail("host-1", "/work/app")
+	if !ok || len(detail.Schedules) != 1 {
+		t.Fatalf("expected 1 schedule in queue, got: %d", len(detail.Schedules))
+	}
+	if detail.Schedules[0].IterationsRemaining != 2 {
+		t.Fatalf("expected 2 iterations remaining, got: %d", detail.Schedules[0].IterationsRemaining)
+	}
+	if len(detail.History) != 0 {
+		t.Fatalf("expected 0 history items, got: %d", len(detail.History))
+	}
+
+	// 2. Poll host leases first iteration
+	job1, leasedSch, _, ok := e.PollHost("host-1")
+	if !ok || job1.ScheduleID != sch.ID {
+		t.Fatalf("expected job for schedule %s, got: %+v", sch.ID, job1)
+	}
+	if leasedSch.IterationsRemaining != 2 {
+		t.Fatalf("expected 2 iterations remaining on lease, got: %d", leasedSch.IterationsRemaining)
+	}
+
+	// 3. Finish iteration 1 with ASEComplete: true
+	e.ApplyFinish("host-1", "/work/app", job1.ID, FinishInput{ASEComplete: true})
+
+	// After iteration 1, queue must still have 1 schedule, but with iterations remaining = 1
+	detail, ok = e.GetRepoDetail("host-1", "/work/app")
+	if !ok || len(detail.Schedules) != 1 {
+		t.Fatalf("expected 1 schedule in queue after iter 1, got: %d", len(detail.Schedules))
+	}
+	if detail.Schedules[0].IterationsRemaining != 1 {
+		t.Fatalf("expected 1 iteration remaining, got: %d", detail.Schedules[0].IterationsRemaining)
+	}
+	if len(detail.History) != 1 {
+		t.Fatalf("expected 1 history item after iter 1, got: %d", len(detail.History))
+	}
+
+	// 4. Poll host leases second iteration
+	job2, _, _, ok := e.PollHost("host-1")
+	if !ok || job2.ScheduleID != sch.ID {
+		t.Fatalf("expected job for schedule %s, got: %+v", sch.ID, job2)
+	}
+
+	// 5. Finish iteration 2 with ASEComplete: true
+	e.ApplyFinish("host-1", "/work/app", job2.ID, FinishInput{ASEComplete: true})
+
+	// After iteration 2 (all iterations complete), queue must be EMPTY (0 schedules)!
+	detail, ok = e.GetRepoDetail("host-1", "/work/app")
+	if !ok || len(detail.Schedules) != 0 {
+		t.Fatalf("expected 0 schedules in queue after all iterations complete, got: %d", len(detail.Schedules))
+	}
+	if len(detail.History) != 2 {
+		t.Fatalf("expected 2 history items after iter 2, got: %d", len(detail.History))
+	}
+}
+
