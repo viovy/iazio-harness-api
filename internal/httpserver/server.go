@@ -63,7 +63,27 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/repos/{host}/finish", s.finish)
 	mux.HandleFunc("POST /v1/repos/{host}/force-pause", s.forcePause)
 	mux.HandleFunc("GET /v1/repos/{host}", s.getRepo)
-	return mux
+	return withCORS(mux)
+}
+
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			origin = "*"
+		}
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Vary", "Origin")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, Last-Event-ID, X-Requested-With, Origin")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD")
+		w.Header().Set("Access-Control-Expose-Headers", "*")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
@@ -596,7 +616,14 @@ func (s *Server) jobStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
+
+	// Send an initial SSE comment and flush to establish connection through reverse proxies
+	_, _ = w.Write([]byte(": ping\n\n"))
+	flusher.Flush()
 	tail := atoiQuery(r.URL.Query().Get("tail"))
 	after := atoiQuery(r.URL.Query().Get("after_seq"))
 	chunks, gapFrom, gapTo := s.Engine.TailLogs(id, tail, after)
