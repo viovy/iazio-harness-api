@@ -129,6 +129,72 @@ func TestLiveStreamTail(t *testing.T) {
 	}
 }
 
+func TestStreamCORSAndHeaders(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	s.Engine.AppendLog("job-stream-cors", control.LogChunk{Type: "OUTPUT_CHUNK", Text: "cors-check"})
+
+	// 1. OPTIONS preflight
+	reqOptions := httptest.NewRequest(http.MethodOptions, "/v1/jobs/job-stream-cors/stream?tail=100", nil)
+	reqOptions.Header.Set("Origin", "https://example.com")
+	reqOptions.Header.Set("Access-Control-Request-Method", "GET")
+	reqOptions.Header.Set("Access-Control-Request-Headers", "authorization, accept")
+	rrOptions := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rrOptions, reqOptions)
+
+	if rrOptions.Code != http.StatusNoContent {
+		t.Fatalf("OPTIONS code = %d, want 204", rrOptions.Code)
+	}
+	if got := rrOptions.Header().Get("Access-Control-Allow-Origin"); got != "https://example.com" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want https://example.com", got)
+	}
+	if got := rrOptions.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(got, "GET") {
+		t.Errorf("Access-Control-Allow-Methods = %q, want containing GET", got)
+	}
+	if got := rrOptions.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(got, "Authorization") {
+		t.Errorf("Access-Control-Allow-Headers = %q, want containing Authorization", got)
+	}
+
+	// 2. GET streaming headers
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	reqGet, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v1/jobs/job-stream-cors/stream?tail=100", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqGet.Header.Set("Origin", "https://example.com")
+	reqGet.Header.Set("Accept", "text/event-stream")
+
+	resp, err := http.DefaultClient.Do(reqGet)
+	if err != nil && !strings.Contains(err.Error(), "context") {
+		t.Fatal(err)
+	}
+	if resp != nil {
+		defer resp.Body.Close()
+		if got := resp.Header.Get("Content-Type"); got != "text/event-stream" {
+			t.Errorf("Content-Type = %q, want text/event-stream", got)
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://example.com" {
+			t.Errorf("Access-Control-Allow-Origin = %q, want https://example.com", got)
+		}
+		if got := resp.Header.Get("Cache-Control"); !strings.Contains(got, "no-cache") {
+			t.Errorf("Cache-Control = %q, want containing no-cache", got)
+		}
+		if got := resp.Header.Get("X-Accel-Buffering"); got != "no" {
+			t.Errorf("X-Accel-Buffering = %q, want no", got)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		if !strings.Contains(string(b), ": ping\n\n") {
+			t.Errorf("expected initial ping comment in body: %s", string(b))
+		}
+		if !strings.Contains(string(b), "cors-check") {
+			t.Errorf("expected chunk log in body: %s", string(b))
+		}
+	}
+}
+
 func post(t *testing.T, h http.Handler, path, body string, want int) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body))
