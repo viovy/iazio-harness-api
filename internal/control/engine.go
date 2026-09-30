@@ -480,6 +480,10 @@ func (e *Engine) PostExit(jobID string, code int) error {
 	job.ExitPosted = true
 	if job.Status == "CANCEL_REQUESTED" {
 		job.Status = "CANCELLED"
+		if sch, ok := e.schedules[job.ScheduleID]; ok {
+			sch.Status = "CANCELLED"
+			sch.IterationsRemaining = 0
+		}
 	}
 	_ = code
 	return nil
@@ -522,6 +526,11 @@ func (e *Engine) ApplyFinish(host, path string, jobID string, in FinishInput) Fi
 		if sch, ok := e.schedules[job.ScheduleID]; ok {
 			if d.Decrement && sch.IterationsRemaining > 0 {
 				sch.IterationsRemaining--
+			}
+			if sch.IterationsRemaining <= 0 {
+				sch.Status = "FINISHED"
+			} else {
+				sch.Status = "QUEUED"
 			}
 			if sch.CloneURL != "" {
 				delete(e.cloneLease, sch.CloneURL)

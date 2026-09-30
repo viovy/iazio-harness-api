@@ -2,6 +2,7 @@ package control
 
 import (
 	"errors"
+	"sort"
 	"strings"
 )
 
@@ -152,10 +153,18 @@ func (e *Engine) GetRepoDetail(host, path string) (RepoDetail, bool) {
 			detail.RunningTitle = sch.PromptTitle
 			detail.RunningEngine = sch.Engine
 		}
-		if sch.Status == "QUEUED" || sch.Status == "RUNNING" {
+	}
+	for _, sch := range e.schedules {
+		if sch.HostID != host || sch.WorktreePath != path {
+			continue
+		}
+		if (sch.Status == "QUEUED" || sch.Status == "RUNNING") && sch.IterationsRemaining > 0 {
 			detail.Schedules = append(detail.Schedules, *sch)
 		}
 	}
+	sort.Slice(detail.Schedules, func(i, j int) bool {
+		return detail.Schedules[i].ID < detail.Schedules[j].ID
+	})
 	if detail.Running == nil && latest != nil && (repo.Lock == LockCooling || repo.Queue == QueueBlocked) {
 		detail.Running = latest
 		detail.RunningTitle = latestTitle
