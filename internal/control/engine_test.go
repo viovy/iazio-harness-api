@@ -230,3 +230,113 @@ func TestRepoQueueDecrementsAndClearsOnFinish(t *testing.T) {
 	}
 }
 
+func TestRepoQueueDecrementsAndClearsEvenIfDirty(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app", CloneURL: "https://example.test/app.git"}); err != nil {
+		t.Fatal(err)
+	}
+	p := e.PutPrompt(Prompt{Title: "Task prompt", Body: "do task", Status: "READY"})
+
+	sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	detail, ok := e.GetRepoDetail("host-1", "/work/app")
+	if !ok || len(detail.Schedules) != 1 {
+		t.Fatalf("expected 1 schedule in queue initially, got: %d", len(detail.Schedules))
+	}
+
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok || job.ScheduleID != sch.ID {
+		t.Fatalf("expected job for schedule %s", sch.ID)
+	}
+
+	// Execution completes with dirty porcelain
+	e.ApplyFinish("host-1", "/work/app", job.ID, FinishInput{WorkPorcelain: " M modified_file.go", ASEComplete: false})
+
+	detail, ok = e.GetRepoDetail("host-1", "/work/app")
+	if !ok {
+		t.Fatal("repo not found")
+	}
+	if len(detail.Schedules) != 0 {
+		t.Fatalf("expected 0 schedules in queue after execution completion even if dirty, got: %d", len(detail.Schedules))
+	}
+	if len(detail.History) != 1 {
+		t.Fatalf("expected 1 history item, got: %d", len(detail.History))
+	}
+	if detail.History[0].ScheduleID != sch.ID {
+		t.Fatalf("expected history schedule_id %s, got: %s", sch.ID, detail.History[0].ScheduleID)
+	}
+	if detail.History[0].Clean {
+		t.Fatal("expected history item clean=false")
+	}
+}
+
+func TestRepoQueueMultiIterationDecrement(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app", CloneURL: "https://example.test/app.git"}); err != nil {
+		t.Fatal(err)
+	}
+	p := e.PutPrompt(Prompt{Title: "Multi-iter prompt", Body: "run 3 times", Status: "READY"})
+
+	sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 3, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Step 1: Iteration 1
+	job1, _, _, ok := e.PollHost("host-1")
+	if !ok || job1.ScheduleID != sch.ID {
+		t.Fatalf("poll 1 failed")
+	}
+	e.ApplyFinish("host-1", "/work/app", job1.ID, FinishInput{ASEComplete: true})
+
+	detail, _ := e.GetRepoDetail("host-1", "/work/app")
+	if len(detail.Schedules) != 1 {
+		t.Fatalf("expected 1 schedule in queue after iter 1, got %d", len(detail.Schedules))
+	}
+	if detail.Schedules[0].IterationsRemaining != 2 || detail.Schedules[0].IterationsCompleted != 1 {
+		t.Fatalf("expected remaining=2, completed=1, got: %+v", detail.Schedules[0])
+	}
+	if len(detail.History) != 1 {
+		t.Fatalf("expected 1 history item, got %d", len(detail.History))
+	}
+
+	// Step 2: Iteration 2
+	job2, _, _, ok := e.PollHost("host-1")
+	if !ok || job2.ScheduleID != sch.ID {
+		t.Fatalf("poll 2 failed")
+	}
+	e.ApplyFinish("host-1", "/work/app", job2.ID, FinishInput{ASEComplete: true})
+
+	detail, _ = e.GetRepoDetail("host-1", "/work/app")
+	if len(detail.Schedules) != 1 {
+		t.Fatalf("expected 1 schedule in queue after iter 2, got %d", len(detail.Schedules))
+	}
+	if detail.Schedules[0].IterationsRemaining != 1 || detail.Schedules[0].IterationsCompleted != 2 {
+		t.Fatalf("expected remaining=1, completed=2, got: %+v", detail.Schedules[0])
+	}
+	if len(detail.History) != 2 {
+		t.Fatalf("expected 2 history items, got %d", len(detail.History))
+	}
+
+	// Step 3: Iteration 3
+	job3, _, _, ok := e.PollHost("host-1")
+	if !ok || job3.ScheduleID != sch.ID {
+		t.Fatalf("poll 3 failed")
+	}
+	e.ApplyFinish("host-1", "/work/app", job3.ID, FinishInput{ASEComplete: true})
+
+	detail, _ = e.GetRepoDetail("host-1", "/work/app")
+	if len(detail.Schedules) != 0 {
+		t.Fatalf("expected 0 schedules in queue after iter 3 (all completed), got %d", len(detail.Schedules))
+	}
+	if len(detail.History) != 3 {
+		t.Fatalf("expected 3 history items, got %d", len(detail.History))
+	}
+}
+
+
