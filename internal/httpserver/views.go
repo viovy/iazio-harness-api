@@ -35,17 +35,18 @@ func scheduleView(s control.Schedule) map[string]any {
 		keys = []string{}
 	}
 	return map[string]any{
-		"id":           s.ID,
-		"prompt_id":    s.PromptID,
-		"prompt_title": s.PromptTitle,
-		"host_id":      s.HostID,
-		"repo_path":    s.WorktreePath,
+		"id":                   s.ID,
+		"prompt_id":            s.PromptID,
+		"prompt_title":         s.PromptTitle,
+		"host_id":              s.HostID,
+		"repo_path":            s.WorktreePath,
 		"iterations":           s.IterationsRemaining,
 		"iterations_total":     s.IterationsTotal,
 		"iterations_remaining": s.IterationsRemaining,
-		"env_keys":     keys,
-		"kind":         s.Kind,
-		"status":       s.Status,
+		"iterations_completed": s.IterationsCompleted,
+		"env_keys":             keys,
+		"kind":                 s.Kind,
+		"status":               s.Status,
 	}
 }
 
@@ -129,6 +130,7 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 		}
 		history = append(history, map[string]any{
 			"job_id":           h.JobID,
+			"schedule_id":      h.ScheduleID,
 			"prompt_title":     h.PromptTitle,
 			"engine":           h.Engine,
 			"clean":            h.Clean,

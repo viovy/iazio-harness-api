@@ -159,7 +159,9 @@ func (e *Engine) GetRepoDetail(host, path string) (RepoDetail, bool) {
 			continue
 		}
 		if (sch.Status == "QUEUED" || sch.Status == "RUNNING") && sch.IterationsRemaining > 0 {
-			detail.Schedules = append(detail.Schedules, *sch)
+			if sch.IterationsTotal <= 0 || sch.IterationsCompleted < sch.IterationsTotal {
+				detail.Schedules = append(detail.Schedules, *sch)
+			}
 		}
 	}
 	sort.Slice(detail.Schedules, func(i, j int) bool {

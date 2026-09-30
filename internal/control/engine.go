@@ -71,6 +71,7 @@ type Schedule struct {
 	Kind                 string
 	IterationsTotal      int
 	IterationsRemaining  int
+	IterationsCompleted  int
 	MaxExecutionDuration time.Duration
 	EnvKeys              []string
 	EnvVars              map[string]string
@@ -136,6 +137,7 @@ type Tool struct {
 // HistoryRow is one finished execution on a repo page.
 type HistoryRow struct {
 	JobID           string
+	ScheduleID      string
 	PromptTitle     string
 	Engine          string
 	Clean           bool
@@ -524,11 +526,13 @@ func (e *Engine) ApplyFinish(host, path string, jobID string, in FinishInput) Fi
 			job.Status = "RUN_FINISHED"
 		}
 		if sch, ok := e.schedules[job.ScheduleID]; ok {
-			if d.Decrement && sch.IterationsRemaining > 0 {
+			sch.IterationsCompleted++
+			if sch.IterationsRemaining > 0 {
 				sch.IterationsRemaining--
 			}
-			if sch.IterationsRemaining <= 0 {
+			if sch.IterationsRemaining <= 0 || (sch.IterationsTotal > 0 && sch.IterationsCompleted >= sch.IterationsTotal) {
 				sch.Status = "FINISHED"
+				sch.IterationsRemaining = 0
 			} else {
 				sch.Status = "QUEUED"
 			}
@@ -537,7 +541,7 @@ func (e *Engine) ApplyFinish(host, path string, jobID string, in FinishInput) Fi
 			}
 			clean := strings.TrimSpace(in.WorkPorcelain) == "" && strings.TrimSpace(in.HubPorcelain) == "" && in.HubAhead == 0
 			e.history[repoKey(host, path)] = append(e.history[repoKey(host, path)], HistoryRow{
-				JobID: jobID, PromptTitle: sch.PromptTitle, Engine: sch.Engine,
+				JobID: jobID, ScheduleID: sch.ID, PromptTitle: sch.PromptTitle, Engine: sch.Engine,
 				Clean: clean, ASEComplete: in.ASEComplete,
 			})
 		}
