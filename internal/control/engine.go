@@ -932,6 +932,28 @@ func (e *Engine) reapExpiredLocked() {
 			}
 		}
 	}
+	for _, sch := range e.schedules {
+		if sch.Status == "RUNNING" || sch.Status == "COMPLETED" {
+			hasActive := false
+			for _, job := range e.jobs {
+				if job.ScheduleID == sch.ID && !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "CANCEL_REQUESTED") {
+					hasActive = true
+					break
+				}
+			}
+			if !hasActive {
+				if sch.IterationsRemaining > 0 && (sch.IterationsTotal <= 0 || sch.IterationsCompleted < sch.IterationsTotal) {
+					sch.Status = "QUEUED"
+				} else {
+					sch.Status = "FINISHED"
+					sch.IterationsRemaining = 0
+				}
+				if sch.CloneURL != "" && sch.IterationsRemaining <= 0 {
+					delete(e.cloneLease, sch.CloneURL)
+				}
+			}
+		}
+	}
 	for _, repo := range e.repos {
 		if repo.Lock == LockRunning {
 			hasActive := false
@@ -1098,6 +1120,49 @@ func (e *Engine) SetSchedulePriority(scheduleID string, priority int) (Schedule,
 	}
 	sch.Priority = priority
 	if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
+		e.notifyRepoLocked(repo)
+	}
+	return *sch, nil
+}
+
+// CancelSchedule cancels a schedule by ID and aborts any active running job for it.
+func (e *Engine) CancelSchedule(scheduleID string) (Schedule, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	sch, ok := e.schedules[scheduleID]
+	if !ok {
+		return Schedule{}, ErrNotFound
+	}
+	if sch.Status == "FINISHED" || sch.Status == "CANCELLED" {
+		return *sch, nil
+	}
+	sch.Status = "CANCELLED"
+	sch.IterationsRemaining = 0
+	if sch.CloneURL != "" {
+		delete(e.cloneLease, sch.CloneURL)
+	}
+
+	for _, job := range e.jobs {
+		if job.ScheduleID == scheduleID && !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "CANCEL_REQUESTED") {
+			job.Status = "CANCEL_REQUESTED"
+			job.FrozenUntil = e.now().Add(ReapFreeze)
+			e.updateHistoryStatusLocked(sch.HostID, sch.WorktreePath, job.ID, "CANCEL_REQUESTED")
+		}
+	}
+
+	if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
+		hasActive := false
+		for _, job := range e.jobs {
+			if !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "CANCEL_REQUESTED") {
+				if s := e.schedules[job.ScheduleID]; s != nil && s.HostID == repo.HostID && s.WorktreePath == repo.WorktreePath {
+					hasActive = true
+					break
+				}
+			}
+		}
+		if !hasActive && repo.Lock == LockRunning {
+			repo.Lock = LockIdle
+		}
 		e.notifyRepoLocked(repo)
 	}
 	return *sch, nil

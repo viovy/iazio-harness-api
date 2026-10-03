@@ -57,6 +57,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/schedules/{id}/priority", s.changePriority)
 	mux.HandleFunc("POST /v1/schedules/{id}/increase-priority", s.increasePriority)
 	mux.HandleFunc("POST /v1/schedules/{id}/decrease-priority", s.decreasePriority)
+	mux.HandleFunc("POST /v1/schedules/{id}/cancel", s.cancelSchedule)
+	mux.HandleFunc("DELETE /v1/schedules/{id}", s.cancelSchedule)
 	mux.HandleFunc("GET /v1/jobs/{id}", s.getJob)
 	mux.HandleFunc("POST /v1/jobs/{id}/exit", s.postExit)
 	mux.HandleFunc("POST /v1/jobs/{id}/decline", s.declineJob)
@@ -513,6 +515,25 @@ func (s *Server) decreasePriority(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, scheduleView(sch))
+}
+
+func (s *Server) cancelSchedule(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sch, err := s.Engine.CancelSchedule(id)
+	if err != nil {
+		if errors.Is(err, control.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, err)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if s.SaveRepo != nil {
+		if repo, ok := s.Engine.GetRepo(sch.HostID, sch.WorktreePath); ok {
+			s.SaveRepo(repo)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "CANCELLED", "id": id})
 }
 
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {

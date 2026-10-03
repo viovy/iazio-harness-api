@@ -836,4 +836,118 @@ func TestLeaseExpirationReapsStaleJob(t *testing.T) {
 	_ = sch
 }
 
+func TestOrphanedRunningScheduleRecovery(t *testing.T) {
+	curr := time.Date(2026, 10, 3, 10, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return curr }
+	e := NewEngine(clock)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app"}); err != nil {
+		t.Fatal(err)
+	}
+
+	p := e.PutPrompt(Prompt{Title: "Orphan prompt", Body: "recover me", Status: "READY"})
+	sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate schedule stuck in RUNNING status without any active job in e.jobs
+	e.mu.Lock()
+	e.schedules[sch.ID].Status = "RUNNING"
+	e.mu.Unlock()
+
+	// Prior to fix, PollHost would ignore it because Status != QUEUED
+	// With fix, GetRepoDetail or PollHost triggers reapExpiredLocked and recovers it to QUEUED
+	job, leasedSch, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatalf("expected orphaned schedule to be recovered to QUEUED and polled, but PollHost returned false")
+	}
+	if leasedSch.ID != sch.ID {
+		t.Fatalf("expected leased schedule %s, got %s", sch.ID, leasedSch.ID)
+	}
+	if job.ScheduleID != sch.ID {
+		t.Fatalf("expected job for schedule %s, got %s", sch.ID, job.ScheduleID)
+	}
+}
+
+func TestOrphanedCompletedScheduleRecovery(t *testing.T) {
+	curr := time.Date(2026, 10, 3, 10, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return curr }
+	e := NewEngine(clock)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app"}); err != nil {
+		t.Fatal(err)
+	}
+
+	p := e.PutPrompt(Prompt{Title: "Exhausted prompt", Body: "done", Status: "READY"})
+	sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate schedule stuck in RUNNING with 0 iterations remaining and no job
+	e.mu.Lock()
+	e.schedules[sch.ID].Status = "RUNNING"
+	e.schedules[sch.ID].IterationsRemaining = 0
+	e.schedules[sch.ID].IterationsCompleted = 1
+	e.mu.Unlock()
+
+	detail, _ := e.GetRepoDetail("host-1", "/work/app")
+	if len(detail.Schedules) != 0 {
+		t.Fatalf("expected 0 active schedules after recovery, got %d", len(detail.Schedules))
+	}
+
+	e.mu.Lock()
+	status := e.schedules[sch.ID].Status
+	e.mu.Unlock()
+	if status != "FINISHED" {
+		t.Fatalf("expected FINISHED status, got %s", status)
+	}
+}
+
+func TestCancelSchedule(t *testing.T) {
+	curr := time.Date(2026, 10, 3, 10, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return curr }
+	e := NewEngine(clock)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app"}); err != nil {
+		t.Fatal(err)
+	}
+
+	p := e.PutPrompt(Prompt{Title: "To be cancelled", Body: "cancel me", Status: "READY"})
+	sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Cancel queued schedule
+	if _, err := e.CancelSchedule(sch.ID); err != nil {
+		t.Fatalf("failed to cancel schedule: %v", err)
+	}
+
+	detail, _ := e.GetRepoDetail("host-1", "/work/app")
+	if len(detail.Schedules) != 0 {
+		t.Fatalf("expected cancelled schedule to not appear in RepoDetail, got: %d", len(detail.Schedules))
+	}
+
+	// 2. Schedule another and poll it into RUNNING state, then cancel schedule
+	sch2, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("poll failed")
+	}
+
+	if _, err := e.CancelSchedule(sch2.ID); err != nil {
+		t.Fatalf("failed to cancel running schedule: %v", err)
+	}
+
+	jobDetail, _ := e.GetJob(job.ID)
+	if jobDetail.Status != "CANCEL_REQUESTED" {
+		t.Fatalf("expected running job to have CANCEL_REQUESTED status, got: %s", jobDetail.Status)
+	}
+}
+
 
