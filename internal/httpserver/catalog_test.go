@@ -380,6 +380,11 @@ func TestPersistenceHooks(t *testing.T) {
 		t.Fatalf("expected SaveRepo called on upsertRepo: %+v", savedRepos)
 	}
 
+	post(t, h, "/v1/repos/hook-host/preflight", `{"worktree_path":"/work/test-1","preflight":{"FreeBytes":100000000,"GitWorkTree":true,"HeadAttached":true,"Branch":"main","DefaultBranch":"main"}}`, http.StatusOK)
+	if len(savedRepos) != 2 || savedRepos[1].WorktreePath != "/work/test-1" {
+		t.Fatalf("expected SaveRepo called on preflight: %+v", savedRepos)
+	}
+
 	req = httptest.NewRequest(http.MethodDelete, "/v1/hosts/hook-host/repos?path=/work/test-1", nil)
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, req)

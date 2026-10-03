@@ -311,7 +311,14 @@ func (s *Server) preflight(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.Engine.ApplyPreflight(r.PathValue("host"), body.Path, body.Pre))
+	host := r.PathValue("host")
+	halt := s.Engine.ApplyPreflight(host, body.Path, body.Pre)
+	if s.SaveRepo != nil {
+		if detail, ok := s.Engine.GetRepoDetail(host, body.Path); ok {
+			s.SaveRepo(detail.Repo)
+		}
+	}
+	writeJSON(w, http.StatusOK, halt)
 }
 
 func (s *Server) finish(w http.ResponseWriter, r *http.Request) {
