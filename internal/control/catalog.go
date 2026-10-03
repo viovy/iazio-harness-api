@@ -401,6 +401,7 @@ func (e *Engine) ForcePauseJob(jobID string) error {
 	if sch.CloneURL != "" {
 		delete(e.cloneLease, sch.CloneURL)
 	}
+	e.notifyRepoLocked(repo)
 	return nil
 }
 

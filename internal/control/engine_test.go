@@ -1,6 +1,7 @@
 package control
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -485,6 +486,170 @@ func TestForcePauseClearsActiveJobAndSchedule(t *testing.T) {
 	}
 	if detail.Running != nil {
 		t.Fatalf("expected running job cleared, got: %+v", detail.Running)
+	}
+}
+
+func TestDeclineJobRequeuesScheduleAndUnlocks(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app", CloneURL: "https://example.test/app.git"}); err != nil {
+		t.Fatal(err)
+	}
+	p := e.PutPrompt(Prompt{Title: "Task 1", Body: "do task 1", Status: "READY"})
+	sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok || job.ScheduleID != sch.ID {
+		t.Fatalf("failed to lease job")
+	}
+
+	// Verify repo is locked while running
+	detail, ok := e.GetRepoDetail("host-1", "/work/app")
+	if !ok || detail.Repo.Lock != LockRunning {
+		t.Fatalf("expected LockRunning during execution, got: %s", detail.Repo.Lock)
+	}
+
+	// Decline job (e.g. worktree busy on agent)
+	if err := e.DeclineJob(job.ID, "worktree_busy"); err != nil {
+		t.Fatalf("DeclineJob failed: %v", err)
+	}
+
+	// Job status must be DECLINED
+	jobDetail, ok := e.GetJob(job.ID)
+	if !ok || jobDetail.Status != "DECLINED" {
+		t.Fatalf("expected job status DECLINED, got: %s", jobDetail.Status)
+	}
+
+	// Repo must be unlocked
+	detail, ok = e.GetRepoDetail("host-1", "/work/app")
+	if !ok || detail.Repo.Lock != LockIdle {
+		t.Fatalf("expected LockIdle after decline, got: %s", detail.Repo.Lock)
+	}
+
+	// Schedule must be requeued (Status == QUEUED)
+	if len(detail.Schedules) != 1 || detail.Schedules[0].Status != "QUEUED" {
+		t.Fatalf("expected 1 QUEUED schedule, got: %+v", detail.Schedules)
+	}
+
+	// Subsequent PollHost should re-lease the schedule
+	job2, _, _, ok := e.PollHost("host-1")
+	if !ok || job2.ScheduleID != sch.ID {
+		t.Fatalf("expected re-leasing declined schedule, but got ok=%v", ok)
+	}
+}
+
+func TestPostExitRunningJobSuccessAndFailure(t *testing.T) {
+	// Test failure exit (code != 0)
+	{
+		e := NewEngine(nil)
+		e.RegisterHost("host-1", "permanent")
+		if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app", CloneURL: "https://example.test/app.git"}); err != nil {
+			t.Fatal(err)
+		}
+		p := e.PutPrompt(Prompt{Title: "Task 1", Body: "do task 1", Status: "READY"})
+		sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		job, _, _, ok := e.PollHost("host-1")
+		if !ok || job.ScheduleID != sch.ID {
+			t.Fatalf("failed to lease job")
+		}
+
+		if err := e.PostExit(job.ID, 1); err != nil {
+			t.Fatalf("PostExit failed: %v", err)
+		}
+
+		jobDetail, ok := e.GetJob(job.ID)
+		if !ok || jobDetail.Status != "FAILED" {
+			t.Fatalf("expected job status FAILED on non-zero exit, got: %s", jobDetail.Status)
+		}
+
+		detail, ok := e.GetRepoDetail("host-1", "/work/app")
+		if !ok || detail.Repo.Lock != LockIdle {
+			t.Fatalf("expected LockIdle on exit, got: %s", detail.Repo.Lock)
+		}
+		if detail.Repo.Queue != QueuePaused {
+			t.Fatalf("expected QueuePaused on non-zero exit, got: %s", detail.Repo.Queue)
+		}
+	}
+
+	// Test success exit (code == 0)
+	{
+		e := NewEngine(nil)
+		e.RegisterHost("host-1", "permanent")
+		if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app", CloneURL: "https://example.test/app.git"}); err != nil {
+			t.Fatal(err)
+		}
+		p := e.PutPrompt(Prompt{Title: "Task 2", Body: "do task 2", Status: "READY"})
+		sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		job, _, _, ok := e.PollHost("host-1")
+		if !ok || job.ScheduleID != sch.ID {
+			t.Fatalf("failed to lease job")
+		}
+
+		if err := e.PostExit(job.ID, 0); err != nil {
+			t.Fatalf("PostExit failed: %v", err)
+		}
+
+		jobDetail, ok := e.GetJob(job.ID)
+		if !ok || jobDetail.Status != "RUN_FINISHED" {
+			t.Fatalf("expected job status RUN_FINISHED on zero exit, got: %s", jobDetail.Status)
+		}
+
+		detail, ok := e.GetRepoDetail("host-1", "/work/app")
+		if !ok || detail.Repo.Lock != LockIdle {
+			t.Fatalf("expected LockIdle on exit, got: %s", detail.Repo.Lock)
+		}
+		if len(detail.Schedules) != 0 {
+			t.Fatalf("expected 0 remaining schedules after completed exit, got: %d", len(detail.Schedules))
+		}
+	}
+}
+
+func TestOnRepoChangeInvoked(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	var saved []Repo
+	var mu sync.Mutex
+	e.OnRepoChange = func(r Repo) {
+		mu.Lock()
+		defer mu.Unlock()
+		saved = append(saved, r)
+	}
+
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app", CloneURL: "https://example.test/app.git"}); err != nil {
+		t.Fatal(err)
+	}
+
+	p := e.PutPrompt(Prompt{Title: "Task 1", Body: "do task 1", Status: "READY"})
+	_, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatalf("expected poll to succeed")
+	}
+
+	_ = e.DeclineJob(job.ID, "busy")
+
+	// Allow goroutines to fire
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(saved) < 2 {
+		t.Fatalf("expected at least 2 OnRepoChange invocations, got: %d", len(saved))
 	}
 }
 

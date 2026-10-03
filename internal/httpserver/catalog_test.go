@@ -391,4 +391,48 @@ func TestPersistenceHooks(t *testing.T) {
 	}
 }
 
+func TestDeclineJobEndpoint(t *testing.T) {
+	e := control.NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	_ = e.UpsertRepo(control.Repo{HostID: "host-1", WorktreePath: "/work/test-1", CloneURL: "https://example.test/test.git"})
+	p := e.PutPrompt(control.Prompt{Title: "Task", Body: "do work", Status: "READY"})
+	_, err := e.ExecutePrompt(p.ID, "host-1", "/work/test-1", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatalf("expected job leased")
+	}
+
+	var savedRepos []control.Repo
+	s := &Server{
+		Engine:   e,
+		SaveRepo: func(r control.Repo) { savedRepos = append(savedRepos, r) },
+	}
+	h := s.Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/decline", strings.NewReader(`{"reason":"worktree_busy"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	jobDetail, ok := e.GetJob(job.ID)
+	if !ok || jobDetail.Status != "DECLINED" {
+		t.Fatalf("expected job DECLINED, got: %+v", jobDetail)
+	}
+
+	if len(savedRepos) == 0 {
+		t.Fatalf("expected SaveRepo called on decline")
+	}
+	if savedRepos[len(savedRepos)-1].Lock != control.LockIdle {
+		t.Fatalf("expected saved repo lock to be LockIdle, got %s", savedRepos[len(savedRepos)-1].Lock)
+	}
+}
+
 

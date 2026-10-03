@@ -56,6 +56,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/prompts/{id}/execute", s.executePrompt)
 	mux.HandleFunc("GET /v1/jobs/{id}", s.getJob)
 	mux.HandleFunc("POST /v1/jobs/{id}/exit", s.postExit)
+	mux.HandleFunc("POST /v1/jobs/{id}/decline", s.declineJob)
 	mux.HandleFunc("POST /v1/jobs/{id}/story-draft", s.storyDraft)
 	mux.HandleFunc("POST /v1/jobs/{id}/cancel", s.cancel)
 	mux.HandleFunc("POST /v1/jobs/{id}/force-pause", s.forcePauseJob)
@@ -457,9 +458,37 @@ func (s *Server) postExit(w http.ResponseWriter, r *http.Request) {
 		ExitCode int `json:"exit_code"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	if err := s.Engine.PostExit(r.PathValue("id"), body.ExitCode); err != nil {
+	jobID := r.PathValue("id")
+	if err := s.Engine.PostExit(jobID, body.ExitCode); err != nil {
 		writeErr(w, http.StatusConflict, err)
 		return
+	}
+	if s.SaveRepo != nil {
+		if repo, ok := s.Engine.GetRepoForJob(jobID); ok {
+			s.SaveRepo(repo)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) declineJob(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	jobID := r.PathValue("id")
+	if err := s.Engine.DeclineJob(jobID, body.Reason); err != nil {
+		code := http.StatusConflict
+		if errors.Is(err, control.ErrNotFound) {
+			code = http.StatusNotFound
+		}
+		writeErr(w, code, err)
+		return
+	}
+	if s.SaveRepo != nil {
+		if repo, ok := s.Engine.GetRepoForJob(jobID); ok {
+			s.SaveRepo(repo)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -503,6 +532,11 @@ func (s *Server) pollHost(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		w.WriteHeader(http.StatusNoContent)
 		return
+	}
+	if s.SaveRepo != nil {
+		if detail, ok := s.Engine.GetRepoDetail(sch.HostID, sch.WorktreePath); ok {
+			s.SaveRepo(detail.Repo)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{
 		"id": job.ID, "kind": job.Kind,
@@ -644,9 +678,15 @@ func (s *Server) intervention(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) forcePauseJob(w http.ResponseWriter, r *http.Request) {
-	if err := s.Engine.ForcePauseJob(r.PathValue("id")); err != nil {
+	jobID := r.PathValue("id")
+	if err := s.Engine.ForcePauseJob(jobID); err != nil {
 		writeErr(w, http.StatusNotFound, err)
 		return
+	}
+	if s.SaveRepo != nil {
+		if repo, ok := s.Engine.GetRepoForJob(jobID); ok {
+			s.SaveRepo(repo)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"queue": control.QueuePaused})
 }
