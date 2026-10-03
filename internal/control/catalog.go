@@ -3,6 +3,7 @@ package control
 import (
 	"errors"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -166,6 +167,18 @@ func (e *Engine) GetRepoDetail(host, path string) (RepoDetail, bool) {
 		}
 	}
 	sort.Slice(detail.Schedules, func(i, j int) bool {
+		if detail.Schedules[i].Priority != detail.Schedules[j].Priority {
+			return detail.Schedules[i].Priority > detail.Schedules[j].Priority
+		}
+		idxI := strings.LastIndex(detail.Schedules[i].ID, "-")
+		idxJ := strings.LastIndex(detail.Schedules[j].ID, "-")
+		if idxI >= 0 && idxJ >= 0 {
+			nI, errI := strconv.Atoi(detail.Schedules[i].ID[idxI+1:])
+			nJ, errJ := strconv.Atoi(detail.Schedules[j].ID[idxJ+1:])
+			if errI == nil && errJ == nil {
+				return nI < nJ
+			}
+		}
 		return detail.Schedules[i].ID < detail.Schedules[j].ID
 	})
 	if detail.Running == nil && latest != nil && (repo.Lock == LockCooling || repo.Queue == QueueBlocked) {

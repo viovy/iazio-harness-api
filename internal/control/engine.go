@@ -80,6 +80,7 @@ type Schedule struct {
 	Status               string
 	PromptTitle          string
 	Engine               string
+	Priority             int
 }
 
 // JobDetail carries the execution payload for iazio-harness.
@@ -143,6 +144,7 @@ type HistoryRow struct {
 	ScheduleID      string
 	PromptTitle     string
 	Engine          string
+	Status          string
 	Clean           bool
 	ASEComplete     bool
 	ConversationIDs []string
@@ -513,9 +515,12 @@ func (e *Engine) PostExit(jobID string, code int) error {
 		if code != 0 {
 			job.Status = "FAILED"
 			if sch, ok := e.schedules[job.ScheduleID]; ok {
-				sch.Status = "FAILED"
-				sch.IterationsRemaining = 0
-				if sch.CloneURL != "" {
+				if sch.IterationsRemaining <= 0 {
+					sch.Status = "FAILED"
+				} else {
+					sch.Status = "QUEUED"
+				}
+				if sch.CloneURL != "" && sch.IterationsRemaining <= 0 {
 					delete(e.cloneLease, sch.CloneURL)
 				}
 				if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
@@ -528,21 +533,18 @@ func (e *Engine) PostExit(jobID string, code int) error {
 					repo.Reason = "NON_ZERO_EXIT"
 					changedRepo = repo
 				}
+				e.updateHistoryStatusLocked(sch.HostID, sch.WorktreePath, jobID, "FAILED")
 			}
 		} else {
 			job.Status = "RUN_FINISHED"
 			if sch, ok := e.schedules[job.ScheduleID]; ok {
-				sch.IterationsCompleted++
-				if sch.IterationsRemaining > 0 {
-					sch.IterationsRemaining--
-				}
 				if sch.IterationsRemaining <= 0 || (sch.IterationsTotal > 0 && sch.IterationsCompleted >= sch.IterationsTotal) {
 					sch.Status = "FINISHED"
 					sch.IterationsRemaining = 0
 				} else {
 					sch.Status = "QUEUED"
 				}
-				if sch.CloneURL != "" {
+				if sch.CloneURL != "" && sch.IterationsRemaining <= 0 {
 					delete(e.cloneLease, sch.CloneURL)
 				}
 				if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
@@ -551,6 +553,7 @@ func (e *Engine) PostExit(jobID string, code int) error {
 					}
 					changedRepo = repo
 				}
+				e.updateHistoryStatusLocked(sch.HostID, sch.WorktreePath, jobID, "RUN_FINISHED")
 			}
 		}
 	}
@@ -561,7 +564,7 @@ func (e *Engine) PostExit(jobID string, code int) error {
 }
 
 // DeclineJob rejects an assignment when the agent cannot execute it (e.g. busy worktree or spawn failure).
-// It resets the schedule to QUEUED and marks the job DECLINED.
+// It resets the schedule to QUEUED, refunds the decremented iteration, and marks the job DECLINED.
 func (e *Engine) DeclineJob(jobID, reason string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -576,6 +579,10 @@ func (e *Engine) DeclineJob(jobID, reason string) error {
 	job.ExitPosted = true
 	var changedRepo *Repo
 	if sch, ok := e.schedules[job.ScheduleID]; ok {
+		sch.IterationsRemaining++
+		if sch.IterationsCompleted > 0 {
+			sch.IterationsCompleted--
+		}
 		sch.Status = "QUEUED"
 		if sch.CloneURL != "" {
 			delete(e.cloneLease, sch.CloneURL)
@@ -597,6 +604,7 @@ func (e *Engine) DeclineJob(jobID, reason string) error {
 			}
 			changedRepo = repo
 		}
+		e.updateHistoryStatusLocked(sch.HostID, sch.WorktreePath, jobID, "DECLINED")
 	}
 	if changedRepo != nil {
 		e.notifyRepoLocked(changedRepo)
@@ -617,6 +625,9 @@ func (e *Engine) Cancel(jobID, reason string) error {
 	job.FrozenUntil = e.now().Add(ReapFreeze)
 	if reason == "" {
 		reason = "cancelled"
+	}
+	if sch, ok := e.schedules[job.ScheduleID]; ok {
+		e.updateHistoryStatusLocked(sch.HostID, sch.WorktreePath, jobID, "CANCEL_REQUESTED")
 	}
 	_ = reason
 	return nil
@@ -641,24 +652,17 @@ func (e *Engine) ApplyFinish(host, path string, jobID string, in FinishInput) Fi
 			job.Status = "RUN_FINISHED"
 		}
 		if sch, ok := e.schedules[job.ScheduleID]; ok {
-			sch.IterationsCompleted++
-			if sch.IterationsRemaining > 0 {
-				sch.IterationsRemaining--
-			}
 			if sch.IterationsRemaining <= 0 || (sch.IterationsTotal > 0 && sch.IterationsCompleted >= sch.IterationsTotal) {
 				sch.Status = "FINISHED"
 				sch.IterationsRemaining = 0
 			} else {
 				sch.Status = "QUEUED"
 			}
-			if sch.CloneURL != "" {
+			if sch.CloneURL != "" && sch.IterationsRemaining <= 0 {
 				delete(e.cloneLease, sch.CloneURL)
 			}
 			clean := strings.TrimSpace(in.WorkPorcelain) == "" && strings.TrimSpace(in.HubPorcelain) == "" && in.HubAhead == 0
-			e.history[repoKey(host, path)] = append(e.history[repoKey(host, path)], HistoryRow{
-				JobID: jobID, ScheduleID: sch.ID, PromptTitle: sch.PromptTitle, Engine: sch.Engine,
-				Clean: clean, ASEComplete: in.ASEComplete,
-			})
+			e.updateHistoryFinishLocked(host, path, jobID, clean, in.ASEComplete, job.Status)
 		}
 	}
 	return d
@@ -892,29 +896,38 @@ func (e *Engine) reapExpiredLocked() {
 					hostOffline = true
 				}
 			}
-			if timedOut || hostOffline {
+			leaseExpired := !job.LeaseExpiry.IsZero() && now.After(job.LeaseExpiry)
+			if timedOut || hostOffline || leaseExpired {
 				job.Status = "FAILED"
 				job.ExitPosted = true
 				reason := "EXECUTION_TIMEOUT"
 				if hostOffline {
 					reason = "HOST_OFFLINE"
+				} else if leaseExpired && !timedOut {
+					reason = "LEASE_EXPIRED"
 				}
 				if sch != nil {
-					sch.Status = "FAILED"
-					sch.IterationsRemaining = 0
-					if sch.CloneURL != "" {
+					if sch.IterationsRemaining > 0 {
+						sch.Status = "QUEUED"
+					} else {
+						sch.Status = "FAILED"
+					}
+					if sch.CloneURL != "" && sch.IterationsRemaining <= 0 {
 						delete(e.cloneLease, sch.CloneURL)
 					}
 					if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
 						if repo.Lock == LockRunning {
 							repo.Lock = LockIdle
 						}
-						if repo.Queue == QueueOpen {
-							repo.Queue = QueuePaused
+						if timedOut || hostOffline {
+							if repo.Queue == QueueOpen {
+								repo.Queue = QueuePaused
+							}
 						}
 						repo.Reason = reason
 						e.notifyRepoLocked(repo)
 					}
+					e.updateHistoryStatusLocked(sch.HostID, sch.WorktreePath, job.ID, reason)
 				}
 			}
 		}
@@ -952,6 +965,9 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 		}
 	}
 	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].Priority != candidates[j].Priority {
+			return candidates[i].Priority > candidates[j].Priority
+		}
 		idxI := strings.LastIndex(candidates[i].ID, "-")
 		idxJ := strings.LastIndex(candidates[j].ID, "-")
 		if idxI >= 0 && idxJ >= 0 {
@@ -978,7 +994,16 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 				continue
 			}
 		}
-		sch.Status = "RUNNING"
+		if sch.IterationsRemaining > 0 {
+			sch.IterationsRemaining--
+		}
+		sch.IterationsCompleted++
+
+		if sch.IterationsRemaining <= 0 || (sch.IterationsTotal > 0 && sch.IterationsCompleted >= sch.IterationsTotal) {
+			sch.Status = "COMPLETED"
+		} else {
+			sch.Status = "RUNNING"
+		}
 		id := e.next("job-")
 		job := &Job{
 			ID: id, ScheduleID: sch.ID, Kind: sch.Kind, Status: "RUNNING",
@@ -995,9 +1020,87 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			docs = repo.DocsHubPath
 			e.notifyRepoLocked(repo)
 		}
+		e.history[repoKey(host, sch.WorktreePath)] = append(e.history[repoKey(host, sch.WorktreePath)], HistoryRow{
+			JobID:           id,
+			ScheduleID:      sch.ID,
+			PromptTitle:     sch.PromptTitle,
+			Engine:          sch.Engine,
+			Status:          "RUNNING",
+			Clean:           false,
+			ASEComplete:     false,
+			ConversationIDs: []string{},
+		})
 		return *job, *sch, docs, true
 	}
 	return Job{}, Schedule{}, "", false
+}
+
+func (e *Engine) updateHistoryStatusLocked(host, path, jobID, status string) {
+	key := repoKey(host, path)
+	rows := e.history[key]
+	for i := range rows {
+		if rows[i].JobID == jobID {
+			rows[i].Status = status
+			return
+		}
+	}
+}
+
+func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseComplete bool, status string) {
+	key := repoKey(host, path)
+	rows := e.history[key]
+	for i := range rows {
+		if rows[i].JobID == jobID {
+			rows[i].Clean = clean
+			rows[i].ASEComplete = aseComplete
+			if status != "" {
+				rows[i].Status = status
+			}
+			return
+		}
+	}
+	title, engine, schID := "", "", ""
+	if j, ok := e.jobs[jobID]; ok {
+		if sch := e.schedules[j.ScheduleID]; sch != nil {
+			title = sch.PromptTitle
+			engine = sch.Engine
+			schID = sch.ID
+		}
+	}
+	e.history[key] = append(e.history[key], HistoryRow{
+		JobID: jobID, ScheduleID: schID, PromptTitle: title, Engine: engine,
+		Status: status, Clean: clean, ASEComplete: aseComplete,
+	})
+}
+
+// ChangeSchedulePriority shifts a schedule's priority by delta.
+func (e *Engine) ChangeSchedulePriority(scheduleID string, delta int) (Schedule, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	sch, ok := e.schedules[scheduleID]
+	if !ok {
+		return Schedule{}, ErrNotFound
+	}
+	sch.Priority += delta
+	if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
+		e.notifyRepoLocked(repo)
+	}
+	return *sch, nil
+}
+
+// SetSchedulePriority sets a schedule's priority directly.
+func (e *Engine) SetSchedulePriority(scheduleID string, priority int) (Schedule, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	sch, ok := e.schedules[scheduleID]
+	if !ok {
+		return Schedule{}, ErrNotFound
+	}
+	sch.Priority = priority
+	if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
+		e.notifyRepoLocked(repo)
+	}
+	return *sch, nil
 }
 
 // GetRepoForJob returns the repository associated with the given job ID.
