@@ -54,6 +54,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /v1/prompts/{id}", s.updatePrompt)
 	mux.HandleFunc("DELETE /v1/prompts/{id}", s.deletePrompt)
 	mux.HandleFunc("POST /v1/prompts/{id}/execute", s.executePrompt)
+	mux.HandleFunc("POST /v1/schedules/{id}/priority", s.changePriority)
+	mux.HandleFunc("POST /v1/schedules/{id}/increase-priority", s.increasePriority)
+	mux.HandleFunc("POST /v1/schedules/{id}/decrease-priority", s.decreasePriority)
 	mux.HandleFunc("GET /v1/jobs/{id}", s.getJob)
 	mux.HandleFunc("POST /v1/jobs/{id}/exit", s.postExit)
 	mux.HandleFunc("POST /v1/jobs/{id}/decline", s.declineJob)
@@ -442,6 +445,74 @@ func (s *Server) executePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, scheduleView(sch))
+}
+
+func (s *Server) changePriority(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Delta    *int `json:"delta"`
+		Priority *int `json:"priority"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	id := r.PathValue("id")
+	if body.Priority != nil {
+		sch, err := s.Engine.SetSchedulePriority(id, *body.Priority)
+		if err != nil {
+			writeErr(w, http.StatusNotFound, err)
+			return
+		}
+		if s.SaveRepo != nil {
+			if repo, ok := s.Engine.GetRepo(sch.HostID, sch.WorktreePath); ok {
+				s.SaveRepo(repo)
+			}
+		}
+		writeJSON(w, http.StatusOK, scheduleView(sch))
+		return
+	}
+	delta := 1
+	if body.Delta != nil {
+		delta = *body.Delta
+	}
+	sch, err := s.Engine.ChangeSchedulePriority(id, delta)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err)
+		return
+	}
+	if s.SaveRepo != nil {
+		if repo, ok := s.Engine.GetRepo(sch.HostID, sch.WorktreePath); ok {
+			s.SaveRepo(repo)
+		}
+	}
+	writeJSON(w, http.StatusOK, scheduleView(sch))
+}
+
+func (s *Server) increasePriority(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sch, err := s.Engine.ChangeSchedulePriority(id, 1)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err)
+		return
+	}
+	if s.SaveRepo != nil {
+		if repo, ok := s.Engine.GetRepo(sch.HostID, sch.WorktreePath); ok {
+			s.SaveRepo(repo)
+		}
+	}
+	writeJSON(w, http.StatusOK, scheduleView(sch))
+}
+
+func (s *Server) decreasePriority(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sch, err := s.Engine.ChangeSchedulePriority(id, -1)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err)
+		return
+	}
+	if s.SaveRepo != nil {
+		if repo, ok := s.Engine.GetRepo(sch.HostID, sch.WorktreePath); ok {
+			s.SaveRepo(repo)
+		}
+	}
+	writeJSON(w, http.StatusOK, scheduleView(sch))
 }
 
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {

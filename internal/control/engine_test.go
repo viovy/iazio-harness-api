@@ -188,13 +188,21 @@ func TestRepoQueueDecrementsAndClearsOnFinish(t *testing.T) {
 		t.Fatalf("expected 0 history items, got: %d", len(detail.History))
 	}
 
-	// 2. Poll host leases first iteration
+	// 2. Poll host leases first iteration (triggering execution decreases iterations scheduled)
 	job1, leasedSch, _, ok := e.PollHost("host-1")
 	if !ok || job1.ScheduleID != sch.ID {
 		t.Fatalf("expected job for schedule %s, got: %+v", sch.ID, job1)
 	}
-	if leasedSch.IterationsRemaining != 2 {
-		t.Fatalf("expected 2 iterations remaining on lease, got: %d", leasedSch.IterationsRemaining)
+	if leasedSch.IterationsRemaining != 1 {
+		t.Fatalf("expected 1 iteration remaining on lease, got: %d", leasedSch.IterationsRemaining)
+	}
+	// History immediately records in-flight entry
+	detail, ok = e.GetRepoDetail("host-1", "/work/app")
+	if !ok || len(detail.History) != 1 || detail.History[0].Status != "RUNNING" {
+		t.Fatalf("expected 1 history item with status RUNNING, got: %+v", detail.History)
+	}
+	if len(detail.Schedules) != 1 || detail.Schedules[0].IterationsRemaining != 1 {
+		t.Fatalf("expected 1 schedule with remaining 1 in queue, got: %+v", detail.Schedules)
 	}
 
 	// 3. Finish iteration 1 with ASEComplete: true
@@ -208,14 +216,24 @@ func TestRepoQueueDecrementsAndClearsOnFinish(t *testing.T) {
 	if detail.Schedules[0].IterationsRemaining != 1 {
 		t.Fatalf("expected 1 iteration remaining, got: %d", detail.Schedules[0].IterationsRemaining)
 	}
-	if len(detail.History) != 1 {
-		t.Fatalf("expected 1 history item after iter 1, got: %d", len(detail.History))
+	if len(detail.History) != 1 || detail.History[0].Status != "RUN_FINISHED" {
+		t.Fatalf("expected 1 history item after iter 1 with status RUN_FINISHED, got: %+v", detail.History)
 	}
 
-	// 4. Poll host leases second iteration
-	job2, _, _, ok := e.PollHost("host-1")
+	// 4. Poll host leases second iteration (iterations reach 0, dequeued from queue)
+	job2, leasedSch2, _, ok := e.PollHost("host-1")
 	if !ok || job2.ScheduleID != sch.ID {
 		t.Fatalf("expected job for schedule %s, got: %+v", sch.ID, job2)
+	}
+	if leasedSch2.IterationsRemaining != 0 {
+		t.Fatalf("expected 0 iterations remaining on lease 2, got: %d", leasedSch2.IterationsRemaining)
+	}
+	detail, ok = e.GetRepoDetail("host-1", "/work/app")
+	if !ok || len(detail.Schedules) != 0 {
+		t.Fatalf("expected schedule dequeued when iterations reach 0, got: %d", len(detail.Schedules))
+	}
+	if len(detail.History) != 2 || detail.History[1].Status != "RUNNING" {
+		t.Fatalf("expected 2 history items, 2nd RUNNING, got: %+v", detail.History)
 	}
 
 	// 5. Finish iteration 2 with ASEComplete: true
@@ -226,7 +244,7 @@ func TestRepoQueueDecrementsAndClearsOnFinish(t *testing.T) {
 	if !ok || len(detail.Schedules) != 0 {
 		t.Fatalf("expected 0 schedules in queue after all iterations complete, got: %d", len(detail.Schedules))
 	}
-	if len(detail.History) != 2 {
+	if len(detail.History) != 2 || detail.History[1].Status != "RUN_FINISHED" {
 		t.Fatalf("expected 2 history items after iter 2, got: %d", len(detail.History))
 	}
 }
@@ -289,9 +307,12 @@ func TestRepoQueueMultiIterationDecrement(t *testing.T) {
 	}
 
 	// Step 1: Iteration 1
-	job1, _, _, ok := e.PollHost("host-1")
+	job1, leased1, _, ok := e.PollHost("host-1")
 	if !ok || job1.ScheduleID != sch.ID {
 		t.Fatalf("poll 1 failed")
+	}
+	if leased1.IterationsRemaining != 2 {
+		t.Fatalf("expected 2 remaining on poll 1, got %d", leased1.IterationsRemaining)
 	}
 	e.ApplyFinish("host-1", "/work/app", job1.ID, FinishInput{ASEComplete: true})
 
@@ -302,14 +323,17 @@ func TestRepoQueueMultiIterationDecrement(t *testing.T) {
 	if detail.Schedules[0].IterationsRemaining != 2 || detail.Schedules[0].IterationsCompleted != 1 {
 		t.Fatalf("expected remaining=2, completed=1, got: %+v", detail.Schedules[0])
 	}
-	if len(detail.History) != 1 {
+	if len(detail.History) != 1 || detail.History[0].Status != "RUN_FINISHED" {
 		t.Fatalf("expected 1 history item, got %d", len(detail.History))
 	}
 
 	// Step 2: Iteration 2
-	job2, _, _, ok := e.PollHost("host-1")
+	job2, leased2, _, ok := e.PollHost("host-1")
 	if !ok || job2.ScheduleID != sch.ID {
 		t.Fatalf("poll 2 failed")
+	}
+	if leased2.IterationsRemaining != 1 {
+		t.Fatalf("expected 1 remaining on poll 2, got %d", leased2.IterationsRemaining)
 	}
 	e.ApplyFinish("host-1", "/work/app", job2.ID, FinishInput{ASEComplete: true})
 
@@ -320,14 +344,17 @@ func TestRepoQueueMultiIterationDecrement(t *testing.T) {
 	if detail.Schedules[0].IterationsRemaining != 1 || detail.Schedules[0].IterationsCompleted != 2 {
 		t.Fatalf("expected remaining=1, completed=2, got: %+v", detail.Schedules[0])
 	}
-	if len(detail.History) != 2 {
+	if len(detail.History) != 2 || detail.History[1].Status != "RUN_FINISHED" {
 		t.Fatalf("expected 2 history items, got %d", len(detail.History))
 	}
 
-	// Step 3: Iteration 3
-	job3, _, _, ok := e.PollHost("host-1")
+	// Step 3: Iteration 3 (reaches 0, dequeued from queue)
+	job3, leased3, _, ok := e.PollHost("host-1")
 	if !ok || job3.ScheduleID != sch.ID {
 		t.Fatalf("poll 3 failed")
+	}
+	if leased3.IterationsRemaining != 0 {
+		t.Fatalf("expected 0 remaining on poll 3, got %d", leased3.IterationsRemaining)
 	}
 	e.ApplyFinish("host-1", "/work/app", job3.ID, FinishInput{ASEComplete: true})
 
@@ -335,7 +362,7 @@ func TestRepoQueueMultiIterationDecrement(t *testing.T) {
 	if len(detail.Schedules) != 0 {
 		t.Fatalf("expected 0 schedules in queue after iter 3 (all completed), got %d", len(detail.Schedules))
 	}
-	if len(detail.History) != 3 {
+	if len(detail.History) != 3 || detail.History[2].Status != "RUN_FINISHED" {
 		t.Fatalf("expected 3 history items, got %d", len(detail.History))
 	}
 }
@@ -651,6 +678,162 @@ func TestOnRepoChangeInvoked(t *testing.T) {
 	if len(saved) < 2 {
 		t.Fatalf("expected at least 2 OnRepoChange invocations, got: %d", len(saved))
 	}
+}
+
+func TestSchedulePrioritization(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app", CloneURL: "https://example.test/app.git"}); err != nil {
+		t.Fatal(err)
+	}
+
+	p1 := e.PutPrompt(Prompt{Title: "Low Priority", Body: "low", Status: "READY"})
+	p2 := e.PutPrompt(Prompt{Title: "High Priority", Body: "high", Status: "READY"})
+
+	schLow, err := e.ExecutePrompt(p1.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schHigh, err := e.ExecutePrompt(p2.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Initially both priority 0, schLow created first so FIFO order
+	detail, _ := e.GetRepoDetail("host-1", "/work/app")
+	if detail.Schedules[0].ID != schLow.ID {
+		t.Fatalf("expected schLow first initially, got: %s", detail.Schedules[0].ID)
+	}
+
+	// Increase priority of schHigh
+	updated, err := e.ChangeSchedulePriority(schHigh.ID, 5)
+	if err != nil {
+		t.Fatalf("failed to change priority: %v", err)
+	}
+	if updated.Priority != 5 {
+		t.Fatalf("expected priority 5, got %d", updated.Priority)
+	}
+
+	// Verify GetRepoDetail puts schHigh first now
+	detail, _ = e.GetRepoDetail("host-1", "/work/app")
+	if detail.Schedules[0].ID != schHigh.ID {
+		t.Fatalf("expected schHigh first after priority bump, got: %s", detail.Schedules[0].ID)
+	}
+
+	// Verify PollHost leases schHigh first!
+	job, leasedSch, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("expected PollHost to lease")
+	}
+	if job.ScheduleID != schHigh.ID || leasedSch.ID != schHigh.ID {
+		t.Fatalf("expected high priority schedule leased first, got job: %+v", job)
+	}
+}
+
+func TestInFlightHistoryStatusTransitions(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app", CloneURL: "https://example.test/app.git"}); err != nil {
+		t.Fatal(err)
+	}
+
+	p := e.PutPrompt(Prompt{Title: "Status test prompt", Body: "test", Status: "READY"})
+	sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Lease job: in-flight history must immediately show RUNNING
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("expected lease")
+	}
+	detail, _ := e.GetRepoDetail("host-1", "/work/app")
+	if len(detail.History) != 1 || detail.History[0].Status != "RUNNING" {
+		t.Fatalf("expected 1 history entry with status RUNNING, got: %+v", detail.History)
+	}
+
+	// Post exit with error code 1: history transitions to FAILED
+	if err := e.PostExit(job.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	detail, _ = e.GetRepoDetail("host-1", "/work/app")
+	if len(detail.History) != 1 || detail.History[0].Status != "FAILED" {
+		t.Fatalf("expected history entry status FAILED, got: %+v", detail.History)
+	}
+
+	// Reset repo queue and lock for next test iteration
+	_ = e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app", Queue: QueueOpen, Lock: LockIdle})
+
+	// Lease second iteration
+	job2, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("expected second lease")
+	}
+	detail, _ = e.GetRepoDetail("host-1", "/work/app")
+	if len(detail.History) != 2 || detail.History[1].Status != "RUNNING" {
+		t.Fatalf("expected 2nd history item RUNNING, got: %+v", detail.History)
+	}
+
+	// Decline job: history transitions to DECLINED, iteration refunded
+	if err := e.DeclineJob(job2.ID, "worktree_busy"); err != nil {
+		t.Fatal(err)
+	}
+	detail, _ = e.GetRepoDetail("host-1", "/work/app")
+	if detail.History[1].Status != "DECLINED" {
+		t.Fatalf("expected 2nd history item DECLINED, got: %s", detail.History[1].Status)
+	}
+	if len(detail.Schedules) != 1 || detail.Schedules[0].ID != sch.ID {
+		t.Fatalf("expected schedule refunded and retained in queue, got: %+v", detail.Schedules)
+	}
+}
+
+func TestLeaseExpirationReapsStaleJob(t *testing.T) {
+	curr := time.Date(2026, 10, 3, 10, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return curr }
+	e := NewEngine(clock)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app", CloneURL: "https://example.test/app.git"}); err != nil {
+		t.Fatal(err)
+	}
+
+	p := e.PutPrompt(Prompt{Title: "Stale prompt", Body: "stale", Status: "READY"})
+	sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("poll failed")
+	}
+
+	// Initially running, lock running
+	detail, _ := e.GetRepoDetail("host-1", "/work/app")
+	if detail.Repo.Lock != LockRunning {
+		t.Fatalf("expected LockRunning, got: %s", detail.Repo.Lock)
+	}
+
+	// Advance clock past LeaseExpiry (60s)
+	curr = curr.Add(LeaseInterval + 10*time.Second)
+
+	// GetRepoDetail triggers reapExpiredLocked
+	detail, _ = e.GetRepoDetail("host-1", "/work/app")
+	if detail.Repo.Lock != LockIdle {
+		t.Fatalf("expected LockIdle after lease expiration, got: %s", detail.Repo.Lock)
+	}
+	if detail.Repo.Reason != "LEASE_EXPIRED" {
+		t.Fatalf("expected reason LEASE_EXPIRED, got: %s", detail.Repo.Reason)
+	}
+
+	jobDetail, _ := e.GetJob(job.ID)
+	if jobDetail.Status != "FAILED" {
+		t.Fatalf("expected job status FAILED, got: %s", jobDetail.Status)
+	}
+	if len(detail.History) != 1 || detail.History[0].Status != "LEASE_EXPIRED" {
+		t.Fatalf("expected history status LEASE_EXPIRED, got: %+v", detail.History)
+	}
+	_ = sch
 }
 
 

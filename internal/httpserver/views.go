@@ -46,6 +46,7 @@ func scheduleView(s control.Schedule) map[string]any {
 		"iterations_completed": s.IterationsCompleted,
 		"env_keys":             keys,
 		"kind":                 s.Kind,
+		"priority":             s.Priority,
 		"status":               s.Status,
 	}
 }
@@ -133,6 +134,7 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 			"schedule_id":      h.ScheduleID,
 			"prompt_title":     h.PromptTitle,
 			"engine":           h.Engine,
+			"status":           h.Status,
 			"clean":            h.Clean,
 			"ase_complete":     h.ASEComplete,
 			"conversation_ids": ids,

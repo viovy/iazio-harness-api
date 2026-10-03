@@ -63,3 +63,66 @@ func TestRoot(t *testing.T) {
 		t.Fatalf("unexpected body: %v", body)
 	}
 }
+
+func TestSchedulePriorityEndpoints(t *testing.T) {
+	e := control.NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	_ = e.UpsertRepo(control.Repo{HostID: "host-1", WorktreePath: "/work/app"})
+	p := e.PutPrompt(control.Prompt{Title: "Task", Body: "run", Status: "READY"})
+	sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Server{Engine: e}
+	handler := s.Handler()
+
+	// 1. increase-priority
+	req := httptest.NewRequest(http.MethodPost, "/v1/schedules/"+sch.ID+"/increase-priority", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got: %d", rr.Code)
+	}
+	var res map[string]any
+	_ = json.Unmarshal(rr.Body.Bytes(), &res)
+	if int(res["priority"].(float64)) != 1 {
+		t.Fatalf("expected priority 1, got %v", res["priority"])
+	}
+
+	// 2. decrease-priority
+	req = httptest.NewRequest(http.MethodPost, "/v1/schedules/"+sch.ID+"/decrease-priority", nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got: %d", rr.Code)
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &res)
+	if int(res["priority"].(float64)) != 0 {
+		t.Fatalf("expected priority 0, got %v", res["priority"])
+	}
+
+	// 3. priority with delta
+	req = httptest.NewRequest(http.MethodPost, "/v1/schedules/"+sch.ID+"/priority", bytes.NewBufferString(`{"delta": 5}`))
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got: %d", rr.Code)
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &res)
+	if int(res["priority"].(float64)) != 5 {
+		t.Fatalf("expected priority 5, got %v", res["priority"])
+	}
+
+	// 4. priority with exact value
+	req = httptest.NewRequest(http.MethodPost, "/v1/schedules/"+sch.ID+"/priority", bytes.NewBufferString(`{"priority": 42}`))
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got: %d", rr.Code)
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &res)
+	if int(res["priority"].(float64)) != 42 {
+		t.Fatalf("expected priority 42, got %v", res["priority"])
+	}
+}
