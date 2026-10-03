@@ -950,4 +950,58 @@ func TestCancelSchedule(t *testing.T) {
 	}
 }
 
+func TestResumeRepoAndPreflightRecovery(t *testing.T) {
+	e := NewEngine(time.Now)
+	repo := Repo{
+		HostID:       "host-1",
+		WorktreePath: "/work/app",
+		Queue:        QueuePaused,
+		Lock:         LockIdle,
+		Reason:       ReasonDirty,
+		Porcelain:    "M dirty.txt",
+	}
+	_ = e.UpsertRepo(repo)
+
+	// 1. ResumeRepo unpauses queue and clears reason/porcelain
+	if err := e.ResumeRepo("host-1", "/work/app"); err != nil {
+		t.Fatalf("expected ResumeRepo to succeed, got: %v", err)
+	}
+	detail, ok := e.GetRepoDetail("host-1", "/work/app")
+	if !ok || detail.Repo.Queue != QueueOpen || detail.Repo.Reason != "" || detail.Repo.Porcelain != "" {
+		t.Fatalf("expected repo to be QueueOpen and clean, got: %+v", detail.Repo)
+	}
+
+	// 2. Preflight dirty pauses the queue
+	e.ApplyPreflight("host-1", "/work/app", Preflight{
+		FreeBytes:     20 << 30,
+		DocsHubOK:     true,
+		GitAuthOK:     true,
+		GitWorkTree:   true,
+		WorkPorcelain: "M another.txt",
+		HeadAttached:  true,
+		Branch:        "main",
+		DefaultBranch: "main",
+	})
+	detail, _ = e.GetRepoDetail("host-1", "/work/app")
+	if detail.Repo.Queue != QueuePaused || detail.Repo.Reason != ReasonDirty {
+		t.Fatalf("expected repo to be QueuePaused for ReasonDirty, got: %+v", detail.Repo)
+	}
+
+	// 3. Preflight clean automatically recovers QueueOpen and clears reason/porcelain
+	e.ApplyPreflight("host-1", "/work/app", Preflight{
+		FreeBytes:     20 << 30,
+		DocsHubOK:     true,
+		GitAuthOK:     true,
+		GitWorkTree:   true,
+		WorkPorcelain: "",
+		HeadAttached:  true,
+		Branch:        "main",
+		DefaultBranch: "main",
+	})
+	detail, _ = e.GetRepoDetail("host-1", "/work/app")
+	if detail.Repo.Queue != QueueOpen || detail.Repo.Reason != "" || detail.Repo.Porcelain != "" {
+		t.Fatalf("expected clean preflight to restore QueueOpen, got: %+v", detail.Repo)
+	}
+}
+
 

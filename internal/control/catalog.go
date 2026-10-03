@@ -347,6 +347,7 @@ func (e *Engine) RequestDiscard(host, path string) error {
 		return ErrDiscardBusy
 	}
 	repo.DiscardPending = true
+	e.notifyRepoLocked(repo)
 	return nil
 }
 

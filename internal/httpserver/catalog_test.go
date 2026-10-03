@@ -380,6 +380,11 @@ func TestPersistenceHooks(t *testing.T) {
 		t.Fatalf("expected SaveRepo called on upsertRepo: %+v", savedRepos)
 	}
 
+	post(t, h, "/v1/repos/hook-host/preflight", `{"worktree_path":"/work/test-1","preflight":{"FreeBytes":100000000,"GitWorkTree":true,"HeadAttached":true,"Branch":"main","DefaultBranch":"main"}}`, http.StatusOK)
+	if len(savedRepos) != 2 || savedRepos[1].WorktreePath != "/work/test-1" {
+		t.Fatalf("expected SaveRepo called on preflight: %+v", savedRepos)
+	}
+
 	req = httptest.NewRequest(http.MethodDelete, "/v1/hosts/hook-host/repos?path=/work/test-1", nil)
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -432,6 +437,56 @@ func TestDeclineJobEndpoint(t *testing.T) {
 	}
 	if savedRepos[len(savedRepos)-1].Lock != control.LockIdle {
 		t.Fatalf("expected saved repo lock to be LockIdle, got %s", savedRepos[len(savedRepos)-1].Lock)
+	}
+}
+
+func TestResumeRepoEndpoint(t *testing.T) {
+	e := control.NewEngine(time.Now)
+	repo := control.Repo{
+		HostID:       "host-1",
+		WorktreePath: "/work/app",
+		Queue:        control.QueuePaused,
+		Lock:         control.LockIdle,
+		Reason:       control.ReasonDirty,
+		Porcelain:    "M dirty.txt",
+	}
+	_ = e.UpsertRepo(repo)
+
+	var savedRepos []control.Repo
+	s := &Server{
+		Engine: e,
+		SaveRepo: func(r control.Repo) {
+			savedRepos = append(savedRepos, r)
+		},
+	}
+	h := s.Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/repos/host-1/resume", strings.NewReader(`{"worktree_path":"/work/app"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"queue":"OPEN"`) {
+		t.Fatalf("expected queue OPEN in response, got %s", rr.Body.String())
+	}
+	detail, ok := e.GetRepoDetail("host-1", "/work/app")
+	if !ok || detail.Repo.Queue != control.QueueOpen || detail.Repo.Reason != "" {
+		t.Fatalf("expected repo queue to be OPEN and reason cleared, got: %+v", detail.Repo)
+	}
+	if len(savedRepos) == 0 || savedRepos[len(savedRepos)-1].Queue != control.QueueOpen {
+		t.Fatalf("expected SaveRepo called with queue OPEN")
+	}
+
+	// 404 for non-existent repo
+	req404 := httptest.NewRequest(http.MethodPost, "/v1/repos/host-1/resume", strings.NewReader(`{"worktree_path":"/work/nonexistent"}`))
+	req404.Header.Set("Content-Type", "application/json")
+	rr404 := httptest.NewRecorder()
+	h.ServeHTTP(rr404, req404)
+	if rr404.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for nonexistent repo, got %d", rr404.Code)
 	}
 }
 
