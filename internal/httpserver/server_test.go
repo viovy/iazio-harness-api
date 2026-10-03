@@ -46,3 +46,20 @@ func TestVersion(t *testing.T) {
 		t.Fatal("empty version")
 	}
 }
+
+func TestRoot(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["status"] != "ok" || body["service"] != "iazio-harness-api" {
+		t.Fatalf("unexpected body: %v", body)
+	}
+}

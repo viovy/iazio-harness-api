@@ -2,6 +2,7 @@ package control
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -620,12 +621,42 @@ func (e *Engine) DeletePrompt(id string) error {
 	return nil
 }
 
+func (e *Engine) ensureSeqLocked(id string) {
+	idx := strings.LastIndex(id, "-")
+	if idx >= 0 && idx < len(id)-1 {
+		if n, err := strconv.Atoi(id[idx+1:]); err == nil && n > e.seq {
+			e.seq = n
+		}
+	}
+}
+
+// PutIdea inserts or updates an idea in memory, typically when hydrating from persistent store.
+func (e *Engine) PutIdea(it Idea) Idea {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.ensureSeqLocked(it.ID)
+	cp := it
+	e.ideas[it.ID] = &cp
+	return cp
+}
+
+// SetHost stores or updates a host with its full state in memory.
+func (e *Engine) SetHost(h Host) Host {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cp := h
+	e.hosts[h.ID] = &cp
+	return cp
+}
+
 // PutPrompt inserts a prompt for tests and the HTTP layer.
 func (e *Engine) PutPrompt(p Prompt) Prompt {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if p.ID == "" {
 		p.ID = e.next("prompt-")
+	} else {
+		e.ensureSeqLocked(p.ID)
 	}
 	if p.Revision == 0 {
 		p.Revision = 1

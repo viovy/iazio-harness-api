@@ -19,11 +19,28 @@ type Server struct {
 	Extract func(shareURL string) (title, transcript string, err error)
 	// SaveIdea persists an idea when a database is configured.
 	SaveIdea func(idea control.Idea)
+	// SavePrompt persists a prompt when a database is configured.
+	SavePrompt func(p control.Prompt)
+	// DeletePrompt removes a prompt when a database is configured.
+	DeletePrompt func(id string)
+	// SaveRepo persists a registered repo when a database is configured.
+	SaveRepo func(r control.Repo)
+	// DeleteRepo removes a registered repo when a database is configured.
+	DeleteRepo func(hostID, path string)
+	// SaveHost persists host inventory when a database is configured.
+	SaveHost func(h control.Host)
 }
 
 // Handler returns the HTTP routes.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status":  "ok",
+			"service": "iazio-harness-api",
+			"version": version.Informational(),
+		})
+	})
 	mux.HandleFunc("GET /version", s.version)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -143,6 +160,9 @@ func (s *Server) triage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	idea, _ := s.Engine.GetIdea(id)
+	if s.SaveIdea != nil {
+		s.SaveIdea(idea)
+	}
 	writeJSON(w, http.StatusOK, ideaView(idea))
 }
 
@@ -158,6 +178,9 @@ func (s *Server) refine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	idea, _ := s.Engine.GetIdea(id)
+	if s.SaveIdea != nil {
+		s.SaveIdea(idea)
+	}
 	writeJSON(w, http.StatusAccepted, ideaView(idea))
 }
 
@@ -175,6 +198,14 @@ func (s *Server) storyDraft(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, http.StatusForbidden, err)
 		return
+	}
+	if s.SavePrompt != nil {
+		s.SavePrompt(p)
+	}
+	if s.SaveIdea != nil && p.SourceIdeaID != "" {
+		if it, ok := s.Engine.GetIdea(p.SourceIdeaID); ok {
+			s.SaveIdea(it)
+		}
 	}
 	writeJSON(w, http.StatusOK, p)
 }
@@ -196,7 +227,11 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.Engine.RegisterHost(body.ID, body.Kind))
+	h := s.Engine.RegisterHost(body.ID, body.Kind)
+	if s.SaveHost != nil {
+		s.SaveHost(h)
+	}
+	writeJSON(w, http.StatusOK, h)
 }
 
 func (s *Server) upsertRepo(w http.ResponseWriter, r *http.Request) {
@@ -218,6 +253,9 @@ func (s *Server) upsertRepo(w http.ResponseWriter, r *http.Request) {
 	if err := s.Engine.UpsertRepo(repo); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
+	}
+	if s.SaveRepo != nil {
+		s.SaveRepo(repo)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "registered"})
 }
@@ -279,7 +317,14 @@ func (s *Server) finish(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.Engine.ApplyFinish(r.PathValue("host"), body.Path, body.JobID, body.In))
+	host := r.PathValue("host")
+	report := s.Engine.ApplyFinish(host, body.Path, body.JobID, body.In)
+	if s.SaveRepo != nil {
+		if detail, ok := s.Engine.GetRepoDetail(host, body.Path); ok {
+			s.SaveRepo(detail.Repo)
+		}
+	}
+	writeJSON(w, http.StatusOK, report)
 }
 
 func (s *Server) forcePause(w http.ResponseWriter, r *http.Request) {
@@ -290,7 +335,13 @@ func (s *Server) forcePause(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	s.Engine.ForcePause(r.PathValue("host"), body.Path)
+	host := r.PathValue("host")
+	s.Engine.ForcePause(host, body.Path)
+	if s.SaveRepo != nil {
+		if detail, ok := s.Engine.GetRepoDetail(host, body.Path); ok {
+			s.SaveRepo(detail.Repo)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"queue": control.QueuePaused})
 }
 
@@ -316,10 +367,14 @@ func (s *Server) createPrompt(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, promptView(s.Engine.PutPrompt(control.Prompt{
+	created := s.Engine.PutPrompt(control.Prompt{
 		Title: raw.Title, Body: raw.Body, Engine: raw.Engine, Status: raw.Status,
 		StoryID: raw.StoryID, SourceIdeaID: raw.SourceIdeaID,
-	})))
+	})
+	if s.SavePrompt != nil {
+		s.SavePrompt(created)
+	}
+	writeJSON(w, http.StatusCreated, promptView(created))
 }
 
 func (s *Server) updatePrompt(w http.ResponseWriter, r *http.Request) {
@@ -347,13 +402,20 @@ func (s *Server) updatePrompt(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, code, err)
 		return
 	}
+	if s.SavePrompt != nil {
+		s.SavePrompt(p)
+	}
 	writeJSON(w, http.StatusOK, promptView(p))
 }
 
 func (s *Server) deletePrompt(w http.ResponseWriter, r *http.Request) {
-	if err := s.Engine.DeletePrompt(r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	if err := s.Engine.DeletePrompt(id); err != nil {
 		writeErr(w, http.StatusConflict, err)
 		return
+	}
+	if s.DeletePrompt != nil {
+		s.DeletePrompt(id)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -466,9 +528,15 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	for _, t := range raw.Tools {
 		tools = append(tools, control.Tool{Name: t.Name, Path: t.Path, Version: t.Version, Status: t.Status})
 	}
-	if err := s.Engine.Heartbeat(r.PathValue("id"), tools, raw.FetchFailed); err != nil {
+	hostID := r.PathValue("id")
+	if err := s.Engine.Heartbeat(hostID, tools, raw.FetchFailed); err != nil {
 		writeErr(w, http.StatusNotFound, err)
 		return
+	}
+	if s.SaveHost != nil {
+		if detail, ok := s.Engine.GetHostDetail(hostID); ok {
+			s.SaveHost(detail.Host)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -484,13 +552,18 @@ func (s *Server) repoDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) unregisterRepo(w http.ResponseWriter, r *http.Request) {
-	if err := s.Engine.UnregisterRepo(r.PathValue("host"), r.URL.Query().Get("path")); err != nil {
+	host := r.PathValue("host")
+	path := r.URL.Query().Get("path")
+	if err := s.Engine.UnregisterRepo(host, path); err != nil {
 		code := http.StatusConflict
 		if errors.Is(err, control.ErrNotFound) {
 			code = http.StatusNotFound
 		}
 		writeErr(w, code, err)
 		return
+	}
+	if s.DeleteRepo != nil {
+		s.DeleteRepo(host, path)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -505,11 +578,21 @@ func (s *Server) repoRequest(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	host := r.PathValue("host")
 	if err := s.Engine.RequestCheckout(control.RepoRequest{
-		HostID: r.PathValue("host"), Mode: raw.Mode, Path: raw.Path, CloneURL: raw.CloneURL,
+		HostID: host, Mode: raw.Mode, Path: raw.Path, CloneURL: raw.CloneURL,
 	}); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
+	}
+	if s.SaveRepo != nil {
+		if detail, ok := s.Engine.GetHostDetail(host); ok {
+			for _, repo := range detail.Repos {
+				if repo.WorktreePath == raw.Path {
+					s.SaveRepo(repo)
+				}
+			}
+		}
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "requested"})
 }
