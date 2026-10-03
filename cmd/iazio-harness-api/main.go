@@ -3,10 +3,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/viovy/iazio-harness-api/internal/control"
 	"github.com/viovy/iazio-harness-api/internal/extract"
@@ -126,47 +128,41 @@ func seedDefaults(ctx context.Context, e *control.Engine, store *pgstore.Store) 
 		log.Printf("seeded %d default prompts", len(seedPrompts))
 	}
 
-	knownHosts := []string{"mac-mini", "pc1-wsl"}
-	for _, id := range knownHosts {
-		if _, ok := e.GetHostDetail(id); !ok {
-			h := e.RegisterHost(id, "permanent")
-			_ = store.SaveHost(ctx, h)
+	if rawHosts := os.Getenv("IAZIO_KNOWN_HOSTS"); rawHosts != "" {
+		for _, id := range strings.Split(rawHosts, ",") {
+			id = strings.TrimSpace(id)
+			if id != "" {
+				if _, ok := e.GetHostDetail(id); !ok {
+					h := e.RegisterHost(id, "permanent")
+					_ = store.SaveHost(ctx, h)
+				}
+			}
 		}
 	}
 
-	detailMac, _ := e.GetHostDetail("mac-mini")
-	detailPC1, _ := e.GetHostDetail("pc1-wsl")
-	if len(detailMac.Repos) == 0 && len(detailPC1.Repos) == 0 {
-		defaultRepos := []control.Repo{
-			{
-				HostID:        "mac-mini",
-				WorktreePath:  "/Users/romeo/work/meta-repo-04",
-				CloneURL:      "local://mac-mini/Users/romeo/work/meta-repo-04",
-				DefaultBranch: "main",
-				Queue:         control.QueueOpen,
-				Lock:          control.LockIdle,
-			},
-			{
-				HostID:        "mac-mini",
-				WorktreePath:  "/Users/romeo/work/iazio-test-repo",
-				CloneURL:      "local://mac-mini/Users/romeo/work/iazio-test-repo",
-				DefaultBranch: "main",
-				Queue:         control.QueueOpen,
-				Lock:          control.LockIdle,
-			},
-			{
-				HostID:        "pc1-wsl",
-				WorktreePath:  "/home/romeo/work/meta-repo-04",
-				CloneURL:      "local://pc1-wsl/home/romeo/work/meta-repo-04",
-				DefaultBranch: "main",
-				Queue:         control.QueueOpen,
-				Lock:          control.LockIdle,
-			},
+	if raw := os.Getenv("IAZIO_DEFAULT_REPOS"); raw != "" {
+		var defaultRepos []control.Repo
+		if err := json.Unmarshal([]byte(raw), &defaultRepos); err == nil {
+			seededCount := 0
+			for _, r := range defaultRepos {
+				if r.DefaultBranch == "" {
+					r.DefaultBranch = "main"
+				}
+				if r.Queue == "" {
+					r.Queue = control.QueueOpen
+				}
+				if r.Lock == "" {
+					r.Lock = control.LockIdle
+				}
+				if _, ok := e.GetRepo(r.HostID, r.WorktreePath); !ok {
+					_ = e.UpsertRepo(r)
+					_ = store.SaveRepo(ctx, r)
+					seededCount++
+				}
+			}
+			if seededCount > 0 {
+				log.Printf("seeded %d default repos from environment", seededCount)
+			}
 		}
-		for _, r := range defaultRepos {
-			_ = e.UpsertRepo(r)
-			_ = store.SaveRepo(ctx, r)
-		}
-		log.Printf("seeded %d default repos across fleet", len(defaultRepos))
 	}
 }
