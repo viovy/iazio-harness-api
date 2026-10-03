@@ -85,6 +85,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/repos/{host}/preflight", s.preflight)
 	mux.HandleFunc("POST /v1/repos/{host}/finish", s.finish)
 	mux.HandleFunc("POST /v1/repos/{host}/force-pause", s.forcePause)
+	mux.HandleFunc("POST /v1/repos/{host}/resume", s.resumeRepo)
 	mux.HandleFunc("GET /v1/repos/{host}", s.getRepo)
 	return withCORS(mux)
 }
@@ -349,6 +350,31 @@ func (s *Server) forcePause(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"queue": control.QueuePaused})
+}
+
+func (s *Server) resumeRepo(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Path string `json:"worktree_path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	host := r.PathValue("host")
+	if err := s.Engine.ResumeRepo(host, body.Path); err != nil {
+		code := http.StatusConflict
+		if errors.Is(err, control.ErrNotFound) {
+			code = http.StatusNotFound
+		}
+		writeErr(w, code, err)
+		return
+	}
+	if s.SaveRepo != nil {
+		if detail, ok := s.Engine.GetRepoDetail(host, body.Path); ok {
+			s.SaveRepo(detail.Repo)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"queue": control.QueueOpen})
 }
 
 func (s *Server) listPrompts(w http.ResponseWriter, _ *http.Request) {

@@ -78,12 +78,14 @@ func hostView(h control.Host, paused int) map[string]any {
 
 func repoSummary(r control.Repo) map[string]any {
 	return map[string]any{
-		"path":          r.WorktreePath,
-		"worktree_path": r.WorktreePath,
-		"queue":         r.Queue,
-		"lock":          r.Lock,
-		"docs_hub_path": r.DocsHubPath,
-		"clone_url":     r.CloneURL,
+		"path":            r.WorktreePath,
+		"worktree_path":   r.WorktreePath,
+		"queue":           r.Queue,
+		"lock":            r.Lock,
+		"reason":          r.Reason,
+		"discard_pending": r.DiscardPending,
+		"docs_hub_path":   r.DocsHubPath,
+		"clone_url":       r.CloneURL,
 	}
 }
 

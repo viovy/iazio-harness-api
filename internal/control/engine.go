@@ -474,6 +474,12 @@ func (e *Engine) ApplyPreflight(host, path string, p Preflight) Halt {
 	}
 	if h.Reason == "" {
 		repo.Lock = LockRunning
+		if repo.Queue == QueuePaused && repo.Reason == ReasonDirty {
+			repo.Queue = QueueOpen
+			repo.Reason = ""
+			repo.Porcelain = ""
+		}
+		e.notifyRepoLocked(repo)
 		return h
 	}
 	repo.Lock = LockIdle
@@ -483,7 +489,24 @@ func (e *Engine) ApplyPreflight(host, path string, p Preflight) Halt {
 	} else {
 		repo.Reason = h.Reason
 	}
+	e.notifyRepoLocked(repo)
 	return h
+}
+
+// ResumeRepo unpauses a paused repository queue and clears any halt reason.
+func (e *Engine) ResumeRepo(host, path string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	repo := e.repos[repoKey(host, path)]
+	if repo == nil {
+		return ErrNotFound
+	}
+	repo.Queue = QueueOpen
+	repo.Reason = ""
+	repo.Porcelain = ""
+	repo.DiscardPending = false
+	e.notifyRepoLocked(repo)
+	return nil
 }
 
 // PostExit marks the child gone. Cancel after this is rejected.
@@ -1021,11 +1044,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 		}
 		sch.IterationsCompleted++
 
-		if sch.IterationsRemaining <= 0 || (sch.IterationsTotal > 0 && sch.IterationsCompleted >= sch.IterationsTotal) {
-			sch.Status = "COMPLETED"
-		} else {
-			sch.Status = "RUNNING"
-		}
+		sch.Status = "RUNNING"
 		id := e.next("job-")
 		job := &Job{
 			ID: id, ScheduleID: sch.ID, Kind: sch.Kind, Status: "RUNNING",
