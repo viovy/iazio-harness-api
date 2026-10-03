@@ -126,3 +126,51 @@ func TestSchedulePriorityEndpoints(t *testing.T) {
 		t.Fatalf("expected priority 42, got %v", res["priority"])
 	}
 }
+
+func TestCancelScheduleEndpoint(t *testing.T) {
+	e := control.NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	_ = e.UpsertRepo(control.Repo{HostID: "host-1", WorktreePath: "/work/app"})
+	p := e.PutPrompt(control.Prompt{Title: "Task", Body: "run", Status: "READY"})
+	sch1, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sch2, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Server{Engine: e}
+	handler := s.Handler()
+
+	// 1. POST /v1/schedules/{id}/cancel
+	req := httptest.NewRequest(http.MethodPost, "/v1/schedules/"+sch1.ID+"/cancel", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got: %d", rr.Code)
+	}
+	var res map[string]any
+	_ = json.Unmarshal(rr.Body.Bytes(), &res)
+	if res["status"] != "CANCELLED" || res["id"] != sch1.ID {
+		t.Fatalf("unexpected cancel response: %v", res)
+	}
+
+	// 2. DELETE /v1/schedules/{id}
+	req = httptest.NewRequest(http.MethodDelete, "/v1/schedules/"+sch2.ID, nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got: %d", rr.Code)
+	}
+
+	// 3. Cancel not found schedule
+	req = httptest.NewRequest(http.MethodPost, "/v1/schedules/non-existent/cancel", nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got: %d", rr.Code)
+	}
+}
+
