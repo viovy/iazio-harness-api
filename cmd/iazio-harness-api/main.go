@@ -45,12 +45,128 @@ func main() {
 			log.Fatal(err)
 		}
 		defer store.Close()
+
+		ctx := context.Background()
+		if ideas, err := store.LoadIdeas(ctx); err == nil {
+			for _, it := range ideas {
+				srv.Engine.PutIdea(it)
+			}
+			log.Printf("loaded %d ideas from database", len(ideas))
+		}
+		if prompts, err := store.LoadPrompts(ctx); err == nil {
+			for _, p := range prompts {
+				srv.Engine.PutPrompt(p)
+			}
+			log.Printf("loaded %d prompts from database", len(prompts))
+		}
+		if hosts, err := store.LoadHosts(ctx); err == nil {
+			for _, h := range hosts {
+				srv.Engine.SetHost(h)
+			}
+			log.Printf("loaded %d hosts from database", len(hosts))
+		}
+		if repos, err := store.LoadRepos(ctx); err == nil {
+			for _, r := range repos {
+				_ = srv.Engine.UpsertRepo(r)
+			}
+			log.Printf("loaded %d repos from database", len(repos))
+		}
+
+		seedDefaults(ctx, srv.Engine, store)
+
 		srv.SaveIdea = func(idea control.Idea) {
-			_ = store.SaveIdea(context.Background(), idea.ID, idea.Title, idea.ShareURL, idea.Transcript, idea.Status, idea.StoryID)
+			_ = store.SaveIdea(context.Background(), idea)
+		}
+		srv.SavePrompt = func(p control.Prompt) {
+			_ = store.SavePrompt(context.Background(), p)
+		}
+		srv.DeletePrompt = func(id string) {
+			_ = store.DeletePrompt(context.Background(), id)
+		}
+		srv.SaveRepo = func(r control.Repo) {
+			_ = store.SaveRepo(context.Background(), r)
+		}
+		srv.DeleteRepo = func(hostID, path string) {
+			_ = store.DeleteRepo(context.Background(), hostID, path)
+		}
+		srv.SaveHost = func(h control.Host) {
+			_ = store.SaveHost(context.Background(), h)
 		}
 	}
 	log.Printf("listening %s %s", addr, version.Informational())
 	if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
 		log.Fatal(err)
+	}
+}
+
+func seedDefaults(ctx context.Context, e *control.Engine, store *pgstore.Store) {
+	if len(e.ListPrompts()) == 0 {
+		seedPrompts := []control.Prompt{
+			{
+				ID:       "prompt-1",
+				Title:    "Ready ASE prompt",
+				Body:     "run {{.StoryID}}",
+				Engine:   "agent",
+				Status:   "READY",
+				Revision: 1,
+			},
+			{
+				ID:       "prompt-2",
+				Title:    "E2E AGY Prompt",
+				Body:     "Respond with the exact word: AGY_E2E_VERIFIED",
+				Engine:   "agy",
+				Status:   "READY",
+				Revision: 1,
+			},
+		}
+		for _, p := range seedPrompts {
+			created := e.PutPrompt(p)
+			_ = store.SavePrompt(ctx, created)
+		}
+		log.Printf("seeded %d default prompts", len(seedPrompts))
+	}
+
+	knownHosts := []string{"mac-mini", "pc1-wsl"}
+	for _, id := range knownHosts {
+		if _, ok := e.GetHostDetail(id); !ok {
+			h := e.RegisterHost(id, "permanent")
+			_ = store.SaveHost(ctx, h)
+		}
+	}
+
+	detailMac, _ := e.GetHostDetail("mac-mini")
+	detailPC1, _ := e.GetHostDetail("pc1-wsl")
+	if len(detailMac.Repos) == 0 && len(detailPC1.Repos) == 0 {
+		defaultRepos := []control.Repo{
+			{
+				HostID:        "mac-mini",
+				WorktreePath:  "/Users/romeo/work/meta-repo-04",
+				CloneURL:      "local://mac-mini/Users/romeo/work/meta-repo-04",
+				DefaultBranch: "main",
+				Queue:         control.QueueOpen,
+				Lock:          control.LockIdle,
+			},
+			{
+				HostID:        "mac-mini",
+				WorktreePath:  "/Users/romeo/work/iazio-test-repo",
+				CloneURL:      "local://mac-mini/Users/romeo/work/iazio-test-repo",
+				DefaultBranch: "main",
+				Queue:         control.QueueOpen,
+				Lock:          control.LockIdle,
+			},
+			{
+				HostID:        "pc1-wsl",
+				WorktreePath:  "/home/romeo/work/meta-repo-04",
+				CloneURL:      "local://pc1-wsl/home/romeo/work/meta-repo-04",
+				DefaultBranch: "main",
+				Queue:         control.QueueOpen,
+				Lock:          control.LockIdle,
+			},
+		}
+		for _, r := range defaultRepos {
+			_ = e.UpsertRepo(r)
+			_ = store.SaveRepo(ctx, r)
+		}
+		log.Printf("seeded %d default repos across fleet", len(defaultRepos))
 	}
 }

@@ -206,6 +206,17 @@ func post(t *testing.T, h http.Handler, path, body string, want int) *httptest.R
 	return rr
 }
 
+func put(t *testing.T, h http.Handler, path, body string, want int) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPut, path, bytes.NewBufferString(body))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != want {
+		t.Fatalf("%s code %d body %s", path, rr.Code, rr.Body.String())
+	}
+	return rr
+}
+
 func get(t *testing.T, h http.Handler, path string, want int) string {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, path, nil)
@@ -310,4 +321,74 @@ func TestRepoRequestsAndUpsert(t *testing.T) {
 		t.Fatalf("expected 2 repos in hostDetail, got: %v", repos)
 	}
 }
+
+func TestPersistenceHooks(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	var savedPrompts []control.Prompt
+	var deletedPromptID string
+	var savedRepos []control.Repo
+	var deletedRepoHost, deletedRepoPath string
+	var savedHosts []control.Host
+
+	s.SavePrompt = func(p control.Prompt) { savedPrompts = append(savedPrompts, p) }
+	s.DeletePrompt = func(id string) { deletedPromptID = id }
+	s.SaveRepo = func(r control.Repo) { savedRepos = append(savedRepos, r) }
+	s.DeleteRepo = func(h, p string) { deletedRepoHost = h; deletedRepoPath = p }
+	s.SaveHost = func(h control.Host) { savedHosts = append(savedHosts, h) }
+
+	h := s.Handler()
+
+	// 1. Host register & heartbeat trigger SaveHost
+	post(t, h, "/v1/hosts/register", `{"id":"hook-host","kind":"permanent"}`, http.StatusOK)
+	if len(savedHosts) != 1 || savedHosts[0].ID != "hook-host" {
+		t.Fatalf("expected SaveHost called on register: %+v", savedHosts)
+	}
+	post(t, h, "/v1/hosts/hook-host/heartbeat", `{"tools":[{"name":"autopilot","path":"/bin/autopilot","status":"OK"}]}`, http.StatusOK)
+	if len(savedHosts) != 2 {
+		t.Fatalf("expected SaveHost called on heartbeat: %+v", savedHosts)
+	}
+
+	// 2. Prompt create, update, delete trigger hooks
+	res := post(t, h, "/v1/prompts", `{"title":"P1","body":"do task","engine":"agent","status":"READY"}`, http.StatusCreated)
+	if len(savedPrompts) != 1 || savedPrompts[0].Title != "P1" {
+		t.Fatalf("expected SavePrompt called on createPrompt: %+v", savedPrompts)
+	}
+	var createdPrompt map[string]any
+	if err := json.Unmarshal(res.Body.Bytes(), &createdPrompt); err != nil {
+		t.Fatal(err)
+	}
+	pID := createdPrompt["id"].(string)
+
+	put(t, h, "/v1/prompts/"+pID, `{"title":"P1-updated","body":"do new task","engine":"agent","status":"READY"}`, http.StatusOK)
+	if len(savedPrompts) != 2 || savedPrompts[1].Title != "P1-updated" {
+		t.Fatalf("expected SavePrompt called on updatePrompt: %+v", savedPrompts)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/prompts/"+pID, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 on deletePrompt, got %d", rr.Code)
+	}
+	if deletedPromptID != pID {
+		t.Fatalf("expected DeletePrompt called with %s, got %s", pID, deletedPromptID)
+	}
+
+	// 3. Repo upsert & unregister trigger hooks
+	post(t, h, "/v1/repos", `{"host_id":"hook-host","worktree_path":"/work/test-1","clone_url":"local:///work/test-1"}`, http.StatusOK)
+	if len(savedRepos) != 1 || savedRepos[0].WorktreePath != "/work/test-1" {
+		t.Fatalf("expected SaveRepo called on upsertRepo: %+v", savedRepos)
+	}
+
+	req = httptest.NewRequest(http.MethodDelete, "/v1/hosts/hook-host/repos?path=/work/test-1", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 on unregisterRepo, got %d", rr.Code)
+	}
+	if deletedRepoHost != "hook-host" || deletedRepoPath != "/work/test-1" {
+		t.Fatalf("expected DeleteRepo called with hook-host /work/test-1, got %s %s", deletedRepoHost, deletedRepoPath)
+	}
+}
+
 
