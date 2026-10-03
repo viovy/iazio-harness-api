@@ -2,6 +2,7 @@ package control
 
 import (
 	"errors"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -110,6 +111,7 @@ type Job struct {
 	ExitPosted  bool
 	Correlation string
 	HealingUsed bool
+	StartedAt   time.Time
 }
 
 // Repo is one registered checkout.
@@ -194,8 +196,17 @@ type Engine struct {
 	runningRev map[string]bool
 	history    map[string][]HistoryRow
 	requests   []RepoRequest
-	logs       map[string][]LogChunk
-	subs       map[string][]chan LogChunk
+	logs         map[string][]LogChunk
+	subs         map[string][]chan LogChunk
+	OnRepoChange func(Repo)
+}
+
+func (e *Engine) notifyRepoLocked(r *Repo) {
+	if r == nil || e.OnRepoChange == nil {
+		return
+	}
+	cp := *r
+	go e.OnRepoChange(cp)
 }
 
 // NewEngine returns an empty control plane.
@@ -313,6 +324,7 @@ func (e *Engine) newJobLocked(host, path, clone, kind string) *Job {
 	job := &Job{
 		ID: id, ScheduleID: sid, Kind: kind, Status: "RUNNING",
 		LeaseHolder: host, LeaseExpiry: e.now().Add(LeaseInterval),
+		StartedAt: e.now(),
 	}
 	e.jobs[id] = job
 	if clone != "" {
@@ -481,14 +493,115 @@ func (e *Engine) PostExit(jobID string, code int) error {
 		return ErrCancelClosed
 	}
 	job.ExitPosted = true
+	var changedRepo *Repo
 	if job.Status == "CANCEL_REQUESTED" {
 		job.Status = "CANCELLED"
 		if sch, ok := e.schedules[job.ScheduleID]; ok {
 			sch.Status = "CANCELLED"
 			sch.IterationsRemaining = 0
+			if sch.CloneURL != "" {
+				delete(e.cloneLease, sch.CloneURL)
+			}
+			if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
+				if repo.Lock == LockRunning {
+					repo.Lock = LockIdle
+				}
+				changedRepo = repo
+			}
+		}
+	} else if job.Status == "RUNNING" {
+		if code != 0 {
+			job.Status = "FAILED"
+			if sch, ok := e.schedules[job.ScheduleID]; ok {
+				sch.Status = "FAILED"
+				sch.IterationsRemaining = 0
+				if sch.CloneURL != "" {
+					delete(e.cloneLease, sch.CloneURL)
+				}
+				if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
+					if repo.Lock == LockRunning {
+						repo.Lock = LockIdle
+					}
+					if repo.Queue == QueueOpen {
+						repo.Queue = QueuePaused
+					}
+					repo.Reason = "NON_ZERO_EXIT"
+					changedRepo = repo
+				}
+			}
+		} else {
+			job.Status = "RUN_FINISHED"
+			if sch, ok := e.schedules[job.ScheduleID]; ok {
+				sch.IterationsCompleted++
+				if sch.IterationsRemaining > 0 {
+					sch.IterationsRemaining--
+				}
+				if sch.IterationsRemaining <= 0 || (sch.IterationsTotal > 0 && sch.IterationsCompleted >= sch.IterationsTotal) {
+					sch.Status = "FINISHED"
+					sch.IterationsRemaining = 0
+				} else {
+					sch.Status = "QUEUED"
+				}
+				if sch.CloneURL != "" {
+					delete(e.cloneLease, sch.CloneURL)
+				}
+				if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
+					if repo.Lock == LockRunning {
+						repo.Lock = LockIdle
+					}
+					changedRepo = repo
+				}
+			}
 		}
 	}
-	_ = code
+	if changedRepo != nil {
+		e.notifyRepoLocked(changedRepo)
+	}
+	return nil
+}
+
+// DeclineJob rejects an assignment when the agent cannot execute it (e.g. busy worktree or spawn failure).
+// It resets the schedule to QUEUED and marks the job DECLINED.
+func (e *Engine) DeclineJob(jobID, reason string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	job, ok := e.jobs[jobID]
+	if !ok {
+		return ErrNotFound
+	}
+	if job.ExitPosted {
+		return ErrCancelClosed
+	}
+	job.Status = "DECLINED"
+	job.ExitPosted = true
+	var changedRepo *Repo
+	if sch, ok := e.schedules[job.ScheduleID]; ok {
+		sch.Status = "QUEUED"
+		if sch.CloneURL != "" {
+			delete(e.cloneLease, sch.CloneURL)
+		}
+		if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
+			hasActive := false
+			for _, other := range e.jobs {
+				if other.ID != jobID && !other.ExitPosted && (other.Status == "RUNNING" || other.Status == "CANCEL_REQUESTED") {
+					if otherSch := e.schedules[other.ScheduleID]; otherSch != nil {
+						if otherSch.HostID == repo.HostID && otherSch.WorktreePath == repo.WorktreePath {
+							hasActive = true
+							break
+						}
+					}
+				}
+			}
+			if !hasActive && repo.Lock == LockRunning {
+				repo.Lock = LockIdle
+			}
+			changedRepo = repo
+		}
+	}
+	if changedRepo != nil {
+		e.notifyRepoLocked(changedRepo)
+	}
+	_ = reason
 	return nil
 }
 
@@ -520,6 +633,7 @@ func (e *Engine) ApplyFinish(host, path string, jobID string, in FinishInput) Fi
 		repo.Reason = d.Reason
 		repo.HealingAttempts = d.HealingAttempts
 		repo.Lock = LockIdle
+		e.notifyRepoLocked(repo)
 	}
 	if job, ok := e.jobs[jobID]; ok {
 		job.ExitPosted = true
@@ -585,6 +699,23 @@ func (e *Engine) ForcePause(host, path string) {
 	repo.Lock = LockIdle
 	repo.Queue = QueuePaused
 	repo.Reason = ReasonCorrTimeout
+	e.notifyRepoLocked(repo)
+	for _, job := range e.jobs {
+		sch := e.schedules[job.ScheduleID]
+		if sch == nil || sch.HostID != host || sch.WorktreePath != path {
+			continue
+		}
+		if !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "CANCEL_REQUESTED") {
+			job.Status = "CANCELLED"
+			job.ExitPosted = true
+			if sch.Status == "RUNNING" {
+				sch.Status = "PAUSED"
+			}
+			if sch.CloneURL != "" {
+				delete(e.cloneLease, sch.CloneURL)
+			}
+		}
+	}
 }
 
 // MarkPromptRunning pins the revision so edits create a new revision instead.
@@ -716,30 +847,176 @@ func (e *Engine) GetRepo(host, path string) (Repo, bool) {
 	return *r, true
 }
 
+func (e *Engine) reapExpiredLocked() {
+	now := e.now()
+	for _, job := range e.jobs {
+		if job.ExitPosted && job.Status != "RUNNING" && job.Status != "CANCEL_REQUESTED" {
+			continue
+		}
+		sch := e.schedules[job.ScheduleID]
+		if job.Status == "CANCEL_REQUESTED" && !job.FrozenUntil.IsZero() && now.After(job.FrozenUntil) {
+			job.Status = "CANCELLED"
+			job.ExitPosted = true
+			if sch != nil {
+				sch.Status = "CANCELLED"
+				sch.IterationsRemaining = 0
+				if sch.CloneURL != "" {
+					delete(e.cloneLease, sch.CloneURL)
+				}
+				if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
+					if repo.Lock == LockRunning {
+						repo.Lock = LockIdle
+					}
+					if repo.Queue == QueueOpen {
+						repo.Queue = QueuePaused
+					}
+					repo.Reason = "CANCELLED"
+					e.notifyRepoLocked(repo)
+				}
+			}
+			continue
+		}
+		if job.Status == "RUNNING" {
+			maxDur := DefaultMaxExec
+			if sch != nil && sch.MaxExecutionDuration > 0 {
+				maxDur = sch.MaxExecutionDuration
+			}
+			started := job.StartedAt
+			if started.IsZero() {
+				started = job.LeaseExpiry.Add(-LeaseInterval)
+			}
+			timedOut := !started.IsZero() && now.Sub(started) > maxDur
+			hostOffline := false
+			if sch != nil {
+				if h, ok := e.hosts[sch.HostID]; ok && h.Presence == "OFFLINE" && now.Sub(h.LastSeen) > EphemeralGrace {
+					hostOffline = true
+				}
+			}
+			if timedOut || hostOffline {
+				job.Status = "FAILED"
+				job.ExitPosted = true
+				reason := "EXECUTION_TIMEOUT"
+				if hostOffline {
+					reason = "HOST_OFFLINE"
+				}
+				if sch != nil {
+					sch.Status = "FAILED"
+					sch.IterationsRemaining = 0
+					if sch.CloneURL != "" {
+						delete(e.cloneLease, sch.CloneURL)
+					}
+					if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
+						if repo.Lock == LockRunning {
+							repo.Lock = LockIdle
+						}
+						if repo.Queue == QueueOpen {
+							repo.Queue = QueuePaused
+						}
+						repo.Reason = reason
+						e.notifyRepoLocked(repo)
+					}
+				}
+			}
+		}
+	}
+	for _, repo := range e.repos {
+		if repo.Lock == LockRunning {
+			hasActive := false
+			for _, job := range e.jobs {
+				if !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "CANCEL_REQUESTED") {
+					sch := e.schedules[job.ScheduleID]
+					if sch != nil && sch.HostID == repo.HostID && sch.WorktreePath == repo.WorktreePath {
+						hasActive = true
+						break
+					}
+				}
+			}
+			if !hasActive {
+				repo.Lock = LockIdle
+				e.notifyRepoLocked(repo)
+			}
+		}
+	}
+}
+
 // PollHost leases the next queued schedule for the host.
 // The bool is false when nothing is waiting.
 func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.reapExpiredLocked()
+	var candidates []*Schedule
 	for _, sch := range e.schedules {
-		if sch.HostID != host || sch.Status != "QUEUED" {
-			continue
+		if sch.HostID == host && sch.Status == "QUEUED" {
+			candidates = append(candidates, sch)
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		idxI := strings.LastIndex(candidates[i].ID, "-")
+		idxJ := strings.LastIndex(candidates[j].ID, "-")
+		if idxI >= 0 && idxJ >= 0 {
+			nI, errI := strconv.Atoi(candidates[i].ID[idxI+1:])
+			nJ, errJ := strconv.Atoi(candidates[j].ID[idxJ+1:])
+			if errI == nil && errJ == nil {
+				return nI < nJ
+			}
+		}
+		return candidates[i].ID < candidates[j].ID
+	})
+	for _, sch := range candidates {
+		repo := e.repos[repoKey(host, sch.WorktreePath)]
+		if repo != nil {
+			if repo.Lock == LockRunning || repo.Lock == LockCooling || repo.Lock == LockCleaning {
+				continue
+			}
+			if repo.Queue != QueueOpen && repo.Queue != QueueHealing {
+				continue
+			}
+		}
+		if sch.CloneURL != "" {
+			if holder, ok := e.cloneLease[sch.CloneURL]; ok && holder != "" {
+				continue
+			}
 		}
 		sch.Status = "RUNNING"
 		id := e.next("job-")
 		job := &Job{
 			ID: id, ScheduleID: sch.ID, Kind: sch.Kind, Status: "RUNNING",
 			LeaseHolder: host, LeaseExpiry: e.now().Add(LeaseInterval),
+			StartedAt: e.now(),
 		}
 		e.jobs[id] = job
+		if sch.CloneURL != "" {
+			e.cloneLease[sch.CloneURL] = id
+		}
 		docs := ""
-		if repo := e.repos[repoKey(host, sch.WorktreePath)]; repo != nil {
+		if repo != nil {
 			repo.Lock = LockRunning
 			docs = repo.DocsHubPath
+			e.notifyRepoLocked(repo)
 		}
 		return *job, *sch, docs, true
 	}
 	return Job{}, Schedule{}, "", false
+}
+
+// GetRepoForJob returns the repository associated with the given job ID.
+func (e *Engine) GetRepoForJob(jobID string) (Repo, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	job, ok := e.jobs[jobID]
+	if !ok {
+		return Repo{}, false
+	}
+	sch, ok := e.schedules[job.ScheduleID]
+	if !ok || sch == nil {
+		return Repo{}, false
+	}
+	repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]
+	if repo == nil {
+		return Repo{}, false
+	}
+	return *repo, true
 }
 
 // GetIdea returns a copy of the idea.
@@ -757,6 +1034,7 @@ func (e *Engine) GetIdea(id string) (Idea, bool) {
 func (e *Engine) GetJob(id string) (JobDetail, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.reapExpiredLocked()
 	job, ok := e.jobs[id]
 	if !ok {
 		return JobDetail{}, false

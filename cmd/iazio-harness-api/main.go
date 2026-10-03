@@ -88,6 +88,7 @@ func main() {
 		srv.SaveRepo = func(r control.Repo) {
 			_ = store.SaveRepo(context.Background(), r)
 		}
+		srv.Engine.OnRepoChange = srv.SaveRepo
 		srv.DeleteRepo = func(hostID, path string) {
 			_ = store.DeleteRepo(context.Background(), hostID, path)
 		}
