@@ -110,6 +110,7 @@ type Job struct {
 	ExitPosted  bool
 	Correlation string
 	HealingUsed bool
+	StartedAt   time.Time
 }
 
 // Repo is one registered checkout.
@@ -313,6 +314,7 @@ func (e *Engine) newJobLocked(host, path, clone, kind string) *Job {
 	job := &Job{
 		ID: id, ScheduleID: sid, Kind: kind, Status: "RUNNING",
 		LeaseHolder: host, LeaseExpiry: e.now().Add(LeaseInterval),
+		StartedAt: e.now(),
 	}
 	e.jobs[id] = job
 	if clone != "" {
@@ -486,6 +488,14 @@ func (e *Engine) PostExit(jobID string, code int) error {
 		if sch, ok := e.schedules[job.ScheduleID]; ok {
 			sch.Status = "CANCELLED"
 			sch.IterationsRemaining = 0
+			if sch.CloneURL != "" {
+				delete(e.cloneLease, sch.CloneURL)
+			}
+			if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
+				if repo.Lock == LockRunning {
+					repo.Lock = LockIdle
+				}
+			}
 		}
 	}
 	_ = code
@@ -585,6 +595,22 @@ func (e *Engine) ForcePause(host, path string) {
 	repo.Lock = LockIdle
 	repo.Queue = QueuePaused
 	repo.Reason = ReasonCorrTimeout
+	for _, job := range e.jobs {
+		sch := e.schedules[job.ScheduleID]
+		if sch == nil || sch.HostID != host || sch.WorktreePath != path {
+			continue
+		}
+		if !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "CANCEL_REQUESTED") {
+			job.Status = "CANCELLED"
+			job.ExitPosted = true
+			if sch.Status == "RUNNING" {
+				sch.Status = "PAUSED"
+			}
+			if sch.CloneURL != "" {
+				delete(e.cloneLease, sch.CloneURL)
+			}
+		}
+	}
 }
 
 // MarkPromptRunning pins the revision so edits create a new revision instead.
@@ -716,24 +742,132 @@ func (e *Engine) GetRepo(host, path string) (Repo, bool) {
 	return *r, true
 }
 
+func (e *Engine) reapExpiredLocked() {
+	now := e.now()
+	for _, job := range e.jobs {
+		if job.ExitPosted {
+			continue
+		}
+		sch := e.schedules[job.ScheduleID]
+		if job.Status == "CANCEL_REQUESTED" && !job.FrozenUntil.IsZero() && now.After(job.FrozenUntil) {
+			job.Status = "CANCELLED"
+			job.ExitPosted = true
+			if sch != nil {
+				sch.Status = "CANCELLED"
+				sch.IterationsRemaining = 0
+				if sch.CloneURL != "" {
+					delete(e.cloneLease, sch.CloneURL)
+				}
+				if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
+					if repo.Lock == LockRunning {
+						repo.Lock = LockIdle
+					}
+					if repo.Queue == QueueOpen {
+						repo.Queue = QueuePaused
+					}
+					repo.Reason = "CANCELLED"
+				}
+			}
+			continue
+		}
+		if job.Status == "RUNNING" {
+			maxDur := DefaultMaxExec
+			if sch != nil && sch.MaxExecutionDuration > 0 {
+				maxDur = sch.MaxExecutionDuration
+			}
+			started := job.StartedAt
+			if started.IsZero() {
+				started = job.LeaseExpiry.Add(-LeaseInterval)
+			}
+			timedOut := !started.IsZero() && now.Sub(started) > maxDur
+			hostOffline := false
+			if sch != nil {
+				if h, ok := e.hosts[sch.HostID]; ok && h.Presence == "OFFLINE" && now.Sub(h.LastSeen) > EphemeralGrace {
+					hostOffline = true
+				}
+			}
+			if timedOut || hostOffline {
+				job.Status = "FAILED"
+				job.ExitPosted = true
+				reason := "EXECUTION_TIMEOUT"
+				if hostOffline {
+					reason = "HOST_OFFLINE"
+				}
+				if sch != nil {
+					sch.Status = "FAILED"
+					sch.IterationsRemaining = 0
+					if sch.CloneURL != "" {
+						delete(e.cloneLease, sch.CloneURL)
+					}
+					if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
+						if repo.Lock == LockRunning {
+							repo.Lock = LockIdle
+						}
+						if repo.Queue == QueueOpen {
+							repo.Queue = QueuePaused
+						}
+						repo.Reason = reason
+					}
+				}
+			}
+		}
+	}
+	for _, repo := range e.repos {
+		if repo.Lock == LockRunning {
+			hasActive := false
+			for _, job := range e.jobs {
+				if !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "CANCEL_REQUESTED") {
+					sch := e.schedules[job.ScheduleID]
+					if sch != nil && sch.HostID == repo.HostID && sch.WorktreePath == repo.WorktreePath {
+						hasActive = true
+						break
+					}
+				}
+			}
+			if !hasActive {
+				repo.Lock = LockIdle
+			}
+		}
+	}
+}
+
 // PollHost leases the next queued schedule for the host.
 // The bool is false when nothing is waiting.
 func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.reapExpiredLocked()
 	for _, sch := range e.schedules {
 		if sch.HostID != host || sch.Status != "QUEUED" {
 			continue
+		}
+		repo := e.repos[repoKey(host, sch.WorktreePath)]
+		if repo != nil {
+			if repo.Lock == LockRunning || repo.Lock == LockCooling || repo.Lock == LockCleaning {
+				continue
+			}
+			if repo.Queue != QueueOpen && repo.Queue != QueueHealing {
+				continue
+			}
+		}
+		if sch.CloneURL != "" {
+			if holder, ok := e.cloneLease[sch.CloneURL]; ok && holder != "" {
+				continue
+			}
 		}
 		sch.Status = "RUNNING"
 		id := e.next("job-")
 		job := &Job{
 			ID: id, ScheduleID: sch.ID, Kind: sch.Kind, Status: "RUNNING",
 			LeaseHolder: host, LeaseExpiry: e.now().Add(LeaseInterval),
+			StartedAt: e.now(),
 		}
 		e.jobs[id] = job
+		if sch.CloneURL != "" {
+			e.cloneLease[sch.CloneURL] = id
+		}
 		docs := ""
-		if repo := e.repos[repoKey(host, sch.WorktreePath)]; repo != nil {
+		if repo != nil {
 			repo.Lock = LockRunning
 			docs = repo.DocsHubPath
 		}
@@ -757,6 +891,7 @@ func (e *Engine) GetIdea(id string) (Idea, bool) {
 func (e *Engine) GetJob(id string) (JobDetail, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.reapExpiredLocked()
 	job, ok := e.jobs[id]
 	if !ok {
 		return JobDetail{}, false

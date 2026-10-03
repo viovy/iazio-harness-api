@@ -116,6 +116,7 @@ type RepoDetail struct {
 func (e *Engine) GetRepoDetail(host, path string) (RepoDetail, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.reapExpiredLocked()
 	repo, ok := e.repos[repoKey(host, path)]
 	if !ok {
 		return RepoDetail{}, false
@@ -390,6 +391,16 @@ func (e *Engine) ForcePauseJob(jobID string) error {
 	repo.Lock = LockIdle
 	repo.Queue = QueuePaused
 	repo.Reason = ReasonCorrTimeout
+	job.ExitPosted = true
+	if job.Status == "RUNNING" || job.Status == "CANCEL_REQUESTED" {
+		job.Status = "FAILED"
+	}
+	if sch.Status == "RUNNING" {
+		sch.Status = "PAUSED"
+	}
+	if sch.CloneURL != "" {
+		delete(e.cloneLease, sch.CloneURL)
+	}
 	return nil
 }
 
@@ -427,6 +438,9 @@ func (e *Engine) AppendLog(jobID string, chunk LogChunk) {
 	e.logs[jobID] = append(e.logs[jobID], chunk)
 	if len(e.logs[jobID]) > RingCap {
 		e.logs[jobID] = e.logs[jobID][len(e.logs[jobID])-RingCap:]
+	}
+	if job, ok := e.jobs[jobID]; ok {
+		job.LeaseExpiry = e.now().Add(LeaseInterval * 2)
 	}
 	for _, ch := range e.subs[jobID] {
 		select {
