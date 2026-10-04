@@ -73,6 +73,12 @@ func main() {
 			}
 			log.Printf("loaded %d repos from database", len(repos))
 		}
+		if hist, err := store.LoadHistory(ctx); err == nil {
+			for key, rows := range hist {
+				srv.Engine.SetHistory(key, rows)
+			}
+			log.Printf("loaded %d repo history records from database", len(hist))
+		}
 
 		seedDefaults(ctx, srv.Engine, store)
 
@@ -89,6 +95,9 @@ func main() {
 			_ = store.SaveRepo(context.Background(), r)
 		}
 		srv.Engine.OnRepoChange = srv.SaveRepo
+		srv.Engine.OnHistoryChange = func(host, path string, row control.HistoryRow) {
+			_ = store.SaveHistory(context.Background(), host, path, row)
+		}
 		srv.DeleteRepo = func(hostID, path string) {
 			_ = store.DeleteRepo(context.Background(), hostID, path)
 		}

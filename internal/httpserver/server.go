@@ -45,6 +45,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	mux.HandleFunc("GET /swagger", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/swagger/", http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("GET /swagger/", s.swaggerUI)
+	mux.HandleFunc("GET /swagger/openapi.json", s.openAPISpec)
 	mux.HandleFunc("GET /v1/ideas", s.listIdeas)
 	mux.HandleFunc("POST /v1/ideas/import-gemini", s.importGemini)
 	mux.HandleFunc("POST /v1/ideas/{id}/triage", s.triage)
@@ -361,14 +366,19 @@ func (s *Server) forcePause(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) resumeRepo(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Path string `json:"worktree_path"`
+		Path         string `json:"path"`
+		WorktreePath string `json:"worktree_path"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	targetPath := body.WorktreePath
+	if targetPath == "" {
+		targetPath = body.Path
+	}
 	host := r.PathValue("host")
-	if err := s.Engine.ResumeRepo(host, body.Path); err != nil {
+	if err := s.Engine.ResumeRepo(host, targetPath); err != nil {
 		code := http.StatusConflict
 		if errors.Is(err, control.ErrNotFound) {
 			code = http.StatusNotFound
@@ -377,7 +387,7 @@ func (s *Server) resumeRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.SaveRepo != nil {
-		if detail, ok := s.Engine.GetRepoDetail(host, body.Path); ok {
+		if detail, ok := s.Engine.GetRepoDetail(host, targetPath); ok {
 			s.SaveRepo(detail.Repo)
 		}
 	}

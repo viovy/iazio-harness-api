@@ -46,3 +46,20 @@ CREATE TABLE IF NOT EXISTS harness_hosts (
   fetch_failed boolean NOT NULL DEFAULT false,
   tools jsonb NOT NULL DEFAULT '[]'::jsonb
 );
+
+CREATE TABLE IF NOT EXISTS harness_history (
+  job_id text PRIMARY KEY,
+  host_id text NOT NULL,
+  worktree_path text NOT NULL,
+  schedule_id text NOT NULL,
+  prompt_title text NOT NULL,
+  engine text NOT NULL DEFAULT 'agent',
+  status text NOT NULL DEFAULT 'RUNNING',
+  clean boolean NOT NULL DEFAULT false,
+  ase_complete boolean NOT NULL DEFAULT false,
+  conversation_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+  created_at timestamp with time zone NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_harness_history_repo ON harness_history (host_id, worktree_path, created_at ASC);
+

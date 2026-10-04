@@ -60,6 +60,22 @@ CREATE TABLE IF NOT EXISTS harness_hosts (
   fetch_failed boolean NOT NULL DEFAULT false,
   tools jsonb NOT NULL DEFAULT '[]'::jsonb
 );
+
+CREATE TABLE IF NOT EXISTS harness_history (
+  job_id text PRIMARY KEY,
+  host_id text NOT NULL,
+  worktree_path text NOT NULL,
+  schedule_id text NOT NULL,
+  prompt_title text NOT NULL,
+  engine text NOT NULL DEFAULT 'agent',
+  status text NOT NULL DEFAULT 'RUNNING',
+  clean boolean NOT NULL DEFAULT false,
+  ase_complete boolean NOT NULL DEFAULT false,
+  conversation_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+  created_at timestamp with time zone NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_harness_history_repo ON harness_history (host_id, worktree_path, created_at ASC);
 `
 
 // Store is a Postgres connection for the control plane.
@@ -329,6 +345,69 @@ FROM harness_hosts ORDER BY id
 	return out, rows.Err()
 }
 
+// SaveHistory inserts or updates one history row.
+func (s *Store) SaveHistory(ctx context.Context, hostID, worktreePath string, row control.HistoryRow) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	convBytes, err := json.Marshal(row.ConversationIDs)
+	if err != nil {
+		convBytes = []byte("[]")
+	}
+	_, err = s.db.ExecContext(ctx, `
+INSERT INTO harness_history (job_id, host_id, worktree_path, schedule_id, prompt_title, engine, status, clean, ase_complete, conversation_ids)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+ON CONFLICT (job_id) DO UPDATE SET
+  host_id = EXCLUDED.host_id,
+  worktree_path = EXCLUDED.worktree_path,
+  schedule_id = EXCLUDED.schedule_id,
+  prompt_title = EXCLUDED.prompt_title,
+  engine = EXCLUDED.engine,
+  status = EXCLUDED.status,
+  clean = EXCLUDED.clean,
+  ase_complete = EXCLUDED.ase_complete,
+  conversation_ids = EXCLUDED.conversation_ids
+`, row.JobID, hostID, worktreePath, row.ScheduleID, row.PromptTitle, row.Engine, row.Status, row.Clean, row.ASEComplete, string(convBytes))
+	if err != nil {
+		return fmt.Errorf("save history: %w", err)
+	}
+	return nil
+}
+
+// LoadHistory loads all history rows grouped by repoKey (host_id + "\x00" + worktree_path).
+func (s *Store) LoadHistory(ctx context.Context) (map[string][]control.HistoryRow, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT job_id, host_id, worktree_path, schedule_id, prompt_title, engine, status, clean, ase_complete, conversation_ids
+FROM harness_history ORDER BY created_at ASC
+`)
+	if err != nil {
+		return nil, fmt.Errorf("load history: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string][]control.HistoryRow)
+	for rows.Next() {
+		var r control.HistoryRow
+		var hostID, worktreePath string
+		var convRaw []byte
+		if err := rows.Scan(&r.JobID, &hostID, &worktreePath, &r.ScheduleID, &r.PromptTitle, &r.Engine, &r.Status, &r.Clean, &r.ASEComplete, &convRaw); err != nil {
+			return nil, err
+		}
+		if len(convRaw) > 0 {
+			_ = json.Unmarshal(convRaw, &r.ConversationIDs)
+		}
+		if r.ConversationIDs == nil {
+			r.ConversationIDs = []string{}
+		}
+		key := hostID + "\x00" + worktreePath
+		out[key] = append(out[key], r)
+	}
+	return out, rows.Err()
+}
+
 // Close closes the pool.
 func (s *Store) Close() error {
 	if s == nil || s.db == nil {
@@ -336,3 +415,4 @@ func (s *Store) Close() error {
 	}
 	return s.db.Close()
 }
+
