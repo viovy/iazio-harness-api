@@ -201,6 +201,7 @@ type Engine struct {
 	logs         map[string][]LogChunk
 	subs         map[string][]chan LogChunk
 	OnRepoChange func(Repo)
+	OnHistoryChange func(host, path string, row HistoryRow)
 }
 
 func (e *Engine) notifyRepoLocked(r *Repo) {
@@ -209,6 +210,21 @@ func (e *Engine) notifyRepoLocked(r *Repo) {
 	}
 	cp := *r
 	go e.OnRepoChange(cp)
+}
+
+func (e *Engine) notifyHistoryLocked(host, path string, row HistoryRow) {
+	if e.OnHistoryChange == nil {
+		return
+	}
+	cp := row
+	go e.OnHistoryChange(host, path, cp)
+}
+
+// SetHistory populates history for a repo key on startup.
+func (e *Engine) SetHistory(key string, rows []HistoryRow) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.history[key] = append([]HistoryRow(nil), rows...)
 }
 
 // NewEngine returns an empty control plane.
@@ -1061,7 +1077,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			docs = repo.DocsHubPath
 			e.notifyRepoLocked(repo)
 		}
-		e.history[repoKey(host, sch.WorktreePath)] = append(e.history[repoKey(host, sch.WorktreePath)], HistoryRow{
+		row := HistoryRow{
 			JobID:           id,
 			ScheduleID:      sch.ID,
 			PromptTitle:     sch.PromptTitle,
@@ -1070,7 +1086,9 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			Clean:           false,
 			ASEComplete:     false,
 			ConversationIDs: []string{},
-		})
+		}
+		e.history[repoKey(host, sch.WorktreePath)] = append(e.history[repoKey(host, sch.WorktreePath)], row)
+		e.notifyHistoryLocked(host, sch.WorktreePath, row)
 		return *job, *sch, docs, true
 	}
 	return Job{}, Schedule{}, "", false
@@ -1082,6 +1100,7 @@ func (e *Engine) updateHistoryStatusLocked(host, path, jobID, status string) {
 	for i := range rows {
 		if rows[i].JobID == jobID {
 			rows[i].Status = status
+			e.notifyHistoryLocked(host, path, rows[i])
 			return
 		}
 	}
@@ -1097,6 +1116,7 @@ func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseC
 			if status != "" {
 				rows[i].Status = status
 			}
+			e.notifyHistoryLocked(host, path, rows[i])
 			return
 		}
 	}
@@ -1108,10 +1128,12 @@ func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseC
 			schID = sch.ID
 		}
 	}
-	e.history[key] = append(e.history[key], HistoryRow{
+	row := HistoryRow{
 		JobID: jobID, ScheduleID: schID, PromptTitle: title, Engine: engine,
 		Status: status, Clean: clean, ASEComplete: aseComplete,
-	})
+	}
+	e.history[key] = append(e.history[key], row)
+	e.notifyHistoryLocked(host, path, row)
 }
 
 // ChangeSchedulePriority shifts a schedule's priority by delta.

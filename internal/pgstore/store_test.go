@@ -50,6 +50,13 @@ func TestNilStore(t *testing.T) {
 		t.Fatalf("expected nil hosts, got %v, %v", hosts, err)
 	}
 
+	if err := s.SaveHistory(ctx, "h1", "/p1", control.HistoryRow{}); err != nil {
+		t.Fatal(err)
+	}
+	if hist, err := s.LoadHistory(ctx); err != nil || hist != nil {
+		t.Fatalf("expected nil history, got %v, %v", hist, err)
+	}
+
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
