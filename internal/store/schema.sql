@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS harness_hosts (
   tools jsonb NOT NULL DEFAULT '[]'::jsonb
 );
 
+-- Persists execution history across container restarts for iazio-web inspection.
 CREATE TABLE IF NOT EXISTS harness_history (
   job_id text PRIMARY KEY,
   host_id text NOT NULL,
