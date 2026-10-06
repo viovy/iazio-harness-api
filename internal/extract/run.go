@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -25,7 +24,7 @@ func Run(ctx context.Context, script, shareURL string) (title, transcript string
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "python3", script)
 	cmd.Env = append(os.Environ(), "SHARE_URL="+shareURL)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setSysProcAttr(cmd)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -37,9 +36,7 @@ func Run(ctx context.Context, script, shareURL string) (title, transcript string
 	select {
 	case err = <-wait:
 	case <-ctx.Done():
-		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		}
+		killProcessGroup(cmd)
 		err = fmt.Errorf("extract deadline")
 		<-wait
 	}

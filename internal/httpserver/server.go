@@ -31,6 +31,10 @@ type Server struct {
 	DeleteRepo func(hostID, path string)
 	// SaveHost persists host inventory when a database is configured.
 	SaveHost func(h control.Host)
+	// SaveProfile persists a distribution profile when a database is configured.
+	SaveProfile func(p control.DistributionProfile)
+	// DeleteProfile removes a distribution profile when a database is configured.
+	DeleteProfile func(name string)
 }
 
 // Handler returns the HTTP routes.
@@ -97,6 +101,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/repos/{host}/force-pause", s.forcePause)
 	mux.HandleFunc("POST /v1/repos/{host}/resume", s.resumeRepo)
 	mux.HandleFunc("GET /v1/repos/{host}", s.getRepo)
+	mux.HandleFunc("GET /v1/fleet/profiles", s.listProfiles)
+	mux.HandleFunc("POST /v1/fleet/profiles", s.createProfile)
+	mux.HandleFunc("GET /v1/fleet/profiles/{name}", s.getProfile)
+	mux.HandleFunc("PUT /v1/fleet/profiles/{name}", s.updateProfile)
+	mux.HandleFunc("DELETE /v1/fleet/profiles/{name}", s.deleteProfile)
+	mux.HandleFunc("POST /v1/fleet/profiles/generic/sync", s.syncGenericProfile)
+	mux.HandleFunc("GET /v1/fleet/manifest", s.getFleetManifest)
 	return withCORS(mux)
 }
 
@@ -237,14 +248,23 @@ func (s *Server) cancel(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ID   string `json:"id"`
-		Kind string `json:"kind"`
+		ID                  string `json:"id"`
+		Kind                string `json:"kind"`
+		DistributionProfile string `json:"distribution_profile,omitempty"`
+		Profile             string `json:"profile,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	h := s.Engine.RegisterHost(body.ID, body.Kind)
+	profile := body.DistributionProfile
+	if profile == "" {
+		profile = body.Profile
+	}
+	if profile == "" {
+		profile = "generic"
+	}
+	h := s.Engine.RegisterHost(body.ID, body.Kind, profile)
 	if s.SaveHost != nil {
 		s.SaveHost(h)
 	}
@@ -1010,6 +1030,114 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func writeErr(w http.ResponseWriter, code int, err error) {
 	writeJSON(w, code, map[string]string{"error": err.Error()})
+}
+
+func (s *Server) listProfiles(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.Engine.ListProfiles())
+}
+
+func (s *Server) createProfile(w http.ResponseWriter, r *http.Request) {
+	var p control.DistributionProfile
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	created, err := s.Engine.UpsertProfile(p)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if s.SaveProfile != nil {
+		s.SaveProfile(*created)
+	}
+	writeJSON(w, http.StatusCreated, created)
+}
+
+func (s *Server) getProfile(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	p, err := s.Engine.GetProfile(name)
+	if err != nil {
+		if errors.Is(err, control.ErrProfileNotFound) {
+			writeErr(w, http.StatusNotFound, err)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+func (s *Server) updateProfile(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	var p control.DistributionProfile
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	p.Name = name
+	updated, err := s.Engine.UpsertProfile(p)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if s.SaveProfile != nil {
+		s.SaveProfile(*updated)
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func (s *Server) deleteProfile(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if err := s.Engine.DeleteProfile(name); err != nil {
+		if errors.Is(err, control.ErrProtectedProfile) {
+			writeErr(w, http.StatusForbidden, err)
+			return
+		}
+		if errors.Is(err, control.ErrProfileNotFound) {
+			writeErr(w, http.StatusNotFound, err)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if s.DeleteProfile != nil {
+		s.DeleteProfile(name)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+func (s *Server) syncGenericProfile(w http.ResponseWriter, r *http.Request) {
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	profile, err := s.Engine.SyncGenericProfile(raw)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if s.SaveProfile != nil {
+		s.SaveProfile(*profile)
+	}
+	writeJSON(w, http.StatusOK, profile)
+}
+
+func (s *Server) getFleetManifest(w http.ResponseWriter, r *http.Request) {
+	profile := r.URL.Query().Get("profile")
+	targetOS := r.URL.Query().Get("os")
+	targetArch := r.URL.Query().Get("arch")
+
+	manifest, err := s.Engine.GetManifest(profile, targetOS, targetArch)
+	if err != nil {
+		if errors.Is(err, control.ErrProfileNotFound) {
+			writeErr(w, http.StatusNotFound, err)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, manifest)
 }
 
 // DecodeLimit reads a small JSON body.

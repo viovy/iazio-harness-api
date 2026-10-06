@@ -64,15 +64,21 @@ func hostView(h control.Host, paused int) map[string]any {
 	for _, tool := range h.Tools {
 		tools = append(tools, toolView(tool))
 	}
+	prof := h.DistributionProfile
+	if prof == "" {
+		prof = "generic"
+	}
 	return map[string]any{
-		"id":             h.ID,
-		"name":           name,
-		"kind":           h.Kind,
-		"presence":       h.Presence,
-		"last_heartbeat": beat,
-		"repos_paused":   paused,
-		"fetch_failed":   h.FetchFailed,
-		"tools":          tools,
+		"id":                   h.ID,
+		"name":                 name,
+		"kind":                 h.Kind,
+		"presence":             h.Presence,
+		"profile":              prof,
+		"distribution_profile": prof,
+		"last_heartbeat":       beat,
+		"repos_paused":         paused,
+		"fetch_failed":         h.FetchFailed,
+		"tools":                tools,
 	}
 }
 
