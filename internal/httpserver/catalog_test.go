@@ -490,4 +490,85 @@ func TestResumeRepoEndpoint(t *testing.T) {
 	}
 }
 
+func TestSchedulesAndHistoryEndpoints(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	h := s.Handler()
+
+	post(t, h, "/v1/hosts/register", `{"id":"runner-1","kind":"permanent"}`, http.StatusOK)
+	post(t, h, "/v1/repos", `{"host_id":"runner-1","worktree_path":"/repos/app","clone_url":"https://example.test/app.git","queue":"OPEN","lock":"IDLE"}`, http.StatusOK)
+
+	// Create prompt
+	rr := post(t, h, "/v1/prompts", `{"title":"Integration Task","body":"echo test","engine":"agent","status":"READY"}`, http.StatusCreated)
+	var prompt map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &prompt); err != nil {
+		t.Fatal(err)
+	}
+	pid := prompt["id"].(string)
+
+	// Execute prompt to schedule 2 iterations
+	rr = post(t, h, "/v1/prompts/"+pid+"/execute", `{"host_id":"runner-1","repo_path":"/repos/app","iterations":2}`, http.StatusCreated)
+	var createdSch map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &createdSch); err != nil {
+		t.Fatal(err)
+	}
+	schID := createdSch["id"].(string)
+
+	// 1. GET /v1/schedules
+	schedulesBody := get(t, h, "/v1/schedules?host_id=runner-1&status=QUEUED", http.StatusOK)
+	if !strings.Contains(schedulesBody, schID) || !strings.Contains(schedulesBody, `"iterations_total":2`) {
+		t.Fatalf("expected schedule %s in /v1/schedules: %s", schID, schedulesBody)
+	}
+
+	// 2. Poll host leases iteration 1
+	pollResp := post(t, h, "/v1/hosts/runner-1/poll", `{"kind":"ordinary"}`, http.StatusOK)
+	var pollJson map[string]any
+	if err := json.Unmarshal(pollResp.Body.Bytes(), &pollJson); err != nil {
+		t.Fatal(err)
+	}
+	jobID, ok := pollJson["id"].(string)
+	if !ok || jobID == "" {
+		t.Fatalf("expected job assigned in poll response: %s", pollResp.Body.String())
+	}
+
+	// 3. GET /v1/history should show in-flight RUNNING row
+	historyBody := get(t, h, "/v1/history?host_id=runner-1&status=RUNNING", http.StatusOK)
+	if !strings.Contains(historyBody, jobID) || !strings.Contains(historyBody, `"status":"RUNNING"`) {
+		t.Fatalf("expected running job %s in /v1/history: %s", jobID, historyBody)
+	}
+
+	// 4. Post log chunk
+	post(t, h, "/v1/jobs/"+jobID+"/chunks", `{"stream":"stdout","text":"chunk 1 data\n"}`, http.StatusAccepted)
+
+	// Verify chunk via /v1/jobs/{id}/logs
+	logsBody := get(t, h, "/v1/jobs/"+jobID+"/logs", http.StatusOK)
+	if !strings.Contains(logsBody, "chunk 1 data") {
+		t.Fatalf("expected chunk 1 data in logs: %s", logsBody)
+	}
+
+	// 5. Post Exit (completion)
+	post(t, h, "/v1/jobs/"+jobID+"/exit", `{"exit_code":0}`, http.StatusOK)
+
+	// 6. GET /v1/history should now show RUN_FINISHED
+	historyFinishedBody := get(t, h, "/v1/history?host_id=runner-1&status=RUN_FINISHED", http.StatusOK)
+	if !strings.Contains(historyFinishedBody, jobID) || !strings.Contains(historyFinishedBody, `"status":"RUN_FINISHED"`) {
+		t.Fatalf("expected finished job in /v1/history: %s", historyFinishedBody)
+	}
+
+	// 7. GET /v1/schedules should show iteration 2 queued
+	schedulesRemainingBody := get(t, h, "/v1/schedules?host_id=runner-1", http.StatusOK)
+	if !strings.Contains(schedulesRemainingBody, schID) || !strings.Contains(schedulesRemainingBody, `"iterations_remaining":1`) {
+		t.Fatalf("expected iteration 2 remaining in /v1/schedules: %s", schedulesRemainingBody)
+	}
+
+	// 8. Test repo_path with trailing slash matches normalized worktreePath
+	historyTrailingSlash := get(t, h, "/v1/history?repo_path=/repos/app/", http.StatusOK)
+	if !strings.Contains(historyTrailingSlash, jobID) {
+		t.Fatalf("expected trailing slash repo_path to match in /v1/history: %s", historyTrailingSlash)
+	}
+	schedulesTrailingSlash := get(t, h, "/v1/schedules?repo_path=/repos/app/", http.StatusOK)
+	if !strings.Contains(schedulesTrailingSlash, schID) {
+		t.Fatalf("expected trailing slash repo_path to match in /v1/schedules: %s", schedulesTrailingSlash)
+	}
+}
+
 

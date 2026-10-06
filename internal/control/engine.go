@@ -150,6 +150,20 @@ type HistoryRow struct {
 	ConversationIDs []string
 }
 
+// HistoryItem is one execution record reported across repositories.
+type HistoryItem struct {
+	HostID          string
+	WorktreePath    string
+	JobID           string
+	ScheduleID      string
+	PromptTitle     string
+	Engine          string
+	Status          string
+	Clean           bool
+	ASEComplete     bool
+	ConversationIDs []string
+}
+
 // LogChunk is one stripped output event.
 type LogChunk struct {
 	Seq          int
@@ -559,7 +573,7 @@ func (e *Engine) PostExit(jobID string, code int) error {
 				} else {
 					sch.Status = "QUEUED"
 				}
-				if sch.CloneURL != "" && sch.IterationsRemaining <= 0 {
+				if sch.CloneURL != "" {
 					delete(e.cloneLease, sch.CloneURL)
 				}
 				if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
@@ -583,7 +597,7 @@ func (e *Engine) PostExit(jobID string, code int) error {
 				} else {
 					sch.Status = "QUEUED"
 				}
-				if sch.CloneURL != "" && sch.IterationsRemaining <= 0 {
+				if sch.CloneURL != "" {
 					delete(e.cloneLease, sch.CloneURL)
 				}
 				if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
@@ -697,7 +711,7 @@ func (e *Engine) ApplyFinish(host, path string, jobID string, in FinishInput) Fi
 			} else {
 				sch.Status = "QUEUED"
 			}
-			if sch.CloneURL != "" && sch.IterationsRemaining <= 0 {
+			if sch.CloneURL != "" {
 				delete(e.cloneLease, sch.CloneURL)
 			}
 			clean := strings.TrimSpace(in.WorkPorcelain) == "" && strings.TrimSpace(in.HubPorcelain) == "" && in.HubAhead == 0
