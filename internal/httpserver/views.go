@@ -159,6 +159,10 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 }
 
 func jobDetailView(j control.JobDetail) map[string]any {
+	cids := j.ConversationIDs
+	if cids == nil {
+		cids = []string{}
+	}
 	return map[string]any{
 		"id":                             j.ID,
 		"schedule_id":                    j.ScheduleID,
@@ -173,6 +177,8 @@ func jobDetailView(j control.JobDetail) map[string]any {
 		"docs_hub_path":                  j.DocsHubPath,
 		"env_vars":                      j.EnvVars,
 		"max_execution_duration_seconds": j.MaxExecutionDurationSeconds,
+		"resume_conversation_id":        j.ResumeConversationID,
+		"conversation_ids":              cids,
 	}
 }
 

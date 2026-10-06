@@ -331,4 +331,124 @@ func TestRepoResumeAndHistory(t *testing.T) {
 	}
 }
 
+func TestJobConversationEndpoints(t *testing.T) {
+	eng := control.NewEngine(nil)
+	eng.RegisterHost("host-1", "permanent")
+	_ = eng.UpsertRepo(control.Repo{
+		HostID:       "host-1",
+		WorktreePath: "/work/repo",
+		Queue:        control.QueueOpen,
+		Lock:         control.LockIdle,
+	})
+	p := eng.PutPrompt(control.Prompt{
+		ID:     "prompt-1",
+		Title:  "Test Prompt",
+		Body:   "do work",
+		Engine: "agy",
+		Status: "READY",
+	})
+
+	s := &Server{Engine: eng}
+	handler := s.Handler()
+
+	// 1. Execute with resume_conversation_id
+	execBody, _ := json.Marshal(map[string]any{
+		"host_id":                "host-1",
+		"repo_path":              "/work/repo",
+		"iterations":             1,
+		"resume_conversation_id": "initial-conv-123",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/prompts/"+p.ID+"/execute", bytes.NewReader(execBody))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("execute failed: code %d body %s", rr.Code, rr.Body.String())
+	}
+
+	// 2. Poll host to lease job
+	req = httptest.NewRequest(http.MethodPost, "/v1/hosts/host-1/poll", nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("poll failed: code %d body %s", rr.Code, rr.Body.String())
+	}
+	var pollResp struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &pollResp); err != nil {
+		t.Fatal(err)
+	}
+	jobID := pollResp.ID
+	if jobID == "" {
+		t.Fatal("empty job id from poll")
+	}
+
+	// 3. Get job details and verify resume_conversation_id
+	req = httptest.NewRequest(http.MethodGet, "/v1/jobs/"+jobID, nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("get job failed: code %d", rr.Code)
+	}
+	var jobDet map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &jobDet); err != nil {
+		t.Fatal(err)
+	}
+	if jobDet["resume_conversation_id"] != "initial-conv-123" {
+		t.Fatalf("expected resume_conversation_id 'initial-conv-123', got %v", jobDet["resume_conversation_id"])
+	}
+
+	// 4. Post an early/streamed conversation ID
+	convBody, _ := json.Marshal(map[string]string{
+		"conversation_id": "streamed-conv-456",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/jobs/"+jobID+"/conversations", bytes.NewReader(convBody))
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("post conversation failed: code %d body %s", rr.Code, rr.Body.String())
+	}
+
+	// 5. Verify conversation appears in GET /v1/jobs/{id}
+	req = httptest.NewRequest(http.MethodGet, "/v1/jobs/"+jobID, nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	_ = json.Unmarshal(rr.Body.Bytes(), &jobDet)
+	cids := jobDet["conversation_ids"].([]any)
+	foundInitial, foundStreamed := false, false
+	for _, c := range cids {
+		if c == "initial-conv-123" {
+			foundInitial = true
+		}
+		if c == "streamed-conv-456" {
+			foundStreamed = true
+		}
+	}
+	if !foundInitial || !foundStreamed {
+		t.Fatalf("expected both initial and streamed conversation IDs, got: %v", cids)
+	}
+
+	// 6. Verify conversation IDs appear in GET /v1/history
+	req = httptest.NewRequest(http.MethodGet, "/v1/history?host_id=host-1", nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("get history failed: code %d", rr.Code)
+	}
+	var histResp struct {
+		History []map[string]any `json:"history"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &histResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(histResp.History) == 0 {
+		t.Fatal("empty history")
+	}
+	histCids := histResp.History[0]["conversation_ids"].([]any)
+	if len(histCids) < 2 {
+		t.Fatalf("expected at least 2 conversation IDs in history row, got %v", histCids)
+	}
+}
+
+
 

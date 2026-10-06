@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/viovy/iazio-harness-api/internal/control"
@@ -75,6 +76,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/jobs/{id}/force-pause", s.forcePauseJob)
 	mux.HandleFunc("POST /v1/jobs/{id}/retry-correlation", s.retryCorrelation)
 	mux.HandleFunc("POST /v1/jobs/{id}/chunks", s.appendChunk)
+	mux.HandleFunc("POST /v1/jobs/{id}/conversations", s.addJobConversation)
 	mux.HandleFunc("GET /v1/jobs/{id}/logs", s.jobLogs)
 	mux.HandleFunc("GET /v1/jobs/{id}/stream", s.jobStream)
 	mux.HandleFunc("POST /v1/hosts/register", s.register)
@@ -474,16 +476,17 @@ func (s *Server) deletePrompt(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) executePrompt(w http.ResponseWriter, r *http.Request) {
 	var raw struct {
-		HostID     string            `json:"host_id"`
-		RepoPath   string            `json:"repo_path"`
-		Iterations int               `json:"iterations"`
-		Env        map[string]string `json:"env_vars"`
+		HostID               string            `json:"host_id"`
+		RepoPath             string            `json:"repo_path"`
+		Iterations           int               `json:"iterations"`
+		Env                  map[string]string `json:"env_vars"`
+		ResumeConversationID string            `json:"resume_conversation_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	sch, err := s.Engine.ExecutePrompt(r.PathValue("id"), raw.HostID, raw.RepoPath, raw.Iterations, raw.Env)
+	sch, err := s.Engine.ExecutePromptWithResume(r.PathValue("id"), raw.HostID, raw.RepoPath, raw.Iterations, raw.Env, raw.ResumeConversationID)
 	if err != nil {
 		code := http.StatusConflict
 		if errors.Is(err, control.ErrNotFound) {
@@ -891,6 +894,26 @@ func (s *Server) appendChunk(w http.ResponseWriter, r *http.Request) {
 	}
 	s.Engine.AppendLog(r.PathValue("id"), control.LogChunk{Type: raw.Type, Stream: raw.Stream, Text: raw.Text})
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "stored"})
+}
+
+func (s *Server) addJobConversation(w http.ResponseWriter, r *http.Request) {
+	var raw struct {
+		ConversationID string `json:"conversation_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	cid := strings.TrimSpace(raw.ConversationID)
+	if cid == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("conversation_id is required"))
+		return
+	}
+	if err := s.Engine.AddJobConversation(r.PathValue("id"), cid); err != nil {
+		writeErr(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "recorded", "conversation_id": cid})
 }
 
 func (s *Server) jobLogs(w http.ResponseWriter, r *http.Request) {
