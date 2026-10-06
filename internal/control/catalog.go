@@ -196,6 +196,11 @@ func (e *Engine) GetRepoDetail(host, path string) (RepoDetail, bool) {
 
 // ExecutePrompt creates a schedule. Environment keys are extracted for display; values are passed to the child process.
 func (e *Engine) ExecutePrompt(promptID, host, path string, iterations int, envVars map[string]string) (Schedule, error) {
+	return e.ExecutePromptWithResume(promptID, host, path, iterations, envVars, "")
+}
+
+// ExecutePromptWithResume creates a schedule with an optional conversation ID to resume.
+func (e *Engine) ExecutePromptWithResume(promptID, host, path string, iterations int, envVars map[string]string, resumeConvID string) (Schedule, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	p, ok := e.prompts[promptID]
@@ -232,6 +237,7 @@ func (e *Engine) ExecutePrompt(promptID, host, path string, iterations int, envV
 		Kind: KindOrdinary, IterationsTotal: iterations, IterationsRemaining: iterations,
 		MaxExecutionDuration: DefaultMaxExec, EnvKeys: envKeys, EnvVars: envCopy,
 		Status: "QUEUED", PromptTitle: p.Title, Engine: p.Engine, CloneURL: repo.CloneURL,
+		ResumeConversationID: strings.TrimSpace(resumeConvID),
 	}
 	e.schedules[sid] = sch
 	return *sch, nil

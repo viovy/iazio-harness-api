@@ -81,6 +81,7 @@ type Schedule struct {
 	PromptTitle          string
 	Engine               string
 	Priority             int
+	ResumeConversationID string
 }
 
 // JobDetail carries the execution payload for iazio-harness.
@@ -98,21 +99,25 @@ type JobDetail struct {
 	DocsHubPath                 string            `json:"docs_hub_path"`
 	EnvVars                     map[string]string `json:"env_vars,omitempty"`
 	MaxExecutionDurationSeconds int               `json:"max_execution_duration_seconds"`
+	ResumeConversationID        string            `json:"resume_conversation_id,omitempty"`
+	ConversationIDs             []string          `json:"conversation_ids,omitempty"`
 }
 
 // Job is one leased execution.
 type Job struct {
-	ID          string
-	ScheduleID  string
-	Kind        string
-	Status      string
-	LeaseHolder string
-	LeaseExpiry time.Time
-	FrozenUntil time.Time
-	ExitPosted  bool
-	Correlation string
-	HealingUsed bool
-	StartedAt   time.Time
+	ID                   string
+	ScheduleID           string
+	Kind                 string
+	Status               string
+	LeaseHolder          string
+	LeaseExpiry          time.Time
+	FrozenUntil          time.Time
+	ExitPosted           bool
+	Correlation          string
+	HealingUsed          bool
+	StartedAt            time.Time
+	ResumeConversationID string
+	ConversationIDs      []string
 }
 
 // Repo is one registered checkout.
@@ -1079,7 +1084,11 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 		job := &Job{
 			ID: id, ScheduleID: sch.ID, Kind: sch.Kind, Status: "RUNNING",
 			LeaseHolder: host, LeaseExpiry: e.now().Add(LeaseInterval),
-			StartedAt: e.now(),
+			StartedAt:            e.now(),
+			ResumeConversationID: sch.ResumeConversationID,
+		}
+		if sch.ResumeConversationID != "" {
+			job.ConversationIDs = []string{sch.ResumeConversationID}
 		}
 		e.jobs[id] = job
 		if sch.CloneURL != "" {
@@ -1100,6 +1109,9 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			Clean:           false,
 			ASEComplete:     false,
 			ConversationIDs: []string{},
+		}
+		if sch.ResumeConversationID != "" {
+			row.ConversationIDs = append(row.ConversationIDs, sch.ResumeConversationID)
 		}
 		e.history[repoKey(host, sch.WorktreePath)] = append(e.history[repoKey(host, sch.WorktreePath)], row)
 		e.notifyHistoryLocked(host, sch.WorktreePath, row)
@@ -1263,13 +1275,18 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 		return JobDetail{}, false
 	}
 	detail := JobDetail{
-		ID:         job.ID,
-		ScheduleID: job.ScheduleID,
-		Kind:       job.Kind,
-		Status:     job.Status,
+		ID:                   job.ID,
+		ScheduleID:           job.ScheduleID,
+		Kind:                 job.Kind,
+		Status:               job.Status,
+		ResumeConversationID: job.ResumeConversationID,
+		ConversationIDs:      append([]string(nil), job.ConversationIDs...),
 	}
 	sch := e.schedules[job.ScheduleID]
 	if sch != nil {
+		if detail.ResumeConversationID == "" {
+			detail.ResumeConversationID = sch.ResumeConversationID
+		}
 		detail.Engine = sch.Engine
 		detail.WorktreePath = sch.WorktreePath
 		detail.EnvVars = sch.EnvVars
@@ -1310,5 +1327,51 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 		}
 	}
 	return detail, true
+}
+
+// AddJobConversation records an early or streamed conversation ID for a job.
+func (e *Engine) AddJobConversation(jobID, convID string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	job, ok := e.jobs[jobID]
+	if !ok {
+		return ErrNotFound
+	}
+	convID = strings.TrimSpace(convID)
+	if convID == "" {
+		return errors.New("empty conversation id")
+	}
+	found := false
+	for _, c := range job.ConversationIDs {
+		if c == convID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		job.ConversationIDs = append(job.ConversationIDs, convID)
+	}
+	sch, okSch := e.schedules[job.ScheduleID]
+	if okSch {
+		key := repoKey(sch.HostID, sch.WorktreePath)
+		rows := e.history[key]
+		for i := range rows {
+			if rows[i].JobID == jobID {
+				has := false
+				for _, c := range rows[i].ConversationIDs {
+					if c == convID {
+						has = true
+						break
+					}
+				}
+				if !has {
+					rows[i].ConversationIDs = append(rows[i].ConversationIDs, convID)
+					e.notifyHistoryLocked(sch.HostID, sch.WorktreePath, rows[i])
+				}
+				break
+			}
+		}
+	}
+	return nil
 }
 
