@@ -176,3 +176,22 @@ func jobDetailView(j control.JobDetail) map[string]any {
 	}
 }
 
+func historyItemView(h control.HistoryItem) map[string]any {
+	ids := h.ConversationIDs
+	if ids == nil {
+		ids = []string{}
+	}
+	return map[string]any{
+		"host_id":          h.HostID,
+		"repo_path":        h.WorktreePath,
+		"job_id":           h.JobID,
+		"schedule_id":      h.ScheduleID,
+		"prompt_title":     h.PromptTitle,
+		"engine":           h.Engine,
+		"status":           h.Status,
+		"clean":            h.Clean,
+		"ase_complete":     h.ASEComplete,
+		"conversation_ids": ids,
+	}
+}
+

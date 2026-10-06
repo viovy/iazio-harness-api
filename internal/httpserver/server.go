@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/viovy/iazio-harness-api/internal/control"
@@ -59,11 +60,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /v1/prompts/{id}", s.updatePrompt)
 	mux.HandleFunc("DELETE /v1/prompts/{id}", s.deletePrompt)
 	mux.HandleFunc("POST /v1/prompts/{id}/execute", s.executePrompt)
+	mux.HandleFunc("GET /v1/schedules", s.listSchedules)
 	mux.HandleFunc("POST /v1/schedules/{id}/priority", s.changePriority)
 	mux.HandleFunc("POST /v1/schedules/{id}/increase-priority", s.increasePriority)
 	mux.HandleFunc("POST /v1/schedules/{id}/decrease-priority", s.decreasePriority)
 	mux.HandleFunc("POST /v1/schedules/{id}/cancel", s.cancelSchedule)
 	mux.HandleFunc("DELETE /v1/schedules/{id}", s.cancelSchedule)
+	mux.HandleFunc("GET /v1/history", s.listHistory)
 	mux.HandleFunc("GET /v1/jobs/{id}", s.getJob)
 	mux.HandleFunc("POST /v1/jobs/{id}/exit", s.postExit)
 	mux.HandleFunc("POST /v1/jobs/{id}/decline", s.declineJob)
@@ -577,6 +580,48 @@ func (s *Server) cancelSchedule(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "CANCELLED", "id": id})
+}
+
+func (s *Server) listSchedules(w http.ResponseWriter, r *http.Request) {
+	hostID := r.URL.Query().Get("host_id")
+	if hostID == "" {
+		hostID = r.URL.Query().Get("host")
+	}
+	repoPath := r.URL.Query().Get("repo_path")
+	if repoPath == "" {
+		repoPath = r.URL.Query().Get("path")
+	}
+	status := r.URL.Query().Get("status")
+	schedules := s.Engine.ListSchedules(hostID, repoPath, status)
+	out := make([]map[string]any, 0, len(schedules))
+	for _, sch := range schedules {
+		out = append(out, scheduleView(sch))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"schedules": out})
+}
+
+func (s *Server) listHistory(w http.ResponseWriter, r *http.Request) {
+	hostID := r.URL.Query().Get("host_id")
+	if hostID == "" {
+		hostID = r.URL.Query().Get("host")
+	}
+	repoPath := r.URL.Query().Get("repo_path")
+	if repoPath == "" {
+		repoPath = r.URL.Query().Get("path")
+	}
+	status := r.URL.Query().Get("status")
+	limit := 50
+	if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
+		if n, err := strconv.Atoi(rawLimit); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	items := s.Engine.ListHistory(hostID, repoPath, status, limit)
+	out := make([]map[string]any, 0, len(items))
+	for _, h := range items {
+		out = append(out, historyItemView(h))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"history": out})
 }
 
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {

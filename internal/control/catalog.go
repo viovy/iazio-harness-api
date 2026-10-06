@@ -2,6 +2,7 @@ package control
 
 import (
 	"errors"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -207,7 +208,8 @@ func (e *Engine) ExecutePrompt(promptID, host, path string, iterations int, envV
 	if _, ok := e.hosts[host]; !ok {
 		return Schedule{}, ErrNotFound
 	}
-	if _, ok := e.repos[repoKey(host, path)]; !ok {
+	repo, ok := e.repos[repoKey(host, path)]
+	if !ok {
 		return Schedule{}, ErrNotFound
 	}
 	if iterations < 1 {
@@ -229,7 +231,7 @@ func (e *Engine) ExecutePrompt(promptID, host, path string, iterations int, envV
 		ID: sid, PromptID: promptID, Revision: p.Revision, HostID: host, WorktreePath: path,
 		Kind: KindOrdinary, IterationsTotal: iterations, IterationsRemaining: iterations,
 		MaxExecutionDuration: DefaultMaxExec, EnvKeys: envKeys, EnvVars: envCopy,
-		Status: "QUEUED", PromptTitle: p.Title, Engine: p.Engine,
+		Status: "QUEUED", PromptTitle: p.Title, Engine: p.Engine, CloneURL: repo.CloneURL,
 	}
 	e.schedules[sid] = sch
 	return *sch, nil
@@ -588,4 +590,102 @@ func atoi(s string) int {
 		n = n*10 + int(r-'0')
 	}
 	return n
+}
+
+// ListSchedules returns matching schedules across the engine.
+func (e *Engine) ListSchedules(hostID, repoPath, status string) []Schedule {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cleanPath := ""
+	if repoPath != "" {
+		cleanPath = filepath.Clean(repoPath)
+	}
+	var out []Schedule
+	for _, sch := range e.schedules {
+		if hostID != "" && sch.HostID != hostID {
+			continue
+		}
+		if cleanPath != "" && filepath.Clean(sch.WorktreePath) != cleanPath {
+			continue
+		}
+		if status != "" && !strings.EqualFold(sch.Status, status) {
+			continue
+		}
+		out = append(out, *sch)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Priority != out[j].Priority {
+			return out[i].Priority > out[j].Priority
+		}
+		idxI := strings.LastIndex(out[i].ID, "-")
+		idxJ := strings.LastIndex(out[j].ID, "-")
+		if idxI >= 0 && idxJ >= 0 {
+			nI, errI := strconv.Atoi(out[i].ID[idxI+1:])
+			nJ, errJ := strconv.Atoi(out[j].ID[idxJ+1:])
+			if errI == nil && errJ == nil {
+				return nI < nJ
+			}
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+// ListHistory returns execution history across repositories.
+func (e *Engine) ListHistory(hostID, repoPath, status string, limit int) []HistoryItem {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cleanPath := ""
+	if repoPath != "" {
+		cleanPath = filepath.Clean(repoPath)
+	}
+	var out []HistoryItem
+	for key, rows := range e.history {
+		parts := strings.SplitN(key, "\x00", 2)
+		hID := ""
+		rPath := ""
+		if len(parts) == 2 {
+			hID = parts[0]
+			rPath = parts[1]
+		}
+		if hostID != "" && hID != hostID {
+			continue
+		}
+		if cleanPath != "" && filepath.Clean(rPath) != cleanPath {
+			continue
+		}
+		for _, row := range rows {
+			if status != "" && !strings.EqualFold(row.Status, status) {
+				continue
+			}
+			out = append(out, HistoryItem{
+				HostID:          hID,
+				WorktreePath:    rPath,
+				JobID:           row.JobID,
+				ScheduleID:      row.ScheduleID,
+				PromptTitle:     row.PromptTitle,
+				Engine:          row.Engine,
+				Status:          row.Status,
+				Clean:           row.Clean,
+				ASEComplete:     row.ASEComplete,
+				ConversationIDs: row.ConversationIDs,
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		idxI := strings.LastIndex(out[i].JobID, "-")
+		idxJ := strings.LastIndex(out[j].JobID, "-")
+		if idxI >= 0 && idxJ >= 0 {
+			nI, errI := strconv.Atoi(out[i].JobID[idxI+1:])
+			nJ, errJ := strconv.Atoi(out[j].JobID[idxJ+1:])
+			if errI == nil && errJ == nil {
+				return nI > nJ
+			}
+		}
+		return out[i].JobID > out[j].JobID
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
 }
