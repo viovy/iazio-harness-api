@@ -172,13 +172,14 @@ type RepoRequest struct {
 
 // Host is a registered supervisor.
 type Host struct {
-	ID          string
-	Name        string
-	Kind        string
-	Presence    string
-	LastSeen    time.Time
-	FetchFailed bool
-	Tools       []Tool
+	ID                  string
+	Name                string
+	Kind                string
+	Presence            string
+	LastSeen            time.Time
+	FetchFailed         bool
+	DistributionProfile string
+	Tools               []Tool
 }
 
 // Engine is the in-process control plane.
@@ -193,6 +194,7 @@ type Engine struct {
 	jobs       map[string]*Job
 	repos      map[string]*Repo
 	hosts      map[string]*Host
+	profiles   map[string]*DistributionProfile
 	cloneLease map[string]string
 	hubLease   string
 	runningRev map[string]bool
@@ -240,6 +242,7 @@ func NewEngine(now func() time.Time) *Engine {
 		jobs:       map[string]*Job{},
 		repos:      map[string]*Repo{},
 		hosts:      map[string]*Host{},
+		profiles:   map[string]*DistributionProfile{},
 		cloneLease: map[string]string{},
 		runningRev: map[string]bool{},
 		history:    map[string][]HistoryRow{},
@@ -426,14 +429,18 @@ func (e *Engine) UpsertRepo(r Repo) error {
 	return nil
 }
 
-// RegisterHost records kind and presence.
-func (e *Engine) RegisterHost(id, kind string) Host {
+// RegisterHost records kind, presence, and distribution profile.
+func (e *Engine) RegisterHost(id, kind string, profile ...string) Host {
 	if kind == "" {
 		kind = "permanent"
 	}
+	p := "generic"
+	if len(profile) > 0 && strings.TrimSpace(profile[0]) != "" {
+		p = strings.TrimSpace(profile[0])
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	h := &Host{ID: id, Name: id, Kind: kind, Presence: "ONLINE", LastSeen: e.now()}
+	h := &Host{ID: id, Name: id, Kind: kind, Presence: "ONLINE", LastSeen: e.now(), DistributionProfile: p}
 	e.hosts[id] = h
 	return *h
 }
@@ -819,6 +826,9 @@ func (e *Engine) SetHost(h Host) Host {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	cp := h
+	if cp.DistributionProfile == "" {
+		cp.DistributionProfile = "generic"
+	}
 	e.hosts[h.ID] = &cp
 	return cp
 }

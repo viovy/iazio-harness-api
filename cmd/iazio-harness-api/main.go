@@ -108,6 +108,18 @@ func main() {
 		srv.SaveHost = func(h control.Host) {
 			_ = store.SaveHost(context.Background(), h)
 		}
+		srv.SaveProfile = func(p control.DistributionProfile) {
+			_ = store.SaveProfile(context.Background(), p)
+		}
+		srv.DeleteProfile = func(name string) {
+			_ = store.DeleteProfile(context.Background(), name)
+		}
+		if profiles, err := store.LoadProfiles(ctx); err == nil {
+			for _, p := range profiles {
+				_, _ = srv.Engine.UpsertProfile(p)
+			}
+			log.Printf("loaded %d distribution profiles from database", len(profiles))
+		}
 	}
 	log.Printf("listening %s %s", addr, version.Informational())
 	if err := http.ListenAndServe(addr, srv.Handler()); err != nil {

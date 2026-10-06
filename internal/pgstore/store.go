@@ -58,8 +58,24 @@ CREATE TABLE IF NOT EXISTS harness_hosts (
   presence text NOT NULL DEFAULT 'ONLINE',
   last_seen timestamp with time zone,
   fetch_failed boolean NOT NULL DEFAULT false,
-  tools jsonb NOT NULL DEFAULT '[]'::jsonb
+  tools jsonb NOT NULL DEFAULT '[]'::jsonb,
+  distribution_profile text NOT NULL DEFAULT 'generic'
 );
+
+ALTER TABLE harness_hosts ADD COLUMN IF NOT EXISTS distribution_profile text NOT NULL DEFAULT 'generic';
+
+CREATE TABLE IF NOT EXISTS fleet_distribution_profiles (
+  name text PRIMARY KEY,
+  description text NOT NULL DEFAULT '',
+  is_default boolean NOT NULL DEFAULT false,
+  install_roots jsonb NOT NULL DEFAULT '{}'::jsonb,
+  endpoints jsonb NOT NULL DEFAULT '{}'::jsonb,
+  tools jsonb NOT NULL DEFAULT '[]'::jsonb,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  updated_at timestamp with time zone NOT NULL DEFAULT now()
+);
+
+ALTER TABLE fleet_distribution_profiles ADD COLUMN IF NOT EXISTS endpoints jsonb NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE TABLE IF NOT EXISTS harness_history (
   job_id text PRIMARY KEY,
@@ -295,17 +311,22 @@ func (s *Store) SaveHost(ctx context.Context, h control.Host) error {
 	if !h.LastSeen.IsZero() {
 		lastSeen = &h.LastSeen
 	}
+	profile := h.DistributionProfile
+	if profile == "" {
+		profile = "generic"
+	}
 	_, err = s.db.ExecContext(ctx, `
-INSERT INTO harness_hosts (id, name, kind, presence, last_seen, fetch_failed, tools)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO harness_hosts (id, name, kind, presence, last_seen, fetch_failed, tools, distribution_profile)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 ON CONFLICT (id) DO UPDATE SET
   name = EXCLUDED.name,
   kind = EXCLUDED.kind,
   presence = EXCLUDED.presence,
   last_seen = EXCLUDED.last_seen,
   fetch_failed = EXCLUDED.fetch_failed,
-  tools = EXCLUDED.tools
-`, h.ID, h.Name, h.Kind, h.Presence, lastSeen, h.FetchFailed, string(toolsBytes))
+  tools = EXCLUDED.tools,
+  distribution_profile = EXCLUDED.distribution_profile
+`, h.ID, h.Name, h.Kind, h.Presence, lastSeen, h.FetchFailed, string(toolsBytes), profile)
 	if err != nil {
 		return fmt.Errorf("save host: %w", err)
 	}
@@ -318,7 +339,7 @@ func (s *Store) LoadHosts(ctx context.Context) ([]control.Host, error) {
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, name, kind, presence, last_seen, fetch_failed, tools
+SELECT id, name, kind, presence, last_seen, fetch_failed, tools, distribution_profile
 FROM harness_hosts ORDER BY id
 `)
 	if err != nil {
@@ -331,8 +352,11 @@ FROM harness_hosts ORDER BY id
 		var h control.Host
 		var lastSeen *time.Time
 		var toolsRaw []byte
-		if err := rows.Scan(&h.ID, &h.Name, &h.Kind, &h.Presence, &lastSeen, &h.FetchFailed, &toolsRaw); err != nil {
+		if err := rows.Scan(&h.ID, &h.Name, &h.Kind, &h.Presence, &lastSeen, &h.FetchFailed, &toolsRaw, &h.DistributionProfile); err != nil {
 			return nil, err
+		}
+		if h.DistributionProfile == "" {
+			h.DistributionProfile = "generic"
 		}
 		if lastSeen != nil {
 			h.LastSeen = *lastSeen
@@ -341,6 +365,87 @@ FROM harness_hosts ORDER BY id
 			_ = json.Unmarshal(toolsRaw, &h.Tools)
 		}
 		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
+// SaveProfile inserts or updates a distribution profile row.
+func (s *Store) SaveProfile(ctx context.Context, p control.DistributionProfile) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	rootsBytes, err := json.Marshal(p.InstallRoots)
+	if err != nil {
+		rootsBytes = []byte("{}")
+	}
+	endpointsBytes, err := json.Marshal(p.Endpoints)
+	if err != nil || p.Endpoints == nil {
+		endpointsBytes = []byte("{}")
+	}
+	toolsBytes, err := json.Marshal(p.Tools)
+	if err != nil {
+		toolsBytes = []byte("[]")
+	}
+	_, err = s.db.ExecContext(ctx, `
+INSERT INTO fleet_distribution_profiles (name, description, is_default, install_roots, endpoints, tools, created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+ON CONFLICT (name) DO UPDATE SET
+  description = EXCLUDED.description,
+  is_default = EXCLUDED.is_default,
+  install_roots = EXCLUDED.install_roots,
+  endpoints = EXCLUDED.endpoints,
+  tools = EXCLUDED.tools,
+  updated_at = EXCLUDED.updated_at
+`, p.Name, p.Description, p.IsDefault, string(rootsBytes), string(endpointsBytes), string(toolsBytes), p.CreatedAt, p.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("save profile: %w", err)
+	}
+	return nil
+}
+
+// DeleteProfile removes a distribution profile row.
+func (s *Store) DeleteProfile(ctx context.Context, name string) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM fleet_distribution_profiles WHERE name = $1`, name)
+	if err != nil {
+		return fmt.Errorf("delete profile: %w", err)
+	}
+	return nil
+}
+
+// LoadProfiles loads all distribution profiles from the database.
+func (s *Store) LoadProfiles(ctx context.Context) ([]control.DistributionProfile, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT name, description, is_default, install_roots, endpoints, tools, created_at, updated_at
+FROM fleet_distribution_profiles ORDER BY name
+`)
+	if err != nil {
+		return nil, fmt.Errorf("load profiles: %w", err)
+	}
+	defer rows.Close()
+
+	var out []control.DistributionProfile
+	for rows.Next() {
+		var p control.DistributionProfile
+		var rootsRaw, endpointsRaw, toolsRaw []byte
+		if err := rows.Scan(&p.Name, &p.Description, &p.IsDefault, &rootsRaw, &endpointsRaw, &toolsRaw, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if len(rootsRaw) > 0 {
+			_ = json.Unmarshal(rootsRaw, &p.InstallRoots)
+		}
+		if len(endpointsRaw) > 0 {
+			_ = json.Unmarshal(endpointsRaw, &p.Endpoints)
+		}
+		if len(toolsRaw) > 0 {
+			_ = json.Unmarshal(toolsRaw, &p.Tools)
+		}
+		out = append(out, p)
 	}
 	return out, rows.Err()
 }
