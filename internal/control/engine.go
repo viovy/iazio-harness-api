@@ -82,6 +82,7 @@ type Schedule struct {
 	Engine               string
 	Priority             int
 	ResumeConversationID string
+	LeaseRetries         int
 }
 
 // JobDetail carries the execution payload for iazio-harness.
@@ -1017,7 +1018,8 @@ func (e *Engine) reapExpiredLocked() {
 					reason = "LEASE_EXPIRED"
 				}
 				if sch != nil {
-					if leaseExpired && !timedOut {
+					if leaseExpired && !timedOut && sch.LeaseRetries < 2 {
+						sch.LeaseRetries++
 						sch.IterationsRemaining++
 						if sch.IterationsCompleted > 0 {
 							sch.IterationsCompleted--
@@ -1411,6 +1413,17 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 		}
 	}
 	return detail, true
+}
+
+// GetJobLeaseExpiry returns the lease expiry for a job.
+func (e *Engine) GetJobLeaseExpiry(id string) (time.Time, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	j, ok := e.jobs[id]
+	if !ok {
+		return time.Time{}, false
+	}
+	return j.LeaseExpiry, true
 }
 
 // AddJobConversation records an early or streamed conversation ID for a job.

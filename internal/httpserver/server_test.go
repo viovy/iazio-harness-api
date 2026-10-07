@@ -2,10 +2,13 @@ package httpserver
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/viovy/iazio-harness-api/internal/control"
 )
@@ -491,7 +494,30 @@ func TestJobStreamKeepaliveAndOutputTick(t *testing.T) {
 	s := &Server{Engine: e}
 	handler := s.Handler()
 
-	// 1. Post OUTPUT_TICK with silent_for_ms
+	initialExpiry, ok := e.GetJobLeaseExpiry(job.ID)
+	if !ok {
+		t.Fatal("expected job to exist")
+	}
+
+	// 1. Verify stream ping on connect
+	streamCtx, cancelStream := context.WithCancel(context.Background())
+	defer cancelStream()
+	streamReq := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+job.ID+"/stream", nil).WithContext(streamCtx)
+	streamRR := httptest.NewRecorder()
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancelStream()
+	}()
+	handler.ServeHTTP(streamRR, streamReq)
+	if streamRR.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", streamRR.Code)
+	}
+	body := streamRR.Body.String()
+	if !strings.Contains(body, ": ping") {
+		t.Fatalf("expected initial ping in stream body, got: %q", body)
+	}
+
+	// 2. Post OUTPUT_TICK with silent_for_ms
 	tickReq := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/chunks", bytes.NewBufferString(`{"type":"OUTPUT_TICK","silent_for_ms":10000}`))
 	tickReq.Header.Set("Content-Type", "application/json")
 	tickRR := httptest.NewRecorder()
@@ -500,7 +526,12 @@ func TestJobStreamKeepaliveAndOutputTick(t *testing.T) {
 		t.Fatalf("expected 202, got %d", tickRR.Code)
 	}
 
-	// 2. Decline job and verify reason in GET /v1/history
+	newExpiry, _ := e.GetJobLeaseExpiry(job.ID)
+	if !newExpiry.After(initialExpiry) {
+		t.Fatalf("expected LeaseExpiry to be extended, initial: %v, new: %v", initialExpiry, newExpiry)
+	}
+
+	// 3. Decline job and verify reason in GET /v1/history
 	declineReq := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/decline", bytes.NewBufferString(`{"reason":"preflight_rejected: HALTED_DIRTY"}`))
 	declineReq.Header.Set("Content-Type", "application/json")
 	declineRR := httptest.NewRecorder()
