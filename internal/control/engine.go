@@ -669,6 +669,16 @@ func (e *Engine) DeclineJob(jobID, reason string) error {
 			}
 			changedRepo = repo
 		}
+		key := repoKey(sch.HostID, sch.WorktreePath)
+		rows := e.history[key]
+		var deduplicated []HistoryRow
+		for _, r := range rows {
+			if r.ScheduleID == sch.ID && r.Status == "DECLINED" && r.JobID != jobID {
+				continue
+			}
+			deduplicated = append(deduplicated, r)
+		}
+		e.history[key] = deduplicated
 		e.updateHistoryStatusLocked(sch.HostID, sch.WorktreePath, jobID, "DECLINED")
 	}
 	if changedRepo != nil {
@@ -1076,7 +1086,17 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 				continue
 			}
 			if repo.Queue != QueueOpen && repo.Queue != QueueHealing {
-				continue
+				if !(repo.Queue == QueuePaused && sch.Kind == KindIntervention) {
+					continue
+				}
+			}
+			if repo.Reason != "" {
+				if repo.Reason == ReasonDisk {
+					continue
+				}
+				if sch.Kind != KindIntervention {
+					continue
+				}
 			}
 		}
 		if sch.CloneURL != "" {

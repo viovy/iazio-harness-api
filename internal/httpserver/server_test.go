@@ -285,6 +285,30 @@ func TestRepoResumeAndHistory(t *testing.T) {
 	if !ok || running["id"] != job.ID {
 		t.Fatalf("expected running job %s, got: %v", job.ID, detail["running_job"])
 	}
+	if running["conversation_ids"] == nil {
+		t.Fatalf("expected running job to include conversation_ids, got: %v", running)
+	}
+
+	// Add conversation ID to running job
+	convBody, _ := json.Marshal(map[string]string{"conversation_id": "conv-test-123"})
+	req = httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/conversations", bytes.NewReader(convBody))
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /conversations, got: %d", rr.Code)
+	}
+
+	// Verify repo detail running_job now includes the conversation ID
+	req = httptest.NewRequest(http.MethodGet, "/v1/hosts/host-1/repos?path=/work/repo", nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	_ = json.Unmarshal(rr.Body.Bytes(), &detail)
+	running = detail["running_job"].(map[string]any)
+	cids, _ := running["conversation_ids"].([]any)
+	if len(cids) != 1 || cids[0] != "conv-test-123" {
+		t.Fatalf("expected running_job conversation_ids to include conv-test-123, got: %v", running["conversation_ids"])
+	}
+
 	history, ok := detail["history"].([]any)
 	if !ok || len(history) != 1 {
 		t.Fatalf("expected 1 history item, got: %v", detail["history"])

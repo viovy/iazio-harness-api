@@ -120,11 +120,16 @@ func chunkView(c control.LogChunk) map[string]any {
 func repoDetailView(d control.RepoDetail) map[string]any {
 	var running any
 	if d.Running != nil {
+		cids := d.Running.ConversationIDs
+		if cids == nil {
+			cids = []string{}
+		}
 		running = map[string]any{
-			"id":           d.Running.ID,
-			"status":       d.Running.Status,
-			"prompt_title": d.RunningTitle,
-			"engine":       d.RunningEngine,
+			"id":               d.Running.ID,
+			"status":           d.Running.Status,
+			"prompt_title":     d.RunningTitle,
+			"engine":           d.RunningEngine,
+			"conversation_ids": cids,
 		}
 	}
 	schedules := make([]map[string]any, 0, len(d.Schedules))
