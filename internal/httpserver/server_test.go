@@ -474,5 +474,62 @@ func TestJobConversationEndpoints(t *testing.T) {
 	}
 }
 
+func TestJobStreamKeepaliveAndOutputTick(t *testing.T) {
+	e := control.NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	_ = e.UpsertRepo(control.Repo{HostID: "host-1", WorktreePath: "/work/app"})
+	p := e.PutPrompt(control.Prompt{Title: "Task", Body: "run", Status: "READY"})
+	sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("poll host failed")
+	}
+
+	s := &Server{Engine: e}
+	handler := s.Handler()
+
+	// 1. Post OUTPUT_TICK with silent_for_ms
+	tickReq := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/chunks", bytes.NewBufferString(`{"type":"OUTPUT_TICK","silent_for_ms":10000}`))
+	tickReq.Header.Set("Content-Type", "application/json")
+	tickRR := httptest.NewRecorder()
+	handler.ServeHTTP(tickRR, tickReq)
+	if tickRR.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d", tickRR.Code)
+	}
+
+	// 2. Decline job and verify reason in GET /v1/history
+	declineReq := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/decline", bytes.NewBufferString(`{"reason":"preflight_rejected: HALTED_DIRTY"}`))
+	declineReq.Header.Set("Content-Type", "application/json")
+	declineRR := httptest.NewRecorder()
+	handler.ServeHTTP(declineRR, declineReq)
+	if declineRR.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", declineRR.Code)
+	}
+
+	histReq := httptest.NewRequest(http.MethodGet, "/v1/history?host_id=host-1", nil)
+	histRR := httptest.NewRecorder()
+	handler.ServeHTTP(histRR, histReq)
+	if histRR.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", histRR.Code)
+	}
+	var histResp struct {
+		History []map[string]any `json:"history"`
+	}
+	if err := json.Unmarshal(histRR.Body.Bytes(), &histResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(histResp.History) == 0 {
+		t.Fatal("expected history")
+	}
+	reason, _ := histResp.History[0]["reason"].(string)
+	if reason != "preflight_rejected: HALTED_DIRTY" {
+		t.Fatalf("expected reason 'preflight_rejected: HALTED_DIRTY', got: %q", reason)
+	}
+	_ = sch
+}
+
 
 

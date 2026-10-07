@@ -168,6 +168,7 @@ type HistoryItem struct {
 	Clean           bool
 	ASEComplete     bool
 	ConversationIDs []string
+	Reason          string
 }
 
 // LogChunk is one stripped output event.
@@ -1016,7 +1017,13 @@ func (e *Engine) reapExpiredLocked() {
 					reason = "LEASE_EXPIRED"
 				}
 				if sch != nil {
-					if sch.IterationsRemaining > 0 {
+					if leaseExpired && !timedOut {
+						sch.IterationsRemaining++
+						if sch.IterationsCompleted > 0 {
+							sch.IterationsCompleted--
+						}
+						sch.Status = "QUEUED"
+					} else if sch.IterationsRemaining > 0 {
 						sch.Status = "QUEUED"
 					} else {
 						sch.Status = "FAILED"
@@ -1187,6 +1194,9 @@ func (e *Engine) updateHistoryStatusLocked(host, path, jobID, status string) {
 	for i := range rows {
 		if rows[i].JobID == jobID {
 			rows[i].Status = status
+			if rows[i].Reason == "" && (status == "LEASE_EXPIRED" || status == "EXECUTION_TIMEOUT" || status == "HOST_OFFLINE" || status == "FAILED") {
+				rows[i].Reason = status
+			}
 			e.notifyHistoryLocked(host, path, rows[i])
 			return
 		}

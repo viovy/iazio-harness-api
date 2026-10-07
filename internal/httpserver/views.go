@@ -210,6 +210,7 @@ func historyItemView(h control.HistoryItem) map[string]any {
 		"clean":            h.Clean,
 		"ase_complete":     h.ASEComplete,
 		"conversation_ids": ids,
+		"reason":           h.Reason,
 	}
 }
 
