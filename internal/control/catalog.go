@@ -66,15 +66,20 @@ type HostSummary struct {
 func (e *Engine) ListHosts() []HostSummary {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	now := e.now()
 	out := make([]HostSummary, 0, len(e.hosts))
 	for _, h := range e.hosts {
+		hostCopy := *h
+		if !hostCopy.LastSeen.IsZero() && now.Sub(hostCopy.LastSeen) > LeaseInterval*2 {
+			hostCopy.Presence = "OFFLINE"
+		}
 		paused := 0
 		for _, repo := range e.repos {
 			if repo.HostID == h.ID && repo.Queue == QueuePaused {
 				paused++
 			}
 		}
-		out = append(out, HostSummary{Host: *h, ReposPaused: paused})
+		out = append(out, HostSummary{Host: hostCopy, ReposPaused: paused})
 	}
 	return out
 }
@@ -93,7 +98,11 @@ func (e *Engine) GetHostDetail(id string) (HostDetail, bool) {
 	if !ok {
 		return HostDetail{}, false
 	}
-	detail := HostDetail{Host: *h}
+	hostCopy := *h
+	if !hostCopy.LastSeen.IsZero() && e.now().Sub(hostCopy.LastSeen) > LeaseInterval*2 {
+		hostCopy.Presence = "OFFLINE"
+	}
+	detail := HostDetail{Host: hostCopy}
 	for _, repo := range e.repos {
 		if repo.HostID == id {
 			detail.Repos = append(detail.Repos, *repo)
@@ -458,9 +467,11 @@ func (e *Engine) AppendLog(jobID string, chunk LogChunk) {
 	if chunk.Type == "" {
 		chunk.Type = "OUTPUT_CHUNK"
 	}
-	e.logs[jobID] = append(e.logs[jobID], chunk)
-	if len(e.logs[jobID]) > RingCap {
-		e.logs[jobID] = e.logs[jobID][len(e.logs[jobID])-RingCap:]
+	if chunk.Type != "OUTPUT_TICK" {
+		e.logs[jobID] = append(e.logs[jobID], chunk)
+		if len(e.logs[jobID]) > RingCap {
+			e.logs[jobID] = e.logs[jobID][len(e.logs[jobID])-RingCap:]
+		}
 	}
 	if job, ok := e.jobs[jobID]; ok {
 		job.LeaseExpiry = e.now().Add(LeaseInterval * 2)
@@ -675,6 +686,7 @@ func (e *Engine) ListHistory(hostID, repoPath, status string, limit int) []Histo
 				Clean:           row.Clean,
 				ASEComplete:     row.ASEComplete,
 				ConversationIDs: row.ConversationIDs,
+				Reason:          row.Reason,
 			})
 		}
 	}

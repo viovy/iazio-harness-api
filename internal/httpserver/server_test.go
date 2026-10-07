@@ -2,10 +2,13 @@ package httpserver
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/viovy/iazio-harness-api/internal/control"
 )
@@ -472,6 +475,91 @@ func TestJobConversationEndpoints(t *testing.T) {
 	if len(histCids) < 2 {
 		t.Fatalf("expected at least 2 conversation IDs in history row, got %v", histCids)
 	}
+}
+
+func TestJobStreamKeepaliveAndOutputTick(t *testing.T) {
+	e := control.NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	_ = e.UpsertRepo(control.Repo{HostID: "host-1", WorktreePath: "/work/app"})
+	p := e.PutPrompt(control.Prompt{Title: "Task", Body: "run", Status: "READY"})
+	sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("poll host failed")
+	}
+
+	s := &Server{Engine: e}
+	handler := s.Handler()
+
+	initialExpiry, ok := e.GetJobLeaseExpiry(job.ID)
+	if !ok {
+		t.Fatal("expected job to exist")
+	}
+
+	// 1. Verify stream ping on connect
+	streamCtx, cancelStream := context.WithCancel(context.Background())
+	defer cancelStream()
+	streamReq := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+job.ID+"/stream", nil).WithContext(streamCtx)
+	streamRR := httptest.NewRecorder()
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancelStream()
+	}()
+	handler.ServeHTTP(streamRR, streamReq)
+	if streamRR.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", streamRR.Code)
+	}
+	body := streamRR.Body.String()
+	if !strings.Contains(body, ": ping") {
+		t.Fatalf("expected initial ping in stream body, got: %q", body)
+	}
+
+	// 2. Post OUTPUT_TICK with silent_for_ms
+	tickReq := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/chunks", bytes.NewBufferString(`{"type":"OUTPUT_TICK","silent_for_ms":10000}`))
+	tickReq.Header.Set("Content-Type", "application/json")
+	tickRR := httptest.NewRecorder()
+	handler.ServeHTTP(tickRR, tickReq)
+	if tickRR.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d", tickRR.Code)
+	}
+
+	newExpiry, _ := e.GetJobLeaseExpiry(job.ID)
+	if !newExpiry.After(initialExpiry) {
+		t.Fatalf("expected LeaseExpiry to be extended, initial: %v, new: %v", initialExpiry, newExpiry)
+	}
+
+	// 3. Decline job and verify reason in GET /v1/history
+	declineReq := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/decline", bytes.NewBufferString(`{"reason":"preflight_rejected: HALTED_DIRTY"}`))
+	declineReq.Header.Set("Content-Type", "application/json")
+	declineRR := httptest.NewRecorder()
+	handler.ServeHTTP(declineRR, declineReq)
+	if declineRR.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", declineRR.Code)
+	}
+
+	histReq := httptest.NewRequest(http.MethodGet, "/v1/history?host_id=host-1", nil)
+	histRR := httptest.NewRecorder()
+	handler.ServeHTTP(histRR, histReq)
+	if histRR.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", histRR.Code)
+	}
+	var histResp struct {
+		History []map[string]any `json:"history"`
+	}
+	if err := json.Unmarshal(histRR.Body.Bytes(), &histResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(histResp.History) == 0 {
+		t.Fatal("expected history")
+	}
+	reason, _ := histResp.History[0]["reason"].(string)
+	if reason != "preflight_rejected: HALTED_DIRTY" {
+		t.Fatalf("expected reason 'preflight_rejected: HALTED_DIRTY', got: %q", reason)
+	}
+	_ = sch
 }
 
 

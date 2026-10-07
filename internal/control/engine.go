@@ -82,6 +82,7 @@ type Schedule struct {
 	Engine               string
 	Priority             int
 	ResumeConversationID string
+	LeaseRetries         int
 }
 
 // JobDetail carries the execution payload for iazio-harness.
@@ -168,6 +169,7 @@ type HistoryItem struct {
 	Clean           bool
 	ASEComplete     bool
 	ConversationIDs []string
+	Reason          string
 }
 
 // LogChunk is one stripped output event.
@@ -1016,7 +1018,14 @@ func (e *Engine) reapExpiredLocked() {
 					reason = "LEASE_EXPIRED"
 				}
 				if sch != nil {
-					if sch.IterationsRemaining > 0 {
+					if leaseExpired && !timedOut && sch.LeaseRetries < 2 {
+						sch.LeaseRetries++
+						sch.IterationsRemaining++
+						if sch.IterationsCompleted > 0 {
+							sch.IterationsCompleted--
+						}
+						sch.Status = "QUEUED"
+					} else if sch.IterationsRemaining > 0 {
 						sch.Status = "QUEUED"
 					} else {
 						sch.Status = "FAILED"
@@ -1187,6 +1196,9 @@ func (e *Engine) updateHistoryStatusLocked(host, path, jobID, status string) {
 	for i := range rows {
 		if rows[i].JobID == jobID {
 			rows[i].Status = status
+			if rows[i].Reason == "" && (status == "LEASE_EXPIRED" || status == "EXECUTION_TIMEOUT" || status == "HOST_OFFLINE" || status == "FAILED") {
+				rows[i].Reason = status
+			}
 			e.notifyHistoryLocked(host, path, rows[i])
 			return
 		}
@@ -1401,6 +1413,17 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 		}
 	}
 	return detail, true
+}
+
+// GetJobLeaseExpiry returns the lease expiry for a job.
+func (e *Engine) GetJobLeaseExpiry(id string) (time.Time, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	j, ok := e.jobs[id]
+	if !ok {
+		return time.Time{}, false
+	}
+	return j.LeaseExpiry, true
 }
 
 // AddJobConversation records an early or streamed conversation ID for a job.

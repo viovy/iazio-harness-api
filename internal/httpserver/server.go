@@ -904,15 +904,21 @@ func (s *Server) retryCorrelation(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) appendChunk(w http.ResponseWriter, r *http.Request) {
 	var raw struct {
-		Type   string `json:"type"`
-		Stream string `json:"stream"`
-		Text   string `json:"text"`
+		Type        string `json:"type"`
+		Stream      string `json:"stream"`
+		Text        string `json:"text"`
+		SilentForMs int    `json:"silent_for_ms"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	s.Engine.AppendLog(r.PathValue("id"), control.LogChunk{Type: raw.Type, Stream: raw.Stream, Text: raw.Text})
+	s.Engine.AppendLog(r.PathValue("id"), control.LogChunk{
+		Type:        raw.Type,
+		Stream:      raw.Stream,
+		Text:        raw.Text,
+		SilentForMs: raw.SilentForMs,
+	})
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "stored"})
 }
 
@@ -982,10 +988,15 @@ func (s *Server) jobStream(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 	sub, cancel := s.Engine.SubscribeLogs(id)
 	defer cancel()
+	keepAliveTicker := time.NewTicker(15 * time.Second)
+	defer keepAliveTicker.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-keepAliveTicker.C:
+			_, _ = w.Write([]byte(": keep-alive\n\n"))
+			flusher.Flush()
 		case c, open := <-sub:
 			if !open {
 				return
