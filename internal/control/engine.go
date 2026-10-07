@@ -153,6 +153,7 @@ type HistoryRow struct {
 	Clean           bool
 	ASEComplete     bool
 	ConversationIDs []string
+	Reason          string
 }
 
 // HistoryItem is one execution record reported across repositories.
@@ -223,6 +224,7 @@ type Engine struct {
 	subs         map[string][]chan LogChunk
 	OnRepoChange func(Repo)
 	OnHistoryChange func(host, path string, row HistoryRow)
+	OnHistoryDelete func(host, path string, jobID string)
 }
 
 func (e *Engine) notifyRepoLocked(r *Repo) {
@@ -239,6 +241,13 @@ func (e *Engine) notifyHistoryLocked(host, path string, row HistoryRow) {
 	}
 	cp := row
 	go e.OnHistoryChange(host, path, cp)
+}
+
+func (e *Engine) notifyHistoryDeleteLocked(host, path, jobID string) {
+	if e.OnHistoryDelete == nil || jobID == "" {
+		return
+	}
+	go e.OnHistoryDelete(host, path, jobID)
 }
 
 // SetHistory populates history for a repo key on startup.
@@ -515,11 +524,29 @@ func (e *Engine) ApplyPreflight(host, path string, p Preflight) Halt {
 		repo.Porcelain = p.HubPorcelain
 	}
 	if h.Reason == "" {
-		repo.Lock = LockRunning
+		if repo.Reason == ReasonDisk {
+			repo.Reason = ""
+		}
 		if repo.Queue == QueuePaused && repo.Reason == ReasonDirty {
 			repo.Queue = QueueOpen
 			repo.Reason = ""
 			repo.Porcelain = ""
+		}
+		hasActive := false
+		for _, other := range e.jobs {
+			if !other.ExitPosted && (other.Status == "RUNNING" || other.Status == "CANCEL_REQUESTED") {
+				if otherSch := e.schedules[other.ScheduleID]; otherSch != nil {
+					if otherSch.HostID == host && otherSch.WorktreePath == path {
+						hasActive = true
+						break
+					}
+				}
+			}
+		}
+		if hasActive {
+			repo.Lock = LockRunning
+		} else {
+			repo.Lock = LockIdle
 		}
 		e.notifyRepoLocked(repo)
 		return h
@@ -669,12 +696,26 @@ func (e *Engine) DeclineJob(jobID, reason string) error {
 			}
 			changedRepo = repo
 		}
-		e.updateHistoryStatusLocked(sch.HostID, sch.WorktreePath, jobID, "DECLINED")
+		key := repoKey(sch.HostID, sch.WorktreePath)
+		rows := e.history[key]
+		var deduplicated []HistoryRow
+		var droppedJobIDs []string
+		for _, r := range rows {
+			if r.ScheduleID == sch.ID && r.Status == "DECLINED" && r.JobID != jobID {
+				droppedJobIDs = append(droppedJobIDs, r.JobID)
+				continue
+			}
+			deduplicated = append(deduplicated, r)
+		}
+		e.history[key] = deduplicated
+		e.updateHistoryDeclineLocked(sch.HostID, sch.WorktreePath, jobID, reason)
+		for _, dropID := range droppedJobIDs {
+			e.notifyHistoryDeleteLocked(sch.HostID, sch.WorktreePath, dropID)
+		}
 	}
 	if changedRepo != nil {
 		e.notifyRepoLocked(changedRepo)
 	}
-	_ = reason
 	return nil
 }
 
@@ -1076,7 +1117,17 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 				continue
 			}
 			if repo.Queue != QueueOpen && repo.Queue != QueueHealing {
-				continue
+				if !(repo.Queue == QueuePaused && sch.Kind == KindIntervention) {
+					continue
+				}
+			}
+			if repo.Reason != "" {
+				if repo.Reason == ReasonDisk {
+					continue
+				}
+				if sch.Kind != KindIntervention {
+					continue
+				}
 			}
 		}
 		if sch.CloneURL != "" {
@@ -1136,6 +1187,19 @@ func (e *Engine) updateHistoryStatusLocked(host, path, jobID, status string) {
 	for i := range rows {
 		if rows[i].JobID == jobID {
 			rows[i].Status = status
+			e.notifyHistoryLocked(host, path, rows[i])
+			return
+		}
+	}
+}
+
+func (e *Engine) updateHistoryDeclineLocked(host, path, jobID, reason string) {
+	key := repoKey(host, path)
+	rows := e.history[key]
+	for i := range rows {
+		if rows[i].JobID == jobID {
+			rows[i].Status = "DECLINED"
+			rows[i].Reason = reason
 			e.notifyHistoryLocked(host, path, rows[i])
 			return
 		}

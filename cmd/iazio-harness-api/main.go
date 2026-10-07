@@ -102,6 +102,11 @@ func main() {
 				log.Printf("warn: save history for %s %s: %v", host, path, err)
 			}
 		}
+		srv.Engine.OnHistoryDelete = func(host, path, jobID string) {
+			if err := store.DeleteHistory(context.Background(), jobID); err != nil {
+				log.Printf("warn: delete history %s for %s %s: %v", jobID, host, path, err)
+			}
+		}
 		srv.DeleteRepo = func(hostID, path string) {
 			_ = store.DeleteRepo(context.Background(), hostID, path)
 		}

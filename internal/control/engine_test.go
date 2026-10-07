@@ -1004,4 +1004,156 @@ func TestResumeRepoAndPreflightRecovery(t *testing.T) {
 	}
 }
 
+func TestPollHostSkipsHaltedDiskRepo(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app", CloneURL: "https://example.test/app.git"}); err != nil {
+		t.Fatal(err)
+	}
+	p := e.PutPrompt(Prompt{Title: "Task 1", Body: "do task 1", Status: "READY"})
+	if _, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Preflight halts with low disk space
+	e.ApplyPreflight("host-1", "/work/app", Preflight{
+		FreeBytes:   2 << 30, // 2 GB < 10 GB
+		GitWorkTree: true,
+		DocsHubOK:   true,
+		GitAuthOK:   true,
+	})
+	detail, _ := e.GetRepoDetail("host-1", "/work/app")
+	if detail.Repo.Reason != ReasonDisk {
+		t.Fatalf("expected ReasonDisk, got: %s", detail.Repo.Reason)
+	}
+
+	// 2. PollHost MUST NOT lease schedule while repo is halted for disk
+	_, _, _, ok := e.PollHost("host-1")
+	if ok {
+		t.Fatalf("expected PollHost to return ok=false while repo is halted with ReasonDisk")
+	}
+
+	// 3. Clear disk halt condition via clean preflight (self-healing, without manual ResumeRepo)
+	e.ApplyPreflight("host-1", "/work/app", Preflight{
+		FreeBytes:     20 << 30,
+		GitWorkTree:   true,
+		DocsHubOK:     true,
+		GitAuthOK:     true,
+		HeadAttached:  true,
+		Branch:        "main",
+		DefaultBranch: "main",
+	})
+	detail, _ = e.GetRepoDetail("host-1", "/work/app")
+	if detail.Repo.Reason != "" {
+		t.Fatalf("expected Reason to be cleared by clean preflight, got: %s", detail.Repo.Reason)
+	}
+
+	// 4. PollHost now leases the schedule
+	job, sch, _, ok := e.PollHost("host-1")
+	if !ok || job.ID == "" || sch.PromptID != p.ID {
+		t.Fatalf("expected PollHost to lease schedule after disk condition cleared, got ok=%v, job=%+v", ok, job)
+	}
+}
+
+func TestPollHostHaltedDirtySkipsOrdinaryAllowsIntervention(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app", CloneURL: "https://example.test/app.git"}); err != nil {
+		t.Fatal(err)
+	}
+	pOrd := e.PutPrompt(Prompt{Title: "Ordinary", Body: "do ord", Status: "READY"})
+	pInt := e.PutPrompt(Prompt{Title: "Intervention", Body: "do int", Status: "READY"})
+
+	// Queue ordinary schedule
+	if _, err := e.ExecutePrompt(pOrd.ID, "host-1", "/work/app", 1, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Halt with dirty tree
+	e.ApplyPreflight("host-1", "/work/app", Preflight{
+		FreeBytes:     20 << 30,
+		GitWorkTree:   true,
+		DocsHubOK:     true,
+		GitAuthOK:     true,
+		WorkPorcelain: "M foo.go",
+		HeadAttached:  true,
+		Branch:        "main",
+		DefaultBranch: "main",
+	})
+
+	// Ordinary schedule is skipped
+	_, _, _, ok := e.PollHost("host-1")
+	if ok {
+		t.Fatalf("expected ordinary schedule to be skipped on dirty repo")
+	}
+
+	// Queue intervention
+	if _, err := e.ScheduleIntervention("host-1", "/work/app", pInt.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Intervention schedule IS leased
+	job, sch, _, ok := e.PollHost("host-1")
+	if !ok || sch.Kind != KindIntervention {
+		t.Fatalf("expected intervention schedule to be leased on dirty repo, got: ok=%v, job=%+v", ok, job)
+	}
+}
+
+func TestDeclineJobDeduplicatesConsecutiveHistory(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app", CloneURL: "https://example.test/app.git"}); err != nil {
+		t.Fatal(err)
+	}
+	p := e.PutPrompt(Prompt{Title: "Task", Body: "do task", Status: "READY"})
+	sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	delCh := make(chan string, 1)
+	e.OnHistoryDelete = func(host, path, jobID string) {
+		delCh <- jobID
+	}
+
+	// Poll 1 & Decline 1
+	j1, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("poll 1 failed")
+	}
+	if err := e.DeclineJob(j1.ID, "worktree_busy"); err != nil {
+		t.Fatal(err)
+	}
+	detail, _ := e.GetRepoDetail("host-1", "/work/app")
+	if len(detail.History) != 1 || detail.History[0].Status != "DECLINED" || detail.History[0].Reason != "worktree_busy" {
+		t.Fatalf("expected 1 DECLINED history row with reason worktree_busy, got: %+v", detail.History)
+	}
+
+	// Poll 2 & Decline 2 (same schedule)
+	j2, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("poll 2 failed")
+	}
+	if err := e.DeclineJob(j2.ID, "spawn_failed"); err != nil {
+		t.Fatal(err)
+	}
+	detail, _ = e.GetRepoDetail("host-1", "/work/app")
+	// History should NOT grow to 2 DECLINED entries for the same schedule; it coalesces to 1 with latest reason!
+	if len(detail.History) != 1 || detail.History[0].JobID != j2.ID || detail.History[0].Status != "DECLINED" || detail.History[0].Reason != "spawn_failed" {
+		t.Fatalf("expected deduplicated 1 DECLINED history row with latest job %s and reason spawn_failed, got: %+v", j2.ID, detail.History)
+	}
+
+	// Verify that j1.ID was notified for deletion
+	select {
+	case gotID := <-delCh:
+		if gotID != j1.ID {
+			t.Fatalf("expected OnHistoryDelete for %s, got: %s", j1.ID, gotID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for OnHistoryDelete for %s", j1.ID)
+	}
+	_ = sch
+}
+
+
 
