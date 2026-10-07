@@ -1033,7 +1033,7 @@ func TestPollHostSkipsHaltedDiskRepo(t *testing.T) {
 		t.Fatalf("expected PollHost to return ok=false while repo is halted with ReasonDisk")
 	}
 
-	// 3. Clear disk halt condition via clean preflight
+	// 3. Clear disk halt condition via clean preflight (self-healing, without manual ResumeRepo)
 	e.ApplyPreflight("host-1", "/work/app", Preflight{
 		FreeBytes:     20 << 30,
 		GitWorkTree:   true,
@@ -1043,7 +1043,10 @@ func TestPollHostSkipsHaltedDiskRepo(t *testing.T) {
 		Branch:        "main",
 		DefaultBranch: "main",
 	})
-	e.ResumeRepo("host-1", "/work/app")
+	detail, _ = e.GetRepoDetail("host-1", "/work/app")
+	if detail.Repo.Reason != "" {
+		t.Fatalf("expected Reason to be cleared by clean preflight, got: %s", detail.Repo.Reason)
+	}
 
 	// 4. PollHost now leases the schedule
 	job, sch, _, ok := e.PollHost("host-1")
@@ -1108,6 +1111,11 @@ func TestDeclineJobDeduplicatesConsecutiveHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	delCh := make(chan string, 1)
+	e.OnHistoryDelete = func(host, path, jobID string) {
+		delCh <- jobID
+	}
+
 	// Poll 1 & Decline 1
 	j1, _, _, ok := e.PollHost("host-1")
 	if !ok {
@@ -1117,8 +1125,8 @@ func TestDeclineJobDeduplicatesConsecutiveHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	detail, _ := e.GetRepoDetail("host-1", "/work/app")
-	if len(detail.History) != 1 || detail.History[0].Status != "DECLINED" {
-		t.Fatalf("expected 1 DECLINED history row, got: %d", len(detail.History))
+	if len(detail.History) != 1 || detail.History[0].Status != "DECLINED" || detail.History[0].Reason != "worktree_busy" {
+		t.Fatalf("expected 1 DECLINED history row with reason worktree_busy, got: %+v", detail.History)
 	}
 
 	// Poll 2 & Decline 2 (same schedule)
@@ -1126,13 +1134,23 @@ func TestDeclineJobDeduplicatesConsecutiveHistory(t *testing.T) {
 	if !ok {
 		t.Fatal("poll 2 failed")
 	}
-	if err := e.DeclineJob(j2.ID, "worktree_busy"); err != nil {
+	if err := e.DeclineJob(j2.ID, "spawn_failed"); err != nil {
 		t.Fatal(err)
 	}
 	detail, _ = e.GetRepoDetail("host-1", "/work/app")
-	// History should NOT grow to 2 DECLINED entries for the same schedule; it coalesces to 1!
-	if len(detail.History) != 1 || detail.History[0].JobID != j2.ID || detail.History[0].Status != "DECLINED" {
-		t.Fatalf("expected deduplicated 1 DECLINED history row with latest job %s, got: %+v", j2.ID, detail.History)
+	// History should NOT grow to 2 DECLINED entries for the same schedule; it coalesces to 1 with latest reason!
+	if len(detail.History) != 1 || detail.History[0].JobID != j2.ID || detail.History[0].Status != "DECLINED" || detail.History[0].Reason != "spawn_failed" {
+		t.Fatalf("expected deduplicated 1 DECLINED history row with latest job %s and reason spawn_failed, got: %+v", j2.ID, detail.History)
+	}
+
+	// Verify that j1.ID was notified for deletion
+	select {
+	case gotID := <-delCh:
+		if gotID != j1.ID {
+			t.Fatalf("expected OnHistoryDelete for %s, got: %s", j1.ID, gotID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for OnHistoryDelete for %s", j1.ID)
 	}
 	_ = sch
 }

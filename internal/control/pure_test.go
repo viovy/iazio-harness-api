@@ -21,15 +21,16 @@ func TestValidateShareURL(t *testing.T) {
 }
 
 func TestDecidePreflight(t *testing.T) {
+	t.Setenv("IAZIO_PREFLIGHT_MIN_FREE_BYTES", "")
 	base := Preflight{
-		Kind: KindOrdinary, FreeBytes: MinFreeBytes, DocsHubOK: true, GitAuthOK: true,
+		Kind: KindOrdinary, FreeBytes: RequiredMinFreeBytes(), DocsHubOK: true, GitAuthOK: true,
 		GitWorkTree: true, HeadAttached: true, Branch: "main", DefaultBranch: "main",
 	}
 	if h := DecidePreflight(base); h.Reason != "" {
 		t.Fatalf("clean ordinary halted: %+v", h)
 	}
 	low := base
-	low.FreeBytes = MinFreeBytes - 1
+	low.FreeBytes = RequiredMinFreeBytes() - 1
 	low.Kind = KindIntervention
 	if h := DecidePreflight(low); h.Reason != ReasonDisk || h.PauseQueue {
 		t.Fatalf("disk: %+v", h)
@@ -109,5 +110,17 @@ func TestDecideFinish(t *testing.T) {
 	d = DecideFinish(ref)
 	if d.Queue != QueuePaused {
 		t.Fatalf("refinement ahead: %+v", d)
+	}
+}
+
+func TestRequiredMinFreeBytes(t *testing.T) {
+	t.Setenv("IAZIO_PREFLIGHT_MIN_FREE_BYTES", "")
+	if got := RequiredMinFreeBytes(); got != DefaultMinFreeBytes {
+		t.Fatalf("expected DefaultMinFreeBytes %d, got %d", DefaultMinFreeBytes, got)
+	}
+
+	t.Setenv("IAZIO_PREFLIGHT_MIN_FREE_BYTES", "2147483648") // 2 GiB
+	if got := RequiredMinFreeBytes(); got != 2147483648 {
+		t.Fatalf("expected 2147483648, got %d", got)
 	}
 }

@@ -92,6 +92,17 @@ CREATE TABLE IF NOT EXISTS harness_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_harness_history_repo ON harness_history (host_id, worktree_path, created_at ASC);
+
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS reason text NOT NULL DEFAULT '';
+
+DELETE FROM harness_history h1
+WHERE h1.status = 'DECLINED'
+  AND EXISTS (
+    SELECT 1 FROM harness_history h2
+    WHERE h2.schedule_id = h1.schedule_id
+      AND h2.status = 'DECLINED'
+      AND h2.created_at > h1.created_at
+  );
 `
 
 // Store is a Postgres connection for the control plane.
@@ -460,8 +471,8 @@ func (s *Store) SaveHistory(ctx context.Context, hostID, worktreePath string, ro
 		convBytes = []byte("[]")
 	}
 	_, err = s.db.ExecContext(ctx, `
-INSERT INTO harness_history (job_id, host_id, worktree_path, schedule_id, prompt_title, engine, status, clean, ase_complete, conversation_ids)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+INSERT INTO harness_history (job_id, host_id, worktree_path, schedule_id, prompt_title, engine, status, clean, ase_complete, conversation_ids, reason)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 ON CONFLICT (job_id) DO UPDATE SET
   host_id = EXCLUDED.host_id,
   worktree_path = EXCLUDED.worktree_path,
@@ -471,10 +482,23 @@ ON CONFLICT (job_id) DO UPDATE SET
   status = EXCLUDED.status,
   clean = EXCLUDED.clean,
   ase_complete = EXCLUDED.ase_complete,
-  conversation_ids = EXCLUDED.conversation_ids
-`, row.JobID, hostID, worktreePath, row.ScheduleID, row.PromptTitle, row.Engine, row.Status, row.Clean, row.ASEComplete, string(convBytes))
+  conversation_ids = EXCLUDED.conversation_ids,
+  reason = EXCLUDED.reason
+`, row.JobID, hostID, worktreePath, row.ScheduleID, row.PromptTitle, row.Engine, row.Status, row.Clean, row.ASEComplete, string(convBytes), row.Reason)
 	if err != nil {
 		return fmt.Errorf("save history: %w", err)
+	}
+	return nil
+}
+
+// DeleteHistory deletes one history row by job_id.
+func (s *Store) DeleteHistory(ctx context.Context, jobID string) error {
+	if s == nil || s.db == nil || jobID == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM harness_history WHERE job_id = $1`, jobID)
+	if err != nil {
+		return fmt.Errorf("delete history: %w", err)
 	}
 	return nil
 }
@@ -485,7 +509,7 @@ func (s *Store) LoadHistory(ctx context.Context) (map[string][]control.HistoryRo
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT job_id, host_id, worktree_path, schedule_id, prompt_title, engine, status, clean, ase_complete, conversation_ids
+SELECT job_id, host_id, worktree_path, schedule_id, prompt_title, engine, status, clean, ase_complete, conversation_ids, reason
 FROM harness_history ORDER BY created_at ASC
 `)
 	if err != nil {
@@ -498,7 +522,7 @@ FROM harness_history ORDER BY created_at ASC
 		var r control.HistoryRow
 		var hostID, worktreePath string
 		var convRaw []byte
-		if err := rows.Scan(&r.JobID, &hostID, &worktreePath, &r.ScheduleID, &r.PromptTitle, &r.Engine, &r.Status, &r.Clean, &r.ASEComplete, &convRaw); err != nil {
+		if err := rows.Scan(&r.JobID, &hostID, &worktreePath, &r.ScheduleID, &r.PromptTitle, &r.Engine, &r.Status, &r.Clean, &r.ASEComplete, &convRaw, &r.Reason); err != nil {
 			return nil, err
 		}
 		if len(convRaw) > 0 {

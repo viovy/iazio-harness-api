@@ -151,6 +151,7 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 			"clean":            h.Clean,
 			"ase_complete":     h.ASEComplete,
 			"conversation_ids": ids,
+			"reason":           h.Reason,
 		})
 	}
 	return map[string]any{

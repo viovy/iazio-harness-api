@@ -5,12 +5,28 @@ package control
 import (
 	"errors"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 )
 
+// DefaultMinFreeBytes is the default free-space floor on the worktree mount (5 GiB).
+const DefaultMinFreeBytes uint64 = 5 << 30
+
+// MinFreeBytes is the fallback constant kept for backward compatibility (10 GiB).
+const MinFreeBytes uint64 = 10 << 30
+
+// RequiredMinFreeBytes returns the active threshold in bytes, configurable via IAZIO_PREFLIGHT_MIN_FREE_BYTES.
+func RequiredMinFreeBytes() uint64 {
+	if v := os.Getenv("IAZIO_PREFLIGHT_MIN_FREE_BYTES"); v != "" {
+		if n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return DefaultMinFreeBytes
+}
+
 const (
-	// MinFreeBytes is the free-space floor on the worktree mount.
-	MinFreeBytes = 10 << 30
 
 	IdeaNew      = "NEW"
 	IdeaTriaged  = "TRIAGED"
@@ -121,7 +137,7 @@ func CanScheduleRefinement(status string) bool {
 // leaves the queue unpaused. Ordinary porcelain, detached HEAD, and untracked
 // branch halts pause the queue and do not lease a resume.
 func DecidePreflight(p Preflight) Halt {
-	if p.FreeBytes < MinFreeBytes {
+	if p.FreeBytes < RequiredMinFreeBytes() {
 		return Halt{Reason: ReasonDisk}
 	}
 	if !p.DocsHubOK {
