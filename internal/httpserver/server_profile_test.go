@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -136,5 +137,86 @@ fleet_distribution:
 	}
 	if host.DistributionProfile != "generic" {
 		t.Errorf("expected host distribution profile generic, got %s", host.DistributionProfile)
+	}
+}
+
+func TestServer_ScanRepoProfile(t *testing.T) {
+	e := control.NewEngine(time.Now)
+	srv := &Server{Engine: e}
+	handler := srv.Handler()
+
+	// 1. Requirement criteria check: host and repo must exist
+	badReq := `{"host_id": "nonexistent", "repo_path": "/tmp/fake"}`
+	recBad := httptest.NewRecorder()
+	handler.ServeHTTP(recBad, httptest.NewRequest("POST", "/v1/fleet/profiles/scan-repo", bytes.NewReader([]byte(badReq))))
+	if recBad.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when host not found, got %d", recBad.Code)
+	}
+
+	// 2. Setup mock repo with metadata.yml
+	tmpDir := t.TempDir()
+	metaContent := `
+fleet_distribution:
+  schema_version: 1
+  install_root:
+    unix:
+      primary: ~/.local/bin
+      fallback: ~/.iazio/bin
+    windows:
+      primary: "%USERPROFILE%/bin"
+      fallback: "%USERPROFILE%/.iazio/bin"
+  endpoints:
+    harness_api: "https://tian.go.ro/iazio-harness-api"
+  tools:
+    - name: iazio-agent
+      repository: viovy/iazio-agent
+      binary_name: iazio-agent
+      description: Remote execution daemon
+      tier: baseline
+`
+	if err := os.WriteFile(tmpDir+"/metadata.yml", []byte(metaContent), 0644); err != nil {
+		t.Fatalf("write metadata: %v", err)
+	}
+
+	// Register host and repo
+	e.RegisterHost("mac-mini", "mac", "generic")
+	e.UpsertRepo(control.Repo{
+		HostID:       "mac-mini",
+		WorktreePath: tmpDir,
+	})
+
+	// 3. Scan repo profile via API
+	scanReq := `{"host_id": "mac-mini", "repo_path": "` + tmpDir + `", "profile_name": "mac-profile"}`
+	recScan := httptest.NewRecorder()
+	handler.ServeHTTP(recScan, httptest.NewRequest("POST", "/v1/fleet/profiles/scan-repo", bytes.NewReader([]byte(scanReq))))
+	if recScan.Code != http.StatusOK {
+		t.Fatalf("expected 200 on scan-repo, got %d: %s", recScan.Code, recScan.Body.String())
+	}
+
+	var scanned control.DistributionProfile
+	if err := json.Unmarshal(recScan.Body.Bytes(), &scanned); err != nil {
+		t.Fatalf("unmarshal scanned profile: %v", err)
+	}
+
+	if scanned.Name != "mac-profile" {
+		t.Errorf("expected profile name mac-profile, got %s", scanned.Name)
+	}
+	if scanned.SourceRepo != tmpDir {
+		t.Errorf("expected source repo %s, got %s", tmpDir, scanned.SourceRepo)
+	}
+	if scanned.SourceHost != "mac-mini" {
+		t.Errorf("expected source host mac-mini, got %s", scanned.SourceHost)
+	}
+	if len(scanned.Tools) != 1 || scanned.Tools[0].Name != "iazio-agent" {
+		t.Errorf("expected iazio-agent tool, got %+v", scanned.Tools)
+	}
+
+	// 4. Verify repo is linked to profile
+	detail, ok := e.GetRepo("mac-mini", tmpDir)
+	if !ok {
+		t.Fatalf("repo not found after scan")
+	}
+	if detail.DistributionProfile != "mac-profile" {
+		t.Errorf("expected repo distribution profile mac-profile, got %s", detail.DistributionProfile)
 	}
 }

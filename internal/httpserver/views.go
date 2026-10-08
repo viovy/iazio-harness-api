@@ -84,14 +84,15 @@ func hostView(h control.Host, paused int) map[string]any {
 
 func repoSummary(r control.Repo) map[string]any {
 	return map[string]any{
-		"path":            r.WorktreePath,
-		"worktree_path":   r.WorktreePath,
-		"queue":           r.Queue,
-		"lock":            r.Lock,
-		"reason":          r.Reason,
-		"discard_pending": r.DiscardPending,
-		"docs_hub_path":   r.DocsHubPath,
-		"clone_url":       r.CloneURL,
+		"path":                 r.WorktreePath,
+		"worktree_path":        r.WorktreePath,
+		"queue":                r.Queue,
+		"lock":                 r.Lock,
+		"reason":               r.Reason,
+		"discard_pending":      r.DiscardPending,
+		"docs_hub_path":        r.DocsHubPath,
+		"clone_url":            r.CloneURL,
+		"distribution_profile": r.DistributionProfile,
 	}
 }
 
@@ -155,18 +156,19 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 		})
 	}
 	return map[string]any{
-		"host_id":           d.Repo.HostID,
-		"path":              d.Repo.WorktreePath,
-		"queue":             d.Repo.Queue,
-		"lock":              d.Repo.Lock,
-		"reason":            d.Repo.Reason,
-		"fetch_failed":      d.FetchFailed,
-		"porcelain":         d.Repo.Porcelain,
-		"docs_hub_path":     d.Repo.DocsHubPath,
-		"docs_hub_all_idle": d.DocsHubAllIdle,
-		"running_job":       running,
-		"schedules":         schedules,
-		"history":           history,
+		"host_id":              d.Repo.HostID,
+		"path":                 d.Repo.WorktreePath,
+		"queue":                d.Repo.Queue,
+		"lock":                 d.Repo.Lock,
+		"reason":               d.Repo.Reason,
+		"fetch_failed":         d.FetchFailed,
+		"porcelain":            d.Repo.Porcelain,
+		"docs_hub_path":        d.Repo.DocsHubPath,
+		"docs_hub_all_idle":    d.DocsHubAllIdle,
+		"distribution_profile": d.Repo.DistributionProfile,
+		"running_job":          running,
+		"schedules":            schedules,
+		"history":              history,
 	}
 }
 
