@@ -3,6 +3,9 @@ package control
 import (
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -25,6 +28,9 @@ type DistributionProfile struct {
 	InstallRoots ProfileInstallRoots `json:"install_roots" yaml:"install_roots"`
 	Endpoints    map[string]string   `json:"endpoints,omitempty" yaml:"endpoints,omitempty"`
 	Tools        []ProfileTool       `json:"tools" yaml:"tools"`
+	Version      string              `json:"version,omitempty" yaml:"version,omitempty"`
+	SourceRepo   string              `json:"source_repo,omitempty" yaml:"source_repo,omitempty"`
+	SourceHost   string              `json:"source_host,omitempty" yaml:"source_host,omitempty"`
 	CreatedAt    time.Time           `json:"created_at" yaml:"created_at"`
 	UpdatedAt    time.Time           `json:"updated_at" yaml:"updated_at"`
 }
@@ -145,8 +151,7 @@ func (e *Engine) DeleteProfile(name string) error {
 	return nil
 }
 
-// SyncGenericProfile parses metadata.yml (or direct JSON/YAML) and updates the generic profile.
-func (e *Engine) SyncGenericProfile(raw []byte) (*DistributionProfile, error) {
+func parseFleetDistribution(raw []byte) (*DistributionProfile, error) {
 	var parsed struct {
 		FleetDistribution struct {
 			SchemaVersion int `yaml:"schema_version" json:"schema_version"`
@@ -182,6 +187,10 @@ func (e *Engine) SyncGenericProfile(raw []byte) (*DistributionProfile, error) {
 	}
 
 	fd := parsed.FleetDistribution
+	if len(fd.Tools) == 0 && fd.InstallRoot.Unix.Primary == "" && fd.InstallRoot.Windows.Primary == "" {
+		return nil, errors.New("fleet_distribution section not found or contains no tools")
+	}
+
 	profile := DistributionProfile{
 		Name:        "generic",
 		Description: "GitOps Default Fleet Distribution Profile",
@@ -214,8 +223,89 @@ func (e *Engine) SyncGenericProfile(raw []byte) (*DistributionProfile, error) {
 			Service:     t.Service,
 		})
 	}
+	return &profile, nil
+}
 
-	return e.UpsertProfile(profile)
+// SyncGenericProfile parses metadata.yml (or direct JSON/YAML) and updates the generic profile.
+func (e *Engine) SyncGenericProfile(raw []byte) (*DistributionProfile, error) {
+	p, err := parseFleetDistribution(raw)
+	if err != nil {
+		return nil, err
+	}
+	return e.UpsertProfile(*p)
+}
+
+// ScanRepoProfile inspects a configured repository on a host, reads its metadata.yml,
+// autodetects its Git Flow version via git describe, updates the profile, and links the repo to it.
+func (e *Engine) ScanRepoProfile(hostID, repoPath, profileName string) (*DistributionProfile, error) {
+	hostID = strings.TrimSpace(hostID)
+	repoPath = strings.TrimSpace(repoPath)
+	if hostID == "" || repoPath == "" {
+		return nil, errors.New("host_id and repo_path are required")
+	}
+
+	e.mu.Lock()
+	if _, ok := e.hosts[hostID]; !ok {
+		e.mu.Unlock()
+		return nil, fmt.Errorf("requirement criteria not met: host %q is not registered", hostID)
+	}
+	repo, ok := e.repos[repoKey(hostID, repoPath)]
+	if !ok || repo == nil {
+		e.mu.Unlock()
+		return nil, fmt.Errorf("requirement criteria not met: repository %q is not configured for host %q", repoPath, hostID)
+	}
+	existingProfile := repo.DistributionProfile
+	e.mu.Unlock()
+
+	// Read metadata.yml from repo
+	metaFile := filepath.Join(repoPath, "metadata.yml")
+	raw, err := os.ReadFile(metaFile)
+	if err != nil {
+		return nil, fmt.Errorf("requirement criteria not met: metadata.yml not found in %s: %w", repoPath, err)
+	}
+
+	profile, err := parseFleetDistribution(raw)
+	if err != nil {
+		return nil, fmt.Errorf("requirement criteria not met: %w", err)
+	}
+
+	// Autodetect version via Git Flow (git describe --tags --always)
+	cmd := exec.Command("git", "describe", "--tags", "--always")
+	cmd.Dir = repoPath
+	out, err := cmd.Output()
+	version := strings.TrimSpace(string(out))
+	if err != nil || version == "" {
+		version = "unknown"
+	}
+
+	pName := strings.TrimSpace(profileName)
+	if pName == "" {
+		pName = existingProfile
+	}
+	if pName == "" {
+		pName = "generic"
+	}
+
+	profile.Name = pName
+	profile.Version = version
+	profile.SourceRepo = repoPath
+	profile.SourceHost = hostID
+	profile.Description = fmt.Sprintf("Scanned from %s on host %s (git flow: %s)", filepath.Base(repoPath), hostID, version)
+	profile.IsDefault = (pName == "generic")
+
+	upserted, err := e.UpsertProfile(*profile)
+	if err != nil {
+		return nil, err
+	}
+
+	// Link repo to profile
+	e.mu.Lock()
+	if r, ok := e.repos[repoKey(hostID, repoPath)]; ok && r != nil {
+		r.DistributionProfile = pName
+	}
+	e.mu.Unlock()
+
+	return upserted, nil
 }
 
 // GetManifest produces a machine-targeted manifest for a profile.

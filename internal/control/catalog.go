@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const logPageSize = 100
@@ -53,6 +54,11 @@ func (e *Engine) Heartbeat(id string, tools []Tool, fetchFailed bool) error {
 	h.LastSeen = e.now()
 	h.FetchFailed = fetchFailed
 	h.Tools = append([]Tool(nil), tools...)
+	for _, j := range e.jobs {
+		if j.LeaseHolder == id && j.Status == "RUNNING" {
+			j.LeaseExpiry = e.now().Add(5 * time.Minute)
+		}
+	}
 	return nil
 }
 
@@ -474,7 +480,7 @@ func (e *Engine) AppendLog(jobID string, chunk LogChunk) {
 		}
 	}
 	if job, ok := e.jobs[jobID]; ok {
-		job.LeaseExpiry = e.now().Add(LeaseInterval * 2)
+		job.LeaseExpiry = e.now().Add(5 * time.Minute)
 	}
 	for _, ch := range e.subs[jobID] {
 		select {

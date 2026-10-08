@@ -131,9 +131,10 @@ type Repo struct {
 	Queue           string
 	Lock            string
 	Reason          string
-	HealingAttempts int
-	Porcelain       string
-	DiscardPending  bool
+	HealingAttempts     int
+	Porcelain           string
+	DiscardPending      bool
+	DistributionProfile string
 }
 
 // Tool is one binary from the latest heartbeat.
@@ -453,6 +454,9 @@ func (e *Engine) UpsertRepo(r Repo) error {
 	}
 	if r.DefaultBranch == "" {
 		r.DefaultBranch = "main"
+	}
+	if r.DistributionProfile == "" {
+		r.DistributionProfile = "generic"
 	}
 	cp := r
 	e.repos[repoKey(r.HostID, r.WorktreePath)] = &cp

@@ -107,6 +107,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /v1/fleet/profiles/{name}", s.updateProfile)
 	mux.HandleFunc("DELETE /v1/fleet/profiles/{name}", s.deleteProfile)
 	mux.HandleFunc("POST /v1/fleet/profiles/generic/sync", s.syncGenericProfile)
+	mux.HandleFunc("POST /v1/fleet/profiles/scan-repo", s.scanRepoProfile)
 	mux.HandleFunc("GET /v1/fleet/manifest", s.getFleetManifest)
 	return withCORS(mux)
 }
@@ -1130,6 +1131,36 @@ func (s *Server) syncGenericProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.SaveProfile != nil {
 		s.SaveProfile(*profile)
+	}
+	writeJSON(w, http.StatusOK, profile)
+}
+
+func (s *Server) scanRepoProfile(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		HostID      string `json:"host_id"`
+		RepoPath    string `json:"repo_path"`
+		ProfileName string `json:"profile_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if strings.TrimSpace(body.HostID) == "" || strings.TrimSpace(body.RepoPath) == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("host_id and repo_path are required"))
+		return
+	}
+	profile, err := s.Engine.ScanRepoProfile(body.HostID, body.RepoPath, body.ProfileName)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if s.SaveProfile != nil {
+		s.SaveProfile(*profile)
+	}
+	if s.SaveRepo != nil {
+		if repo, ok := s.Engine.GetRepo(body.HostID, body.RepoPath); ok {
+			s.SaveRepo(repo)
+		}
 	}
 	writeJSON(w, http.StatusOK, profile)
 }
