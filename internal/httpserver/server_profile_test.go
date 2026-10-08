@@ -166,7 +166,7 @@ fleet_distribution:
       primary: "%USERPROFILE%/bin"
       fallback: "%USERPROFILE%/.iazio/bin"
   endpoints:
-    harness_api: "https://tian.go.ro/iazio-harness-api"
+    harness_api: "https://example.com/iazio-harness-api"
   tools:
     - name: iazio-agent
       repository: viovy/iazio-agent
