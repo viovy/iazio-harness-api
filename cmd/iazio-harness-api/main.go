@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/viovy/iazio-harness-api/internal/control"
 	"github.com/viovy/iazio-harness-api/internal/extract"
@@ -36,6 +37,7 @@ func main() {
 		addr = v
 	}
 	srv := &httpserver.Server{Engine: control.NewEngine(nil)}
+	srv.Engine.StartReaper(context.Background(), 10*time.Second)
 	if script := os.Getenv("IAZIO_EXTRACT_WORKER"); script != "" {
 		srv.Extract = func(shareURL string) (string, string, error) {
 			return extract.Run(context.Background(), script, shareURL)

@@ -77,6 +77,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/jobs/{id}/decline", s.declineJob)
 	mux.HandleFunc("POST /v1/jobs/{id}/story-draft", s.storyDraft)
 	mux.HandleFunc("POST /v1/jobs/{id}/cancel", s.cancel)
+	mux.HandleFunc("POST /v1/jobs/{id}/abandon", s.abandonJob)
+	mux.HandleFunc("POST /v1/jobs/{id}/resume", s.resumeJob)
 	mux.HandleFunc("POST /v1/jobs/{id}/force-pause", s.forcePauseJob)
 	mux.HandleFunc("POST /v1/jobs/{id}/retry-correlation", s.retryCorrelation)
 	mux.HandleFunc("POST /v1/jobs/{id}/chunks", s.appendChunk)
@@ -100,6 +102,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/repos/{host}/finish", s.finish)
 	mux.HandleFunc("POST /v1/repos/{host}/force-pause", s.forcePause)
 	mux.HandleFunc("POST /v1/repos/{host}/resume", s.resumeRepo)
+	mux.HandleFunc("POST /v1/repos/{host}/remediate", s.remediateRepo)
 	mux.HandleFunc("GET /v1/repos/{host}", s.getRepo)
 	mux.HandleFunc("GET /v1/fleet/profiles", s.listProfiles)
 	mux.HandleFunc("POST /v1/fleet/profiles", s.createProfile)
@@ -245,6 +248,40 @@ func (s *Server) cancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "CANCEL_REQUESTED"})
+}
+
+func (s *Server) abandonJob(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("id")
+	var raw struct {
+		Reason string `json:"reason"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&raw)
+	if err := s.Engine.AbandonJob(jobID, raw.Reason); err != nil {
+		code := http.StatusConflict
+		if errors.Is(err, control.ErrNotFound) {
+			code = http.StatusNotFound
+		}
+		writeErr(w, code, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status": "ABANDONED",
+		"job_id": jobID,
+	})
+}
+
+func (s *Server) resumeJob(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("id")
+	sch, err := s.Engine.ResumeJob(jobID)
+	if err != nil {
+		code := http.StatusConflict
+		if errors.Is(err, control.ErrNotFound) {
+			code = http.StatusNotFound
+		}
+		writeErr(w, code, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, scheduleView(sch))
 }
 
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {
@@ -418,6 +455,42 @@ func (s *Server) resumeRepo(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"queue": control.QueueOpen})
+}
+
+func (s *Server) remediateRepo(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Path         string `json:"path"`
+		WorktreePath string `json:"worktree_path"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	targetPath := body.WorktreePath
+	if targetPath == "" {
+		targetPath = body.Path
+	}
+	if targetPath == "" {
+		targetPath = r.URL.Query().Get("path")
+	}
+	host := r.PathValue("host")
+	if err := s.Engine.RemediateRepo(host, targetPath); err != nil {
+		code := http.StatusConflict
+		if errors.Is(err, control.ErrNotFound) {
+			code = http.StatusNotFound
+		}
+		writeErr(w, code, err)
+		return
+	}
+	if s.SaveRepo != nil {
+		if detail, ok := s.Engine.GetRepoDetail(host, targetPath); ok {
+			s.SaveRepo(detail.Repo)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status":  "REMEDIATED",
+		"host_id": host,
+		"path":    targetPath,
+		"queue":   control.QueueOpen,
+		"lock":    control.LockIdle,
+	})
 }
 
 func (s *Server) listPrompts(w http.ResponseWriter, _ *http.Request) {
@@ -757,6 +830,11 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 			Version string `json:"version"`
 			Status  string `json:"status"`
 		} `json:"tools"`
+		ActiveJobs []struct {
+			JobID        string `json:"job_id"`
+			WorktreePath string `json:"worktree_path"`
+			PID          int    `json:"pid"`
+		} `json:"active_jobs"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -766,8 +844,16 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	for _, t := range raw.Tools {
 		tools = append(tools, control.Tool{Name: t.Name, Path: t.Path, Version: t.Version, Status: t.Status})
 	}
+	var activeJobs []control.ActiveJob
+	for _, aj := range raw.ActiveJobs {
+		activeJobs = append(activeJobs, control.ActiveJob{
+			JobID:        aj.JobID,
+			WorktreePath: aj.WorktreePath,
+			PID:          aj.PID,
+		})
+	}
 	hostID := r.PathValue("id")
-	if err := s.Engine.Heartbeat(hostID, tools, raw.FetchFailed); err != nil {
+	if err := s.Engine.Heartbeat(hostID, tools, raw.FetchFailed, activeJobs...); err != nil {
 		writeErr(w, http.StatusNotFound, err)
 		return
 	}

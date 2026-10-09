@@ -562,5 +562,52 @@ func TestJobStreamKeepaliveAndOutputTick(t *testing.T) {
 	_ = sch
 }
 
+func TestAbandonResumeAndRemediateEndpoints(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	handler := s.Handler()
+
+	s.Engine.RegisterHost("host-1", "permanent")
+	_ = s.Engine.UpsertRepo(control.Repo{HostID: "host-1", WorktreePath: "/work/app"})
+	p := s.Engine.PutPrompt(control.Prompt{Title: "Task", Body: "run task", Status: "READY"})
+	_, _ = s.Engine.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	job, _, _, ok := s.Engine.PollHost("host-1")
+	if !ok {
+		t.Fatal("poll failed")
+	}
+
+	// 1. Abandon endpoint
+	abandonReq := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/abandon", bytes.NewBufferString(`{"reason":"process_died"}`))
+	abandonRR := httptest.NewRecorder()
+	handler.ServeHTTP(abandonRR, abandonReq)
+	if abandonRR.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body %s", abandonRR.Code, abandonRR.Body.String())
+	}
+
+	// 2. Resume endpoint
+	resumeReq := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/resume", nil)
+	resumeRR := httptest.NewRecorder()
+	handler.ServeHTTP(resumeRR, resumeReq)
+	if resumeRR.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body %s", resumeRR.Code, resumeRR.Body.String())
+	}
+
+	// 3. Remediate endpoint
+	remReq := httptest.NewRequest(http.MethodPost, "/v1/repos/host-1/remediate", bytes.NewBufferString(`{"worktree_path":"/work/app"}`))
+	remRR := httptest.NewRecorder()
+	handler.ServeHTTP(remRR, remReq)
+	if remRR.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body %s", remRR.Code, remRR.Body.String())
+	}
+
+	// 4. Heartbeat with active_jobs
+	hbBody := `{"fetch_failed":false,"tools":[],"active_jobs":[{"job_id":"job-live","worktree_path":"/work/app","pid":1234}]}`
+	hbReq := httptest.NewRequest(http.MethodPost, "/v1/hosts/host-1/heartbeat", bytes.NewBufferString(hbBody))
+	hbRR := httptest.NewRecorder()
+	handler.ServeHTTP(hbRR, hbReq)
+	if hbRR.Code != http.StatusOK {
+		t.Fatalf("expected 200 from heartbeat, got %d body %s", hbRR.Code, hbRR.Body.String())
+	}
+}
+
 
 

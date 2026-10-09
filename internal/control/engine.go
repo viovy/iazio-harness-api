@@ -1,6 +1,7 @@
 package control
 
 import (
+	"context"
 	"errors"
 	"sort"
 	"strconv"
@@ -102,6 +103,17 @@ type JobDetail struct {
 	MaxExecutionDurationSeconds int               `json:"max_execution_duration_seconds"`
 	ResumeConversationID        string            `json:"resume_conversation_id,omitempty"`
 	ConversationIDs             []string          `json:"conversation_ids,omitempty"`
+	SilentForSeconds            int               `json:"silent_for_seconds,omitempty"`
+	IsStalled                   bool              `json:"is_stalled,omitempty"`
+	StartedAt                   string            `json:"started_at,omitempty"`
+	Reason                      string            `json:"reason,omitempty"`
+}
+
+// ActiveJob describes an active job reported on heartbeat.
+type ActiveJob struct {
+	JobID        string `json:"job_id"`
+	WorktreePath string `json:"worktree_path"`
+	PID          int    `json:"pid"`
 }
 
 // Job is one leased execution.
@@ -117,24 +129,28 @@ type Job struct {
 	Correlation          string
 	HealingUsed          bool
 	StartedAt            time.Time
+	LastChunkAt          time.Time
+	LastOutputAt         time.Time
 	ResumeConversationID string
 	ConversationIDs      []string
+	Reason               string
 }
 
 // Repo is one registered checkout.
 type Repo struct {
-	HostID          string
-	WorktreePath    string
-	DocsHubPath     string
-	CloneURL        string
-	DefaultBranch   string
-	Queue           string
-	Lock            string
-	Reason          string
+	HostID              string
+	WorktreePath        string
+	DocsHubPath         string
+	CloneURL            string
+	DefaultBranch       string
+	Queue               string
+	Lock                string
+	Reason              string
 	HealingAttempts     int
 	Porcelain           string
 	DiscardPending      bool
 	DistributionProfile string
+	RunningJobID        string
 }
 
 // Tool is one binary from the latest heartbeat.
@@ -1052,6 +1068,7 @@ func (e *Engine) reapExpiredLocked() {
 						if repo.Lock == LockRunning {
 							repo.Lock = LockIdle
 						}
+						repo.RunningJobID = ""
 						if timedOut || hostOffline {
 							if repo.Queue == QueueOpen {
 								repo.Queue = QueuePaused
@@ -1095,12 +1112,14 @@ func (e *Engine) reapExpiredLocked() {
 					sch := e.schedules[job.ScheduleID]
 					if sch != nil && sch.HostID == repo.HostID && sch.WorktreePath == repo.WorktreePath {
 						hasActive = true
+						repo.RunningJobID = job.ID
 						break
 					}
 				}
 			}
 			if !hasActive {
 				repo.Lock = LockIdle
+				repo.RunningJobID = ""
 				e.notifyRepoLocked(repo)
 			}
 		}
@@ -1170,6 +1189,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			ID: id, ScheduleID: sch.ID, Kind: sch.Kind, Status: "RUNNING",
 			LeaseHolder: host, LeaseExpiry: e.now().Add(LeaseInterval),
 			StartedAt:            e.now(),
+			LastChunkAt:          e.now(),
 			ResumeConversationID: sch.ResumeConversationID,
 		}
 		if sch.ResumeConversationID != "" {
@@ -1184,6 +1204,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 		docs := ""
 		if repo != nil {
 			repo.Lock = LockRunning
+			repo.RunningJobID = id
 			docs = repo.DocsHubPath
 			e.notifyRepoLocked(repo)
 		}
@@ -1384,6 +1405,18 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 		Status:               job.Status,
 		ResumeConversationID: job.ResumeConversationID,
 		ConversationIDs:      append([]string(nil), job.ConversationIDs...),
+		Reason:               job.Reason,
+	}
+	if !job.StartedAt.IsZero() {
+		detail.StartedAt = job.StartedAt.UTC().Format(time.RFC3339)
+		lastAct := job.StartedAt
+		if !job.LastChunkAt.IsZero() && job.LastChunkAt.After(lastAct) {
+			lastAct = job.LastChunkAt
+		}
+		detail.SilentForSeconds = int(e.now().Sub(lastAct).Seconds())
+		if job.Status == "RUNNING" && detail.SilentForSeconds > 120 {
+			detail.IsStalled = true
+		}
 	}
 	sch := e.schedules[job.ScheduleID]
 	if sch != nil {
@@ -1487,5 +1520,164 @@ func (e *Engine) AddJobConversation(jobID, convID string) error {
 		}
 	}
 	return nil
+}
+
+// AbandonJob forcibly abandons a job, marks it FAILED, and frees any locks.
+func (e *Engine) AbandonJob(jobID, reason string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	job, ok := e.jobs[jobID]
+	if !ok {
+		return ErrNotFound
+	}
+	if reason == "" {
+		reason = "MANUAL_ABANDON"
+	}
+	job.Status = "FAILED"
+	job.ExitPosted = true
+	job.Reason = reason
+	if sch, ok := e.schedules[job.ScheduleID]; ok {
+		sch.Status = "FAILED"
+		sch.IterationsRemaining = 0
+		if sch.CloneURL != "" {
+			delete(e.cloneLease, sch.CloneURL)
+		}
+		if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
+			repo.Lock = LockIdle
+			repo.RunningJobID = ""
+			repo.Reason = reason
+			if repo.Queue == QueueOpen {
+				repo.Queue = QueuePaused
+			}
+			e.notifyRepoLocked(repo)
+		}
+		e.updateHistoryStatusLocked(sch.HostID, sch.WorktreePath, jobID, reason)
+	}
+	e.reapExpiredLocked()
+	return nil
+}
+
+// ResumeJob resumes a stalled or abandoned job using captured conversation IDs or prompt settings.
+func (e *Engine) ResumeJob(jobID string) (Schedule, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	job, ok := e.jobs[jobID]
+	if !ok {
+		return Schedule{}, ErrNotFound
+	}
+	origSch, ok := e.schedules[job.ScheduleID]
+	if !ok {
+		return Schedule{}, ErrNotFound
+	}
+
+	// Capture latest conversation ID if available.
+	resumeConvID := job.ResumeConversationID
+	if len(job.ConversationIDs) > 0 {
+		resumeConvID = job.ConversationIDs[len(job.ConversationIDs)-1]
+	} else if origSch.ResumeConversationID != "" {
+		resumeConvID = origSch.ResumeConversationID
+	}
+
+	// Mark previous job closed if still running.
+	if !job.ExitPosted {
+		job.Status = "FAILED"
+		job.ExitPosted = true
+		job.Reason = "RESUMED_AS_NEW_SCHEDULE"
+	}
+
+	// Clear repo lock and ensure queue is open.
+	if repo := e.repos[repoKey(origSch.HostID, origSch.WorktreePath)]; repo != nil {
+		repo.Lock = LockIdle
+		repo.RunningJobID = ""
+		repo.Queue = QueueOpen
+		repo.Reason = ""
+		e.notifyRepoLocked(repo)
+	}
+
+	// Create new schedule to resume execution.
+	schID := e.next("sch-")
+	newSch := &Schedule{
+		ID:                   schID,
+		PromptID:             origSch.PromptID,
+		Revision:             origSch.Revision,
+		HostID:               origSch.HostID,
+		WorktreePath:         origSch.WorktreePath,
+		CloneURL:             origSch.CloneURL,
+		Kind:                 origSch.Kind,
+		IterationsTotal:      1,
+		IterationsRemaining:  1,
+		IterationsCompleted:  0,
+		MaxExecutionDuration: origSch.MaxExecutionDuration,
+		EnvKeys:              origSch.EnvKeys,
+		EnvVars:              origSch.EnvVars,
+		Status:               "QUEUED",
+		PromptTitle:          origSch.PromptTitle,
+		Engine:               origSch.Engine,
+		Priority:             origSch.Priority + 10,
+		ResumeConversationID: resumeConvID,
+	}
+	e.schedules[schID] = newSch
+	return *newSch, nil
+}
+
+// RemediateRepo clears locks and re-opens the queue for a stuck worktree.
+func (e *Engine) RemediateRepo(hostID, worktreePath string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	repo := e.repos[repoKey(hostID, worktreePath)]
+	if repo == nil {
+		return ErrNotFound
+	}
+
+	for _, job := range e.jobs {
+		if !job.ExitPosted {
+			sch := e.schedules[job.ScheduleID]
+			if sch != nil && sch.HostID == hostID && sch.WorktreePath == worktreePath {
+				job.Status = "FAILED"
+				job.ExitPosted = true
+				job.Reason = "REMEDIATED"
+				sch.Status = "FAILED"
+				sch.IterationsRemaining = 0
+				if sch.CloneURL != "" {
+					delete(e.cloneLease, sch.CloneURL)
+				}
+				e.updateHistoryStatusLocked(hostID, worktreePath, job.ID, "REMEDIATED")
+			}
+		}
+	}
+
+	repo.Lock = LockIdle
+	repo.RunningJobID = ""
+	repo.Queue = QueueOpen
+	repo.Reason = "REMEDIATED"
+	e.notifyRepoLocked(repo)
+	e.reapExpiredLocked()
+	return nil
+}
+
+// StartReaper runs background expiration sweeps periodically until context is cancelled.
+func (e *Engine) StartReaper(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				e.ReapExpired()
+			}
+		}
+	}()
+}
+
+// ReapExpired runs an expiration sweep under the engine lock.
+func (e *Engine) ReapExpired() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.reapExpiredLocked()
 }
 

@@ -93,6 +93,7 @@ func repoSummary(r control.Repo) map[string]any {
 		"docs_hub_path":        r.DocsHubPath,
 		"clone_url":            r.CloneURL,
 		"distribution_profile": r.DistributionProfile,
+		"running_job_id":       r.RunningJobID,
 	}
 }
 
@@ -125,12 +126,19 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 		if cids == nil {
 			cids = []string{}
 		}
+		var startedAt any
+		if !d.RunningStartedAt.IsZero() {
+			startedAt = d.RunningStartedAt.UTC().Format(time.RFC3339)
+		}
 		running = map[string]any{
-			"id":               d.Running.ID,
-			"status":           d.Running.Status,
-			"prompt_title":     d.RunningTitle,
-			"engine":           d.RunningEngine,
-			"conversation_ids": cids,
+			"id":                 d.Running.ID,
+			"status":             d.Running.Status,
+			"prompt_title":       d.RunningTitle,
+			"engine":             d.RunningEngine,
+			"conversation_ids":   cids,
+			"silent_for_seconds": d.RunningSilentSeconds,
+			"is_stalled":         d.RunningIsStalled,
+			"started_at":         startedAt,
 		}
 	}
 	schedules := make([]map[string]any, 0, len(d.Schedules))
@@ -193,6 +201,10 @@ func jobDetailView(j control.JobDetail) map[string]any {
 		"max_execution_duration_seconds": j.MaxExecutionDurationSeconds,
 		"resume_conversation_id":        j.ResumeConversationID,
 		"conversation_ids":              cids,
+		"silent_for_seconds":            j.SilentForSeconds,
+		"is_stalled":                     j.IsStalled,
+		"started_at":                     j.StartedAt,
+		"reason":                         j.Reason,
 	}
 }
 
