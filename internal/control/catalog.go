@@ -42,8 +42,8 @@ func (e *Engine) ListPrompts() []Prompt {
 	return out
 }
 
-// Heartbeat stores the tool inventory and marks the host online.
-func (e *Engine) Heartbeat(id string, tools []Tool, fetchFailed bool) error {
+// Heartbeat stores the tool inventory, marks the host online, and reconciles active jobs.
+func (e *Engine) Heartbeat(id string, tools []Tool, fetchFailed bool, activeJobs ...ActiveJob) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	h, ok := e.hosts[id]
@@ -54,9 +54,23 @@ func (e *Engine) Heartbeat(id string, tools []Tool, fetchFailed bool) error {
 	h.LastSeen = e.now()
 	h.FetchFailed = fetchFailed
 	h.Tools = append([]Tool(nil), tools...)
+
+	activeMap := make(map[string]bool)
+	for _, aj := range activeJobs {
+		if aj.JobID != "" {
+			activeMap[aj.JobID] = true
+		}
+	}
+
 	for _, j := range e.jobs {
 		if j.LeaseHolder == id && j.Status == "RUNNING" {
-			j.LeaseExpiry = e.now().Add(5 * time.Minute)
+			if len(activeJobs) > 0 {
+				if activeMap[j.ID] {
+					j.LeaseExpiry = e.now().Add(5 * time.Minute)
+				}
+			} else {
+				j.LeaseExpiry = e.now().Add(5 * time.Minute)
+			}
 		}
 	}
 	return nil
@@ -119,14 +133,17 @@ func (e *Engine) GetHostDetail(id string) (HostDetail, bool) {
 
 // RepoDetail is the queue page.
 type RepoDetail struct {
-	Repo           Repo
-	FetchFailed    bool
-	DocsHubAllIdle bool
-	Running        *Job
-	RunningTitle   string
-	RunningEngine  string
-	Schedules      []Schedule
-	History        []HistoryRow
+	Repo                 Repo
+	FetchFailed          bool
+	DocsHubAllIdle       bool
+	Running              *Job
+	RunningTitle         string
+	RunningEngine        string
+	RunningSilentSeconds int
+	RunningIsStalled     bool
+	RunningStartedAt     time.Time
+	Schedules            []Schedule
+	History              []HistoryRow
 }
 
 // GetRepoDetail returns the queue, lock, schedules, and history.
@@ -170,6 +187,15 @@ func (e *Engine) GetRepoDetail(host, path string) (RepoDetail, bool) {
 			detail.Running = &cp
 			detail.RunningTitle = sch.PromptTitle
 			detail.RunningEngine = sch.Engine
+			detail.RunningStartedAt = job.StartedAt
+			lastAct := job.StartedAt
+			if !job.LastChunkAt.IsZero() && job.LastChunkAt.After(lastAct) {
+				lastAct = job.LastChunkAt
+			}
+			detail.RunningSilentSeconds = int(e.now().Sub(lastAct).Seconds())
+			if job.Status == "RUNNING" && detail.RunningSilentSeconds > 120 {
+				detail.RunningIsStalled = true
+			}
 		}
 	}
 	for _, sch := range e.schedules {
@@ -481,6 +507,10 @@ func (e *Engine) AppendLog(jobID string, chunk LogChunk) {
 	}
 	if job, ok := e.jobs[jobID]; ok {
 		job.LeaseExpiry = e.now().Add(5 * time.Minute)
+		job.LastChunkAt = e.now()
+		if chunk.Type != "OUTPUT_TICK" {
+			job.LastOutputAt = e.now()
+		}
 	}
 	for _, ch := range e.subs[jobID] {
 		select {

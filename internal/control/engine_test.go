@@ -1227,5 +1227,137 @@ func TestSetHistoryAdvancesSequenceAndConversationIDUpdatesLatest(t *testing.T) 
 	}
 }
 
+func TestAbandonAndResumeJob(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app", CloneURL: "https://example.test/app.git"}); err != nil {
+		t.Fatal(err)
+	}
+	p := e.PutPrompt(Prompt{Title: "Task 1", Body: "do task 1", Status: "READY"})
+	_, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatalf("expected poll to succeed")
+	}
+	if err := e.AddJobConversation(job.ID, "conv-12345"); err != nil {
+		t.Fatal(err)
+	}
+
+	repo, _ := e.GetRepo("host-1", "/work/app")
+	if repo.Lock != LockRunning || repo.RunningJobID != job.ID {
+		t.Fatalf("expected repo lock RUNNING with running job id, got lock=%s job=%s", repo.Lock, repo.RunningJobID)
+	}
+
+	// Abandon the job
+	if err := e.AbandonJob(job.ID, "STALLED_SILENT"); err != nil {
+		t.Fatal(err)
+	}
+
+	jd, ok := e.GetJob(job.ID)
+	if !ok || jd.Status != "FAILED" || jd.Reason != "STALLED_SILENT" {
+		t.Fatalf("expected abandoned job to be FAILED with reason STALLED_SILENT, got: %+v", jd)
+	}
+
+	repo, _ = e.GetRepo("host-1", "/work/app")
+	if repo.Lock != LockIdle || repo.RunningJobID != "" {
+		t.Fatalf("expected repo lock IDLE after abandon, got: lock=%s job=%s", repo.Lock, repo.RunningJobID)
+	}
+
+	// Resume the job
+	newSch, err := e.ResumeJob(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newSch.ResumeConversationID != "conv-12345" {
+		t.Fatalf("expected resume conversation ID conv-12345, got %s", newSch.ResumeConversationID)
+	}
+	if newSch.Status != "QUEUED" {
+		t.Fatalf("expected new schedule to be QUEUED, got %s", newSch.Status)
+	}
+
+	// Next poll leases the resumed schedule
+	resumedJob, sch, _, ok := e.PollHost("host-1")
+	if !ok || resumedJob.ID == job.ID {
+		t.Fatalf("expected new resumed job from poll, got ok=%v id=%s", ok, resumedJob.ID)
+	}
+	if sch.ResumeConversationID != "conv-12345" {
+		t.Fatalf("expected resumed job to carry conversation id conv-12345, got %s", sch.ResumeConversationID)
+	}
+}
+
+func TestRemediateRepo(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app", CloneURL: "https://example.test/app.git"}); err != nil {
+		t.Fatal(err)
+	}
+	p := e.PutPrompt(Prompt{Title: "Task 1", Body: "do task 1", Status: "READY"})
+	_, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatalf("expected poll to succeed")
+	}
+
+	if err := e.RemediateRepo("host-1", "/work/app"); err != nil {
+		t.Fatal(err)
+	}
+
+	repo, _ := e.GetRepo("host-1", "/work/app")
+	if repo.Lock != LockIdle || repo.Queue != QueueOpen || repo.Reason != "REMEDIATED" {
+		t.Fatalf("expected repo to be remediated and idle, got: %+v", repo)
+	}
+	jd, _ := e.GetJob(job.ID)
+	if jd.Status != "FAILED" || jd.Reason != "REMEDIATED" {
+		t.Fatalf("expected job to be FAILED with REMEDIATED, got: %+v", jd)
+	}
+}
+
+func TestHeartbeatConditionalLeaseRenewal(t *testing.T) {
+	curr := time.Unix(1_700_000_000, 0)
+	e := NewEngine(func() time.Time { return curr })
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app"}); err != nil {
+		t.Fatal(err)
+	}
+	p := e.PutPrompt(Prompt{Title: "Task 1", Body: "do task 1", Status: "READY"})
+	_, _ = e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("poll failed")
+	}
+
+	// Initial expiry is curr + 30s
+	initialExpiry, _ := e.GetJobLeaseExpiry(job.ID)
+
+	// Advance time by 40 seconds - without heartbeat renewal this would expire
+	curr = curr.Add(40 * time.Second)
+
+	// Heartbeat reporting NO active jobs -> should NOT renew lease for job
+	err := e.Heartbeat("host-1", nil, false, ActiveJob{JobID: "other-job", WorktreePath: "/other"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiryAfterMissed, _ := e.GetJobLeaseExpiry(job.ID)
+	if !expiryAfterMissed.Equal(initialExpiry) {
+		t.Fatalf("expected lease not renewed when job is missing from active_jobs")
+	}
+
+	// Trigger reaper - job should be reaped
+	e.ReapExpired()
+	jd, _ := e.GetJob(job.ID)
+	if jd.Status != "FAILED" {
+		t.Fatalf("expected dead job to be marked FAILED after lease expired, got %s", jd.Status)
+	}
+}
+
 
 
