@@ -1287,7 +1287,60 @@ func TestAbandonAndResumeJob(t *testing.T) {
 	if sch.ResumeConversationID != "conv-12345" {
 		t.Fatalf("expected resumed job to carry conversation id conv-12345, got %s", sch.ResumeConversationID)
 	}
+	if sch.Kind != KindResume {
+		t.Fatalf("expected resumed schedule to have KindResume, got %s", sch.Kind)
+	}
 }
+
+func TestResumeJobUnhaltsDirtyQueueAndCustomConversationID(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{
+		HostID:       "host-1",
+		WorktreePath: "/work/app",
+		CloneURL:     "https://example.test/app.git",
+		Queue:        QueueOpen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := e.PutPrompt(Prompt{Title: "Task 1", Body: "do task 1", Status: "READY"})
+	_, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatalf("expected poll to succeed")
+	}
+
+	// Simulate repo queue becoming paused with HALTED_DIRTY
+	repo, _ := e.GetRepo("host-1", "/work/app")
+	repo.Queue = QueuePaused
+	repo.Reason = ReasonDirty
+	_ = e.UpsertRepo(repo)
+
+	// Resume job with custom conversation ID and unhalting dirty queue
+	newSch, err := e.ResumeJob(job.ID, ResumeOptions{
+		ConversationID: "custom-recovered-conv-999",
+		AllowDirty:     true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newSch.ResumeConversationID != "custom-recovered-conv-999" {
+		t.Fatalf("expected custom conversation ID, got %s", newSch.ResumeConversationID)
+	}
+	if newSch.Kind != KindResume {
+		t.Fatalf("expected KindResume, got %s", newSch.Kind)
+	}
+
+	// Verify repo queue was unpaused and reason cleared
+	repo, _ = e.GetRepo("host-1", "/work/app")
+	if repo.Queue != QueueOpen || repo.Reason != "" {
+		t.Fatalf("expected repo queue OPEN and reason empty, got queue=%s reason=%s", repo.Queue, repo.Reason)
+	}
+}
+
 
 func TestRemediateRepo(t *testing.T) {
 	e := NewEngine(nil)
@@ -1358,6 +1411,115 @@ func TestHeartbeatConditionalLeaseRenewal(t *testing.T) {
 		t.Fatalf("expected dead job to be marked FAILED after lease expired, got %s", jd.Status)
 	}
 }
+
+func TestDirtyStoryDetectionAndResumption(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{
+		HostID:       "host-1",
+		WorktreePath: "/work/demo-repo-04",
+		CloneURL:     "https://example.test/demo-repo-04.git",
+		Queue:        QueueOpen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := e.PutPrompt(Prompt{Title: "iazio3", Body: "run iazio3", Status: "READY"})
+	_, err := e.ExecutePrompt(p.ID, "host-1", "/work/demo-repo-04", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatalf("expected poll to succeed")
+	}
+
+	// 1. Report dirty preflight with detected story ID and review file
+	pre := Preflight{
+		Kind:                   "ordinary",
+		FreeBytes:              20 << 30,
+		GitWorkTree:            true,
+		HeadAttached:           true,
+		Branch:                 "main",
+		DefaultBranch:          "main",
+		GitAuthOK:              true,
+		DocsHubOK:              true,
+		WorkPorcelain:          " M sub-agent\n?? docs/reviews/2026-10-09-review-v0-44c767-STORY-APP-0098.md",
+		DirtyStoryID:           "STORY-APP-0098",
+		DirtyReviewFile:        "docs/reviews/2026-10-09-review-v0-44c767-STORY-APP-0098.md",
+		DetectedConversationID: "4fc5bf81-6e70-4800-af36-8da466524b99",
+		DetectedVerdict:        "CLEAN",
+	}
+	halt := e.ApplyPreflight("host-1", "/work/demo-repo-04", pre)
+	if halt.Reason != ReasonDirty {
+		t.Fatalf("expected halt reason HALTED_DIRTY, got: %s", halt.Reason)
+	}
+
+	detail, ok := e.GetRepoDetail("host-1", "/work/demo-repo-04")
+	if !ok {
+		t.Fatal("repo not found")
+	}
+	if detail.Repo.DirtyStoryID != "STORY-APP-0098" {
+		t.Fatalf("expected DirtyStoryID STORY-APP-0098, got %q", detail.Repo.DirtyStoryID)
+	}
+	if detail.Repo.DetectedConversationID != "4fc5bf81-6e70-4800-af36-8da466524b99" {
+		t.Fatalf("expected DetectedConversationID 4fc5bf81..., got %q", detail.Repo.DetectedConversationID)
+	}
+	if detail.Repo.DetectedVerdict != "CLEAN" {
+		t.Fatalf("expected DetectedVerdict CLEAN, got %q", detail.Repo.DetectedVerdict)
+	}
+
+	// 2. Test porcelain parsing fallback
+	preFallback := Preflight{
+		Kind:          "ordinary",
+		FreeBytes:     20 << 30,
+		GitWorkTree:   true,
+		HeadAttached:  true,
+		Branch:        "main",
+		DefaultBranch: "main",
+		GitAuthOK:     true,
+		DocsHubOK:     true,
+		WorkPorcelain: " M sub-agent\n?? docs/reviews/2026-10-09-review-v0-26991d-STORY-APP-0098.md",
+	}
+	e.ApplyPreflight("host-1", "/work/demo-repo-04", preFallback)
+	detail, _ = e.GetRepoDetail("host-1", "/work/demo-repo-04")
+	if detail.Repo.DirtyStoryID != "STORY-APP-0098" {
+		t.Fatalf("expected fallback DirtyStoryID STORY-APP-0098, got %q", detail.Repo.DirtyStoryID)
+	}
+	if detail.Repo.DirtyReviewFile != "docs/reviews/2026-10-09-review-v0-26991d-STORY-APP-0098.md" {
+		t.Fatalf("expected DirtyReviewFile parsed from porcelain, got %q", detail.Repo.DirtyReviewFile)
+	}
+
+	// 3. Resume job using detected context
+	newSch, err := e.ResumeJob(job.ID, ResumeOptions{AllowDirty: true})
+	if err != nil {
+		t.Fatalf("ResumeJob failed: %v", err)
+	}
+	if newSch.Kind != KindResume {
+		t.Fatalf("expected KindResume, got %s", newSch.Kind)
+	}
+	if newSch.StoryID != "STORY-APP-0098" {
+		t.Fatalf("expected resumed schedule to adopt story ID STORY-APP-0098, got %s", newSch.StoryID)
+	}
+
+	// 4. Verify repo queue is open and dirty context cleared
+	detail, _ = e.GetRepoDetail("host-1", "/work/demo-repo-04")
+	if detail.Repo.Queue != QueueOpen || detail.Repo.Reason != "" {
+		t.Fatalf("expected repo queue open and reason cleared, got queue=%s reason=%s", detail.Repo.Queue, detail.Repo.Reason)
+	}
+	if detail.Repo.DirtyStoryID != "" {
+		t.Fatalf("expected DirtyStoryID cleared after resume, got %q", detail.Repo.DirtyStoryID)
+	}
+
+	// 5. Verify next poll leases the resumed schedule
+	resumedJob, sch, _, ok := e.PollHost("host-1")
+	if !ok || resumedJob.ID == job.ID {
+		t.Fatalf("expected resumed job from poll, got ok=%v id=%s", ok, resumedJob.ID)
+	}
+	if sch.Kind != KindResume || sch.StoryID != "STORY-APP-0098" {
+		t.Fatalf("unexpected leased schedule: kind=%s story=%s", sch.Kind, sch.StoryID)
+	}
+}
+
 
 
 

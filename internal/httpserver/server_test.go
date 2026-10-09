@@ -590,6 +590,24 @@ func TestAbandonResumeAndRemediateEndpoints(t *testing.T) {
 	if resumeRR.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d body %s", resumeRR.Code, resumeRR.Body.String())
 	}
+	var resSch map[string]any
+	_ = json.Unmarshal(resumeRR.Body.Bytes(), &resSch)
+	if resSch["kind"] != "resume" {
+		t.Fatalf("expected kind 'resume', got %v", resSch["kind"])
+	}
+
+	// 2b. Resume endpoint with custom conversation ID body
+	resumeWithBodyReq := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/resume", bytes.NewBufferString(`{"conversation_id":"custom-conv-from-body"}`))
+	resumeWithBodyRR := httptest.NewRecorder()
+	handler.ServeHTTP(resumeWithBodyRR, resumeWithBodyReq)
+	if resumeWithBodyRR.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body %s", resumeWithBodyRR.Code, resumeWithBodyRR.Body.String())
+	}
+	var resBodySch map[string]any
+	_ = json.Unmarshal(resumeWithBodyRR.Body.Bytes(), &resBodySch)
+	if resBodySch["resume_conversation_id"] != "custom-conv-from-body" {
+		t.Fatalf("expected custom conversation id 'custom-conv-from-body', got %v", resBodySch["resume_conversation_id"])
+	}
 
 	// 3. Remediate endpoint
 	remReq := httptest.NewRequest(http.MethodPost, "/v1/repos/host-1/remediate", bytes.NewBufferString(`{"worktree_path":"/work/app"}`))

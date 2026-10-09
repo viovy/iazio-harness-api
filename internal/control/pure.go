@@ -47,6 +47,7 @@ const (
 	KindOrdinary     = "ordinary"
 	KindRefinement   = "story_refinement"
 	KindIntervention = "intervention"
+	KindResume       = "resume"
 
 	ReasonDirty       = "HALTED_DIRTY"
 	ReasonDetached    = "HALTED_DETACHED"
@@ -56,6 +57,13 @@ const (
 	ReasonGitAuth     = "HALTED_GIT_AUTH"
 	ReasonCorrTimeout = "CORRELATION_TIMEOUT"
 )
+
+// ResumeOptions specifies parameters when resuming a stalled or abandoned execution.
+type ResumeOptions struct {
+	ConversationID string `json:"conversation_id,omitempty"`
+	AllowDirty     bool   `json:"allow_dirty,omitempty"`
+	StoryID        string `json:"story_id,omitempty"`
+}
 
 // ErrBadShareURL is returned when an import URL is not a Gemini share link.
 var ErrBadShareURL = errors.New("share url must be https://gemini.google.com/share/<id>")
@@ -68,17 +76,21 @@ var ErrIdeaState = errors.New("refinement is accepted only from NEW or TRIAGED")
 
 // Preflight is the checkout report the supervisor posts before spawn.
 type Preflight struct {
-	Kind          string
-	FreeBytes     uint64
-	WorkPorcelain string
-	HubPorcelain  string
-	HeadAttached  bool
-	Branch        string
-	DefaultBranch string
-	HasUpstream   bool
-	DocsHubOK     bool
-	GitAuthOK     bool
-	GitWorkTree   bool
+	Kind                   string
+	FreeBytes              uint64
+	WorkPorcelain          string
+	HubPorcelain           string
+	HeadAttached           bool
+	Branch                 string
+	DefaultBranch          string
+	HasUpstream            bool
+	DocsHubOK              bool
+	GitAuthOK              bool
+	GitWorkTree            bool
+	DirtyStoryID           string `json:"DirtyStoryID,omitempty"`
+	DirtyReviewFile        string `json:"DirtyReviewFile,omitempty"`
+	DetectedConversationID string `json:"DetectedConversationID,omitempty"`
+	DetectedVerdict        string `json:"DetectedVerdict,omitempty"`
 }
 
 // Halt is the pre-launch decision.

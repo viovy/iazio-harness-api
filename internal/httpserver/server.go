@@ -272,7 +272,11 @@ func (s *Server) abandonJob(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) resumeJob(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
-	sch, err := s.Engine.ResumeJob(jobID)
+	var opts control.ResumeOptions
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&opts)
+	}
+	sch, err := s.Engine.ResumeJob(jobID, opts)
 	if err != nil {
 		code := http.StatusConflict
 		if errors.Is(err, control.ErrNotFound) {
