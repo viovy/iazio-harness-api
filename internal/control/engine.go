@@ -3,12 +3,28 @@ package control
 import (
 	"context"
 	"errors"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+var (
+	storyIDPattern     = regexp.MustCompile(`(?i)\b(STORY-[A-Z0-9]+-[0-9]+)\b`)
+	prefixStoryPattern = regexp.MustCompile(`(?i)\b(iazio|gov|vigo|ci)-([0-9]+)\b`)
+)
+
+func extractStoryIDFromString(s string) string {
+	if m := storyIDPattern.FindStringSubmatch(s); len(m) > 1 {
+		return strings.ToUpper(m[1])
+	}
+	if m := prefixStoryPattern.FindStringSubmatch(s); len(m) > 2 {
+		return "STORY-" + strings.ToUpper(m[1]) + "-" + m[2]
+	}
+	return ""
+}
 
 const (
 	// RingCap is the live chunk ring per job.
@@ -84,6 +100,7 @@ type Schedule struct {
 	Priority             int
 	ResumeConversationID string
 	LeaseRetries         int
+	StoryID              string
 }
 
 // JobDetail carries the execution payload for iazio-harness.
@@ -148,9 +165,13 @@ type Repo struct {
 	Reason              string
 	HealingAttempts     int
 	Porcelain           string
-	DiscardPending      bool
-	DistributionProfile string
-	RunningJobID        string
+	DiscardPending         bool
+	DistributionProfile    string
+	RunningJobID           string
+	DirtyStoryID           string
+	DirtyReviewFile        string
+	DetectedConversationID string
+	DetectedVerdict        string
 }
 
 // Tool is one binary from the latest heartbeat.
@@ -556,7 +577,39 @@ func (e *Engine) ApplyPreflight(host, path string, p Preflight) Halt {
 	} else if strings.TrimSpace(p.HubPorcelain) != "" {
 		repo.Porcelain = p.HubPorcelain
 	}
+
+	if p.DirtyStoryID != "" {
+		repo.DirtyStoryID = p.DirtyStoryID
+		repo.DirtyReviewFile = p.DirtyReviewFile
+		repo.DetectedConversationID = p.DetectedConversationID
+		repo.DetectedVerdict = p.DetectedVerdict
+	} else if repo.Porcelain != "" {
+		lines := strings.Split(repo.Porcelain, "\n")
+		for _, l := range lines {
+			trimmed := strings.TrimSpace(l)
+			if len(trimmed) > 3 {
+				pathPart := strings.TrimSpace(trimmed[3:])
+				if strings.HasPrefix(pathPart, "docs/reviews/") && strings.HasSuffix(pathPart, ".md") {
+					repo.DirtyReviewFile = pathPart
+					if sid := extractStoryIDFromString(pathPart); sid != "" {
+						repo.DirtyStoryID = sid
+					}
+					break
+				}
+				if repo.DirtyStoryID == "" && strings.HasPrefix(pathPart, "docs/stories/") {
+					if sid := extractStoryIDFromString(pathPart); sid != "" {
+						repo.DirtyStoryID = sid
+					}
+				}
+			}
+		}
+	}
+
 	if h.Reason == "" {
+		repo.DirtyStoryID = ""
+		repo.DirtyReviewFile = ""
+		repo.DetectedConversationID = ""
+		repo.DetectedVerdict = ""
 		if repo.Reason == ReasonDisk {
 			repo.Reason = ""
 		}
@@ -1160,7 +1213,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 				continue
 			}
 			if repo.Queue != QueueOpen && repo.Queue != QueueHealing {
-				if !(repo.Queue == QueuePaused && sch.Kind == KindIntervention) {
+				if !(repo.Queue == QueuePaused && (sch.Kind == KindIntervention || sch.Kind == KindResume)) {
 					continue
 				}
 			}
@@ -1168,7 +1221,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 				if repo.Reason == ReasonDisk {
 					continue
 				}
-				if sch.Kind != KindIntervention {
+				if sch.Kind != KindIntervention && sch.Kind != KindResume {
 					continue
 				}
 			}
@@ -1435,6 +1488,9 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 				detail.Engine = p.Engine
 			}
 		}
+		if detail.StoryID == "" && sch.StoryID != "" {
+			detail.StoryID = sch.StoryID
+		}
 		if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
 			detail.DocsHubPath = repo.DocsHubPath
 		}
@@ -1585,6 +1641,11 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 		resumeConvID = origSch.ResumeConversationID
 	}
 
+	targetStoryID := opt.StoryID
+	if targetStoryID == "" {
+		targetStoryID = origSch.StoryID
+	}
+
 	// Mark previous job closed if still running.
 	if !job.ExitPosted {
 		job.Status = "FAILED"
@@ -1594,10 +1655,20 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 
 	// Clear repo lock and ensure queue is open, clearing any HALTED_DIRTY or prior halt reason.
 	if repo := e.repos[repoKey(origSch.HostID, origSch.WorktreePath)]; repo != nil {
+		if resumeConvID == "" && repo.DetectedConversationID != "" {
+			resumeConvID = repo.DetectedConversationID
+		}
+		if targetStoryID == "" && repo.DirtyStoryID != "" {
+			targetStoryID = repo.DirtyStoryID
+		}
 		repo.Lock = LockIdle
 		repo.RunningJobID = ""
 		repo.Queue = QueueOpen
 		repo.Reason = ""
+		repo.DirtyStoryID = ""
+		repo.DirtyReviewFile = ""
+		repo.DetectedConversationID = ""
+		repo.DetectedVerdict = ""
 		e.notifyRepoLocked(repo)
 	}
 
@@ -1622,6 +1693,7 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 		Engine:               origSch.Engine,
 		Priority:             origSch.Priority + 10,
 		ResumeConversationID: resumeConvID,
+		StoryID:              targetStoryID,
 	}
 	e.schedules[schID] = newSch
 	return *newSch, nil
