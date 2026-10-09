@@ -48,6 +48,7 @@ func scheduleView(s control.Schedule) map[string]any {
 		"kind":                 s.Kind,
 		"priority":             s.Priority,
 		"status":               s.Status,
+		"resume_conversation_id": s.ResumeConversationID,
 	}
 }
 

@@ -1558,7 +1558,7 @@ func (e *Engine) AbandonJob(jobID, reason string) error {
 }
 
 // ResumeJob resumes a stalled or abandoned job using captured conversation IDs or prompt settings.
-func (e *Engine) ResumeJob(jobID string) (Schedule, error) {
+func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	job, ok := e.jobs[jobID]
@@ -1570,9 +1570,16 @@ func (e *Engine) ResumeJob(jobID string) (Schedule, error) {
 		return Schedule{}, ErrNotFound
 	}
 
+	var opt ResumeOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+
 	// Capture latest conversation ID if available.
 	resumeConvID := job.ResumeConversationID
-	if len(job.ConversationIDs) > 0 {
+	if opt.ConversationID != "" {
+		resumeConvID = opt.ConversationID
+	} else if len(job.ConversationIDs) > 0 {
 		resumeConvID = job.ConversationIDs[len(job.ConversationIDs)-1]
 	} else if origSch.ResumeConversationID != "" {
 		resumeConvID = origSch.ResumeConversationID
@@ -1585,7 +1592,7 @@ func (e *Engine) ResumeJob(jobID string) (Schedule, error) {
 		job.Reason = "RESUMED_AS_NEW_SCHEDULE"
 	}
 
-	// Clear repo lock and ensure queue is open.
+	// Clear repo lock and ensure queue is open, clearing any HALTED_DIRTY or prior halt reason.
 	if repo := e.repos[repoKey(origSch.HostID, origSch.WorktreePath)]; repo != nil {
 		repo.Lock = LockIdle
 		repo.RunningJobID = ""
@@ -1594,7 +1601,7 @@ func (e *Engine) ResumeJob(jobID string) (Schedule, error) {
 		e.notifyRepoLocked(repo)
 	}
 
-	// Create new schedule to resume execution.
+	// Create new schedule to resume execution with KindResume.
 	schID := e.next("sch-")
 	newSch := &Schedule{
 		ID:                   schID,
@@ -1603,7 +1610,7 @@ func (e *Engine) ResumeJob(jobID string) (Schedule, error) {
 		HostID:               origSch.HostID,
 		WorktreePath:         origSch.WorktreePath,
 		CloneURL:             origSch.CloneURL,
-		Kind:                 origSch.Kind,
+		Kind:                 KindResume,
 		IterationsTotal:      1,
 		IterationsRemaining:  1,
 		IterationsCompleted:  0,

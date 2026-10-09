@@ -47,6 +47,7 @@ const (
 	KindOrdinary     = "ordinary"
 	KindRefinement   = "story_refinement"
 	KindIntervention = "intervention"
+	KindResume       = "resume"
 
 	ReasonDirty       = "HALTED_DIRTY"
 	ReasonDetached    = "HALTED_DETACHED"
@@ -56,6 +57,12 @@ const (
 	ReasonGitAuth     = "HALTED_GIT_AUTH"
 	ReasonCorrTimeout = "CORRELATION_TIMEOUT"
 )
+
+// ResumeOptions specifies parameters when resuming a stalled or abandoned execution.
+type ResumeOptions struct {
+	ConversationID string `json:"conversation_id,omitempty"`
+	AllowDirty     bool   `json:"allow_dirty,omitempty"`
+}
 
 // ErrBadShareURL is returned when an import URL is not a Gemini share link.
 var ErrBadShareURL = errors.New("share url must be https://gemini.google.com/share/<id>")

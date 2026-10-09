@@ -1287,7 +1287,60 @@ func TestAbandonAndResumeJob(t *testing.T) {
 	if sch.ResumeConversationID != "conv-12345" {
 		t.Fatalf("expected resumed job to carry conversation id conv-12345, got %s", sch.ResumeConversationID)
 	}
+	if sch.Kind != KindResume {
+		t.Fatalf("expected resumed schedule to have KindResume, got %s", sch.Kind)
+	}
 }
+
+func TestResumeJobUnhaltsDirtyQueueAndCustomConversationID(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{
+		HostID:       "host-1",
+		WorktreePath: "/work/app",
+		CloneURL:     "https://example.test/app.git",
+		Queue:        QueueOpen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := e.PutPrompt(Prompt{Title: "Task 1", Body: "do task 1", Status: "READY"})
+	_, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatalf("expected poll to succeed")
+	}
+
+	// Simulate repo queue becoming paused with HALTED_DIRTY
+	repo, _ := e.GetRepo("host-1", "/work/app")
+	repo.Queue = QueuePaused
+	repo.Reason = ReasonDirty
+	_ = e.UpsertRepo(repo)
+
+	// Resume job with custom conversation ID and unhalting dirty queue
+	newSch, err := e.ResumeJob(job.ID, ResumeOptions{
+		ConversationID: "custom-recovered-conv-999",
+		AllowDirty:     true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newSch.ResumeConversationID != "custom-recovered-conv-999" {
+		t.Fatalf("expected custom conversation ID, got %s", newSch.ResumeConversationID)
+	}
+	if newSch.Kind != KindResume {
+		t.Fatalf("expected KindResume, got %s", newSch.Kind)
+	}
+
+	// Verify repo queue was unpaused and reason cleared
+	repo, _ = e.GetRepo("host-1", "/work/app")
+	if repo.Queue != QueueOpen || repo.Reason != "" {
+		t.Fatalf("expected repo queue OPEN and reason empty, got queue=%s reason=%s", repo.Queue, repo.Reason)
+	}
+}
+
 
 func TestRemediateRepo(t *testing.T) {
 	e := NewEngine(nil)
