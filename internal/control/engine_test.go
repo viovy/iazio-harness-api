@@ -1155,5 +1155,77 @@ func TestDeclineJobDeduplicatesConsecutiveHistory(t *testing.T) {
 	_ = sch
 }
 
+func TestSetHistoryAdvancesSequenceAndConversationIDUpdatesLatest(t *testing.T) {
+	e := NewEngine(nil)
+	key := repoKey("host-1", "/work/app")
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app", CloneURL: "https://example.test/app.git"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. SetHistory with existing job-50 and sch-45
+	e.SetHistory(key, []HistoryRow{
+		{
+			JobID:           "job-50",
+			ScheduleID:      "sch-45",
+			PromptTitle:     "Task 1",
+			Status:          "LEASE_EXPIRED",
+			ConversationIDs: []string{"old-conv-1"},
+		},
+	})
+
+	// Sequence should now be at least 50
+	p := e.PutPrompt(Prompt{Title: "Task 2", Body: "do task 2", Status: "READY"})
+	sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("poll failed")
+	}
+
+	// Job ID should be >= job-51, definitely not job-1..job-50
+	if j.ID == "job-50" {
+		t.Fatalf("expected job ID > job-50 to prevent collision, got %s", j.ID)
+	}
+	if len(j.ConversationIDs) != 0 {
+		t.Fatalf("expected empty ConversationIDs for fresh job without resume conv, got: %+v", j.ConversationIDs)
+	}
+
+	// Add an active running history row with the same ID or multiple rows
+	e.SetHistory(key, []HistoryRow{
+		{
+			JobID:           j.ID,
+			ScheduleID:      "sch-old",
+			PromptTitle:     "Old Prompt",
+			Status:          "FAILED",
+			ConversationIDs: []string{"old-conv-99"},
+		},
+		{
+			JobID:           j.ID,
+			ScheduleID:      sch.ID,
+			PromptTitle:     p.Title,
+			Status:          "RUNNING",
+			ConversationIDs: []string{},
+		},
+	})
+
+	// AddJobConversation should update the LATEST row (index 1), not index 0
+	if err := e.AddJobConversation(j.ID, "new-active-conv"); err != nil {
+		t.Fatal(err)
+	}
+	detail, _ := e.GetRepoDetail("host-1", "/work/app")
+	if len(detail.History) != 2 {
+		t.Fatalf("expected 2 history entries, got %d", len(detail.History))
+	}
+	if len(detail.History[0].ConversationIDs) != 1 || detail.History[0].ConversationIDs[0] != "old-conv-99" {
+		t.Fatalf("older history row should not have been modified, got: %+v", detail.History[0].ConversationIDs)
+	}
+	if len(detail.History[1].ConversationIDs) != 1 || detail.History[1].ConversationIDs[0] != "new-active-conv" {
+		t.Fatalf("latest history row should have received new conversation ID, got: %+v", detail.History[1].ConversationIDs)
+	}
+}
+
 
 

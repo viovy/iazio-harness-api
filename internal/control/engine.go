@@ -253,11 +253,22 @@ func (e *Engine) notifyHistoryDeleteLocked(host, path, jobID string) {
 	go e.OnHistoryDelete(host, path, jobID)
 }
 
-// SetHistory populates history for a repo key on startup.
+// SetHistory populates history for a repo key on startup and advances sequence.
 func (e *Engine) SetHistory(key string, rows []HistoryRow) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	for _, r := range rows {
+		e.ensureSeqLocked(r.JobID)
+		e.ensureSeqLocked(r.ScheduleID)
+	}
 	e.history[key] = append([]HistoryRow(nil), rows...)
+}
+
+// EnsureSeq ensures the internal sequence counter is at least as large as the numeric suffix of id.
+func (e *Engine) EnsureSeq(id string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.ensureSeqLocked(id)
 }
 
 // NewEngine returns an empty control plane.
@@ -1163,6 +1174,8 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 		}
 		if sch.ResumeConversationID != "" {
 			job.ConversationIDs = []string{sch.ResumeConversationID}
+		} else {
+			job.ConversationIDs = []string{}
 		}
 		e.jobs[id] = job
 		if sch.CloneURL != "" {
@@ -1197,7 +1210,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 func (e *Engine) updateHistoryStatusLocked(host, path, jobID, status string) {
 	key := repoKey(host, path)
 	rows := e.history[key]
-	for i := range rows {
+	for i := len(rows) - 1; i >= 0; i-- {
 		if rows[i].JobID == jobID {
 			rows[i].Status = status
 			if rows[i].Reason == "" && (status == "LEASE_EXPIRED" || status == "EXECUTION_TIMEOUT" || status == "HOST_OFFLINE" || status == "FAILED") {
@@ -1212,7 +1225,7 @@ func (e *Engine) updateHistoryStatusLocked(host, path, jobID, status string) {
 func (e *Engine) updateHistoryDeclineLocked(host, path, jobID, reason string) {
 	key := repoKey(host, path)
 	rows := e.history[key]
-	for i := range rows {
+	for i := len(rows) - 1; i >= 0; i-- {
 		if rows[i].JobID == jobID {
 			rows[i].Status = "DECLINED"
 			rows[i].Reason = reason
@@ -1225,7 +1238,7 @@ func (e *Engine) updateHistoryDeclineLocked(host, path, jobID, reason string) {
 func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseComplete bool, status string) {
 	key := repoKey(host, path)
 	rows := e.history[key]
-	for i := range rows {
+	for i := len(rows) - 1; i >= 0; i-- {
 		if rows[i].JobID == jobID {
 			rows[i].Clean = clean
 			rows[i].ASEComplete = aseComplete
@@ -1456,7 +1469,7 @@ func (e *Engine) AddJobConversation(jobID, convID string) error {
 	if okSch {
 		key := repoKey(sch.HostID, sch.WorktreePath)
 		rows := e.history[key]
-		for i := range rows {
+		for i := len(rows) - 1; i >= 0; i-- {
 			if rows[i].JobID == jobID {
 				has := false
 				for _, c := range rows[i].ConversationIDs {

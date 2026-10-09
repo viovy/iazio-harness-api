@@ -261,6 +261,9 @@ func (e *Engine) ScanRepoProfile(hostID, repoPath, profileName string) (*Distrib
 	metaFile := filepath.Join(repoPath, "metadata.yml")
 	raw, err := os.ReadFile(metaFile)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("requirement criteria not met: metadata.yml not found in %s (host %q may be remote): %w", repoPath, hostID, err)
+		}
 		return nil, fmt.Errorf("requirement criteria not met: metadata.yml not found in %s: %w", repoPath, err)
 	}
 
