@@ -1523,14 +1523,14 @@ func TestDirtyStoryDetectionAndResumption(t *testing.T) {
 func TestResumeRepoInPlace(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("host-mac-mini", "permanent")
-	repoPath := "/Users/romeo/work/meta-repo-04"
+	repoPath := "/Users/alice/work/test-repo-04"
 	if err := e.UpsertRepo(Repo{
 		HostID:                 "host-mac-mini",
 		WorktreePath:           repoPath,
 		CloneURL:               "https://example.test/repo.git",
 		Queue:                  QueuePaused,
 		Reason:                 ReasonDirty,
-		DirtyStoryID:           "STORY-IAZIO-0098",
+		DirtyStoryID:           "STORY-SAMPLE-0098",
 		DetectedConversationID: "conv-mac-mini-0098",
 	}); err != nil {
 		t.Fatal(err)
@@ -1547,8 +1547,8 @@ func TestResumeRepoInPlace(t *testing.T) {
 	if sch.Kind != KindResume {
 		t.Fatalf("expected KindResume, got: %s", sch.Kind)
 	}
-	if sch.StoryID != "STORY-IAZIO-0098" {
-		t.Fatalf("expected StoryID STORY-IAZIO-0098, got: %s", sch.StoryID)
+	if sch.StoryID != "STORY-SAMPLE-0098" {
+		t.Fatalf("expected StoryID STORY-SAMPLE-0098, got: %s", sch.StoryID)
 	}
 	if sch.ResumeConversationID != "conv-mac-mini-0098" {
 		t.Fatalf("expected ResumeConversationID conv-mac-mini-0098, got: %s", sch.ResumeConversationID)
@@ -1567,7 +1567,7 @@ func TestResumeRepoInPlace(t *testing.T) {
 	if detail.Repo.Queue != QueueOpen || detail.Repo.Reason != "" {
 		t.Fatalf("expected QueueOpen and cleared reason, got queue=%s reason=%s", detail.Repo.Queue, detail.Repo.Reason)
 	}
-	if detail.Repo.DirtyStoryID != "STORY-IAZIO-0098" || detail.Repo.DetectedConversationID != "conv-mac-mini-0098" {
+	if detail.Repo.DirtyStoryID != "STORY-SAMPLE-0098" || detail.Repo.DetectedConversationID != "conv-mac-mini-0098" {
 		t.Fatalf("expected dirty context retained on repo, got story=%q conv=%q", detail.Repo.DirtyStoryID, detail.Repo.DetectedConversationID)
 	}
 
@@ -1576,7 +1576,7 @@ func TestResumeRepoInPlace(t *testing.T) {
 	if !ok || job.ScheduleID != sch.ID {
 		t.Fatalf("expected poll to lease resumed schedule, got ok=%v", ok)
 	}
-	if leasedSch.Kind != KindResume || leasedSch.StoryID != "STORY-IAZIO-0098" {
+	if leasedSch.Kind != KindResume || leasedSch.StoryID != "STORY-SAMPLE-0098" {
 		t.Fatalf("unexpected leased schedule: %+v", leasedSch)
 	}
 }
@@ -1584,14 +1584,14 @@ func TestResumeRepoInPlace(t *testing.T) {
 func TestResumeJobHistoricalFallbackWhenJobNotInActiveMemory(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("host-mac-mini", "permanent")
-	repoPath := "/Users/romeo/work/meta-repo-04"
+	repoPath := "/Users/alice/work/test-repo-04"
 	if err := e.UpsertRepo(Repo{
 		HostID:       "host-mac-mini",
 		WorktreePath: repoPath,
 		CloneURL:     "https://example.test/repo.git",
 		Queue:        QueuePaused,
 		Reason:       ReasonDirty,
-		DirtyStoryID: "STORY-IAZIO-0098",
+		DirtyStoryID: "STORY-SAMPLE-0098",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1622,8 +1622,8 @@ func TestResumeJobHistoricalFallbackWhenJobNotInActiveMemory(t *testing.T) {
 	if sch.Kind != KindResume {
 		t.Fatalf("expected KindResume, got: %s", sch.Kind)
 	}
-	if sch.StoryID != "STORY-IAZIO-0098" {
-		t.Fatalf("expected StoryID STORY-IAZIO-0098, got: %s", sch.StoryID)
+	if sch.StoryID != "STORY-SAMPLE-0098" {
+		t.Fatalf("expected StoryID STORY-SAMPLE-0098, got: %s", sch.StoryID)
 	}
 	if sch.ResumeConversationID != "conv-discovered-from-history" {
 		t.Fatalf("expected ResumeConversationID conv-discovered-from-history, got: %s", sch.ResumeConversationID)
@@ -1638,7 +1638,7 @@ func TestResumeJobHistoricalFallbackWhenJobNotInActiveMemory(t *testing.T) {
 func TestResumeRepoInPlaceResolvesStoryFromBranchAndPorcelain(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("host-mac-mini", "permanent")
-	repoPath := "/work/meta-repo-04"
+	repoPath := "/work/test-repo-04"
 	if err := e.UpsertRepo(Repo{
 		HostID:       "host-mac-mini",
 		WorktreePath: repoPath,
@@ -1653,15 +1653,15 @@ func TestResumeRepoInPlaceResolvesStoryFromBranchAndPorcelain(t *testing.T) {
 	e.ApplyPreflight("host-mac-mini", repoPath, Preflight{
 		GitWorkTree:  true,
 		HeadAttached: true,
-		Branch:       "feat/iazio-0101-repo-in-place-resume",
+		Branch:       "feat/story-sample-0101-repo-in-place-resume",
 	})
 
 	sch, err := e.ResumeRepoInPlace("host-mac-mini", repoPath)
 	if err != nil {
 		t.Fatalf("ResumeRepoInPlace failed: %v", err)
 	}
-	if sch.StoryID != "STORY-IAZIO-0101" {
-		t.Fatalf("expected StoryID STORY-IAZIO-0101 from branch, got: %s", sch.StoryID)
+	if sch.StoryID != "STORY-SAMPLE-0101" {
+		t.Fatalf("expected StoryID STORY-SAMPLE-0101 from branch, got: %s", sch.StoryID)
 	}
 }
 
