@@ -102,6 +102,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/repos/{host}/finish", s.finish)
 	mux.HandleFunc("POST /v1/repos/{host}/force-pause", s.forcePause)
 	mux.HandleFunc("POST /v1/repos/{host}/resume", s.resumeRepo)
+	mux.HandleFunc("POST /v1/repos/{host}/resume-in-place", s.resumeRepoInPlace)
 	mux.HandleFunc("POST /v1/repos/{host}/remediate", s.remediateRepo)
 	mux.HandleFunc("GET /v1/repos/{host}", s.getRepo)
 	mux.HandleFunc("GET /v1/fleet/profiles", s.listProfiles)
@@ -285,6 +286,11 @@ func (s *Server) resumeJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, code, err)
 		return
 	}
+	if s.SaveRepo != nil {
+		if repo, ok := s.Engine.GetRepo(sch.HostID, sch.WorktreePath); ok {
+			s.SaveRepo(repo)
+		}
+	}
 	writeJSON(w, http.StatusOK, scheduleView(sch))
 }
 
@@ -459,6 +465,56 @@ func (s *Server) resumeRepo(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"queue": control.QueueOpen})
+}
+
+func (s *Server) resumeRepoInPlace(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Path           string `json:"path"`
+		WorktreePath   string `json:"worktree_path"`
+		StoryID        string `json:"story_id"`
+		ConversationID string `json:"conversation_id"`
+		JobID          string `json:"job_id"`
+		AllowDirty     bool   `json:"allow_dirty"`
+		PromptID       string `json:"prompt_id"`
+		PromptTitle    string `json:"prompt_title"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	targetPath := body.WorktreePath
+	if targetPath == "" {
+		targetPath = body.Path
+	}
+	if targetPath == "" {
+		targetPath = r.URL.Query().Get("path")
+	}
+	host := r.PathValue("host")
+	opts := control.ResumeOptions{
+		ConversationID: body.ConversationID,
+		AllowDirty:     body.AllowDirty,
+		StoryID:        body.StoryID,
+		JobID:          body.JobID,
+		PromptID:       body.PromptID,
+		PromptTitle:    body.PromptTitle,
+		HostID:         host,
+		WorktreePath:   targetPath,
+	}
+	sch, err := s.Engine.ResumeRepoInPlace(host, targetPath, opts)
+	if err != nil {
+		code := http.StatusConflict
+		if errors.Is(err, control.ErrNotFound) {
+			code = http.StatusNotFound
+		}
+		writeErr(w, code, err)
+		return
+	}
+	if s.SaveRepo != nil {
+		if detail, ok := s.Engine.GetRepoDetail(host, targetPath); ok {
+			s.SaveRepo(detail.Repo)
+		}
+	}
+	writeJSON(w, http.StatusOK, scheduleView(sch))
 }
 
 func (s *Server) remediateRepo(w http.ResponseWriter, r *http.Request) {

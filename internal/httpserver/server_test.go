@@ -627,5 +627,53 @@ func TestAbandonResumeAndRemediateEndpoints(t *testing.T) {
 	}
 }
 
+func TestResumeRepoInPlaceEndpoint(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	handler := s.Handler()
+
+	s.Engine.RegisterHost("mac-mini", "permanent")
+	_ = s.Engine.UpsertRepo(control.Repo{
+		HostID:                 "mac-mini",
+		WorktreePath:           "/Users/romeo/work/meta-repo-04",
+		Queue:                  control.QueuePaused,
+		Reason:                 control.ReasonDirty,
+		DirtyStoryID:           "STORY-IAZIO-0098",
+		DetectedConversationID: "conv-mac-mini-0098",
+	})
+	p := s.Engine.PutPrompt(control.Prompt{Title: "Ready ASE prompt", Body: "run {{.StoryID}}", Status: "READY"})
+
+	// Call POST /v1/repos/{host}/resume-in-place
+	payload := `{"worktree_path":"/Users/romeo/work/meta-repo-04","allow_dirty":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/repos/mac-mini/resume-in-place", bytes.NewBufferString(payload))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body %s", rr.Code, rr.Body.String())
+	}
+
+	var res map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &res); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if res["kind"] != "resume" {
+		t.Fatalf("expected kind 'resume', got %v", res["kind"])
+	}
+	if res["story_id"] != "STORY-IAZIO-0098" {
+		t.Fatalf("expected story_id 'STORY-IAZIO-0098', got %v", res["story_id"])
+	}
+	if res["resume_conversation_id"] != "conv-mac-mini-0098" {
+		t.Fatalf("expected resume_conversation_id 'conv-mac-mini-0098', got %v", res["resume_conversation_id"])
+	}
+	if res["prompt_id"] != p.ID {
+		t.Fatalf("expected prompt_id %s, got %v", p.ID, res["prompt_id"])
+	}
+
+	detail, ok := s.Engine.GetRepoDetail("mac-mini", "/Users/romeo/work/meta-repo-04")
+	if !ok || detail.Repo.Queue != control.QueueOpen || detail.Repo.Reason != "" {
+		t.Fatalf("expected repo queue OPEN and reason cleared: %+v", detail.Repo)
+	}
+}
+
 
 
