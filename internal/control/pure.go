@@ -63,6 +63,11 @@ type ResumeOptions struct {
 	ConversationID string `json:"conversation_id,omitempty"`
 	AllowDirty     bool   `json:"allow_dirty,omitempty"`
 	StoryID        string `json:"story_id,omitempty"`
+	JobID          string `json:"job_id,omitempty"`
+	PromptID       string `json:"prompt_id,omitempty"`
+	PromptTitle    string `json:"prompt_title,omitempty"`
+	HostID         string `json:"host_id,omitempty"`
+	WorktreePath   string `json:"worktree_path,omitempty"`
 }
 
 // ErrBadShareURL is returned when an import URL is not a Gemini share link.

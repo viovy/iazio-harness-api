@@ -160,6 +160,7 @@ type Repo struct {
 	DocsHubPath         string
 	CloneURL            string
 	DefaultBranch       string
+	CurrentBranch       string
 	Queue               string
 	Lock                string
 	Reason              string
@@ -576,6 +577,9 @@ func (e *Engine) ApplyPreflight(host, path string, p Preflight) Halt {
 		repo.Porcelain = p.WorkPorcelain
 	} else if strings.TrimSpace(p.HubPorcelain) != "" {
 		repo.Porcelain = p.HubPorcelain
+	}
+	if p.Branch != "" {
+		repo.CurrentBranch = p.Branch
 	}
 
 	if p.DirtyStoryID != "" {
@@ -1613,22 +1617,229 @@ func (e *Engine) AbandonJob(jobID, reason string) error {
 	return nil
 }
 
-// ResumeJob resumes a stalled or abandoned job using captured conversation IDs or prompt settings.
-func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error) {
+// ResumeRepoInPlace unpauses a repository queue, clears any halt reasons, and schedules an in-place KindResume job.
+func (e *Engine) ResumeRepoInPlace(host, path string, opts ...ResumeOptions) (Schedule, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	job, ok := e.jobs[jobID]
-	if !ok {
-		return Schedule{}, ErrNotFound
-	}
-	origSch, ok := e.schedules[job.ScheduleID]
-	if !ok {
+	return e.resumeRepoInPlaceLocked(host, path, opts...)
+}
+
+func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOptions) (Schedule, error) {
+	repo := e.repos[repoKey(host, path)]
+	if repo == nil {
 		return Schedule{}, ErrNotFound
 	}
 
 	var opt ResumeOptions
 	if len(opts) > 0 {
 		opt = opts[0]
+	}
+
+	// 1. Resolve target story ID: explicit opt -> repo.DirtyStoryID -> extract from active branch -> extract from porcelain (F5)
+	targetStoryID := opt.StoryID
+	if targetStoryID == "" {
+		targetStoryID = repo.DirtyStoryID
+	}
+	if targetStoryID == "" && repo.CurrentBranch != "" {
+		targetStoryID = extractStoryIDFromString(repo.CurrentBranch)
+	}
+	if targetStoryID == "" && repo.Porcelain != "" {
+		targetStoryID = extractStoryIDFromString(repo.Porcelain)
+	}
+
+	// 2. Resolve conversation ID: explicit opt -> repo.DetectedConversationID -> latest from history
+	resumeConvID := opt.ConversationID
+	if resumeConvID == "" {
+		resumeConvID = repo.DetectedConversationID
+	}
+	if resumeConvID == "" {
+		if rows := e.history[repoKey(host, path)]; len(rows) > 0 {
+			for i := len(rows) - 1; i >= 0; i-- {
+				if len(rows[i].ConversationIDs) > 0 {
+					resumeConvID = rows[i].ConversationIDs[len(rows[i].ConversationIDs)-1]
+					break
+				}
+			}
+		}
+	}
+
+	// 3. Resolve Prompt
+	var targetPrompt *Prompt
+	promptTitle := opt.PromptTitle
+	promptID := opt.PromptID
+	engineName := "agent"
+
+	// 3a. Explicit prompt ID
+	if promptID != "" {
+		if p, ok := e.prompts[promptID]; ok {
+			targetPrompt = p
+		}
+	}
+
+	// 3b. Try to find prompt from history
+	if targetPrompt == nil {
+		if rows := e.history[repoKey(host, path)]; len(rows) > 0 {
+			if promptTitle == "" {
+				promptTitle = rows[len(rows)-1].PromptTitle
+			}
+			if rows[len(rows)-1].Engine != "" {
+				engineName = rows[len(rows)-1].Engine
+			}
+		}
+		if promptTitle != "" {
+			for _, p := range e.prompts {
+				if p.Title == promptTitle {
+					targetPrompt = p
+					break
+				}
+			}
+		}
+	}
+
+	// 3c. Fallback to first READY prompt
+	if targetPrompt == nil {
+		for _, p := range e.prompts {
+			if p.Status == "READY" {
+				targetPrompt = p
+				break
+			}
+		}
+	}
+
+	promptRev := 1
+	if targetPrompt != nil {
+		promptID = targetPrompt.ID
+		promptTitle = targetPrompt.Title
+		promptRev = targetPrompt.Revision
+		if targetPrompt.Engine != "" {
+			engineName = targetPrompt.Engine
+		}
+	}
+	if promptID == "" {
+		promptID = "prompt-1"
+	}
+	if promptTitle == "" {
+		promptTitle = "Ready ASE prompt"
+	}
+
+	// Reset repo lock and clear halt state, retaining in-flight story and conversation bindings (F3)
+	repo.Lock = LockIdle
+	repo.RunningJobID = ""
+	repo.Queue = QueueOpen
+	repo.Reason = ""
+	repo.Porcelain = ""
+	repo.DiscardPending = false
+	if targetStoryID != "" && repo.DirtyStoryID == "" {
+		repo.DirtyStoryID = targetStoryID
+	}
+	if resumeConvID != "" && repo.DetectedConversationID == "" {
+		repo.DetectedConversationID = resumeConvID
+	}
+	e.notifyRepoLocked(repo)
+
+	// Create and enqueue new resume schedule
+	schID := e.next("sch-")
+	newSch := &Schedule{
+		ID:                   schID,
+		PromptID:             promptID,
+		Revision:             promptRev,
+		HostID:               host,
+		WorktreePath:         path,
+		CloneURL:             repo.CloneURL,
+		Kind:                 KindResume,
+		IterationsTotal:      1,
+		IterationsRemaining:  1,
+		IterationsCompleted:  0,
+		MaxExecutionDuration: 1800,
+		Status:               "QUEUED",
+		PromptTitle:          promptTitle,
+		Engine:               engineName,
+		Priority:             100, // Elevated priority for manual in-place resume
+		ResumeConversationID: resumeConvID,
+		StoryID:              targetStoryID,
+	}
+	e.schedules[schID] = newSch
+	return *newSch, nil
+}
+
+// ResumeJob resumes a stalled or abandoned job using captured conversation IDs or prompt settings,
+// gracefully recovering via history or repository in-place resumption when the in-memory job has expired.
+func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	var opt ResumeOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+
+	job, ok := e.jobs[jobID]
+	if !ok {
+		// Fallback 1: Search history for matching jobID across all repositories
+		for k, rows := range e.history {
+			for i := range rows {
+				if rows[i].JobID == jobID {
+					parts := strings.Split(k, "\x00")
+					if len(parts) == 2 {
+						histHost, histPath := parts[0], parts[1]
+						if opt.ConversationID == "" && len(rows[i].ConversationIDs) > 0 {
+							opt.ConversationID = rows[i].ConversationIDs[len(rows[i].ConversationIDs)-1]
+						}
+						if opt.PromptTitle == "" {
+							opt.PromptTitle = rows[i].PromptTitle
+						}
+						return e.resumeRepoInPlaceLocked(histHost, histPath, opt)
+					}
+				}
+			}
+		}
+
+		// Fallback 2: If HostID and WorktreePath were provided in options
+		if opt.HostID != "" && opt.WorktreePath != "" {
+			return e.resumeRepoInPlaceLocked(opt.HostID, opt.WorktreePath, opt)
+		}
+
+		return Schedule{}, ErrNotFound
+	}
+
+	origSch, ok := e.schedules[job.ScheduleID]
+	if !ok {
+		// Fallback 3: Job exists in memory but original schedule was purged; recover via repository or history (F4)
+		for _, repo := range e.repos {
+			if repo.RunningJobID == job.ID {
+				if opt.ConversationID == "" && job.ResumeConversationID != "" {
+					opt.ConversationID = job.ResumeConversationID
+				} else if opt.ConversationID == "" && len(job.ConversationIDs) > 0 {
+					opt.ConversationID = job.ConversationIDs[len(job.ConversationIDs)-1]
+				}
+				return e.resumeRepoInPlaceLocked(repo.HostID, repo.WorktreePath, opt)
+			}
+		}
+		for k, rows := range e.history {
+			for _, entry := range rows {
+				if entry.JobID == job.ID {
+					parts := strings.Split(k, "\x00")
+					if len(parts) == 2 {
+						histHost, histPath := parts[0], parts[1]
+						if opt.ConversationID == "" && job.ResumeConversationID != "" {
+							opt.ConversationID = job.ResumeConversationID
+						} else if opt.ConversationID == "" && len(job.ConversationIDs) > 0 {
+							opt.ConversationID = job.ConversationIDs[len(job.ConversationIDs)-1]
+						} else if opt.ConversationID == "" && len(entry.ConversationIDs) > 0 {
+							opt.ConversationID = entry.ConversationIDs[len(entry.ConversationIDs)-1]
+						}
+						if opt.PromptTitle == "" {
+							opt.PromptTitle = entry.PromptTitle
+						}
+						return e.resumeRepoInPlaceLocked(histHost, histPath, opt)
+					}
+				}
+			}
+		}
+		if opt.HostID != "" && opt.WorktreePath != "" {
+			return e.resumeRepoInPlaceLocked(opt.HostID, opt.WorktreePath, opt)
+		}
+		return Schedule{}, ErrNotFound
 	}
 
 	// Capture latest conversation ID if available.

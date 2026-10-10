@@ -1520,6 +1520,151 @@ func TestDirtyStoryDetectionAndResumption(t *testing.T) {
 	}
 }
 
+func TestResumeRepoInPlace(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-mac-mini", "permanent")
+	repoPath := "/Users/romeo/work/meta-repo-04"
+	if err := e.UpsertRepo(Repo{
+		HostID:                 "host-mac-mini",
+		WorktreePath:           repoPath,
+		CloneURL:               "https://example.test/repo.git",
+		Queue:                  QueuePaused,
+		Reason:                 ReasonDirty,
+		DirtyStoryID:           "STORY-IAZIO-0098",
+		DetectedConversationID: "conv-mac-mini-0098",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := e.PutPrompt(Prompt{Title: "Ready ASE prompt", Body: "run {{.StoryID}}", Status: "READY"})
+
+	sch, err := e.ResumeRepoInPlace("host-mac-mini", repoPath, ResumeOptions{
+		AllowDirty: true,
+	})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace failed: %v", err)
+	}
+
+	if sch.Kind != KindResume {
+		t.Fatalf("expected KindResume, got: %s", sch.Kind)
+	}
+	if sch.StoryID != "STORY-IAZIO-0098" {
+		t.Fatalf("expected StoryID STORY-IAZIO-0098, got: %s", sch.StoryID)
+	}
+	if sch.ResumeConversationID != "conv-mac-mini-0098" {
+		t.Fatalf("expected ResumeConversationID conv-mac-mini-0098, got: %s", sch.ResumeConversationID)
+	}
+	if sch.Priority < 100 {
+		t.Fatalf("expected elevated priority >= 100, got: %d", sch.Priority)
+	}
+	if sch.PromptID != p.ID {
+		t.Fatalf("expected PromptID %s, got: %s", p.ID, sch.PromptID)
+	}
+
+	detail, ok := e.GetRepoDetail("host-mac-mini", repoPath)
+	if !ok {
+		t.Fatal("repo detail not found")
+	}
+	if detail.Repo.Queue != QueueOpen || detail.Repo.Reason != "" {
+		t.Fatalf("expected QueueOpen and cleared reason, got queue=%s reason=%s", detail.Repo.Queue, detail.Repo.Reason)
+	}
+	if detail.Repo.DirtyStoryID != "STORY-IAZIO-0098" || detail.Repo.DetectedConversationID != "conv-mac-mini-0098" {
+		t.Fatalf("expected dirty context retained on repo, got story=%q conv=%q", detail.Repo.DirtyStoryID, detail.Repo.DetectedConversationID)
+	}
+
+	// Verify host can lease the resumed schedule
+	job, leasedSch, _, ok := e.PollHost("host-mac-mini")
+	if !ok || job.ScheduleID != sch.ID {
+		t.Fatalf("expected poll to lease resumed schedule, got ok=%v", ok)
+	}
+	if leasedSch.Kind != KindResume || leasedSch.StoryID != "STORY-IAZIO-0098" {
+		t.Fatalf("unexpected leased schedule: %+v", leasedSch)
+	}
+}
+
+func TestResumeJobHistoricalFallbackWhenJobNotInActiveMemory(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-mac-mini", "permanent")
+	repoPath := "/Users/romeo/work/meta-repo-04"
+	if err := e.UpsertRepo(Repo{
+		HostID:       "host-mac-mini",
+		WorktreePath: repoPath,
+		CloneURL:     "https://example.test/repo.git",
+		Queue:        QueuePaused,
+		Reason:       ReasonDirty,
+		DirtyStoryID: "STORY-IAZIO-0098",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := e.PutPrompt(Prompt{Title: "Ready ASE prompt", Body: "run {{.StoryID}}", Status: "READY"})
+
+	// Simulate history after restart where in-memory e.jobs is empty
+	key := repoKey("host-mac-mini", repoPath)
+	e.SetHistory(key, []HistoryRow{
+		{
+			JobID:           "historical-job-404",
+			ScheduleID:      "sch-old-1",
+			PromptTitle:     p.Title,
+			Engine:          "agent",
+			Status:          "DECLINED",
+			Reason:          "preflight_rejected: HALTED_DIRTY",
+			ConversationIDs: []string{"conv-discovered-from-history"},
+		},
+	})
+
+	// Calling ResumeJob on an in-memory-missing jobID should gracefully recover via history
+	sch, err := e.ResumeJob("historical-job-404", ResumeOptions{
+		AllowDirty: true,
+	})
+	if err != nil {
+		t.Fatalf("ResumeJob failed to recover via history: %v", err)
+	}
+
+	if sch.Kind != KindResume {
+		t.Fatalf("expected KindResume, got: %s", sch.Kind)
+	}
+	if sch.StoryID != "STORY-IAZIO-0098" {
+		t.Fatalf("expected StoryID STORY-IAZIO-0098, got: %s", sch.StoryID)
+	}
+	if sch.ResumeConversationID != "conv-discovered-from-history" {
+		t.Fatalf("expected ResumeConversationID conv-discovered-from-history, got: %s", sch.ResumeConversationID)
+	}
+
+	detail, ok := e.GetRepoDetail("host-mac-mini", repoPath)
+	if !ok || detail.Repo.Queue != QueueOpen || detail.Repo.Reason != "" {
+		t.Fatalf("expected QueueOpen and cleared reason, got: %+v", detail.Repo)
+	}
+}
+
+func TestResumeRepoInPlaceResolvesStoryFromBranchAndPorcelain(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-mac-mini", "permanent")
+	repoPath := "/work/meta-repo-04"
+	if err := e.UpsertRepo(Repo{
+		HostID:       "host-mac-mini",
+		WorktreePath: repoPath,
+		CloneURL:     "https://example.test/repo.git",
+		Queue:        QueuePaused,
+		Reason:       ReasonDirty,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set branch on repo via preflight
+	e.ApplyPreflight("host-mac-mini", repoPath, Preflight{
+		GitWorkTree:  true,
+		HeadAttached: true,
+		Branch:       "feat/iazio-0101-repo-in-place-resume",
+	})
+
+	sch, err := e.ResumeRepoInPlace("host-mac-mini", repoPath)
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace failed: %v", err)
+	}
+	if sch.StoryID != "STORY-IAZIO-0101" {
+		t.Fatalf("expected StoryID STORY-IAZIO-0101 from branch, got: %s", sch.StoryID)
+	}
+}
+
 
 
 

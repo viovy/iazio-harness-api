@@ -416,6 +416,36 @@ const openAPISpecJSON = `{
         }
       }
     },
+    "/v1/repos/{host}/resume-in-place": {
+      "post": {
+        "summary": "Resume paused repo in-place with dirty worktree and schedule KindResume job",
+        "parameters": [
+          { "name": "host", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "worktree_path": { "type": "string" },
+                  "path": { "type": "string" },
+                  "story_id": { "type": "string" },
+                  "conversation_id": { "type": "string" },
+                  "job_id": { "type": "string" },
+                  "allow_dirty": { "type": "boolean" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Repo resumed and resume schedule created" },
+          "404": { "description": "Repo not found" }
+        }
+      }
+    },
     "/v1/repos/{host}/force-pause": {
       "post": {
         "summary": "Force pause repo queue",
