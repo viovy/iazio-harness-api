@@ -1676,6 +1676,97 @@ func TestResumeRepoInPlaceResolvesStoryFromBranchAndPorcelain(t *testing.T) {
 	}
 }
 
+func TestDeclineJobCancellationSafetyAndCircuitBreaker(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app", CloneURL: "https://example.test/app.git"}); err != nil {
+		t.Fatal(err)
+	}
+	p := e.PutPrompt(Prompt{Title: "Task", Body: "do task", Status: "READY"})
+
+	// 1. Decline on preflight_rejected should immediately mark schedule DECLINED
+	sch1, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j1, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("poll 1 failed")
+	}
+	if err := e.DeclineJob(j1.ID, "preflight_rejected: HALTED_DIRTY"); err != nil {
+		t.Fatal(err)
+	}
+	schAfter, ok := e.schedules[sch1.ID]
+	if !ok || schAfter.Status != "DECLINED" {
+		t.Fatalf("expected preflight_rejected to mark schedule DECLINED, got: %s", schAfter.Status)
+	}
+	// Next poll should NOT re-lease the declined schedule
+	_, _, _, ok = e.PollHost("host-1")
+	if ok {
+		t.Fatalf("expected no schedule leased after preflight rejection")
+	}
+
+	// 2. Cancellation safety: declining an in-flight job on a cancelled schedule should NOT resurrect it
+	sch2, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j2, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("poll 2 failed")
+	}
+	// Cancel the schedule while job is running
+	if _, err := e.CancelSchedule(sch2.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Agent declines the cancelled job
+	if err := e.DeclineJob(j2.ID, "worktree_busy"); err != nil {
+		t.Fatal(err)
+	}
+	sch2After, ok := e.schedules[sch2.ID]
+	if !ok || sch2After.Status != "CANCELLED" {
+		t.Fatalf("expected schedule to remain CANCELLED after decline, got: %s", sch2After.Status)
+	}
+
+	// 3. Circuit breaker: 3 consecutive transient declines (e.g. worktree_busy) marks schedule DECLINED
+	sch3, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Decline 1
+	j3_1, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("poll 3.1 failed")
+	}
+	_ = e.DeclineJob(j3_1.ID, "worktree_busy")
+	if e.schedules[sch3.ID].Status != "QUEUED" {
+		t.Fatalf("expected QUEUED on retry 1, got: %s", e.schedules[sch3.ID].Status)
+	}
+	// Decline 2
+	j3_2, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("poll 3.2 failed")
+	}
+	_ = e.DeclineJob(j3_2.ID, "worktree_busy")
+	if e.schedules[sch3.ID].Status != "QUEUED" {
+		t.Fatalf("expected QUEUED on retry 2, got: %s", e.schedules[sch3.ID].Status)
+	}
+	// Decline 3 (exceeds MaxDeclineRetries)
+	j3_3, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("poll 3.3 failed")
+	}
+	_ = e.DeclineJob(j3_3.ID, "worktree_busy")
+	if e.schedules[sch3.ID].Status != "DECLINED" {
+		t.Fatalf("expected DECLINED on retry 3, got: %s", e.schedules[sch3.ID].Status)
+	}
+	// Verify no fourth poll
+	_, _, _, ok = e.PollHost("host-1")
+	if ok {
+		t.Fatalf("expected no schedule leased after circuit breaker tripped")
+	}
+}
+
 
 
 

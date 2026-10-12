@@ -39,6 +39,8 @@ const (
 	CorrelationWindow = 5 * time.Minute
 	// EphemeralGrace archives an offline one-shot host.
 	EphemeralGrace = 10 * time.Minute
+	// MaxDeclineRetries is the maximum consecutive declines before a schedule is halted.
+	MaxDeclineRetries = 3
 )
 
 var (
@@ -765,7 +767,14 @@ func (e *Engine) DeclineJob(jobID, reason string) error {
 		if sch.IterationsCompleted > 0 {
 			sch.IterationsCompleted--
 		}
-		sch.Status = "QUEUED"
+		if sch.Status != "CANCELLED" && sch.Status != "FINISHED" {
+			sch.LeaseRetries++
+			if sch.LeaseRetries >= MaxDeclineRetries || strings.HasPrefix(reason, "preflight_rejected:") {
+				sch.Status = "DECLINED"
+			} else {
+				sch.Status = "QUEUED"
+			}
+		}
 		if sch.CloneURL != "" {
 			delete(e.cloneLease, sch.CloneURL)
 		}
