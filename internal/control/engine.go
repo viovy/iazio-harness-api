@@ -1750,7 +1750,7 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		IterationsTotal:      1,
 		IterationsRemaining:  1,
 		IterationsCompleted:  0,
-		MaxExecutionDuration: 1800,
+		MaxExecutionDuration: DefaultMaxExec,
 		Status:               "QUEUED",
 		PromptTitle:          promptTitle,
 		Engine:               engineName,

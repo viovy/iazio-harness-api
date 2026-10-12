@@ -1571,6 +1571,10 @@ func TestResumeRepoInPlace(t *testing.T) {
 		t.Fatalf("expected dirty context retained on repo, got story=%q conv=%q", detail.Repo.DirtyStoryID, detail.Repo.DetectedConversationID)
 	}
 
+	if sch.MaxExecutionDuration < time.Minute {
+		t.Fatalf("expected MaxExecutionDuration >= 1m, got: %v", sch.MaxExecutionDuration)
+	}
+
 	// Verify host can lease the resumed schedule
 	job, leasedSch, _, ok := e.PollHost("host-mac-mini")
 	if !ok || job.ScheduleID != sch.ID {
@@ -1578,6 +1582,13 @@ func TestResumeRepoInPlace(t *testing.T) {
 	}
 	if leasedSch.Kind != KindResume || leasedSch.StoryID != "STORY-SAMPLE-0098" {
 		t.Fatalf("unexpected leased schedule: %+v", leasedSch)
+	}
+
+	// Verify job does not immediately timeout on reap sweep (regression check for 1800ns bug)
+	e.ReapExpired()
+	leasedJob, ok := e.GetJob(job.ID)
+	if !ok || leasedJob.Status != "RUNNING" {
+		t.Fatalf("expected job to remain RUNNING, got: %+v", leasedJob)
 	}
 }
 
