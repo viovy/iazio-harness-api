@@ -126,6 +126,9 @@ type JobDetail struct {
 	IsStalled                   bool              `json:"is_stalled,omitempty"`
 	StartedAt                   string            `json:"started_at,omitempty"`
 	Reason                      string            `json:"reason,omitempty"`
+	Model                       string            `json:"model,omitempty"`
+	Agent                       string            `json:"agent,omitempty"`
+	DisableSlashCommands        *bool             `json:"disable_slash_commands,omitempty"`
 }
 
 // ActiveJob describes an active job reported on heartbeat.
@@ -1492,6 +1495,14 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 		detail.Engine = sch.Engine
 		detail.WorktreePath = sch.WorktreePath
 		detail.EnvVars = sch.EnvVars
+		if detail.EnvVars != nil {
+			if m, ok := detail.EnvVars["MODEL"]; ok && m != "" {
+				detail.Model = m
+			}
+			if a, ok := detail.EnvVars["AGENT"]; ok && a != "" {
+				detail.Agent = a
+			}
+		}
 		detail.MaxExecutionDurationSeconds = int(sch.MaxExecutionDuration.Seconds())
 		if p, ok := e.prompts[sch.PromptID]; ok {
 			detail.Prompt = p.Body
