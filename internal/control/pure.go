@@ -169,6 +169,18 @@ func DecidePreflight(p Preflight) Halt {
 		}
 		return Halt{}
 	}
+	if p.Kind == KindResume {
+		// Resumption is explicitly intended to recover an in-flight prompt execution
+		// that left uncommitted work, modified submodules, or local review reports in the worktree.
+		// It permits dirty porcelain and untracked branches, skipping ReasonDirty and ReasonUntracked.
+		if !p.GitWorkTree {
+			return Halt{Reason: ReasonNoDocsHub, PauseQueue: false}
+		}
+		if !p.HeadAttached {
+			return Halt{Reason: ReasonDetached, PauseQueue: true}
+		}
+		return Halt{}
+	}
 	hubDirty := strings.TrimSpace(p.HubPorcelain) != ""
 	workDirty := strings.TrimSpace(p.WorkPorcelain) != ""
 	if p.Kind == KindRefinement {

@@ -58,6 +58,18 @@ func TestDecidePreflight(t *testing.T) {
 	if h := DecidePreflight(iv); h.Reason != "" {
 		t.Fatalf("intervention: %+v", h)
 	}
+	res := base
+	res.Kind = KindResume
+	res.WorkPorcelain = " M x"
+	res.HeadAttached = true
+	if h := DecidePreflight(res); h.Reason != "" {
+		t.Fatalf("resume with attached HEAD should permit dirty porcelain: %+v", h)
+	}
+	resDetached := res
+	resDetached.HeadAttached = false
+	if h := DecidePreflight(resDetached); h.Reason != ReasonDetached || !h.PauseQueue {
+		t.Fatalf("resume with detached HEAD should pause queue: %+v", h)
+	}
 	ref := base
 	ref.Kind = KindRefinement
 	ref.WorkPorcelain = " M leaf"
