@@ -1342,6 +1342,56 @@ func TestResumeJobUnhaltsDirtyQueueAndCustomConversationID(t *testing.T) {
 	}
 }
 
+func TestResumeJobAutoSwitchesAgentToAgyOnAntigravitySessionOrQuota(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "host-1",
+		WorktreePath: "/work/app",
+		CloneURL:     "https://example.test/app.git",
+		Queue:        QueueOpen,
+	})
+	p := e.PutPrompt(Prompt{Title: "Task 1", Body: "do task 1", Engine: "agent", Status: "READY"})
+	_, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatalf("expected poll to succeed")
+	}
+
+	// 1. Resume with Antigravity UUID conversation -> switches engine to agy
+	resSch, err := e.ResumeJob(job.ID, ResumeOptions{
+		ConversationID: "0ddc4208-8d7a-490b-86bb-1dee2e91ae82",
+		AllowDirty:     true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resSch.Engine != "agy" {
+		t.Fatalf("expected engine 'agy' for Antigravity conversation, got %s", resSch.Engine)
+	}
+
+	// 2. Job with ActionRequiredError / QUOTA_EXHAUSTED -> switches engine to agy
+	p2 := e.PutPrompt(Prompt{Title: "Task 2", Body: "do task 2", Engine: "agent", Status: "READY"})
+	_, _ = e.ExecutePrompt(p2.ID, "host-1", "/work/app", 1, nil)
+	job2, _, _, _ := e.PollHost("host-1")
+	_ = e.PostExit(job2.ID, 1, ExitOptions{
+		Reason:         "ActionRequiredError: Increase limits for faster responses You're out of usage.",
+		DiagnosticCode: "QUOTA_EXHAUSTED",
+	})
+	resSch2, err := e.ResumeJob(job2.ID, ResumeOptions{
+		AllowDirty: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resSch2.Engine != "agy" {
+		t.Fatalf("expected engine 'agy' on ActionRequiredError quota exhaustion, got %s", resSch2.Engine)
+	}
+}
+
 
 func TestRemediateRepo(t *testing.T) {
 	e := NewEngine(nil)
