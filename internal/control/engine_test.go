@@ -1676,6 +1676,51 @@ func TestResumeRepoInPlaceResolvesStoryFromBranchAndPorcelain(t *testing.T) {
 	}
 }
 
+func TestResumeRepoInPlaceEngineSelection(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-mac", "permanent")
+	repoPath := "/work/app"
+	if err := e.UpsertRepo(Repo{
+		HostID:                 "host-mac",
+		WorktreePath:           repoPath,
+		CloneURL:               "https://example.test/app.git",
+		DetectedConversationID: "0ddc4208-8d7a-490b-86bb-1dee2e91ae82",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Antigravity conversation ID should select "agy" engine
+	sch1, err := e.ResumeRepoInPlace("host-mac", repoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sch1.Engine != "agy" {
+		t.Fatalf("expected engine 'agy' for Antigravity conversation ID, got: %s", sch1.Engine)
+	}
+
+	// 2. Explicit engine override should be honored
+	sch2, err := e.ResumeRepoInPlace("host-mac", repoPath, ResumeOptions{
+		Engine: "custom-agent",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sch2.Engine != "custom-agent" {
+		t.Fatalf("expected engine 'custom-agent', got: %s", sch2.Engine)
+	}
+
+	// 3. Cursor conversation ID should select "agent" engine
+	sch3, err := e.ResumeRepoInPlace("host-mac", repoPath, ResumeOptions{
+		ConversationID: "cursor-123456",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sch3.Engine != "agent" {
+		t.Fatalf("expected engine 'agent' for cursor conversation ID, got: %s", sch3.Engine)
+	}
+}
+
 func TestDeclineJobCancellationSafetyAndCircuitBreaker(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("host-1", "permanent")

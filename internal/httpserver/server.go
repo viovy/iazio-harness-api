@@ -477,6 +477,7 @@ func (s *Server) resumeRepoInPlace(w http.ResponseWriter, r *http.Request) {
 		AllowDirty     bool   `json:"allow_dirty"`
 		PromptID       string `json:"prompt_id"`
 		PromptTitle    string `json:"prompt_title"`
+		Engine         string `json:"engine"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
 		writeErr(w, http.StatusBadRequest, err)
@@ -497,6 +498,7 @@ func (s *Server) resumeRepoInPlace(w http.ResponseWriter, r *http.Request) {
 		JobID:          body.JobID,
 		PromptID:       body.PromptID,
 		PromptTitle:    body.PromptTitle,
+		Engine:         body.Engine,
 		HostID:         host,
 		WorktreePath:   targetPath,
 	}
