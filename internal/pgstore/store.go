@@ -94,6 +94,10 @@ CREATE TABLE IF NOT EXISTS harness_history (
 CREATE INDEX IF NOT EXISTS idx_harness_history_repo ON harness_history (host_id, worktree_path, created_at ASC);
 
 ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS reason text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS error_message text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS diagnostic_code text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS model text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS remediation text NOT NULL DEFAULT '';
 
 DELETE FROM harness_history h1
 WHERE h1.status = 'DECLINED'
@@ -471,8 +475,8 @@ func (s *Store) SaveHistory(ctx context.Context, hostID, worktreePath string, ro
 		convBytes = []byte("[]")
 	}
 	_, err = s.db.ExecContext(ctx, `
-INSERT INTO harness_history (job_id, host_id, worktree_path, schedule_id, prompt_title, engine, status, clean, ase_complete, conversation_ids, reason)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+INSERT INTO harness_history (job_id, host_id, worktree_path, schedule_id, prompt_title, engine, status, clean, ase_complete, conversation_ids, reason, error_message, diagnostic_code, model, remediation)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 ON CONFLICT (job_id) DO UPDATE SET
   host_id = EXCLUDED.host_id,
   worktree_path = EXCLUDED.worktree_path,
@@ -483,8 +487,12 @@ ON CONFLICT (job_id) DO UPDATE SET
   clean = EXCLUDED.clean,
   ase_complete = EXCLUDED.ase_complete,
   conversation_ids = EXCLUDED.conversation_ids,
-  reason = EXCLUDED.reason
-`, row.JobID, hostID, worktreePath, row.ScheduleID, row.PromptTitle, row.Engine, row.Status, row.Clean, row.ASEComplete, string(convBytes), row.Reason)
+  reason = EXCLUDED.reason,
+  error_message = EXCLUDED.error_message,
+  diagnostic_code = EXCLUDED.diagnostic_code,
+  model = EXCLUDED.model,
+  remediation = EXCLUDED.remediation
+`, row.JobID, hostID, worktreePath, row.ScheduleID, row.PromptTitle, row.Engine, row.Status, row.Clean, row.ASEComplete, string(convBytes), row.Reason, row.ErrorMessage, row.DiagnosticCode, row.Model, row.Remediation)
 	if err != nil {
 		return fmt.Errorf("save history: %w", err)
 	}
@@ -503,13 +511,25 @@ func (s *Store) DeleteHistory(ctx context.Context, jobID string) error {
 	return nil
 }
 
+// ClearRepoHistory deletes all history rows for a host and worktree.
+func (s *Store) ClearRepoHistory(ctx context.Context, hostID, worktreePath string) error {
+	if s == nil || s.db == nil || hostID == "" || worktreePath == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM harness_history WHERE host_id = $1 AND worktree_path = $2`, hostID, worktreePath)
+	if err != nil {
+		return fmt.Errorf("clear repo history: %w", err)
+	}
+	return nil
+}
+
 // LoadHistory loads all history rows grouped by repoKey (host_id + "\x00" + worktree_path).
 func (s *Store) LoadHistory(ctx context.Context) (map[string][]control.HistoryRow, error) {
 	if s == nil || s.db == nil {
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT job_id, host_id, worktree_path, schedule_id, prompt_title, engine, status, clean, ase_complete, conversation_ids, reason
+SELECT job_id, host_id, worktree_path, schedule_id, prompt_title, engine, status, clean, ase_complete, conversation_ids, reason, error_message, diagnostic_code, model, remediation, created_at
 FROM harness_history ORDER BY created_at ASC
 `)
 	if err != nil {
@@ -522,7 +542,7 @@ FROM harness_history ORDER BY created_at ASC
 		var r control.HistoryRow
 		var hostID, worktreePath string
 		var convRaw []byte
-		if err := rows.Scan(&r.JobID, &hostID, &worktreePath, &r.ScheduleID, &r.PromptTitle, &r.Engine, &r.Status, &r.Clean, &r.ASEComplete, &convRaw, &r.Reason); err != nil {
+		if err := rows.Scan(&r.JobID, &hostID, &worktreePath, &r.ScheduleID, &r.PromptTitle, &r.Engine, &r.Status, &r.Clean, &r.ASEComplete, &convRaw, &r.Reason, &r.ErrorMessage, &r.DiagnosticCode, &r.Model, &r.Remediation, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		if len(convRaw) > 0 {

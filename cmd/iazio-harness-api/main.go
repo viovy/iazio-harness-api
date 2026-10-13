@@ -109,6 +109,8 @@ func main() {
 				log.Printf("warn: delete history %s for %s %s: %v", jobID, host, path, err)
 			}
 		}
+		srv.DeleteHistory = store.DeleteHistory
+		srv.ClearHistory = store.ClearRepoHistory
 		srv.DeleteRepo = func(hostID, path string) {
 			_ = store.DeleteRepo(context.Background(), hostID, path)
 		}

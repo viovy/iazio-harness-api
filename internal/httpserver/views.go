@@ -47,7 +47,8 @@ func scheduleView(s control.Schedule) map[string]any {
 		"env_keys":             keys,
 		"kind":                 s.Kind,
 		"priority":             s.Priority,
-		"status":               s.Status,
+		"status":                 s.Status,
+		"engine":                 s.Engine,
 		"resume_conversation_id": s.ResumeConversationID,
 		"story_id":               s.StoryID,
 	}
@@ -165,6 +166,11 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 			"ase_complete":     h.ASEComplete,
 			"conversation_ids": ids,
 			"reason":           h.Reason,
+			"error_message":    h.ErrorMessage,
+			"diagnostic_code":  h.DiagnosticCode,
+			"model":            h.Model,
+			"remediation":      h.Remediation,
+			"created_at":       h.CreatedAt.UTC().Format(time.RFC3339),
 		})
 	}
 	return map[string]any{
@@ -234,6 +240,11 @@ func historyItemView(h control.HistoryItem) map[string]any {
 		"ase_complete":     h.ASEComplete,
 		"conversation_ids": ids,
 		"reason":           h.Reason,
+		"error_message":    h.ErrorMessage,
+		"diagnostic_code":  h.DiagnosticCode,
+		"model":            h.Model,
+		"remediation":      h.Remediation,
+		"created_at":       h.CreatedAt.UTC().Format(time.RFC3339),
 	}
 }
 

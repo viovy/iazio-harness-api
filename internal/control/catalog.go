@@ -723,6 +723,11 @@ func (e *Engine) ListHistory(hostID, repoPath, status string, limit int) []Histo
 				ASEComplete:     row.ASEComplete,
 				ConversationIDs: row.ConversationIDs,
 				Reason:          row.Reason,
+				ErrorMessage:    row.ErrorMessage,
+				DiagnosticCode:  row.DiagnosticCode,
+				Model:           row.Model,
+				Remediation:     row.Remediation,
+				CreatedAt:       row.CreatedAt,
 			})
 		}
 	}

@@ -2,6 +2,7 @@
 package httpserver
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -35,6 +36,10 @@ type Server struct {
 	SaveProfile func(p control.DistributionProfile)
 	// DeleteProfile removes a distribution profile when a database is configured.
 	DeleteProfile func(name string)
+	// DeleteHistory removes a single history record when a database is configured.
+	DeleteHistory func(ctx context.Context, jobID string) error
+	// ClearHistory removes all history records for a repo when a database is configured.
+	ClearHistory func(ctx context.Context, hostID, worktreePath string) error
 }
 
 // Handler returns the HTTP routes.
@@ -92,6 +97,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/hosts/{id}/poll", s.pollHost)
 	mux.HandleFunc("GET /v1/hosts/{host}/repos", s.repoDetail)
 	mux.HandleFunc("DELETE /v1/hosts/{host}/repos", s.unregisterRepo)
+	mux.HandleFunc("DELETE /v1/hosts/{host}/repos/history", s.clearRepoHistory)
+	mux.HandleFunc("DELETE /v1/history/{id}", s.deleteHistoryRow)
 	mux.HandleFunc("POST /v1/hosts/{host}/repo-requests", s.repoRequest)
 	mux.HandleFunc("POST /v1/hosts/{host}/docs-hub/discard", s.discardHub)
 	mux.HandleFunc("POST /v1/repos", s.upsertRepo)
@@ -793,12 +800,10 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) postExit(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		ExitCode int `json:"exit_code"`
-	}
+	var body control.ExitOptions
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	jobID := r.PathValue("id")
-	if err := s.Engine.PostExit(jobID, body.ExitCode); err != nil {
+	if err := s.Engine.PostExit(jobID, body.ExitCode, body); err != nil {
 		writeErr(w, http.StatusConflict, err)
 		return
 	}
@@ -952,6 +957,44 @@ func (s *Server) unregisterRepo(w http.ResponseWriter, r *http.Request) {
 		s.DeleteRepo(host, path)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) deleteHistoryRow(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("id")
+	if jobID == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("missing job id"))
+		return
+	}
+	deleted := s.Engine.DeleteHistoryRow(jobID)
+	if s.DeleteHistory != nil {
+		_ = s.DeleteHistory(r.Context(), jobID)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted, "job_id": jobID})
+}
+
+func (s *Server) clearRepoHistory(w http.ResponseWriter, r *http.Request) {
+	host := r.PathValue("host")
+	repoPath := r.URL.Query().Get("path")
+	if repoPath == "" && r.Body != nil {
+		var body struct {
+			Path         string `json:"path"`
+			WorktreePath string `json:"worktree_path"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		repoPath = body.WorktreePath
+		if repoPath == "" {
+			repoPath = body.Path
+		}
+	}
+	if host == "" || repoPath == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("missing host or path"))
+		return
+	}
+	count := s.Engine.ClearHistory(host, repoPath)
+	if s.ClearHistory != nil {
+		_ = s.ClearHistory(r.Context(), host, repoPath)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"cleared": count, "host": host, "path": repoPath})
 }
 
 func (s *Server) repoRequest(w http.ResponseWriter, r *http.Request) {
