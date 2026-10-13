@@ -793,8 +793,11 @@ func (e *Engine) DeclineJob(jobID, reason string) error {
 					}
 				}
 			}
-			if !hasActive && repo.Lock == LockRunning {
-				repo.Lock = LockIdle
+			if !hasActive {
+				if repo.Lock == LockRunning {
+					repo.Lock = LockIdle
+				}
+				repo.RunningJobID = ""
 			}
 			changedRepo = repo
 		}
@@ -1233,7 +1236,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 					continue
 				}
 			}
-			if repo.Reason != "" {
+			if repo.Reason != "" && repo.Reason != "REMEDIATED" {
 				if repo.Reason == ReasonDisk {
 					continue
 				}
@@ -1274,6 +1277,9 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 		if repo != nil {
 			repo.Lock = LockRunning
 			repo.RunningJobID = id
+			if repo.Reason == "REMEDIATED" {
+				repo.Reason = ""
+			}
 			docs = repo.DocsHubPath
 			e.notifyRepoLocked(repo)
 		}

@@ -1767,6 +1767,77 @@ func TestDeclineJobCancellationSafetyAndCircuitBreaker(t *testing.T) {
 	}
 }
 
+func TestPollHostSchedulesNormalJobsWhenRemediated(t *testing.T) {
+	curr := time.Unix(1_700_000_000, 0)
+	e := NewEngine(func() time.Time { return curr })
+	e.RegisterHost("host-1", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "host-1",
+		WorktreePath: "/work/app",
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+		Reason:       "REMEDIATED",
+	})
 
+	p := e.PutPrompt(Prompt{Title: "Task 1", Body: "do task 1", Status: "READY"})
+	_, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatalf("expected normal schedule to be leased on REMEDIATED repo with QueueOpen")
+	}
+	if job.Status != "RUNNING" {
+		t.Fatalf("expected job RUNNING, got %s", job.Status)
+	}
 
+	repo, _ := e.GetRepo("host-1", "/work/app")
+	if repo.Lock != LockRunning || repo.RunningJobID != job.ID {
+		t.Fatalf("expected repo lock RUNNING and RunningJobID set, got: %+v", repo)
+	}
+	if repo.Reason != "" {
+		t.Fatalf("expected REMEDIATED reason to be cleared when job starts, got: %s", repo.Reason)
+	}
+}
+
+func TestDeclineJobClearsRunningJobID(t *testing.T) {
+	curr := time.Unix(1_700_000_000, 0)
+	e := NewEngine(func() time.Time { return curr })
+	e.RegisterHost("host-1", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "host-1",
+		WorktreePath: "/work/app",
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	p := e.PutPrompt(Prompt{Title: "Task 1", Body: "do task 1", Status: "READY"})
+	_, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("poll failed")
+	}
+
+	repo, _ := e.GetRepo("host-1", "/work/app")
+	if repo.RunningJobID != job.ID || repo.Lock != LockRunning {
+		t.Fatalf("expected running job %s, got: %+v", job.ID, repo)
+	}
+
+	if err := e.DeclineJob(job.ID, "preflight_rejected: HALTED_DIRTY"); err != nil {
+		t.Fatal(err)
+	}
+
+	repo, _ = e.GetRepo("host-1", "/work/app")
+	if repo.Lock != LockIdle {
+		t.Fatalf("expected repo LockIdle after decline, got: %s", repo.Lock)
+	}
+	if repo.RunningJobID != "" {
+		t.Fatalf("expected repo RunningJobID cleared after decline, got: %s", repo.RunningJobID)
+	}
+}
