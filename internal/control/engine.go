@@ -231,6 +231,11 @@ type HistoryRow struct {
 	ASEComplete     bool
 	ConversationIDs []string
 	Reason          string
+	ErrorMessage    string
+	DiagnosticCode  string
+	Model           string
+	Remediation     string
+	CreatedAt       time.Time
 }
 
 // HistoryItem is one execution record reported across repositories.
@@ -246,6 +251,11 @@ type HistoryItem struct {
 	ASEComplete     bool
 	ConversationIDs []string
 	Reason          string
+	ErrorMessage    string
+	DiagnosticCode  string
+	Model           string
+	Remediation     string
+	CreatedAt       time.Time
 }
 
 // LogChunk is one stripped output event.
@@ -708,12 +718,19 @@ func (e *Engine) ResumeRepo(host, path string) error {
 }
 
 // PostExit marks the child gone. Cancel after this is rejected.
-func (e *Engine) PostExit(jobID string, code int) error {
+func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	job, ok := e.jobs[jobID]
 	if !ok {
 		return ErrCancelClosed
+	}
+	var opt ExitOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+		if opt.ExitCode != 0 && code == 0 {
+			code = opt.ExitCode
+		}
 	}
 	job.ExitPosted = true
 	var changedRepo *Repo
@@ -735,6 +752,11 @@ func (e *Engine) PostExit(jobID string, code int) error {
 	} else if job.Status == "RUNNING" {
 		if code != 0 {
 			job.Status = "FAILED"
+			if opt.Reason != "" {
+				job.Reason = opt.Reason
+			} else if opt.DiagnosticCode != "" {
+				job.Reason = opt.DiagnosticCode
+			}
 			if sch, ok := e.schedules[job.ScheduleID]; ok {
 				if sch.IterationsRemaining <= 0 {
 					sch.Status = "FAILED"
@@ -751,10 +773,16 @@ func (e *Engine) PostExit(jobID string, code int) error {
 					if repo.Queue == QueueOpen {
 						repo.Queue = QueuePaused
 					}
-					repo.Reason = "NON_ZERO_EXIT"
+					if opt.DiagnosticCode != "" {
+						repo.Reason = opt.DiagnosticCode
+					} else if opt.Reason != "" {
+						repo.Reason = opt.Reason
+					} else {
+						repo.Reason = "NON_ZERO_EXIT"
+					}
 					changedRepo = repo
 				}
-				e.updateHistoryStatusLocked(sch.HostID, sch.WorktreePath, jobID, "FAILED")
+				e.updateHistoryStatusLocked(sch.HostID, sch.WorktreePath, jobID, "FAILED", opt)
 			}
 		} else {
 			job.Status = "RUN_FINISHED"
@@ -774,7 +802,7 @@ func (e *Engine) PostExit(jobID string, code int) error {
 					}
 					changedRepo = repo
 				}
-				e.updateHistoryStatusLocked(sch.HostID, sch.WorktreePath, jobID, "RUN_FINISHED")
+				e.updateHistoryStatusLocked(sch.HostID, sch.WorktreePath, jobID, "RUN_FINISHED", opt)
 			}
 		}
 	}
@@ -1351,6 +1379,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			Clean:           false,
 			ASEComplete:     false,
 			ConversationIDs: []string{},
+			CreatedAt:       e.now(),
 		}
 		if sch.ResumeConversationID != "" {
 			row.ConversationIDs = append(row.ConversationIDs, sch.ResumeConversationID)
@@ -1362,12 +1391,33 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 	return Job{}, Schedule{}, "", false
 }
 
-func (e *Engine) updateHistoryStatusLocked(host, path, jobID, status string) {
+func (e *Engine) updateHistoryStatusLocked(host, path, jobID, status string, opts ...ExitOptions) {
 	key := repoKey(host, path)
 	rows := e.history[key]
 	for i := len(rows) - 1; i >= 0; i-- {
 		if rows[i].JobID == jobID {
 			rows[i].Status = status
+			if len(opts) > 0 {
+				opt := opts[0]
+				if opt.Reason != "" {
+					rows[i].Reason = opt.Reason
+				}
+				if opt.ErrorMessage != "" {
+					rows[i].ErrorMessage = opt.ErrorMessage
+				}
+				if opt.DiagnosticCode != "" {
+					rows[i].DiagnosticCode = opt.DiagnosticCode
+				}
+				if opt.Model != "" {
+					rows[i].Model = opt.Model
+				}
+				if opt.Remediation != "" {
+					rows[i].Remediation = opt.Remediation
+				}
+				if opt.Engine != "" {
+					rows[i].Engine = opt.Engine
+				}
+			}
 			if rows[i].Reason == "" && (status == "LEASE_EXPIRED" || status == "EXECUTION_TIMEOUT" || status == "HOST_OFFLINE" || status == "FAILED") {
 				rows[i].Reason = status
 			}
@@ -1414,10 +1464,44 @@ func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseC
 	}
 	row := HistoryRow{
 		JobID: jobID, ScheduleID: schID, PromptTitle: title, Engine: engine,
-		Status: status, Clean: clean, ASEComplete: aseComplete,
+		Status: status, Clean: clean, ASEComplete: aseComplete, CreatedAt: e.now(),
 	}
 	e.history[key] = append(e.history[key], row)
 	e.notifyHistoryLocked(host, path, row)
+}
+
+// DeleteHistoryRow removes one finished job record by job_id from history and fires OnHistoryDelete.
+func (e *Engine) DeleteHistoryRow(jobID string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for key, rows := range e.history {
+		for i, r := range rows {
+			if r.JobID == jobID {
+				host, path := "", ""
+				if idx := strings.Index(key, "\x00"); idx >= 0 {
+					host, path = key[:idx], key[idx+1:]
+				}
+				e.history[key] = append(rows[:i], rows[i+1:]...)
+				e.notifyHistoryDeleteLocked(host, path, jobID)
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ClearHistory removes all history records for a repo and notifies deletion for each.
+func (e *Engine) ClearHistory(host, path string) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	key := repoKey(host, path)
+	rows := e.history[key]
+	count := len(rows)
+	for _, r := range rows {
+		e.notifyHistoryDeleteLocked(host, path, r.JobID)
+	}
+	delete(e.history, key)
+	return count
 }
 
 // ChangeSchedulePriority shifts a schedule's priority by delta.
@@ -1777,11 +1861,16 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 	// 3b. Try to find prompt from history
 	if targetPrompt == nil {
 		if rows := e.history[repoKey(host, path)]; len(rows) > 0 {
+			lastRow := rows[len(rows)-1]
 			if promptTitle == "" {
-				promptTitle = rows[len(rows)-1].PromptTitle
+				promptTitle = lastRow.PromptTitle
 			}
-			if engineName == "" && rows[len(rows)-1].Engine != "" {
-				engineName = rows[len(rows)-1].Engine
+			if engineName == "" {
+				if (lastRow.DiagnosticCode == "QUOTA_EXHAUSTED" || lastRow.Reason == "QUOTA_EXHAUSTED" || repo.Reason == "QUOTA_EXHAUSTED" || lastRow.Remediation == "switch_to_agy") && (lastRow.Engine == "agent" || lastRow.Engine == "") {
+					engineName = "agy"
+				} else if lastRow.Engine != "" {
+					engineName = lastRow.Engine
+				}
 			}
 		}
 		if promptTitle != "" {

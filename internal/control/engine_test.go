@@ -1,6 +1,7 @@
 package control
 
 import (
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -2035,3 +2036,99 @@ func TestResumeRepoInPlaceResilience(t *testing.T) {
 	}
 	_ = job
 }
+
+func TestPostExitDiagnosticOptionsAndResumeFallback(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "permanent", "generic")
+	p := e.PutPrompt(Prompt{
+		Title:   "Story Execution",
+		Body:    "execute story",
+		Engine:  "agent",
+		Status:  "READY",
+		StoryID: "STORY-123",
+	})
+	if err := e.UpsertRepo(Repo{
+		HostID:       "host-1",
+		WorktreePath: "/work/app-tree",
+		CloneURL:     "https://github.com/org/repo.git",
+		Queue:        QueueOpen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := e.ExecutePrompt(p.ID, "host-1", "/work/app-tree", 1, nil)
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	job, sch, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("poll failed")
+	}
+	if sch.Engine != "agent" {
+		t.Fatalf("expected engine agent, got %s", sch.Engine)
+	}
+
+	// Harness reports exit with QUOTA_EXHAUSTED diagnostic options
+	exitErr := e.PostExit(job.ID, 1, ExitOptions{
+		ExitCode:       1,
+		Reason:         "QUOTA_EXHAUSTED",
+		DiagnosticCode: "QUOTA_EXHAUSTED",
+		ErrorMessage:   "ActionRequiredError: Increase limits for faster responses You're out of usage. Switch to Auto, or ask your admin to increase your limit to continue.",
+		Engine:         "agent",
+		Model:          "auto",
+		Remediation:    "switch_to_agy",
+	})
+	if exitErr != nil {
+		t.Fatalf("PostExit failed: %v", exitErr)
+	}
+
+	detail, ok := e.GetRepoDetail("host-1", "/work/app-tree")
+	if !ok {
+		t.Fatal("repo not found")
+	}
+	if detail.Repo.Reason != "QUOTA_EXHAUSTED" {
+		t.Fatalf("expected repo.Reason QUOTA_EXHAUSTED, got %q", detail.Repo.Reason)
+	}
+	if detail.Repo.Queue != QueuePaused {
+		t.Fatalf("expected repo.Queue PAUSED, got %q", detail.Repo.Queue)
+	}
+	if len(detail.History) == 0 {
+		t.Fatal("expected history row")
+	}
+	lastRow := detail.History[len(detail.History)-1]
+	if lastRow.DiagnosticCode != "QUOTA_EXHAUSTED" {
+		t.Fatalf("expected history DiagnosticCode QUOTA_EXHAUSTED, got %q", lastRow.DiagnosticCode)
+	}
+	if lastRow.ErrorMessage == "" || !strings.Contains(lastRow.ErrorMessage, "ActionRequiredError") {
+		t.Fatalf("expected history ErrorMessage to contain ActionRequiredError, got %q", lastRow.ErrorMessage)
+	}
+	if lastRow.Model != "auto" {
+		t.Fatalf("expected history Model auto, got %q", lastRow.Model)
+	}
+	if lastRow.Remediation != "switch_to_agy" {
+		t.Fatalf("expected history Remediation switch_to_agy, got %q", lastRow.Remediation)
+	}
+
+	items := e.ListHistory("host-1", "/work/app-tree", "", 10)
+	if len(items) == 0 || items[0].DiagnosticCode != "QUOTA_EXHAUSTED" {
+		t.Fatalf("expected ListHistory to reflect diagnostic code, got %+v", items)
+	}
+
+	// Trigger ResumeRepoInPlace without explicit engine -> should automatically switch to "agy"
+	resumeSch, err := e.ResumeRepoInPlace("host-1", "/work/app-tree", ResumeOptions{AllowDirty: true})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace failed: %v", err)
+	}
+	if resumeSch.Engine != "agy" {
+		t.Fatalf("expected resume schedule engine 'agy' due to auto-fallback, got %q", resumeSch.Engine)
+	}
+
+	detailAfterResume, _ := e.GetRepoDetail("host-1", "/work/app-tree")
+	if detailAfterResume.Repo.Queue != QueueOpen {
+		t.Fatalf("expected repo queue OPEN after resume, got %q", detailAfterResume.Repo.Queue)
+	}
+	if detailAfterResume.Repo.Reason != "" {
+		t.Fatalf("expected cleared repo reason after resume, got %q", detailAfterResume.Repo.Reason)
+	}
+}
+

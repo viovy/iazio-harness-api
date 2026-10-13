@@ -675,5 +675,120 @@ func TestResumeRepoInPlaceEndpoint(t *testing.T) {
 	}
 }
 
+func TestPostExitDiagnosticsHTTP(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	h := s.Handler()
+
+	s.Engine.RegisterHost("host-1", "permanent", "generic")
+	p := s.Engine.PutPrompt(control.Prompt{
+		Title:   "Story Exec",
+		Body:    "body",
+		Engine:  "agent",
+		Status:  "READY",
+		StoryID: "STORY-555",
+	})
+	if err := s.Engine.UpsertRepo(control.Repo{
+		HostID:       "host-1",
+		WorktreePath: "/work/test-repo",
+		CloneURL:     "https://github.com/org/repo.git",
+		Queue:        control.QueueOpen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Engine.ExecutePrompt(p.ID, "host-1", "/work/test-repo", 1, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	job, _, _, ok := s.Engine.PollHost("host-1")
+	if !ok {
+		t.Fatal("poll failed")
+	}
+
+	exitBody, _ := json.Marshal(map[string]any{
+		"exit_code":       1,
+		"reason":          "QUOTA_EXHAUSTED",
+		"diagnostic_code": "QUOTA_EXHAUSTED",
+		"error_message":   "ActionRequiredError: Increase limits for faster responses You're out of usage. Switch to Auto, or ask your admin to increase your limit to continue.",
+		"model":           "auto",
+		"engine":          "agent",
+		"remediation":     "switch_to_agy",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/exit", bytes.NewReader(exitBody))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("exit failed: code %d body %s", rr.Code, rr.Body.String())
+	}
+
+	// Verify repo detail endpoint includes diagnostic fields
+	req = httptest.NewRequest(http.MethodGet, "/v1/hosts/host-1/repos?path=/work/test-repo", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("get repo detail failed: code %d body %s", rr.Code, rr.Body.String())
+	}
+	var repoResp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &repoResp); err != nil {
+		t.Fatal(err)
+	}
+	if repoResp["reason"] != "QUOTA_EXHAUSTED" {
+		t.Fatalf("expected repo reason QUOTA_EXHAUSTED, got %v", repoResp["reason"])
+	}
+	historyList, ok := repoResp["history"].([]any)
+	if !ok || len(historyList) == 0 {
+		t.Fatalf("expected non-empty history list: %v", repoResp["history"])
+	}
+	firstHistory := historyList[0].(map[string]any)
+	if firstHistory["diagnostic_code"] != "QUOTA_EXHAUSTED" {
+		t.Fatalf("expected diagnostic_code QUOTA_EXHAUSTED, got %v", firstHistory["diagnostic_code"])
+	}
+	if firstHistory["model"] != "auto" {
+		t.Fatalf("expected model auto, got %v", firstHistory["model"])
+	}
+	if firstHistory["remediation"] != "switch_to_agy" {
+		t.Fatalf("expected remediation switch_to_agy, got %v", firstHistory["remediation"])
+	}
+	if firstHistory["created_at"] == nil || firstHistory["created_at"] == "" {
+		t.Fatalf("expected created_at timestamp in history, got %v", firstHistory["created_at"])
+	}
+
+	// Resume repo via HTTP endpoint -> verify auto-fallback to agy
+	resumeBody, _ := json.Marshal(map[string]any{
+		"path":        "/work/test-repo",
+		"allow_dirty": true,
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/repos/host-1/resume-in-place", bytes.NewReader(resumeBody))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("resume failed: code %d body %s", rr.Code, rr.Body.String())
+	}
+	var resumeResp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &resumeResp); err != nil {
+		t.Fatal(err)
+	}
+	if resumeResp["engine"] != "agy" {
+		t.Fatalf("expected engine 'agy' on resume, got %v", resumeResp["engine"])
+	}
+
+	// Delete one history entry via DELETE /v1/history/{id}
+	histJobID := firstHistory["job_id"].(string)
+	req = httptest.NewRequest(http.MethodDelete, "/v1/history/"+histJobID, nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("delete history failed: code %d body %s", rr.Code, rr.Body.String())
+	}
+
+	// Clear history endpoint test
+	req = httptest.NewRequest(http.MethodDelete, "/v1/hosts/host-1/repos/history?path=/work/test-repo", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("clear history failed: code %d body %s", rr.Code, rr.Body.String())
+	}
+}
+
+
 
 

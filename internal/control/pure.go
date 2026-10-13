@@ -72,6 +72,17 @@ type ResumeOptions struct {
 	Engine         string `json:"engine,omitempty"`
 }
 
+// ExitOptions provides additional diagnostic and error context when a job finishes.
+type ExitOptions struct {
+	ExitCode       int    `json:"exit_code"`
+	Reason         string `json:"reason,omitempty"`
+	ErrorMessage   string `json:"error_message,omitempty"`
+	DiagnosticCode string `json:"diagnostic_code,omitempty"`
+	Engine         string `json:"engine,omitempty"`
+	Model          string `json:"model,omitempty"`
+	Remediation    string `json:"remediation,omitempty"`
+}
+
 // ErrBadShareURL is returned when an import URL is not a Gemini share link.
 var ErrBadShareURL = errors.New("share url must be https://gemini.google.com/share/<id>")
 
