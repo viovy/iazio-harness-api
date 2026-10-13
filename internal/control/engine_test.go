@@ -1719,6 +1719,45 @@ func TestResumeRepoInPlaceEngineSelection(t *testing.T) {
 	if sch3.Engine != "agent" {
 		t.Fatalf("expected engine 'agent' for cursor conversation ID, got: %s", sch3.Engine)
 	}
+
+	// 4. agy- prefixed conversation ID should select "agy" engine
+	sch4, err := e.ResumeRepoInPlace("host-mac", repoPath, ResumeOptions{
+		ConversationID: "agy-0ddc4208-8d7a-490b-86bb-1dee2e91ae82",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sch4.Engine != "agy" {
+		t.Fatalf("expected engine 'agy' for agy- prefixed conversation ID, got: %s", sch4.Engine)
+	}
+
+	// 5. Uppercase UUID should select "agy" engine
+	sch5, err := e.ResumeRepoInPlace("host-mac", repoPath, ResumeOptions{
+		ConversationID: "0DDC4208-8D7A-490B-86BB-1DEE2E91AE82",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sch5.Engine != "agy" {
+		t.Fatalf("expected engine 'agy' for uppercase UUID, got: %s", sch5.Engine)
+	}
+
+	// 6. Unknown / empty conversation ID defaults to "agy"
+	repoEmpty := "/work/app-empty"
+	if err := e.UpsertRepo(Repo{
+		HostID:       "host-mac",
+		WorktreePath: repoEmpty,
+		CloneURL:     "https://example.test/app-empty.git",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sch6, err := e.ResumeRepoInPlace("host-mac", repoEmpty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sch6.Engine != "agy" {
+		t.Fatalf("expected default engine 'agy' for empty conversation ID, got: %s", sch6.Engine)
+	}
 }
 
 func TestDeclineJobCancellationSafetyAndCircuitBreaker(t *testing.T) {
