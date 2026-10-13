@@ -13,7 +13,7 @@ import (
 
 var (
 	storyIDPattern     = regexp.MustCompile(`(?i)\b(STORY-[A-Z0-9]+-[0-9]+)\b`)
-	prefixStoryPattern = regexp.MustCompile(`(?i)\b(iazio|gov|vigo|ci)-([0-9]+)\b`)
+	prefixStoryPattern = regexp.MustCompile(`(?i)\b([a-z0-9]{2,10})-([0-9]{3,5})\b`)
 )
 
 func extractStoryIDFromString(s string) string {
@@ -24,6 +24,38 @@ func extractStoryIDFromString(s string) string {
 		return "STORY-" + strings.ToUpper(m[1]) + "-" + m[2]
 	}
 	return ""
+}
+
+func extractStoryIDFromPorcelain(porcelain string) (storyID, reviewFile string) {
+	if strings.TrimSpace(porcelain) == "" {
+		return "", ""
+	}
+	lines := strings.Split(porcelain, "\n")
+	for _, l := range lines {
+		if len(l) < 3 {
+			continue
+		}
+		pathPart := strings.TrimSpace(l[2:])
+		if idx := strings.Index(pathPart, " -> "); idx != -1 {
+			pathPart = strings.TrimSpace(pathPart[idx+4:])
+		}
+		if (strings.HasPrefix(pathPart, "docs/reviews/") || strings.Contains(pathPart, "/docs/reviews/")) && strings.HasSuffix(pathPart, ".md") {
+			reviewFile = pathPart
+			if sid := extractStoryIDFromString(pathPart); sid != "" {
+				storyID = sid
+				return storyID, reviewFile
+			}
+		}
+		if storyID == "" && (strings.HasPrefix(pathPart, "docs/stories/") || strings.Contains(pathPart, "/docs/stories/")) {
+			if sid := extractStoryIDFromString(pathPart); sid != "" {
+				storyID = sid
+			}
+		}
+	}
+	if storyID == "" {
+		storyID = extractStoryIDFromString(porcelain)
+	}
+	return storyID, reviewFile
 }
 
 const (
@@ -593,36 +625,38 @@ func (e *Engine) ApplyPreflight(host, path string, p Preflight) Halt {
 		repo.DetectedConversationID = p.DetectedConversationID
 		repo.DetectedVerdict = p.DetectedVerdict
 	} else if repo.Porcelain != "" {
-		lines := strings.Split(repo.Porcelain, "\n")
-		for _, l := range lines {
-			trimmed := strings.TrimSpace(l)
-			if len(trimmed) > 3 {
-				pathPart := strings.TrimSpace(trimmed[3:])
-				if strings.HasPrefix(pathPart, "docs/reviews/") && strings.HasSuffix(pathPart, ".md") {
-					repo.DirtyReviewFile = pathPart
-					if sid := extractStoryIDFromString(pathPart); sid != "" {
-						repo.DirtyStoryID = sid
-					}
-					break
-				}
-				if repo.DirtyStoryID == "" && strings.HasPrefix(pathPart, "docs/stories/") {
-					if sid := extractStoryIDFromString(pathPart); sid != "" {
-						repo.DirtyStoryID = sid
-					}
-				}
-			}
+		sid, rfile := extractStoryIDFromPorcelain(repo.Porcelain)
+		if sid != "" {
+			repo.DirtyStoryID = sid
+		}
+		if rfile != "" {
+			repo.DirtyReviewFile = rfile
+		}
+	}
+	if repo.DirtyStoryID == "" && repo.CurrentBranch != "" {
+		if sid := extractStoryIDFromString(repo.CurrentBranch); sid != "" {
+			repo.DirtyStoryID = sid
 		}
 	}
 
-	if h.Reason == "" {
+	clean := strings.TrimSpace(p.WorkPorcelain) == "" && strings.TrimSpace(p.HubPorcelain) == ""
+	if clean {
 		repo.DirtyStoryID = ""
 		repo.DirtyReviewFile = ""
 		repo.DetectedConversationID = ""
 		repo.DetectedVerdict = ""
+		repo.Porcelain = ""
+		if repo.Queue == QueuePaused && repo.Reason == ReasonDirty {
+			repo.Queue = QueueOpen
+			repo.Reason = ""
+		}
+	}
+
+	if h.Reason == "" {
 		if repo.Reason == ReasonDisk {
 			repo.Reason = ""
 		}
-		if repo.Queue == QueuePaused && repo.Reason == ReasonDirty {
+		if clean && repo.Queue == QueuePaused && repo.Reason == ReasonDirty {
 			repo.Queue = QueueOpen
 			repo.Reason = ""
 			repo.Porcelain = ""
@@ -855,6 +889,31 @@ func (e *Engine) ApplyFinish(host, path string, jobID string, in FinishInput) Fi
 		repo.Reason = d.Reason
 		repo.HealingAttempts = d.HealingAttempts
 		repo.Lock = LockIdle
+		if strings.TrimSpace(in.WorkPorcelain) != "" {
+			repo.Porcelain = in.WorkPorcelain
+		}
+		if d.Reason == ReasonDirty {
+			if repo.DirtyStoryID == "" {
+				if sid, rfile := extractStoryIDFromPorcelain(in.WorkPorcelain); sid != "" {
+					repo.DirtyStoryID = sid
+					if rfile != "" {
+						repo.DirtyReviewFile = rfile
+					}
+				}
+			}
+			if repo.DirtyStoryID == "" && repo.CurrentBranch != "" {
+				if sid := extractStoryIDFromString(repo.CurrentBranch); sid != "" {
+					repo.DirtyStoryID = sid
+				}
+			}
+			if repo.DirtyStoryID == "" {
+				if job, ok := e.jobs[jobID]; ok {
+					if sch, ok := e.schedules[job.ScheduleID]; ok && sch.StoryID != "" {
+						repo.DirtyStoryID = sch.StoryID
+					}
+				}
+			}
+		}
 		e.notifyRepoLocked(repo)
 	}
 	if job, ok := e.jobs[jobID]; ok {
@@ -1670,7 +1729,20 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		targetStoryID = extractStoryIDFromString(repo.CurrentBranch)
 	}
 	if targetStoryID == "" && repo.Porcelain != "" {
-		targetStoryID = extractStoryIDFromString(repo.Porcelain)
+		targetStoryID, _ = extractStoryIDFromPorcelain(repo.Porcelain)
+	}
+	if targetStoryID == "" {
+		if rows := e.history[repoKey(host, path)]; len(rows) > 0 {
+			for i := len(rows) - 1; i >= 0; i-- {
+				if sid := extractStoryIDFromString(rows[i].PromptTitle); sid != "" {
+					targetStoryID = sid
+					break
+				}
+			}
+		}
+	}
+	if targetStoryID == "" {
+		targetStoryID = "STORY-RESUME-INPLACE"
 	}
 
 	// 2. Resolve conversation ID: explicit opt -> repo.DetectedConversationID -> latest from history
@@ -1744,8 +1816,12 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 	if promptID == "" {
 		promptID = "prompt-1"
 	}
-	if promptTitle == "" {
-		promptTitle = "Ready ASE prompt"
+	if promptTitle == "" || promptTitle == "Ready ASE prompt" {
+		if targetStoryID != "" && targetStoryID != "STORY-RESUME-INPLACE" {
+			promptTitle = "Resume " + targetStoryID + " In-Place"
+		} else {
+			promptTitle = "Resume complete current ASE flow"
+		}
 	}
 
 	// If engine is still unset, infer from conversation ID (or default to agy for standard Antigravity sessions)
