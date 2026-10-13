@@ -1689,11 +1689,11 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		}
 	}
 
-	// 3. Resolve Prompt
+	// 3. Resolve Prompt and Engine
 	var targetPrompt *Prompt
 	promptTitle := opt.PromptTitle
 	promptID := opt.PromptID
-	engineName := "agent"
+	engineName := opt.Engine
 
 	// 3a. Explicit prompt ID
 	if promptID != "" {
@@ -1708,7 +1708,7 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 			if promptTitle == "" {
 				promptTitle = rows[len(rows)-1].PromptTitle
 			}
-			if rows[len(rows)-1].Engine != "" {
+			if engineName == "" && rows[len(rows)-1].Engine != "" {
 				engineName = rows[len(rows)-1].Engine
 			}
 		}
@@ -1737,7 +1737,7 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		promptID = targetPrompt.ID
 		promptTitle = targetPrompt.Title
 		promptRev = targetPrompt.Revision
-		if targetPrompt.Engine != "" {
+		if engineName == "" && targetPrompt.Engine != "" {
 			engineName = targetPrompt.Engine
 		}
 	}
@@ -1746,6 +1746,16 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 	}
 	if promptTitle == "" {
 		promptTitle = "Ready ASE prompt"
+	}
+
+	// If engine is still unset, infer from conversation ID (or default to agy for standard Antigravity sessions)
+	if engineName == "" {
+		low := strings.ToLower(resumeConvID)
+		if strings.HasPrefix(low, "cursor-") {
+			engineName = "agent"
+		} else {
+			engineName = "agy"
+		}
 	}
 
 	// Reset repo lock and clear halt state, retaining in-flight story and conversation bindings (F3)
@@ -1909,6 +1919,18 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 		e.notifyRepoLocked(repo)
 	}
 
+	resumeEngine := origSch.Engine
+	if opt.Engine != "" {
+		resumeEngine = opt.Engine
+	} else if resumeEngine == "" {
+		low := strings.ToLower(resumeConvID)
+		if strings.HasPrefix(low, "cursor-") {
+			resumeEngine = "agent"
+		} else {
+			resumeEngine = "agy"
+		}
+	}
+
 	// Create new schedule to resume execution with KindResume.
 	schID := e.next("sch-")
 	newSch := &Schedule{
@@ -1927,7 +1949,7 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 		EnvVars:              origSch.EnvVars,
 		Status:               "QUEUED",
 		PromptTitle:          origSch.PromptTitle,
-		Engine:               origSch.Engine,
+		Engine:               resumeEngine,
 		Priority:             origSch.Priority + 10,
 		ResumeConversationID: resumeConvID,
 		StoryID:              targetStoryID,
