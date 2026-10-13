@@ -3,6 +3,7 @@
 package control
 
 import (
+	"encoding/json"
 	"errors"
 	"net/url"
 	"os"
@@ -82,21 +83,93 @@ var ErrIdeaState = errors.New("refinement is accepted only from NEW or TRIAGED")
 
 // Preflight is the checkout report the supervisor posts before spawn.
 type Preflight struct {
-	Kind                   string
-	FreeBytes              uint64
-	WorkPorcelain          string
-	HubPorcelain           string
-	HeadAttached           bool
-	Branch                 string
-	DefaultBranch          string
-	HasUpstream            bool
-	DocsHubOK              bool
-	GitAuthOK              bool
-	GitWorkTree            bool
-	DirtyStoryID           string `json:"DirtyStoryID,omitempty"`
-	DirtyReviewFile        string `json:"DirtyReviewFile,omitempty"`
-	DetectedConversationID string `json:"DetectedConversationID,omitempty"`
-	DetectedVerdict        string `json:"DetectedVerdict,omitempty"`
+	Kind                   string `json:"kind"`
+	FreeBytes              uint64 `json:"free_bytes"`
+	WorkPorcelain          string `json:"work_porcelain"`
+	HubPorcelain           string `json:"hub_porcelain"`
+	HeadAttached           bool   `json:"head_attached"`
+	Branch                 string `json:"branch"`
+	DefaultBranch          string `json:"default_branch"`
+	HasUpstream            bool   `json:"has_upstream"`
+	DocsHubOK              bool   `json:"docs_hub_ok"`
+	GitAuthOK              bool   `json:"git_auth_ok"`
+	GitWorkTree            bool   `json:"git_work_tree"`
+	DirtyStoryID           string `json:"dirty_story_id,omitempty"`
+	DirtyReviewFile        string `json:"dirty_review_file,omitempty"`
+	DetectedConversationID string `json:"detected_conversation_id,omitempty"`
+	DetectedVerdict        string `json:"detected_verdict,omitempty"`
+}
+
+func (p *Preflight) UnmarshalJSON(data []byte) error {
+	type rawPreflight Preflight
+	var raw struct {
+		rawPreflight
+		AltKind                   string `json:"Kind"`
+		AltFreeBytes              uint64 `json:"FreeBytes"`
+		AltWorkPorcelain          string `json:"WorkPorcelain"`
+		AltHubPorcelain           string `json:"HubPorcelain"`
+		AltHeadAttached           bool   `json:"HeadAttached"`
+		AltBranch                 string `json:"Branch"`
+		AltDefaultBranch          string `json:"DefaultBranch"`
+		AltHasUpstream            bool   `json:"HasUpstream"`
+		AltDocsHubOK              bool   `json:"DocsHubOK"`
+		AltGitAuthOK              bool   `json:"GitAuthOK"`
+		AltGitWorkTree            bool   `json:"GitWorkTree"`
+		AltDirtyStoryID           string `json:"DirtyStoryID"`
+		AltDirtyReviewFile        string `json:"DirtyReviewFile"`
+		AltDetectedConversationID string `json:"DetectedConversationID"`
+		AltDetectedVerdict        string `json:"DetectedVerdict"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*p = Preflight(raw.rawPreflight)
+	if p.Kind == "" && raw.AltKind != "" {
+		p.Kind = raw.AltKind
+	}
+	if p.FreeBytes == 0 && raw.AltFreeBytes != 0 {
+		p.FreeBytes = raw.AltFreeBytes
+	}
+	if p.WorkPorcelain == "" && raw.AltWorkPorcelain != "" {
+		p.WorkPorcelain = raw.AltWorkPorcelain
+	}
+	if p.HubPorcelain == "" && raw.AltHubPorcelain != "" {
+		p.HubPorcelain = raw.AltHubPorcelain
+	}
+	if !p.HeadAttached && raw.AltHeadAttached {
+		p.HeadAttached = raw.AltHeadAttached
+	}
+	if p.Branch == "" && raw.AltBranch != "" {
+		p.Branch = raw.AltBranch
+	}
+	if p.DefaultBranch == "" && raw.AltDefaultBranch != "" {
+		p.DefaultBranch = raw.AltDefaultBranch
+	}
+	if !p.HasUpstream && raw.AltHasUpstream {
+		p.HasUpstream = raw.AltHasUpstream
+	}
+	if !p.DocsHubOK && raw.AltDocsHubOK {
+		p.DocsHubOK = raw.AltDocsHubOK
+	}
+	if !p.GitAuthOK && raw.AltGitAuthOK {
+		p.GitAuthOK = raw.AltGitAuthOK
+	}
+	if !p.GitWorkTree && raw.AltGitWorkTree {
+		p.GitWorkTree = raw.AltGitWorkTree
+	}
+	if p.DirtyStoryID == "" && raw.AltDirtyStoryID != "" {
+		p.DirtyStoryID = raw.AltDirtyStoryID
+	}
+	if p.DirtyReviewFile == "" && raw.AltDirtyReviewFile != "" {
+		p.DirtyReviewFile = raw.AltDirtyReviewFile
+	}
+	if p.DetectedConversationID == "" && raw.AltDetectedConversationID != "" {
+		p.DetectedConversationID = raw.AltDetectedConversationID
+	}
+	if p.DetectedVerdict == "" && raw.AltDetectedVerdict != "" {
+		p.DetectedVerdict = raw.AltDetectedVerdict
+	}
+	return nil
 }
 
 // Halt is the pre-launch decision.

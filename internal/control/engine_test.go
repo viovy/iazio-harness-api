@@ -1925,3 +1925,113 @@ func TestDeclineJobClearsRunningJobID(t *testing.T) {
 		t.Fatalf("expected repo RunningJobID cleared after decline, got: %s", repo.RunningJobID)
 	}
 }
+
+func TestExtractStoryIDFromBranchAndPorcelain(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"chore/app-0098-distribution-profile-remote-scan", "STORY-APP-0098"},
+		{"feat/STORY-CORE-104-refactor", "STORY-CORE-104"},
+		{"bug/vigo-0042", "STORY-VIGO-0042"},
+		{"chore/app-0098-feature", "STORY-APP-0098"},
+		{"clean-branch-name-no-id", ""},
+	}
+	for _, tc := range tests {
+		got := extractStoryIDFromString(tc.input)
+		if got != tc.expected {
+			t.Errorf("extractStoryIDFromString(%q) = %q, expected %q", tc.input, got, tc.expected)
+		}
+	}
+
+	porcelain := " M sub-agent\n?? docs/reviews/2026-10-09-review-v0-26991d-STORY-APP-0098.md"
+	sid, rfile := extractStoryIDFromPorcelain(porcelain)
+	if sid != "STORY-APP-0098" {
+		t.Errorf("expected sid STORY-APP-0098, got %q", sid)
+	}
+	if rfile != "docs/reviews/2026-10-09-review-v0-26991d-STORY-APP-0098.md" {
+		t.Errorf("expected review file docs/reviews/..., got %q", rfile)
+	}
+}
+
+func TestResumeRepoInPlaceResilience(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{
+		HostID:       "host-1",
+		WorktreePath: "/work/app-tree",
+		CloneURL:     "https://example.test/app-tree.git",
+		Queue:        QueueOpen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := e.PutPrompt(Prompt{Title: "Ready ASE prompt", Body: "do work", Status: "READY"})
+	_ = p
+
+	// Preflight marks repo dirty on branch chore/app-0098-feature
+	pre := Preflight{
+		Kind:          "ordinary",
+		FreeBytes:     20 << 30,
+		GitWorkTree:   true,
+		HeadAttached:  true,
+		Branch:        "chore/app-0098-feature",
+		DefaultBranch: "main",
+		GitAuthOK:     true,
+		DocsHubOK:     true,
+		WorkPorcelain: " M sub-agent\n?? docs/reviews/2026-10-09-review-v0-26991d-STORY-APP-0098.md",
+	}
+	halt := e.ApplyPreflight("host-1", "/work/app-tree", pre)
+	if halt.Reason != ReasonDirty {
+		t.Fatalf("expected ReasonDirty, got %q", halt.Reason)
+	}
+
+	detail, _ := e.GetRepoDetail("host-1", "/work/app-tree")
+	if detail.Repo.DirtyStoryID != "STORY-APP-0098" {
+		t.Fatalf("expected DirtyStoryID STORY-APP-0098, got %q", detail.Repo.DirtyStoryID)
+	}
+
+	// Trigger ResumeRepoInPlace without explicit story ID
+	sch, err := e.ResumeRepoInPlace("host-1", "/work/app-tree", ResumeOptions{AllowDirty: true})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace failed: %v", err)
+	}
+	if sch.Kind != KindResume {
+		t.Fatalf("expected KindResume, got %s", sch.Kind)
+	}
+	if sch.StoryID != "STORY-APP-0098" {
+		t.Fatalf("expected sch.StoryID STORY-APP-0098, got %q", sch.StoryID)
+	}
+	if sch.PromptTitle != "Resume STORY-APP-0098 In-Place" {
+		t.Fatalf("expected prompt title 'Resume STORY-APP-0098 In-Place', got %q", sch.PromptTitle)
+	}
+
+	// Host leases job
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("poll failed for resume job")
+	}
+
+	// Host sends preflight for resume job with dirty porcelain
+	preResume := Preflight{
+		Kind:          KindResume,
+		FreeBytes:     20 << 30,
+		GitWorkTree:   true,
+		HeadAttached:  true,
+		Branch:        "chore/app-0098-feature",
+		DefaultBranch: "main",
+		GitAuthOK:     true,
+		DocsHubOK:     true,
+		WorkPorcelain: " M sub-agent\n?? docs/reviews/2026-10-09-review-v0-26991d-STORY-APP-0098.md",
+	}
+	haltResume := e.ApplyPreflight("host-1", "/work/app-tree", preResume)
+	if haltResume.Reason != "" {
+		t.Fatalf("expected empty halt reason for KindResume on dirty worktree, got %q", haltResume.Reason)
+	}
+
+	// Verify DirtyStoryID was NOT wiped by preflight
+	detailResume, _ := e.GetRepoDetail("host-1", "/work/app-tree")
+	if detailResume.Repo.DirtyStoryID != "STORY-APP-0098" {
+		t.Fatalf("expected DirtyStoryID to be preserved on resume, got %q", detailResume.Repo.DirtyStoryID)
+	}
+	_ = job
+}

@@ -97,6 +97,7 @@ func repoSummary(r control.Repo) map[string]any {
 		"distribution_profile": r.DistributionProfile,
 		"running_job_id":       r.RunningJobID,
 		"dirty_story_id":       r.DirtyStoryID,
+		"current_branch":       r.CurrentBranch,
 	}
 }
 
@@ -177,6 +178,7 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 		"docs_hub_path":            d.Repo.DocsHubPath,
 		"docs_hub_all_idle":        d.DocsHubAllIdle,
 		"distribution_profile":     d.Repo.DistributionProfile,
+		"current_branch":           d.Repo.CurrentBranch,
 		"dirty_story_id":           d.Repo.DirtyStoryID,
 		"dirty_review_file":        d.Repo.DirtyReviewFile,
 		"detected_conversation_id": d.Repo.DetectedConversationID,
