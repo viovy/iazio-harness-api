@@ -1913,14 +1913,17 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		}
 	}
 
-	// If engine is still unset, infer from conversation ID (or default to agy for standard Antigravity sessions)
-	if engineName == "" {
+	// If engine is unset, or if agent is selected with a non-cursor conversation or after quota exhaustion, switch to agy
+	if engineName == "" || (engineName == "agent" && resumeConvID != "" && !strings.HasPrefix(strings.ToLower(resumeConvID), "cursor-")) {
 		low := strings.ToLower(resumeConvID)
 		if strings.HasPrefix(low, "cursor-") {
 			engineName = "agent"
 		} else {
 			engineName = "agy"
 		}
+	}
+	if engineName == "agent" && (repo.Reason == "QUOTA_EXHAUSTED" || (len(e.history[repoKey(host, path)]) > 0 && (e.history[repoKey(host, path)][len(e.history[repoKey(host, path)])-1].DiagnosticCode == "QUOTA_EXHAUSTED" || strings.Contains(e.history[repoKey(host, path)][len(e.history[repoKey(host, path)])-1].ErrorMessage, "ActionRequiredError") || strings.Contains(e.history[repoKey(host, path)][len(e.history[repoKey(host, path)])-1].Reason, "ActionRequiredError")))) {
+		engineName = "agy"
 	}
 
 	// Reset repo lock and clear halt state, retaining in-flight story and conversation bindings (F3)
@@ -2058,6 +2061,7 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 		targetStoryID = origSch.StoryID
 	}
 
+	prevReason := job.Reason
 	// Mark previous job closed if still running.
 	if !job.ExitPosted {
 		job.Status = "FAILED"
@@ -2087,12 +2091,28 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 	resumeEngine := origSch.Engine
 	if opt.Engine != "" {
 		resumeEngine = opt.Engine
-	} else if resumeEngine == "" {
+	}
+	if resumeEngine == "" || (resumeEngine == "agent" && resumeConvID != "" && !strings.HasPrefix(strings.ToLower(resumeConvID), "cursor-")) {
 		low := strings.ToLower(resumeConvID)
 		if strings.HasPrefix(low, "cursor-") {
 			resumeEngine = "agent"
 		} else {
 			resumeEngine = "agy"
+		}
+	}
+	// If prior job failed with quota exhaustion or ActionRequiredError, auto-switch to agy
+	if resumeEngine == "agent" {
+		if prevReason == "QUOTA_EXHAUSTED" || strings.Contains(prevReason, "ActionRequiredError") || strings.Contains(prevReason, "out of usage") {
+			resumeEngine = "agy"
+		} else {
+			for _, rows := range e.history {
+				for _, r := range rows {
+					if r.JobID == job.ID && (r.DiagnosticCode == "QUOTA_EXHAUSTED" || strings.Contains(r.ErrorMessage, "ActionRequiredError") || strings.Contains(r.Reason, "ActionRequiredError")) {
+						resumeEngine = "agy"
+						break
+					}
+				}
+			}
 		}
 	}
 
