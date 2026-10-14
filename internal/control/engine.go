@@ -1417,6 +1417,9 @@ func (e *Engine) updateHistoryStatusLocked(host, path, jobID, status string, opt
 				if opt.Engine != "" {
 					rows[i].Engine = opt.Engine
 				}
+				if opt.ASEComplete {
+					rows[i].ASEComplete = true
+				}
 			}
 			if rows[i].Reason == "" && (status == "LEASE_EXPIRED" || status == "EXECUTION_TIMEOUT" || status == "HOST_OFFLINE" || status == "FAILED") {
 				rows[i].Reason = status

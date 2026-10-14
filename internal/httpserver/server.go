@@ -885,6 +885,7 @@ func (s *Server) pollHost(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
 		"id": job.ID, "kind": job.Kind,
 		"worktree_path": sch.WorktreePath, "docs_hub_path": docs,
+		"story_id": sch.StoryID,
 	})
 }
 

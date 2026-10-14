@@ -81,6 +81,7 @@ type ExitOptions struct {
 	Engine         string `json:"engine,omitempty"`
 	Model          string `json:"model,omitempty"`
 	Remediation    string `json:"remediation,omitempty"`
+	ASEComplete    bool   `json:"ase_complete,omitempty"`
 }
 
 // ErrBadShareURL is returned when an import URL is not a Gemini share link.
