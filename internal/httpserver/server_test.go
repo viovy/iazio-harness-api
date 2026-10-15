@@ -67,6 +67,25 @@ func TestRoot(t *testing.T) {
 	}
 }
 
+func TestHealthzAndReadyz(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	for _, path := range []string{"/healthz", "/readyz"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%s expected 200, got %d", path, rr.Code)
+		}
+		var body map[string]string
+		if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+			t.Fatalf("%s unmarshal: %v", path, err)
+		}
+		if body["status"] != "ok" {
+			t.Fatalf("%s expected status ok, got %v", path, body)
+		}
+	}
+}
+
 func TestSchedulePriorityEndpoints(t *testing.T) {
 	e := control.NewEngine(nil)
 	e.RegisterHost("host-1", "permanent")
