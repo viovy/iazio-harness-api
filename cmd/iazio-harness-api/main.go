@@ -4,11 +4,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/viovy/iazio-harness-api/internal/control"
@@ -130,9 +133,36 @@ func main() {
 			log.Printf("loaded %d distribution profiles from database", len(profiles))
 		}
 	}
-	log.Printf("listening %s %s", addr, version.Informational())
-	if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
-		log.Fatal(err)
+	httpServer := &http.Server{
+		Addr:              addr,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Printf("listening %s %s", addr, version.Informational())
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+		close(serverErr)
+	}()
+
+	select {
+	case err := <-serverErr:
+		if err != nil {
+			log.Fatalf("server error: %v", err)
+		}
+	case <-sigCtx.Done():
+		log.Printf("shutting down gracefully...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("shutdown error: %v", err)
+		}
 	}
 }
 
