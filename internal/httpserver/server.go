@@ -3,6 +3,7 @@ package httpserver
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -40,6 +41,8 @@ type Server struct {
 	DeleteHistory func(ctx context.Context, jobID string) error
 	// ClearHistory removes all history records for a repo when a database is configured.
 	ClearHistory func(ctx context.Context, hostID, worktreePath string) error
+	// AuthToken, when non-empty, requires Bearer token authentication on control-plane endpoints.
+	AuthToken string
 }
 
 // Handler returns the HTTP routes.
@@ -123,7 +126,35 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/fleet/profiles/generic/sync", s.syncGenericProfile)
 	mux.HandleFunc("POST /v1/fleet/profiles/scan-repo", s.scanRepoProfile)
 	mux.HandleFunc("GET /v1/fleet/manifest", s.getFleetManifest)
-	return withCORS(mux)
+	return withCORS(withAuth(mux, s.AuthToken))
+}
+
+func withAuth(next http.Handler, token string) http.Handler {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if path == "/" || path == "/healthz" || path == "/readyz" || path == "/version" ||
+			strings.HasPrefix(path, "/swagger") || r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+		const prefix = "Bearer "
+		if !strings.HasPrefix(authHeader, prefix) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		got := strings.TrimSpace(strings.TrimPrefix(authHeader, prefix))
+		if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func withCORS(next http.Handler) http.Handler {

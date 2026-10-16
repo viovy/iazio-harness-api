@@ -40,6 +40,11 @@ func main() {
 		addr = v
 	}
 	srv := &httpserver.Server{Engine: control.NewEngine(nil)}
+	if tok := strings.TrimSpace(os.Getenv("IAZIO_AUTH_TOKEN")); tok != "" {
+		srv.AuthToken = tok
+	} else if tok := strings.TrimSpace(os.Getenv("IAZIO_HARNESS_API_TOKEN")); tok != "" {
+		srv.AuthToken = tok
+	}
 	srv.Engine.StartReaper(context.Background(), 10*time.Second)
 	if script := os.Getenv("IAZIO_EXTRACT_WORKER"); script != "" {
 		srv.Extract = func(shareURL string) (string, string, error) {
