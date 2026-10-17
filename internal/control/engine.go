@@ -278,6 +278,12 @@ type RepoRequest struct {
 	CloneURL string
 }
 
+// PendingToolUpdate describes an update command queued for an agent host.
+type PendingToolUpdate struct {
+	Tools []string `json:"tools,omitempty"`
+	Force bool     `json:"force,omitempty"`
+}
+
 // Host is a registered supervisor.
 type Host struct {
 	ID                  string
@@ -288,6 +294,7 @@ type Host struct {
 	FetchFailed         bool
 	DistributionProfile string
 	Tools               []Tool
+	PendingToolUpdate   *PendingToolUpdate
 }
 
 // Engine is the in-process control plane.
@@ -310,6 +317,7 @@ type Engine struct {
 	requests   []RepoRequest
 	logs         map[string][]LogChunk
 	subs         map[string][]chan LogChunk
+	Releases     *ReleaseService
 	OnRepoChange func(Repo)
 	OnHistoryChange func(host, path string, row HistoryRow)
 	OnHistoryDelete func(host, path string, jobID string)
@@ -375,6 +383,7 @@ func NewEngine(now func() time.Time) *Engine {
 		history:    map[string][]HistoryRow{},
 		logs:       map[string][]LogChunk{},
 		subs:       map[string][]chan LogChunk{},
+		Releases:   NewReleaseService(),
 	}
 }
 
