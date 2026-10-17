@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -174,7 +175,7 @@ fleet_distribution:
       description: Remote execution daemon
       tier: baseline
 `
-	if err := os.WriteFile(tmpDir+"/metadata.yml", []byte(metaContent), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(tmpDir, "metadata.yml"), []byte(metaContent), 0644); err != nil {
 		t.Fatalf("write metadata: %v", err)
 	}
 
@@ -186,9 +187,16 @@ fleet_distribution:
 	})
 
 	// 3. Scan repo profile via API
-	scanReq := `{"host_id": "mac-mini", "repo_path": "` + tmpDir + `", "profile_name": "mac-profile"}`
+	scanBody, err := json.Marshal(map[string]string{
+		"host_id":      "mac-mini",
+		"repo_path":    tmpDir,
+		"profile_name": "mac-profile",
+	})
+	if err != nil {
+		t.Fatalf("marshal scan req: %v", err)
+	}
 	recScan := httptest.NewRecorder()
-	handler.ServeHTTP(recScan, httptest.NewRequest("POST", "/v1/fleet/profiles/scan-repo", bytes.NewReader([]byte(scanReq))))
+	handler.ServeHTTP(recScan, httptest.NewRequest("POST", "/v1/fleet/profiles/scan-repo", bytes.NewReader(scanBody)))
 	if recScan.Code != http.StatusOK {
 		t.Fatalf("expected 200 on scan-repo, got %d: %s", recScan.Code, recScan.Body.String())
 	}

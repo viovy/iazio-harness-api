@@ -42,15 +42,47 @@ func (e *Engine) ListPrompts() []Prompt {
 	return out
 }
 
-// Heartbeat stores the tool inventory, marks the host online, and reconciles active jobs.
-func (e *Engine) Heartbeat(id string, tools []Tool, fetchFailed bool, activeJobs ...ActiveJob) error {
+// QueueToolUpdate registers an update command for tools on the given host.
+func (e *Engine) QueueToolUpdate(hostID string, tools []string, force bool) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	h, ok := e.hosts[hostID]
+	if !ok {
+		return ErrNotFound
+	}
+	h.PendingToolUpdate = &PendingToolUpdate{
+		Tools: tools,
+		Force: force,
+	}
+	return nil
+}
+
+// ConsumePendingToolUpdate retrieves and clears the pending tool update for a host.
+func (e *Engine) ConsumePendingToolUpdate(hostID string) *PendingToolUpdate {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	h, ok := e.hosts[hostID]
+	if !ok || h.PendingToolUpdate == nil {
+		return nil
+	}
+	res := h.PendingToolUpdate
+	h.PendingToolUpdate = nil
+	return res
+}
+
+// HeartbeatDetailed stores the tool inventory, updates presence, and reconciles active jobs.
+func (e *Engine) HeartbeatDetailed(id, presence string, tools []Tool, fetchFailed bool, activeJobs ...ActiveJob) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	h, ok := e.hosts[id]
 	if !ok {
 		return ErrNotFound
 	}
-	h.Presence = "ONLINE"
+	if strings.TrimSpace(presence) != "" {
+		h.Presence = strings.TrimSpace(presence)
+	} else {
+		h.Presence = "ONLINE"
+	}
 	h.LastSeen = e.now()
 	h.FetchFailed = fetchFailed
 	h.Tools = append([]Tool(nil), tools...)
@@ -74,6 +106,11 @@ func (e *Engine) Heartbeat(id string, tools []Tool, fetchFailed bool, activeJobs
 		}
 	}
 	return nil
+}
+
+// Heartbeat stores the tool inventory, marks the host online, and reconciles active jobs.
+func (e *Engine) Heartbeat(id string, tools []Tool, fetchFailed bool, activeJobs ...ActiveJob) error {
+	return e.HeartbeatDetailed(id, "ONLINE", tools, fetchFailed, activeJobs...)
 }
 
 // HostSummary is the fleet-list row.

@@ -100,6 +100,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/hosts", s.listHosts)
 	mux.HandleFunc("GET /v1/hosts/{id}", s.hostDetail)
 	mux.HandleFunc("POST /v1/hosts/{id}/heartbeat", s.heartbeat)
+	mux.HandleFunc("POST /v1/hosts/{id}/tools/update", s.queueToolUpdate)
 	mux.HandleFunc("POST /v1/hosts/{id}/poll", s.pollHost)
 	mux.HandleFunc("GET /v1/hosts/{host}/repos", s.repoDetail)
 	mux.HandleFunc("DELETE /v1/hosts/{host}/repos", s.unregisterRepo)
@@ -126,6 +127,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/fleet/profiles/generic/sync", s.syncGenericProfile)
 	mux.HandleFunc("POST /v1/fleet/profiles/scan-repo", s.scanRepoProfile)
 	mux.HandleFunc("GET /v1/fleet/manifest", s.getFleetManifest)
+	mux.HandleFunc("GET /v1/fleet/profiles/{name}/releases", s.getProfileReleases)
 	return withCORS(withAuth(mux, s.AuthToken))
 }
 
@@ -925,7 +927,8 @@ func (s *Server) pollHost(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	var raw struct {
-		FetchFailed bool `json:"fetch_failed"`
+		Presence    string `json:"presence"`
+		FetchFailed bool   `json:"fetch_failed"`
 		Tools       []struct {
 			Name    string `json:"name"`
 			Path    string `json:"path"`
@@ -955,7 +958,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	hostID := r.PathValue("id")
-	if err := s.Engine.Heartbeat(hostID, tools, raw.FetchFailed, activeJobs...); err != nil {
+	if err := s.Engine.HeartbeatDetailed(hostID, raw.Presence, tools, raw.FetchFailed, activeJobs...); err != nil {
 		writeErr(w, http.StatusNotFound, err)
 		return
 	}
@@ -964,7 +967,69 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 			s.SaveHost(detail.Host)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	pending := s.Engine.ConsumePendingToolUpdate(hostID)
+	res := map[string]any{"status": "ok"}
+	if pending != nil {
+		res["pending_tool_update"] = pending
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
+	hostID := r.PathValue("id")
+	var body struct {
+		Tools []string `json:"tools"`
+		Force bool     `json:"force"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
+	if err := s.Engine.QueueToolUpdate(hostID, body.Tools, body.Force); err != nil {
+		writeErr(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "queued",
+		"host_id": hostID,
+		"tools":   body.Tools,
+		"force":   body.Force,
+	})
+}
+
+func (s *Server) getProfileReleases(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = "generic"
+	}
+	profile, err := s.Engine.GetProfile(name)
+	if err != nil {
+		if name == "generic" {
+			profile = &control.DistributionProfile{
+				Name: "generic",
+				Tools: []control.ProfileTool{
+					{Name: "autopilot", Repository: "viovy/autopilot-plugins-internal"},
+					{Name: "iazio-harness", Repository: "viovy/iazio-harness"},
+					{Name: "iazio-agent", Repository: "viovy/iazio-agent"},
+					{Name: "iazio-mcp", Repository: "viovy/iazio-mcp"},
+				},
+			}
+		} else {
+			writeErr(w, http.StatusNotFound, err)
+			return
+		}
+	}
+	if s.Engine.Releases == nil {
+		s.Engine.Releases = control.NewReleaseService()
+	}
+	releases, err := s.Engine.Releases.GetProfileReleases(r.Context(), *profile)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"profile":  name,
+		"releases": releases,
+	})
 }
 
 func (s *Server) repoDetail(w http.ResponseWriter, r *http.Request) {
