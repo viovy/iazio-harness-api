@@ -1,6 +1,7 @@
 package control
 
 import (
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -2179,6 +2180,59 @@ func TestPostExitDiagnosticOptionsAndResumeFallback(t *testing.T) {
 	}
 	if detailAfterResume.Repo.Reason != "" {
 		t.Fatalf("expected cleared repo reason after resume, got %q", detailAfterResume.Repo.Reason)
+	}
+}
+
+func TestLeaseExternalAndRelease(t *testing.T) {
+	e := NewEngine(func() time.Time { return time.Now().UTC() })
+	repo := Repo{HostID: "mac-mini", WorktreePath: "/work/sample-repo", Queue: QueueOpen, Lock: LockIdle}
+	_ = e.UpsertRepo(repo)
+
+	// 1. Acquire external lease
+	leased, err := e.LeaseExternal("mac-mini", "/work/sample-repo", "autopilot-cli-1", "TASK-42", 10*time.Minute)
+	if err != nil {
+		t.Fatalf("LeaseExternal failed: %v", err)
+	}
+	if leased.Lock != LockAutopilot || leased.LockHolder != "autopilot-cli-1" {
+		t.Fatalf("expected LockAutopilot and holder autopilot-cli-1, got lock=%s holder=%s", leased.Lock, leased.LockHolder)
+	}
+
+	// 2. Conflicting external lease from different holder should fail with ErrLockHeld
+	_, err2 := e.LeaseExternal("mac-mini", "/work/sample-repo", "autopilot-cli-2", "STORY-OTHER", 10*time.Minute)
+	if !errors.Is(err2, ErrLockHeld) {
+		t.Fatalf("expected ErrLockHeld for conflicting external lease, got: %v", err2)
+	}
+
+	// 3. LeaseOrdinary should fail because repo is busy with LockAutopilot
+	_, err3 := e.LeaseOrdinary("mac-mini", "/work/sample-repo", "https://github.com/example/sample-repo.git")
+	if !errors.Is(err3, ErrQueueBlocked) {
+		t.Fatalf("expected ErrQueueBlocked for ordinary lease while LockAutopilot active, got: %v", err3)
+	}
+
+	// 4. Release external lease
+	released, err := e.ReleaseExternal("mac-mini", "/work/sample-repo", "autopilot-cli-1")
+	if err != nil {
+		t.Fatalf("ReleaseExternal failed: %v", err)
+	}
+	if released.Lock != LockIdle || released.LockHolder != "" {
+		t.Fatalf("expected LockIdle after release, got lock=%s holder=%s", released.Lock, released.LockHolder)
+	}
+
+	// 5. Now another holder can acquire
+	leased2, err := e.LeaseExternal("mac-mini", "/work/sample-repo", "autopilot-cli-2", "STORY-OTHER", 10*time.Minute)
+	if err != nil {
+		t.Fatalf("expected successful lease after release, got: %v", err)
+	}
+	if leased2.Lock != LockAutopilot || leased2.LockHolder != "autopilot-cli-2" {
+		t.Fatalf("expected LockAutopilot for holder 2, got lock=%s", leased2.Lock)
+	}
+
+	// 6. Repo in LockASE must reject LeaseExternal
+	repoASE := Repo{HostID: "mac-mini", WorktreePath: "/work/ase-repo", Queue: QueueOpen, Lock: LockASE}
+	_ = e.UpsertRepo(repoASE)
+	_, errASE := e.LeaseExternal("mac-mini", "/work/ase-repo", "autopilot-cli-1", "STORY-1", 10*time.Minute)
+	if !errors.Is(errASE, ErrLockHeld) {
+		t.Fatalf("expected ErrLockHeld for repo in LockASE, got: %v", errASE)
 	}
 }
 

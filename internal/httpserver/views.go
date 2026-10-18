@@ -86,11 +86,17 @@ func hostView(h control.Host, paused int) map[string]any {
 }
 
 func repoSummary(r control.Repo) map[string]any {
+	var expiresAt any
+	if !r.LockExpiresAt.IsZero() {
+		expiresAt = r.LockExpiresAt.UTC().Format(time.RFC3339)
+	}
 	return map[string]any{
 		"path":                 r.WorktreePath,
 		"worktree_path":        r.WorktreePath,
 		"queue":                r.Queue,
 		"lock":                 r.Lock,
+		"lock_holder":          r.LockHolder,
+		"lock_expires_at":      expiresAt,
 		"reason":               r.Reason,
 		"discard_pending":      r.DiscardPending,
 		"docs_hub_path":        r.DocsHubPath,
@@ -173,11 +179,18 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 			"created_at":       h.CreatedAt.UTC().Format(time.RFC3339),
 		})
 	}
+	var lockExpiresAt any
+	if !d.Repo.LockExpiresAt.IsZero() {
+		lockExpiresAt = d.Repo.LockExpiresAt.UTC().Format(time.RFC3339)
+	}
+
 	return map[string]any{
 		"host_id":                  d.Repo.HostID,
 		"path":                     d.Repo.WorktreePath,
 		"queue":                    d.Repo.Queue,
 		"lock":                     d.Repo.Lock,
+		"lock_holder":              d.Repo.LockHolder,
+		"lock_expires_at":          lockExpiresAt,
 		"reason":                   d.Repo.Reason,
 		"fetch_failed":             d.FetchFailed,
 		"porcelain":                d.Repo.Porcelain,
