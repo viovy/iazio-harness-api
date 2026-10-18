@@ -138,6 +138,7 @@ type Schedule struct {
 	ResumeConversationID string
 	LeaseRetries         int
 	StoryID              string
+	IsGlobal             bool
 }
 
 // JobDetail carries the execution payload for iazio-harness.
@@ -215,6 +216,7 @@ type Repo struct {
 	DetectedVerdict        string
 	LockHolder             string
 	LockExpiresAt          time.Time
+	GlobalQueueAllocationEnabled bool
 }
 
 // Tool is one binary from the latest heartbeat.
@@ -568,8 +570,30 @@ func (e *Engine) UpsertRepo(r Repo) error {
 	if r.DistributionProfile == "" {
 		r.DistributionProfile = "generic"
 	}
+	key := repoKey(r.HostID, r.WorktreePath)
+	if existing, exists := e.repos[key]; exists {
+		r.GlobalQueueAllocationEnabled = existing.GlobalQueueAllocationEnabled
+	} else {
+		r.GlobalQueueAllocationEnabled = true
+	}
 	cp := r
-	e.repos[repoKey(r.HostID, r.WorktreePath)] = &cp
+	e.repos[key] = &cp
+	return nil
+}
+
+// SetRepoQueueAllocation updates whether a repository dynamically accepts tasks from the global fleet queue.
+func (e *Engine) SetRepoQueueAllocation(hostID, worktreePath string, enabled bool) error {
+	if hostID == "" || worktreePath == "" {
+		return errors.New("host and worktree_path are required")
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	key := repoKey(hostID, worktreePath)
+	r, ok := e.repos[key]
+	if !ok {
+		return ErrNotFound
+	}
+	r.GlobalQueueAllocationEnabled = enabled
 	return nil
 }
 
@@ -1381,11 +1405,36 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 	e.reapExpiredLocked()
 	var candidates []*Schedule
 	for _, sch := range e.schedules {
-		if sch.HostID == host && sch.Status == "QUEUED" {
+		if sch.Status != "QUEUED" {
+			continue
+		}
+		// Level 1: Direct local repo schedule for this host
+		if sch.HostID == host && !sch.IsGlobal {
 			candidates = append(candidates, sch)
+		} else if sch.IsGlobal || sch.HostID == "global" || sch.HostID == "" {
+			// Level 2: Shared fleet global queue.
+			// Eligible if the target repo (or any repo on this host) has GlobalQueueAllocationEnabled == true.
+			if sch.WorktreePath != "" {
+				repo := e.repos[repoKey(host, sch.WorktreePath)]
+				if repo != nil && repo.GlobalQueueAllocationEnabled {
+					candidates = append(candidates, sch)
+				}
+			} else {
+				for _, r := range e.repos {
+					if r.HostID == host && r.GlobalQueueAllocationEnabled {
+						candidates = append(candidates, sch)
+						break
+					}
+				}
+			}
 		}
 	}
 	sort.Slice(candidates, func(i, j int) bool {
+		iLocal := !candidates[i].IsGlobal && candidates[i].HostID == host
+		jLocal := !candidates[j].IsGlobal && candidates[j].HostID == host
+		if iLocal != jLocal {
+			return iLocal
+		}
 		if candidates[i].Priority != candidates[j].Priority {
 			return candidates[i].Priority > candidates[j].Priority
 		}
@@ -1402,7 +1451,21 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 	})
 	for _, sch := range candidates {
 		repo := e.repos[repoKey(host, sch.WorktreePath)]
+		if repo == nil && (sch.IsGlobal || sch.HostID == "global" || sch.HostID == "") {
+			// Dynamically allocate to an idle repo that has GlobalQueueAllocationEnabled == true
+			for _, r := range e.repos {
+				if r.HostID == host && r.GlobalQueueAllocationEnabled && r.Lock == LockIdle && (r.Queue == QueueOpen || r.Queue == QueueHealing) {
+					repo = r
+					sch.WorktreePath = r.WorktreePath
+					sch.HostID = host
+					break
+				}
+			}
+		}
 		if repo != nil {
+			if (sch.IsGlobal || sch.HostID == "global" || sch.HostID == "") && !repo.GlobalQueueAllocationEnabled {
+				continue
+			}
 			if repo.Lock == LockRunning || repo.Lock == LockCooling || repo.Lock == LockCleaning {
 				continue
 			}
@@ -2293,5 +2356,41 @@ func (e *Engine) ReapExpired() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.reapExpiredLocked()
+}
+
+// EnqueueGlobalSchedule enqueues a prompt into Level 2 (Fleet Global Queue).
+func (e *Engine) EnqueueGlobalSchedule(promptID string, iterations int, envVars map[string]string) (Schedule, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	p, ok := e.prompts[promptID]
+	if !ok {
+		return Schedule{}, ErrNotFound
+	}
+	if p.Status != "READY" {
+		return Schedule{}, ErrNotReady
+	}
+	if iterations < 1 {
+		iterations = 1
+	}
+	var envKeys []string
+	var envCopy map[string]string
+	if len(envVars) > 0 {
+		envCopy = make(map[string]string, len(envVars))
+		for k, v := range envVars {
+			envKeys = append(envKeys, k)
+			envCopy[k] = v
+		}
+	} else {
+		envKeys = []string{}
+	}
+	sid := e.next("sch-")
+	sch := &Schedule{
+		ID: sid, PromptID: promptID, Revision: p.Revision, HostID: "global",
+		IsGlobal: true, Kind: KindOrdinary, IterationsTotal: iterations, IterationsRemaining: iterations,
+		MaxExecutionDuration: DefaultMaxExec, EnvKeys: envKeys, EnvVars: envCopy,
+		Status: "QUEUED", PromptTitle: p.Title, Engine: p.Engine,
+	}
+	e.schedules[sid] = sch
+	return *sch, nil
 }
 

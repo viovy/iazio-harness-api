@@ -119,6 +119,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/repos/{host}/resume", s.resumeRepo)
 	mux.HandleFunc("POST /v1/repos/{host}/resume-in-place", s.resumeRepoInPlace)
 	mux.HandleFunc("POST /v1/repos/{host}/remediate", s.remediateRepo)
+	mux.HandleFunc("POST /v1/repos/{host}/queue-allocation", s.setRepoQueueAllocation)
 	mux.HandleFunc("GET /v1/repos/{host}", s.getRepo)
 	mux.HandleFunc("GET /v1/fleet/profiles", s.listProfiles)
 	mux.HandleFunc("POST /v1/fleet/profiles", s.createProfile)
@@ -656,6 +657,60 @@ func (s *Server) remediateRepo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) setRepoQueueAllocation(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Path                         string `json:"path"`
+		WorktreePath                 string `json:"worktree_path"`
+		Enabled                      *bool  `json:"enabled"`
+		GlobalQueueAllocationEnabled *bool  `json:"global_queue_allocation_enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	targetPath := body.WorktreePath
+	if targetPath == "" {
+		targetPath = body.Path
+	}
+	if targetPath == "" {
+		targetPath = r.URL.Query().Get("path")
+	}
+	if targetPath == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("worktree_path is required"))
+		return
+	}
+	if body.Enabled == nil && body.GlobalQueueAllocationEnabled == nil {
+		writeErr(w, http.StatusBadRequest, errors.New("enabled or global_queue_allocation_enabled is required"))
+		return
+	}
+	enabled := false
+	if body.GlobalQueueAllocationEnabled != nil {
+		enabled = *body.GlobalQueueAllocationEnabled
+	} else if body.Enabled != nil {
+		enabled = *body.Enabled
+	}
+	host := r.PathValue("host")
+	if err := s.Engine.SetRepoQueueAllocation(host, targetPath, enabled); err != nil {
+		code := http.StatusConflict
+		if errors.Is(err, control.ErrNotFound) {
+			code = http.StatusNotFound
+		}
+		writeErr(w, code, err)
+		return
+	}
+	if s.SaveRepo != nil {
+		if detail, ok := s.Engine.GetRepoDetail(host, targetPath); ok {
+			s.SaveRepo(detail.Repo)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":                         "ok",
+		"host_id":                        host,
+		"worktree_path":                  targetPath,
+		"global_queue_allocation_enabled": enabled,
+	})
+}
+
 func (s *Server) listPrompts(w http.ResponseWriter, _ *http.Request) {
 	prompts := s.Engine.ListPrompts()
 	rows := make([]map[string]any, 0, len(prompts))
@@ -738,12 +793,19 @@ func (s *Server) executePrompt(w http.ResponseWriter, r *http.Request) {
 		Iterations           int               `json:"iterations"`
 		Env                  map[string]string `json:"env_vars"`
 		ResumeConversationID string            `json:"resume_conversation_id"`
+		IsGlobal             bool              `json:"is_global"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	sch, err := s.Engine.ExecutePromptWithResume(r.PathValue("id"), raw.HostID, raw.RepoPath, raw.Iterations, raw.Env, raw.ResumeConversationID)
+	var sch control.Schedule
+	var err error
+	if raw.IsGlobal || raw.HostID == "global" {
+		sch, err = s.Engine.EnqueueGlobalSchedule(r.PathValue("id"), raw.Iterations, raw.Env)
+	} else {
+		sch, err = s.Engine.ExecutePromptWithResume(r.PathValue("id"), raw.HostID, raw.RepoPath, raw.Iterations, raw.Env, raw.ResumeConversationID)
+	}
 	if err != nil {
 		code := http.StatusConflict
 		if errors.Is(err, control.ErrNotFound) {

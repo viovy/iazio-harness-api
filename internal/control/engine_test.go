@@ -2236,3 +2236,148 @@ func TestLeaseExternalAndRelease(t *testing.T) {
 	}
 }
 
+func TestGlobalQueueAllocationHonoredByPollHost(t *testing.T) {
+	e := NewEngine(func() time.Time { return time.Unix(100, 0) })
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{
+		HostID:       "host-1",
+		WorktreePath: "/repos/app-1",
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.SetRepoQueueAllocation("host-1", "/repos/app-1", false); err != nil {
+		t.Fatal(err)
+	}
+
+	pLocal := e.PutPrompt(Prompt{
+		Title:    "Local task",
+		Engine:   "agent",
+		Status:   "READY",
+		Revision: 1,
+	})
+	pGlobal := e.PutPrompt(Prompt{
+		Title:    "Global task",
+		Engine:   "agent",
+		Status:   "READY",
+		Revision: 1,
+	})
+
+	// 1. Enqueue Level 2 Global Schedule
+	globalSch, err := e.EnqueueGlobalSchedule(pGlobal.ID, 1, nil)
+	if err != nil {
+		t.Fatalf("EnqueueGlobalSchedule failed: %v", err)
+	}
+	if !globalSch.IsGlobal {
+		t.Fatalf("expected IsGlobal true on global schedule")
+	}
+
+	// 2. PollHost when GlobalQueueAllocationEnabled is false -> should NOT lease global schedule
+	_, _, _, ok := e.PollHost("host-1")
+	if ok {
+		t.Fatal("expected PollHost to return false when GlobalQueueAllocationEnabled is false")
+	}
+
+	// 3. Enqueue Level 1 Local Schedule
+	localSch, err := e.ExecutePrompt(pLocal.ID, "host-1", "/repos/app-1", 1, nil)
+	if err != nil {
+		t.Fatalf("ExecutePrompt failed: %v", err)
+	}
+	if localSch.IsGlobal {
+		t.Fatalf("expected IsGlobal false on local schedule")
+	}
+
+	// 4. PollHost should now lease the local schedule even though GlobalQueueAllocationEnabled is false
+	job, leasedSch, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("expected PollHost to lease Level 1 local schedule")
+	}
+	if leasedSch.ID != localSch.ID {
+		t.Fatalf("expected leased schedule %s, got %s", localSch.ID, leasedSch.ID)
+	}
+
+	// Finish local job
+	e.ApplyFinish("host-1", "/repos/app-1", job.ID, FinishInput{ASEComplete: true})
+
+	// 5. Check GetRepoDetail exposes both local and global schedules
+	detail, ok := e.GetRepoDetail("host-1", "/repos/app-1")
+	if !ok {
+		t.Fatal("GetRepoDetail returned false")
+	}
+	if len(detail.GlobalSchedules) != 1 || detail.GlobalSchedules[0].ID != globalSch.ID {
+		t.Fatalf("expected 1 global schedule in detail, got %+v", detail.GlobalSchedules)
+	}
+
+	// 6. Enable global queue allocation
+	if err := e.SetRepoQueueAllocation("host-1", "/repos/app-1", true); err != nil {
+		t.Fatalf("SetRepoQueueAllocation failed: %v", err)
+	}
+
+	// 7. PollHost should now lease the global schedule
+	globalJob, leasedGlobalSch, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("expected PollHost to lease Level 2 global schedule when enabled")
+	}
+	if leasedGlobalSch.ID != globalSch.ID {
+		t.Fatalf("expected leased schedule %s, got %s", globalSch.ID, leasedGlobalSch.ID)
+	}
+	if globalJob.ID == "" {
+		t.Fatal("expected non-empty job ID for leased global job")
+	}
+}
+
+func TestLocalSchedulePrioritizedOverHigherPriorityGlobalSchedule(t *testing.T) {
+	e := NewEngine(func() time.Time { return time.Unix(100, 0) })
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{
+		HostID:       "host-1",
+		WorktreePath: "/repos/app-1",
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pGlobal := e.PutPrompt(Prompt{
+		Title:    "Global high priority task",
+		Engine:   "agent",
+		Status:   "READY",
+		Revision: 1,
+	})
+	pLocal := e.PutPrompt(Prompt{
+		Title:    "Local normal priority task",
+		Engine:   "agent",
+		Status:   "READY",
+		Revision: 1,
+	})
+
+	// Enqueue Level 2 Global Schedule with higher numeric priority
+	globalSch, err := e.EnqueueGlobalSchedule(pGlobal.ID, 1, nil)
+	if err != nil {
+		t.Fatalf("EnqueueGlobalSchedule failed: %v", err)
+	}
+	e.mu.Lock()
+	e.schedules[globalSch.ID].Priority = 999
+	e.mu.Unlock()
+
+	// Enqueue Level 1 Local Schedule with lower numeric priority (10)
+	localSch, err := e.ExecutePrompt(pLocal.ID, "host-1", "/repos/app-1", 1, nil)
+	if err != nil {
+		t.Fatalf("ExecutePrompt failed: %v", err)
+	}
+	e.mu.Lock()
+	e.schedules[localSch.ID].Priority = 10
+	e.mu.Unlock()
+
+	// PollHost must choose Level 1 Local schedule over Level 2 Global schedule
+	_, leased, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("expected PollHost to return true")
+	}
+	if leased.ID != localSch.ID {
+		t.Fatalf("expected Level 1 local schedule %s to take precedence over Level 2 global schedule %s, got %s", localSch.ID, globalSch.ID, leased.ID)
+	}
+}
+
+
