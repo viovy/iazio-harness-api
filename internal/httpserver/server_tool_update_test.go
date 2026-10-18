@@ -85,6 +85,24 @@ func TestServer_ToolUpdateAndReleases(t *testing.T) {
 	}
 
 	// 6. Test GET /v1/fleet/profiles/generic/releases
+	e.Releases.SetCachedRelease("viovy/autopilot-plugins-internal", "latest", control.ToolRelease{
+		Name:          "autopilot",
+		Repository:    "viovy/autopilot-plugins-internal",
+		LatestVersion: "0.1.0",
+		TagName:       "v0.1.0",
+	}, 10*time.Minute)
+	e.Releases.SetCachedRelease("viovy/iazio-mcp", "latest", control.ToolRelease{
+		Name:          "iazio-mcp",
+		Repository:    "viovy/iazio-mcp",
+		LatestVersion: "0.0.42",
+		TagName:       "v0.0.42",
+	}, 10*time.Minute)
+	e.Releases.SetCachedRelease("viovy/iazio-agent", "latest", control.ToolRelease{
+		Name:          "iazio-agent",
+		Repository:    "viovy/iazio-agent",
+		LatestVersion: "0.1.0",
+		TagName:       "v0.1.0",
+	}, 10*time.Minute)
 	recRel := httptest.NewRecorder()
 	handler.ServeHTTP(recRel, httptest.NewRequest("GET", "/v1/fleet/profiles/generic/releases", nil))
 	if recRel.Code != http.StatusOK {

@@ -407,3 +407,20 @@ func (s *ReleaseService) GetProfileReleases(ctx context.Context, p DistributionP
 	}
 	return out, nil
 }
+
+// SetCachedRelease manually injects a cached release (useful for testing and deterministic offline mocking).
+func (s *ReleaseService) SetCachedRelease(repo, version string, release ToolRelease, ttl time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	if version == "" {
+		version = "latest"
+	}
+	s.cache[repo+":"+version] = cachedRelease{
+		release:   release,
+		expiresAt: s.now().Add(ttl),
+	}
+}
+
