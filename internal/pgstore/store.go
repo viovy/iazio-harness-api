@@ -48,8 +48,12 @@ CREATE TABLE IF NOT EXISTS harness_repos (
   healing_attempts integer NOT NULL DEFAULT 0,
   porcelain text NOT NULL DEFAULT '',
   discard_pending boolean NOT NULL DEFAULT false,
+  repo_alias text NOT NULL DEFAULT '',
   PRIMARY KEY (host_id, worktree_path)
 );
+
+ALTER TABLE harness_repos ADD COLUMN IF NOT EXISTS repo_alias text NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX IF NOT EXISTS harness_repos_host_alias_idx ON harness_repos (host_id, lower(repo_alias)) WHERE repo_alias <> '';
 
 CREATE TABLE IF NOT EXISTS harness_hosts (
   id text PRIMARY KEY,
@@ -107,6 +111,15 @@ WHERE h1.status = 'DECLINED'
       AND h2.status = 'DECLINED'
       AND h2.created_at > h1.created_at
   );
+
+CREATE TABLE IF NOT EXISTS harness_git_credentials (
+  id text PRIMARY KEY,
+  name text NOT NULL,
+  repository_pattern text NOT NULL,
+  token text NOT NULL,
+  type text NOT NULL DEFAULT 'pat',
+  created_at timestamp with time zone NOT NULL DEFAULT now()
+);
 `
 
 // Store is a Postgres connection for the control plane.
@@ -256,9 +269,10 @@ func (s *Store) SaveRepo(ctx context.Context, r control.Repo) error {
 	if s == nil || s.db == nil {
 		return nil
 	}
+	alias := r.EffectiveAlias()
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO harness_repos (host_id, worktree_path, docs_hub_path, clone_url, default_branch, queue, lock, reason, healing_attempts, porcelain, discard_pending)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+INSERT INTO harness_repos (host_id, worktree_path, docs_hub_path, clone_url, default_branch, queue, lock, reason, healing_attempts, porcelain, discard_pending, repo_alias)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 ON CONFLICT (host_id, worktree_path) DO UPDATE SET
   docs_hub_path = EXCLUDED.docs_hub_path,
   clone_url = EXCLUDED.clone_url,
@@ -268,8 +282,9 @@ ON CONFLICT (host_id, worktree_path) DO UPDATE SET
   reason = EXCLUDED.reason,
   healing_attempts = EXCLUDED.healing_attempts,
   porcelain = EXCLUDED.porcelain,
-  discard_pending = EXCLUDED.discard_pending
-`, r.HostID, r.WorktreePath, r.DocsHubPath, r.CloneURL, r.DefaultBranch, r.Queue, r.Lock, r.Reason, r.HealingAttempts, r.Porcelain, r.DiscardPending)
+  discard_pending = EXCLUDED.discard_pending,
+  repo_alias = EXCLUDED.repo_alias
+`, r.HostID, r.WorktreePath, r.DocsHubPath, r.CloneURL, r.DefaultBranch, r.Queue, r.Lock, r.Reason, r.HealingAttempts, r.Porcelain, r.DiscardPending, alias)
 	if err != nil {
 		return fmt.Errorf("save repo: %w", err)
 	}
@@ -294,7 +309,7 @@ func (s *Store) LoadRepos(ctx context.Context) ([]control.Repo, error) {
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT host_id, worktree_path, docs_hub_path, clone_url, default_branch, queue, lock, reason, healing_attempts, porcelain, discard_pending
+SELECT host_id, worktree_path, docs_hub_path, clone_url, default_branch, queue, lock, reason, healing_attempts, porcelain, discard_pending, repo_alias
 FROM harness_repos ORDER BY host_id, worktree_path
 `)
 	if err != nil {
@@ -305,7 +320,7 @@ FROM harness_repos ORDER BY host_id, worktree_path
 	var out []control.Repo
 	for rows.Next() {
 		var r control.Repo
-		if err := rows.Scan(&r.HostID, &r.WorktreePath, &r.DocsHubPath, &r.CloneURL, &r.DefaultBranch, &r.Queue, &r.Lock, &r.Reason, &r.HealingAttempts, &r.Porcelain, &r.DiscardPending); err != nil {
+		if err := rows.Scan(&r.HostID, &r.WorktreePath, &r.DocsHubPath, &r.CloneURL, &r.DefaultBranch, &r.Queue, &r.Lock, &r.Reason, &r.HealingAttempts, &r.Porcelain, &r.DiscardPending, &r.RepoAlias); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -553,6 +568,66 @@ FROM harness_history ORDER BY created_at ASC
 		}
 		key := hostID + "\x00" + worktreePath
 		out[key] = append(out[key], r)
+	}
+	return out, rows.Err()
+}
+
+// SaveGitCredential persists a git credential.
+func (s *Store) SaveGitCredential(ctx context.Context, cred control.GitCredential) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	t := cred.Type
+	if t == "" {
+		t = "pat"
+	}
+	ca := cred.CreatedAt
+	if ca.IsZero() {
+		ca = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO harness_git_credentials (id, name, repository_pattern, token, type, created_at)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (id) DO UPDATE SET
+  name = EXCLUDED.name,
+  repository_pattern = EXCLUDED.repository_pattern,
+  token = EXCLUDED.token,
+  type = EXCLUDED.type;
+`, cred.ID, cred.Name, cred.Pattern, cred.Token, t, ca)
+	return err
+}
+
+// DeleteGitCredential removes a git credential by ID.
+func (s *Store) DeleteGitCredential(ctx context.Context, id string) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM harness_git_credentials WHERE id = $1;`, id)
+	return err
+}
+
+// LoadGitCredentials returns all registered git credentials.
+func (s *Store) LoadGitCredentials(ctx context.Context) ([]control.GitCredential, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, name, repository_pattern, token, type, created_at
+FROM harness_git_credentials
+ORDER BY created_at ASC;
+`)
+	if err != nil {
+		return nil, fmt.Errorf("load git credentials: %w", err)
+	}
+	defer rows.Close()
+
+	var out []control.GitCredential
+	for rows.Next() {
+		var c control.GitCredential
+		if err := rows.Scan(&c.ID, &c.Name, &c.Pattern, &c.Token, &c.Type, &c.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
 	}
 	return out, rows.Err()
 }

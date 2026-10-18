@@ -130,6 +130,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/fleet/profiles/scan-repo", s.scanRepoProfile)
 	mux.HandleFunc("GET /v1/fleet/manifest", s.getFleetManifest)
 	mux.HandleFunc("GET /v1/fleet/profiles/{name}/releases", s.getProfileReleases)
+	mux.HandleFunc("GET /v1/fleet/credentials/git", s.listGitCredentials)
+	mux.HandleFunc("POST /v1/fleet/credentials/git", s.registerGitCredential)
+	mux.HandleFunc("DELETE /v1/fleet/credentials/git/{id}", s.deleteGitCredential)
 	return withCORS(withAuth(mux, s.AuthToken))
 }
 
@@ -379,6 +382,10 @@ func (s *Server) upsertRepo(w http.ResponseWriter, r *http.Request) {
 		Queue:         firstString(raw, "queue", "Queue"),
 		Lock:          firstString(raw, "lock", "Lock"),
 		Reason:        firstString(raw, "reason", "Reason"),
+		RepoAlias:     firstString(raw, "repo_alias", "alias", "RepoAlias", "Alias"),
+	}
+	if repo.RepoAlias == "" && repo.WorktreePath != "" {
+		repo.RepoAlias = repo.EffectiveAlias()
 	}
 	if err := s.Engine.UpsertRepo(repo); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -1151,6 +1158,63 @@ func (s *Server) getProfileReleases(w http.ResponseWriter, r *http.Request) {
 		"releases": releases,
 	})
 }
+
+func (s *Server) listGitCredentials(w http.ResponseWriter, _ *http.Request) {
+	if s.Engine.Releases == nil {
+		s.Engine.Releases = control.NewReleaseService()
+	}
+	writeJSON(w, http.StatusOK, s.Engine.Releases.ListCredentials())
+}
+
+func (s *Server) registerGitCredential(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name    string `json:"name"`
+		Pattern string `json:"pattern"`
+		Token   string `json:"token"`
+		Type    string `json:"type"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if strings.TrimSpace(body.Pattern) == "" {
+		body.Pattern = "*"
+	}
+	if s.Engine.Releases == nil {
+		s.Engine.Releases = control.NewReleaseService()
+	}
+	cred, err := s.Engine.Releases.RegisterCredential(control.GitCredential{
+		Name:    body.Name,
+		Pattern: body.Pattern,
+		Token:   body.Token,
+		Type:    body.Type,
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":     "registered",
+		"credential": cred,
+	})
+}
+
+func (s *Server) deleteGitCredential(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.Engine.Releases == nil {
+		s.Engine.Releases = control.NewReleaseService()
+	}
+	if err := s.Engine.Releases.DeleteCredential(id); err != nil {
+		if errors.Is(err, control.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, err)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 
 func (s *Server) repoDetail(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")

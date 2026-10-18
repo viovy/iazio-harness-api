@@ -92,9 +92,11 @@ func repoSummary(r control.Repo) map[string]any {
 		expiresAt = r.LockExpiresAt.UTC().Format(time.RFC3339)
 	}
 	return map[string]any{
-		"path":                 r.WorktreePath,
-		"worktree_path":        r.WorktreePath,
-		"queue":                r.Queue,
+		"path":                            r.WorktreePath,
+		"worktree_path":                   r.WorktreePath,
+		"repo_alias":                      r.EffectiveAlias(),
+		"alias":                           r.EffectiveAlias(),
+		"queue":                           r.Queue,
 		"lock":                 r.Lock,
 		"lock_holder":          r.LockHolder,
 		"lock_expires_at":      expiresAt,
@@ -191,9 +193,12 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 	}
 
 	return map[string]any{
-		"host_id":                  d.Repo.HostID,
-		"path":                     d.Repo.WorktreePath,
-		"queue":                    d.Repo.Queue,
+		"host_id":                         d.Repo.HostID,
+		"path":                            d.Repo.WorktreePath,
+		"worktree_path":                   d.Repo.WorktreePath,
+		"repo_alias":                      d.Repo.EffectiveAlias(),
+		"alias":                           d.Repo.EffectiveAlias(),
+		"queue":                           d.Repo.Queue,
 		"lock":                     d.Repo.Lock,
 		"lock_holder":              d.Repo.LockHolder,
 		"lock_expires_at":          lockExpiresAt,
