@@ -51,6 +51,7 @@ func scheduleView(s control.Schedule) map[string]any {
 		"engine":                 s.Engine,
 		"resume_conversation_id": s.ResumeConversationID,
 		"story_id":               s.StoryID,
+		"is_global":               s.IsGlobal,
 	}
 }
 
@@ -157,6 +158,10 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 	for _, s := range d.Schedules {
 		schedules = append(schedules, scheduleView(s))
 	}
+	globalSchedules := make([]map[string]any, 0, len(d.GlobalSchedules))
+	for _, s := range d.GlobalSchedules {
+		globalSchedules = append(globalSchedules, scheduleView(s))
+	}
 	history := make([]map[string]any, 0, len(d.History))
 	for _, h := range d.History {
 		ids := h.ConversationIDs
@@ -205,6 +210,7 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 		"detected_verdict":         d.Repo.DetectedVerdict,
 		"running_job":                     running,
 		"schedules":                       schedules,
+		"global_schedules":                globalSchedules,
 		"history":                         history,
 		"global_queue_allocation_enabled": d.Repo.GlobalQueueAllocationEnabled,
 	}

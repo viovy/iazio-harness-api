@@ -180,6 +180,7 @@ type RepoDetail struct {
 	RunningIsStalled     bool
 	RunningStartedAt     time.Time
 	Schedules            []Schedule
+	GlobalSchedules      []Schedule
 	History              []HistoryRow
 }
 
@@ -236,30 +237,35 @@ func (e *Engine) GetRepoDetail(host, path string) (RepoDetail, bool) {
 		}
 	}
 	for _, sch := range e.schedules {
-		if sch.HostID != host || sch.WorktreePath != path {
-			continue
-		}
 		if (sch.Status == "QUEUED" || sch.Status == "RUNNING") && sch.IterationsRemaining > 0 {
 			if sch.IterationsTotal <= 0 || sch.IterationsCompleted < sch.IterationsTotal {
-				detail.Schedules = append(detail.Schedules, *sch)
+				if sch.HostID == host && sch.WorktreePath == path && !sch.IsGlobal {
+					detail.Schedules = append(detail.Schedules, *sch)
+				} else if sch.IsGlobal || sch.HostID == "global" || sch.HostID == "" {
+					detail.GlobalSchedules = append(detail.GlobalSchedules, *sch)
+				}
 			}
 		}
 	}
-	sort.Slice(detail.Schedules, func(i, j int) bool {
-		if detail.Schedules[i].Priority != detail.Schedules[j].Priority {
-			return detail.Schedules[i].Priority > detail.Schedules[j].Priority
-		}
-		idxI := strings.LastIndex(detail.Schedules[i].ID, "-")
-		idxJ := strings.LastIndex(detail.Schedules[j].ID, "-")
-		if idxI >= 0 && idxJ >= 0 {
-			nI, errI := strconv.Atoi(detail.Schedules[i].ID[idxI+1:])
-			nJ, errJ := strconv.Atoi(detail.Schedules[j].ID[idxJ+1:])
-			if errI == nil && errJ == nil {
-				return nI < nJ
+	sortSchedules := func(s []Schedule) {
+		sort.Slice(s, func(i, j int) bool {
+			if s[i].Priority != s[j].Priority {
+				return s[i].Priority > s[j].Priority
 			}
-		}
-		return detail.Schedules[i].ID < detail.Schedules[j].ID
-	})
+			idxI := strings.LastIndex(s[i].ID, "-")
+			idxJ := strings.LastIndex(s[j].ID, "-")
+			if idxI >= 0 && idxJ >= 0 {
+				nI, errI := strconv.Atoi(s[i].ID[idxI+1:])
+				nJ, errJ := strconv.Atoi(s[j].ID[idxJ+1:])
+				if errI == nil && errJ == nil {
+					return nI < nJ
+				}
+			}
+			return s[i].ID < s[j].ID
+		})
+	}
+	sortSchedules(detail.Schedules)
+	sortSchedules(detail.GlobalSchedules)
 	if detail.Running == nil && latest != nil && (repo.Lock == LockCooling || repo.Queue == QueueBlocked) {
 		detail.Running = latest
 		detail.RunningTitle = latestTitle

@@ -659,9 +659,10 @@ func (s *Server) remediateRepo(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) setRepoQueueAllocation(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Path         string `json:"path"`
-		WorktreePath string `json:"worktree_path"`
-		Enabled      *bool  `json:"enabled"`
+		Path                         string `json:"path"`
+		WorktreePath                 string `json:"worktree_path"`
+		Enabled                      *bool  `json:"enabled"`
+		GlobalQueueAllocationEnabled *bool  `json:"global_queue_allocation_enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
 		writeErr(w, http.StatusBadRequest, err)
@@ -678,8 +679,14 @@ func (s *Server) setRepoQueueAllocation(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusBadRequest, errors.New("worktree_path is required"))
 		return
 	}
-	enabled := true
-	if body.Enabled != nil {
+	if body.Enabled == nil && body.GlobalQueueAllocationEnabled == nil {
+		writeErr(w, http.StatusBadRequest, errors.New("enabled or global_queue_allocation_enabled is required"))
+		return
+	}
+	enabled := false
+	if body.GlobalQueueAllocationEnabled != nil {
+		enabled = *body.GlobalQueueAllocationEnabled
+	} else if body.Enabled != nil {
 		enabled = *body.Enabled
 	}
 	host := r.PathValue("host")
@@ -786,12 +793,19 @@ func (s *Server) executePrompt(w http.ResponseWriter, r *http.Request) {
 		Iterations           int               `json:"iterations"`
 		Env                  map[string]string `json:"env_vars"`
 		ResumeConversationID string            `json:"resume_conversation_id"`
+		IsGlobal             bool              `json:"is_global"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	sch, err := s.Engine.ExecutePromptWithResume(r.PathValue("id"), raw.HostID, raw.RepoPath, raw.Iterations, raw.Env, raw.ResumeConversationID)
+	var sch control.Schedule
+	var err error
+	if raw.IsGlobal || raw.HostID == "global" {
+		sch, err = s.Engine.EnqueueGlobalSchedule(r.PathValue("id"), raw.Iterations, raw.Env)
+	} else {
+		sch, err = s.Engine.ExecutePromptWithResume(r.PathValue("id"), raw.HostID, raw.RepoPath, raw.Iterations, raw.Env, raw.ResumeConversationID)
+	}
 	if err != nil {
 		code := http.StatusConflict
 		if errors.Is(err, control.ErrNotFound) {
