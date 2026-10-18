@@ -215,6 +215,7 @@ type Repo struct {
 	DetectedVerdict        string
 	LockHolder             string
 	LockExpiresAt          time.Time
+	GlobalQueueAllocationEnabled bool
 }
 
 // Tool is one binary from the latest heartbeat.
@@ -568,8 +569,32 @@ func (e *Engine) UpsertRepo(r Repo) error {
 	if r.DistributionProfile == "" {
 		r.DistributionProfile = "generic"
 	}
+	key := repoKey(r.HostID, r.WorktreePath)
+	if existing, exists := e.repos[key]; exists {
+		if !r.GlobalQueueAllocationEnabled && existing.GlobalQueueAllocationEnabled {
+			r.GlobalQueueAllocationEnabled = existing.GlobalQueueAllocationEnabled
+		}
+	} else {
+		r.GlobalQueueAllocationEnabled = true
+	}
 	cp := r
-	e.repos[repoKey(r.HostID, r.WorktreePath)] = &cp
+	e.repos[key] = &cp
+	return nil
+}
+
+// SetRepoQueueAllocation updates whether a repository dynamically accepts tasks from the global fleet queue.
+func (e *Engine) SetRepoQueueAllocation(hostID, worktreePath string, enabled bool) error {
+	if hostID == "" || worktreePath == "" {
+		return errors.New("host and worktree_path are required")
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	key := repoKey(hostID, worktreePath)
+	r, ok := e.repos[key]
+	if !ok {
+		return ErrNotFound
+	}
+	r.GlobalQueueAllocationEnabled = enabled
 	return nil
 }
 

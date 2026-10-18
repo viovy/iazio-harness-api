@@ -119,6 +119,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/repos/{host}/resume", s.resumeRepo)
 	mux.HandleFunc("POST /v1/repos/{host}/resume-in-place", s.resumeRepoInPlace)
 	mux.HandleFunc("POST /v1/repos/{host}/remediate", s.remediateRepo)
+	mux.HandleFunc("POST /v1/repos/{host}/queue-allocation", s.setRepoQueueAllocation)
 	mux.HandleFunc("GET /v1/repos/{host}", s.getRepo)
 	mux.HandleFunc("GET /v1/fleet/profiles", s.listProfiles)
 	mux.HandleFunc("POST /v1/fleet/profiles", s.createProfile)
@@ -653,6 +654,53 @@ func (s *Server) remediateRepo(w http.ResponseWriter, r *http.Request) {
 		"path":    targetPath,
 		"queue":   control.QueueOpen,
 		"lock":    control.LockIdle,
+	})
+}
+
+func (s *Server) setRepoQueueAllocation(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Path         string `json:"path"`
+		WorktreePath string `json:"worktree_path"`
+		Enabled      *bool  `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	targetPath := body.WorktreePath
+	if targetPath == "" {
+		targetPath = body.Path
+	}
+	if targetPath == "" {
+		targetPath = r.URL.Query().Get("path")
+	}
+	if targetPath == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("worktree_path is required"))
+		return
+	}
+	enabled := true
+	if body.Enabled != nil {
+		enabled = *body.Enabled
+	}
+	host := r.PathValue("host")
+	if err := s.Engine.SetRepoQueueAllocation(host, targetPath, enabled); err != nil {
+		code := http.StatusConflict
+		if errors.Is(err, control.ErrNotFound) {
+			code = http.StatusNotFound
+		}
+		writeErr(w, code, err)
+		return
+	}
+	if s.SaveRepo != nil {
+		if detail, ok := s.Engine.GetRepoDetail(host, targetPath); ok {
+			s.SaveRepo(detail.Repo)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":                         "ok",
+		"host_id":                        host,
+		"worktree_path":                  targetPath,
+		"global_queue_allocation_enabled": enabled,
 	})
 }
 

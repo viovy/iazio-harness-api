@@ -884,7 +884,58 @@ func TestServer_ExternalLeaseAndRelease(t *testing.T) {
 	}
 }
 
+func TestRepoQueueAllocationEndpoint(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	handler := s.Handler()
 
+	s.Engine.RegisterHost("host-1", "permanent")
+	_ = s.Engine.UpsertRepo(control.Repo{
+		HostID:       "host-1",
+		WorktreePath: "/work/test-repo",
+	})
+
+	// 1. Initial state check: default should be true
+	det, ok := s.Engine.GetRepoDetail("host-1", "/work/test-repo")
+	if !ok || !det.Repo.GlobalQueueAllocationEnabled {
+		t.Fatalf("expected default globalQueueAllocationEnabled true, got: %+v", det)
+	}
+
+	// 2. Toggle to false: POST /v1/repos/host-1/queue-allocation
+	falseVal := false
+	body, _ := json.Marshal(map[string]any{
+		"worktree_path": "/work/test-repo",
+		"enabled":       falseVal,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/repos/host-1/queue-allocation", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body %s", rr.Code, rr.Body.String())
+	}
+
+	det, ok = s.Engine.GetRepoDetail("host-1", "/work/test-repo")
+	if !ok || det.Repo.GlobalQueueAllocationEnabled {
+		t.Fatalf("expected globalQueueAllocationEnabled false after toggle, got: %+v", det)
+	}
+
+	// 3. Toggle back to true
+	trueVal := true
+	body, _ = json.Marshal(map[string]any{
+		"worktree_path": "/work/test-repo",
+		"enabled":       trueVal,
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/repos/host-1/queue-allocation", bytes.NewReader(body))
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body %s", rr.Code, rr.Body.String())
+	}
+
+	det, ok = s.Engine.GetRepoDetail("host-1", "/work/test-repo")
+	if !ok || !det.Repo.GlobalQueueAllocationEnabled {
+		t.Fatalf("expected globalQueueAllocationEnabled true after toggle back, got: %+v", det)
+	}
+}
 
 
 

@@ -103,8 +103,9 @@ func repoSummary(r control.Repo) map[string]any {
 		"clone_url":            r.CloneURL,
 		"distribution_profile": r.DistributionProfile,
 		"running_job_id":       r.RunningJobID,
-		"dirty_story_id":       r.DirtyStoryID,
-		"current_branch":       r.CurrentBranch,
+		"dirty_story_id":                  r.DirtyStoryID,
+		"current_branch":                  r.CurrentBranch,
+		"global_queue_allocation_enabled": r.GlobalQueueAllocationEnabled,
 	}
 }
 
@@ -202,9 +203,10 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 		"dirty_review_file":        d.Repo.DirtyReviewFile,
 		"detected_conversation_id": d.Repo.DetectedConversationID,
 		"detected_verdict":         d.Repo.DetectedVerdict,
-		"running_job":              running,
-		"schedules":                schedules,
-		"history":                  history,
+		"running_job":                     running,
+		"schedules":                       schedules,
+		"history":                         history,
+		"global_queue_allocation_enabled": d.Repo.GlobalQueueAllocationEnabled,
 	}
 }
 
