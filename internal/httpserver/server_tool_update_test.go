@@ -103,6 +103,12 @@ func TestServer_ToolUpdateAndReleases(t *testing.T) {
 		LatestVersion: "0.1.0",
 		TagName:       "v0.1.0",
 	}, 10*time.Minute)
+	e.Releases.SetCachedRelease("viovy/iazio-harness", "latest", control.ToolRelease{
+		Name:          "iazio-harness",
+		Repository:    "viovy/iazio-harness",
+		LatestVersion: "0.1.0",
+		TagName:       "v0.1.0",
+	}, 10*time.Minute)
 	recRel := httptest.NewRecorder()
 	handler.ServeHTTP(recRel, httptest.NewRequest("GET", "/v1/fleet/profiles/generic/releases", nil))
 	if recRel.Code != http.StatusOK {

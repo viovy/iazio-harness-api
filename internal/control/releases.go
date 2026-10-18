@@ -186,6 +186,9 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 	if !strings.Contains(repo, "/") {
 		repo = "viovy/" + repo
 	}
+	if targetVersion == "" {
+		targetVersion = "latest"
+	}
 
 	cacheKey := repo + ":" + targetVersion
 	s.mu.RLock()
