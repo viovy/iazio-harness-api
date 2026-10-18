@@ -642,7 +642,7 @@ func (e *Engine) LeaseExternal(host, path, holderID, storyID string, ttl time.Du
 	}
 
 	now := e.now()
-	if repo.Lock == LockRunning || repo.Lock == LockCleaning {
+	if repo.Lock == LockRunning || repo.Lock == LockCleaning || repo.Lock == LockCooling || repo.Lock == LockASE {
 		return *repo, ErrLockHeld
 	}
 

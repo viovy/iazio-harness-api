@@ -2226,5 +2226,13 @@ func TestLeaseExternalAndRelease(t *testing.T) {
 	if leased2.Lock != LockAutopilot || leased2.LockHolder != "autopilot-cli-2" {
 		t.Fatalf("expected LockAutopilot for holder 2, got lock=%s", leased2.Lock)
 	}
+
+	// 6. Repo in LockASE must reject LeaseExternal
+	repoASE := Repo{HostID: "mac-mini", WorktreePath: "/work/ase-repo", Queue: QueueOpen, Lock: LockASE}
+	_ = e.UpsertRepo(repoASE)
+	_, errASE := e.LeaseExternal("mac-mini", "/work/ase-repo", "autopilot-cli-1", "STORY-1", 10*time.Minute)
+	if !errors.Is(errASE, ErrLockHeld) {
+		t.Fatalf("expected ErrLockHeld for repo in LockASE, got: %v", errASE)
+	}
 }
 
