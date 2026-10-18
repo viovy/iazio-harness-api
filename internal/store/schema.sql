@@ -34,8 +34,11 @@ CREATE TABLE IF NOT EXISTS harness_repos (
   healing_attempts integer NOT NULL DEFAULT 0,
   porcelain text NOT NULL DEFAULT '',
   discard_pending boolean NOT NULL DEFAULT false,
+  repo_alias text NOT NULL DEFAULT '',
   PRIMARY KEY (host_id, worktree_path)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS harness_repos_host_alias_idx ON harness_repos (host_id, lower(repo_alias)) WHERE repo_alias <> '';
 
 CREATE TABLE IF NOT EXISTS harness_hosts (
   id text PRIMARY KEY,
@@ -63,4 +66,13 @@ CREATE TABLE IF NOT EXISTS harness_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_harness_history_repo ON harness_history (host_id, worktree_path, created_at ASC);
+
+CREATE TABLE IF NOT EXISTS harness_git_credentials (
+  id text PRIMARY KEY,
+  name text NOT NULL,
+  repository_pattern text NOT NULL,
+  token text NOT NULL,
+  type text NOT NULL DEFAULT 'pat',
+  created_at timestamp with time zone NOT NULL DEFAULT now()
+);
 

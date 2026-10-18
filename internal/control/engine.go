@@ -3,7 +3,9 @@ package control
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -217,6 +219,20 @@ type Repo struct {
 	LockHolder             string
 	LockExpiresAt          time.Time
 	GlobalQueueAllocationEnabled bool
+	RepoAlias              string
+}
+
+// EffectiveAlias returns the configured RepoAlias or falls back to the last directory component of WorktreePath.
+func (r Repo) EffectiveAlias() string {
+	if strings.TrimSpace(r.RepoAlias) != "" {
+		return strings.TrimSpace(r.RepoAlias)
+	}
+	clean := filepath.Clean(strings.ReplaceAll(r.WorktreePath, "\\", "/"))
+	base := filepath.Base(clean)
+	if base == "." || base == "/" || base == "" {
+		return r.WorktreePath
+	}
+	return base
 }
 
 // Tool is one binary from the latest heartbeat.
@@ -556,8 +572,19 @@ func (e *Engine) UpsertRepo(r Repo) error {
 	if r.HostID == "" || r.WorktreePath == "" {
 		return errors.New("host and worktree_path are required")
 	}
+	alias := r.EffectiveAlias()
+	if strings.EqualFold(alias, "tools") {
+		return errors.New("repository alias 'tools' is reserved for host tools")
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	for _, other := range e.repos {
+		if other.HostID == r.HostID && other.WorktreePath != r.WorktreePath {
+			if strings.EqualFold(other.EffectiveAlias(), alias) {
+				return fmt.Errorf("repository alias %q is already in use by %s on this host", alias, other.WorktreePath)
+			}
+		}
+	}
 	if r.Queue == "" {
 		r.Queue = QueueOpen
 	}
@@ -1251,6 +1278,15 @@ func (e *Engine) GetRepo(host, path string) (Repo, bool) {
 	defer e.mu.Unlock()
 	r, ok := e.repos[repoKey(host, path)]
 	if !ok {
+		for _, candidate := range e.repos {
+			if candidate.HostID == host && (candidate.EffectiveAlias() == path || candidate.WorktreePath == path) {
+				r = candidate
+				ok = true
+				break
+			}
+		}
+	}
+	if !ok {
 		return Repo{}, false
 	}
 	return *r, true
@@ -1403,6 +1439,9 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.reapExpiredLocked()
+	if h, ok := e.hosts[host]; ok && (h.Presence == "ONLINE_UPDATING_TOOLS" || h.Presence == "UPDATING_TOOLS") {
+		return Job{}, Schedule{}, "", false
+	}
 	var candidates []*Schedule
 	for _, sch := range e.schedules {
 		if sch.Status != "QUEUED" {

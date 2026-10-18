@@ -191,6 +191,16 @@ func (e *Engine) GetRepoDetail(host, path string) (RepoDetail, bool) {
 	e.reapExpiredLocked()
 	repo, ok := e.repos[repoKey(host, path)]
 	if !ok {
+		for _, r := range e.repos {
+			if r.HostID == host && (r.EffectiveAlias() == path || r.WorktreePath == path) {
+				repo = r
+				path = r.WorktreePath
+				ok = true
+				break
+			}
+		}
+	}
+	if !ok {
 		return RepoDetail{}, false
 	}
 	detail := RepoDetail{Repo: *repo, DocsHubAllIdle: true}

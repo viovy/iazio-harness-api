@@ -137,6 +137,12 @@ func main() {
 			}
 			log.Printf("loaded %d distribution profiles from database", len(profiles))
 		}
+		if srv.Engine.Releases != nil {
+			if err := srv.Engine.Releases.SetStore(store); err != nil {
+				log.Fatalf("fatal: failed to load git credentials into release service: %v", err)
+			}
+			log.Printf("attached git credentials store to release service")
+		}
 	}
 	httpServer := &http.Server{
 		Addr:              addr,
