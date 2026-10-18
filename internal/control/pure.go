@@ -40,10 +40,12 @@ const (
 	QueueBlocked  = "BLOCKED_AWAITING_CORRELATION"
 	QueueCleaning = "CLEANING_HUB"
 
-	LockIdle     = "IDLE"
-	LockRunning  = "RUNNING_HARNESS"
-	LockCooling  = "COOLING_OFF"
-	LockCleaning = "CLEANING_HUB"
+	LockIdle      = "IDLE"
+	LockRunning   = "RUNNING_HARNESS"
+	LockCooling   = "COOLING_OFF"
+	LockCleaning  = "CLEANING_HUB"
+	LockAutopilot = "AUTOPILOT_LOCAL"
+	LockASE       = "RUNNING_ASE"
 
 	KindOrdinary     = "ordinary"
 	KindRefinement   = "story_refinement"

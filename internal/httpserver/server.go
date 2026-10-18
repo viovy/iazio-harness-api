@@ -112,6 +112,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/repos/discard", s.discardRepo)
 	mux.HandleFunc("POST /v1/repos/intervention", s.intervention)
 	mux.HandleFunc("POST /v1/repos/{host}/lease", s.lease)
+	mux.HandleFunc("POST /v1/repos/{host}/release", s.releaseExternalLease)
 	mux.HandleFunc("POST /v1/repos/{host}/preflight", s.preflight)
 	mux.HandleFunc("POST /v1/repos/{host}/finish", s.finish)
 	mux.HandleFunc("POST /v1/repos/{host}/force-pause", s.forcePause)
@@ -401,26 +402,83 @@ func firstString(raw map[string]any, keys ...string) string {
 
 func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Path     string `json:"worktree_path"`
-		CloneURL string `json:"clone_url"`
-		Kind     string `json:"kind"`
+		Path       string `json:"worktree_path"`
+		CloneURL   string `json:"clone_url"`
+		Kind       string `json:"kind"`
+		HolderID   string `json:"holder_id"`
+		CallerType string `json:"caller_type"`
+		StoryID    string `json:"story_id"`
+		TTLSeconds int    `json:"ttl_seconds"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+
+	host := r.PathValue("host")
+	if body.CallerType == "autopilot-cli" || body.HolderID != "" {
+		ttl := time.Duration(body.TTLSeconds) * time.Second
+		if ttl <= 0 {
+			ttl = 300 * time.Second
+		}
+		repo, err := s.Engine.LeaseExternal(host, body.Path, body.HolderID, body.StoryID, ttl)
+		if err != nil {
+			writeErr(w, http.StatusConflict, err)
+			return
+		}
+		if s.SaveRepo != nil {
+			s.SaveRepo(repo)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":        "LEASED",
+			"host":          host,
+			"worktree_path": repo.WorktreePath,
+			"holder_id":     repo.LockHolder,
+			"lock":          repo.Lock,
+			"story_id":      repo.DirtyStoryID,
+			"expires_at":    repo.LockExpiresAt.UTC().Format(time.RFC3339),
+		})
+		return
+	}
+
 	var job control.Job
 	var err error
 	if body.Kind == control.KindIntervention {
-		job, err = s.Engine.LeaseIntervention(r.PathValue("host"), body.Path, body.CloneURL)
+		job, err = s.Engine.LeaseIntervention(host, body.Path, body.CloneURL)
 	} else {
-		job, err = s.Engine.LeaseOrdinary(r.PathValue("host"), body.Path, body.CloneURL)
+		job, err = s.Engine.LeaseOrdinary(host, body.Path, body.CloneURL)
 	}
 	if err != nil {
 		writeErr(w, http.StatusConflict, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
+}
+
+func (s *Server) releaseExternalLease(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Path     string `json:"worktree_path"`
+		HolderID string `json:"holder_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	host := r.PathValue("host")
+	repo, err := s.Engine.ReleaseExternal(host, body.Path, body.HolderID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err)
+		return
+	}
+	if s.SaveRepo != nil {
+		s.SaveRepo(repo)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":        "RELEASED",
+		"host":          host,
+		"worktree_path": repo.WorktreePath,
+		"lock":          repo.Lock,
+	})
 }
 
 func (s *Server) preflight(w http.ResponseWriter, r *http.Request) {

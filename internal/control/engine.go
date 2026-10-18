@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"errors"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -78,6 +79,8 @@ const (
 var (
 	// ErrNotLeaseHolder rejects a story draft from the wrong caller.
 	ErrNotLeaseHolder = errors.New("caller does not hold the lease")
+	// ErrLockHeld rejects lease when worktree is locked or held.
+	ErrLockHeld = errors.New("worktree lock held")
 	// ErrCancelClosed rejects cancel after the exit code is posted.
 	ErrCancelClosed = errors.New("cancel rejected after exit")
 	// ErrPromptRunning refuses body edits and deletes on a running revision.
@@ -210,6 +213,8 @@ type Repo struct {
 	DirtyReviewFile        string
 	DetectedConversationID string
 	DetectedVerdict        string
+	LockHolder             string
+	LockExpiresAt          time.Time
 }
 
 // Tool is one binary from the latest heartbeat.
@@ -595,7 +600,7 @@ func (e *Engine) LeaseOrdinary(host, path, clone string) (Job, error) {
 	if repo.Queue != QueueOpen && repo.Queue != QueueHealing {
 		return Job{}, ErrQueueBlocked
 	}
-	if repo.Lock == LockRunning || repo.Lock == LockCooling || repo.Lock == LockCleaning {
+	if repo.Lock == LockRunning || repo.Lock == LockCooling || repo.Lock == LockCleaning || repo.Lock == LockAutopilot || repo.Lock == LockASE {
 		return Job{}, ErrQueueBlocked
 	}
 	if holder, ok := e.cloneLease[clone]; ok && holder != "" {
@@ -618,6 +623,72 @@ func (e *Engine) LeaseIntervention(host, path, clone string) (Job, error) {
 	repo.Lock = LockRunning
 	job := e.newJobLocked(host, path, clone, KindIntervention)
 	return *job, nil
+}
+
+// LeaseExternal grants or renews an execution lease for an external CLI process (e.g. autopilot).
+func (e *Engine) LeaseExternal(host, path, holderID, storyID string, ttl time.Duration) (Repo, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	key := repoKey(host, path)
+	repo := e.repos[key]
+	if repo == nil {
+		repo = &Repo{
+			HostID:       host,
+			WorktreePath: path,
+			Queue:        QueueOpen,
+			Lock:         LockIdle,
+		}
+		e.repos[key] = repo
+	}
+
+	now := e.now()
+	if repo.Lock == LockRunning || repo.Lock == LockCleaning {
+		return *repo, ErrLockHeld
+	}
+
+	if repo.Lock == LockAutopilot && !repo.LockExpiresAt.IsZero() && now.Before(repo.LockExpiresAt) {
+		if repo.LockHolder != "" && repo.LockHolder != holderID {
+			return *repo, ErrLockHeld
+		}
+	}
+
+	if ttl <= 0 {
+		ttl = 300 * time.Second
+	}
+
+	repo.Lock = LockAutopilot
+	repo.LockHolder = holderID
+	repo.LockExpiresAt = now.Add(ttl)
+	if strings.TrimSpace(storyID) != "" {
+		repo.DirtyStoryID = storyID
+		repo.RunningJobID = storyID
+	}
+	e.notifyRepoLocked(repo)
+	return *repo, nil
+}
+
+// ReleaseExternal releases an external execution lease held on a repository.
+func (e *Engine) ReleaseExternal(host, path, holderID string) (Repo, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	key := repoKey(host, path)
+	repo := e.repos[key]
+	if repo == nil {
+		return Repo{}, os.ErrNotExist
+	}
+
+	if repo.Lock == LockAutopilot {
+		if holderID == "" || repo.LockHolder == holderID {
+			repo.Lock = LockIdle
+			repo.LockHolder = ""
+			repo.LockExpiresAt = time.Time{}
+			if repo.RunningJobID == repo.DirtyStoryID {
+				repo.RunningJobID = ""
+			}
+			e.notifyRepoLocked(repo)
+		}
+	}
+	return *repo, nil
 }
 
 // ApplyPreflight records a halt. Disk and git-auth do not pause the queue.
@@ -1290,6 +1361,14 @@ func (e *Engine) reapExpiredLocked() {
 				repo.RunningJobID = ""
 				e.notifyRepoLocked(repo)
 			}
+		} else if repo.Lock == LockAutopilot && !repo.LockExpiresAt.IsZero() && now.After(repo.LockExpiresAt) {
+			repo.Lock = LockIdle
+			repo.LockHolder = ""
+			repo.LockExpiresAt = time.Time{}
+			if repo.RunningJobID == repo.DirtyStoryID {
+				repo.RunningJobID = ""
+			}
+			e.notifyRepoLocked(repo)
 		}
 	}
 }

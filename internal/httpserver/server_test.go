@@ -808,6 +808,83 @@ func TestPostExitDiagnosticsHTTP(t *testing.T) {
 	}
 }
 
+func TestServer_ExternalLeaseAndRelease(t *testing.T) {
+	e := control.NewEngine(func() time.Time { return time.Now().UTC() })
+	_ = e.UpsertRepo(control.Repo{HostID: "host-1", WorktreePath: "/work/test-repo", Queue: control.QueueOpen, Lock: control.LockIdle})
+
+	s := &Server{Engine: e}
+	h := s.Handler()
+
+	// 1. Acquire external lease
+	body, _ := json.Marshal(map[string]any{
+		"worktree_path": "/work/test-repo",
+		"holder_id":     "autopilot-cli-100",
+		"caller_type":   "autopilot-cli",
+		"story_id":      "TASK-42",
+		"ttl_seconds":   600,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/repos/host-1/lease", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200 on external lease, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(rr.Body.Bytes(), &resp)
+	if resp["lock"] != "AUTOPILOT_LOCAL" || resp["holder_id"] != "autopilot-cli-100" {
+		t.Fatalf("unexpected lease response: %+v", resp)
+	}
+
+	// 2. Conflicting external lease
+	body2, _ := json.Marshal(map[string]any{
+		"worktree_path": "/work/test-repo",
+		"holder_id":     "autopilot-cli-200",
+		"caller_type":   "autopilot-cli",
+	})
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/repos/host-1/lease", bytes.NewReader(body2))
+	rr2 := httptest.NewRecorder()
+	h.ServeHTTP(rr2, req2)
+	if rr2.Code != http.StatusConflict {
+		t.Fatalf("expected HTTP 409 Conflict, got %d: %s", rr2.Code, rr2.Body.String())
+	}
+
+	// 3. Inspect repo detail view reflects lock_holder and AUTOPILOT_LOCAL
+	reqGet := httptest.NewRequest(http.MethodGet, "/v1/hosts/host-1/repos?path=/work/test-repo", nil)
+	rrGet := httptest.NewRecorder()
+	h.ServeHTTP(rrGet, reqGet)
+	if rrGet.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200, got %d: %s", rrGet.Code, rrGet.Body.String())
+	}
+	var getResp map[string]any
+	_ = json.Unmarshal(rrGet.Body.Bytes(), &getResp)
+	if getResp["lock"] != "AUTOPILOT_LOCAL" || getResp["lock_holder"] != "autopilot-cli-100" {
+		t.Fatalf("expected lock AUTOPILOT_LOCAL with holder, got %+v", getResp)
+	}
+
+	// 4. Release external lease
+	relBody, _ := json.Marshal(map[string]any{
+		"worktree_path": "/work/test-repo",
+		"holder_id":     "autopilot-cli-100",
+	})
+	reqRel := httptest.NewRequest(http.MethodPost, "/v1/repos/host-1/release", bytes.NewReader(relBody))
+	rrRel := httptest.NewRecorder()
+	h.ServeHTTP(rrRel, reqRel)
+	if rrRel.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200 on release, got %d: %s", rrRel.Code, rrRel.Body.String())
+	}
+
+	// 5. Verify restored to IDLE
+	reqGet2 := httptest.NewRequest(http.MethodGet, "/v1/hosts/host-1/repos?path=/work/test-repo", nil)
+	rrGet2 := httptest.NewRecorder()
+	h.ServeHTTP(rrGet2, reqGet2)
+	var getResp2 map[string]any
+	_ = json.Unmarshal(rrGet2.Body.Bytes(), &getResp2)
+	if getResp2["lock"] != "IDLE" || getResp2["lock_holder"] != "" {
+		t.Fatalf("expected lock IDLE after release, got %+v", getResp2)
+	}
+}
+
+
 
 
 
