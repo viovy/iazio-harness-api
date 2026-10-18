@@ -572,9 +572,7 @@ func (e *Engine) UpsertRepo(r Repo) error {
 	}
 	key := repoKey(r.HostID, r.WorktreePath)
 	if existing, exists := e.repos[key]; exists {
-		if !r.GlobalQueueAllocationEnabled && existing.GlobalQueueAllocationEnabled {
-			r.GlobalQueueAllocationEnabled = existing.GlobalQueueAllocationEnabled
-		}
+		r.GlobalQueueAllocationEnabled = existing.GlobalQueueAllocationEnabled
 	} else {
 		r.GlobalQueueAllocationEnabled = true
 	}
@@ -1432,6 +1430,11 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 		}
 	}
 	sort.Slice(candidates, func(i, j int) bool {
+		iLocal := !candidates[i].IsGlobal && candidates[i].HostID == host
+		jLocal := !candidates[j].IsGlobal && candidates[j].HostID == host
+		if iLocal != jLocal {
+			return iLocal
+		}
 		if candidates[i].Priority != candidates[j].Priority {
 			return candidates[i].Priority > candidates[j].Priority
 		}
