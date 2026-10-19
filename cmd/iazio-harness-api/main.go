@@ -303,13 +303,6 @@ func seedDefaults(ctx context.Context, e *control.Engine, store *pgstore.Store, 
 					UpdatedAt:     now,
 				},
 				{
-					Name:          "iazio-infra",
-					Path:          "iazio-infra",
-					DefaultBranch: "main",
-					Description:   "Umbrella orchestration, deployments, and CI/CD pipelines",
-					UpdatedAt:     now,
-				},
-				{
 					Name:          "iazio-rag-api",
 					Path:          "iazio-rag-api",
 					DefaultBranch: "main",
