@@ -1,0 +1,184 @@
+package dispatch
+
+import (
+	"context"
+	"encoding/json"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestQueue_EnqueueAndGet(t *testing.T) {
+	q := NewInMemoryQueue()
+	ctx := context.Background()
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type:    JobTypeStoryCreate,
+		Repo:    "iazio-mcp",
+		Payload: json.RawMessage(`{"title":"test"}`),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error enqueuing: %v", err)
+	}
+	if job.ID == "" {
+		t.Fatal("expected generated job ID, got empty")
+	}
+	if job.Status != JobStatusPending {
+		t.Fatalf("expected status %s, got %s", JobStatusPending, job.Status)
+	}
+
+	retrieved, ok := q.Get(job.ID)
+	if !ok || retrieved == nil {
+		t.Fatalf("expected job %s to be found", job.ID)
+	}
+	if retrieved.Repo != "iazio-mcp" {
+		t.Fatalf("expected repo iazio-mcp, got %s", retrieved.Repo)
+	}
+}
+
+func TestQueue_ClaimFilters(t *testing.T) {
+	q := NewInMemoryQueue()
+	ctx := context.Background()
+
+	_, err := q.Enqueue(ctx, &Job{
+		Type:       JobTypePromptExecute,
+		Repo:       "repo-1",
+		TargetHost: "host-a",
+	})
+	if err != nil {
+		t.Fatalf("enqueue error: %v", err)
+	}
+
+	_, err = q.Enqueue(ctx, &Job{
+		Type:       JobTypeStoryCreate,
+		Repo:       "repo-2",
+		TargetHost: "host-b",
+	})
+	if err != nil {
+		t.Fatalf("enqueue error: %v", err)
+	}
+
+	// Claim with unmatched host should return nil
+	claimed, err := q.Claim(ctx, "host-c", []string{JobTypeStoryCreate})
+	if err != nil {
+		t.Fatalf("claim error: %v", err)
+	}
+	if claimed != nil {
+		t.Fatalf("expected nil claim, got %v", claimed)
+	}
+
+	// Claim with matching host and type
+	claimed, err = q.Claim(ctx, "host-b", []string{JobTypeStoryCreate})
+	if err != nil {
+		t.Fatalf("claim error: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("expected claimed job, got nil")
+	}
+	if claimed.Type != JobTypeStoryCreate || claimed.TargetHost != "host-b" {
+		t.Fatalf("unexpected claimed job attributes: %+v", claimed)
+	}
+	if claimed.Status != JobStatusClaimed {
+		t.Fatalf("expected status claimed, got %s", claimed.Status)
+	}
+}
+
+func TestQueue_AwaitAndComplete(t *testing.T) {
+	q := NewInMemoryQueue()
+	ctx := context.Background()
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type: JobTypeStoryCreate,
+		Repo: "iazio-mcp",
+	})
+	if err != nil {
+		t.Fatalf("enqueue error: %v", err)
+	}
+
+	resultCh := make(chan *Job)
+	errCh := make(chan error)
+
+	go func() {
+		completedJob, err := q.Await(ctx, job.ID, 2*time.Second)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		resultCh <- completedJob
+	}()
+
+	// Simulate agent processing
+	time.Sleep(50 * time.Millisecond)
+	err = q.Complete(ctx, job.ID, json.RawMessage(`{"story_id":"STORY-001"}`), "")
+	if err != nil {
+		t.Fatalf("complete error: %v", err)
+	}
+
+	select {
+	case res := <-resultCh:
+		if res.Status != JobStatusCompleted {
+			t.Fatalf("expected completed status, got %s", res.Status)
+		}
+		if string(res.Result) != `{"story_id":"STORY-001"}` {
+			t.Fatalf("unexpected result: %s", string(res.Result))
+		}
+	case err := <-errCh:
+		t.Fatalf("unexpected await error: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("test timed out awaiting completion")
+	}
+}
+
+func TestQueue_AwaitTimeout(t *testing.T) {
+	q := NewInMemoryQueue()
+	ctx := context.Background()
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type: JobTypeStoryCreate,
+		Repo: "iazio-mcp",
+	})
+	if err != nil {
+		t.Fatalf("enqueue error: %v", err)
+	}
+
+	_, err = q.Await(ctx, job.ID, 50*time.Millisecond)
+	if err != ErrTimeout {
+		t.Fatalf("expected ErrTimeout, got %v", err)
+	}
+}
+
+func TestQueue_ConcurrentOperations(t *testing.T) {
+	q := NewInMemoryQueue()
+	ctx := context.Background()
+
+	const count = 50
+	var wg sync.WaitGroup
+	wg.Add(count)
+
+	for i := 0; i < count; i++ {
+		go func() {
+			defer wg.Done()
+			_, _ = q.Enqueue(ctx, &Job{
+				Type: JobTypeStoryCreate,
+				Repo: "concurrent-repo",
+			})
+		}()
+	}
+	wg.Wait()
+
+	// Claim all
+	claimedCount := 0
+	for i := 0; i < count; i++ {
+		claimed, err := q.Claim(ctx, "", nil)
+		if err != nil {
+			t.Fatalf("claim error: %v", err)
+		}
+		if claimed != nil {
+			claimedCount++
+			_ = q.Complete(ctx, claimed.ID, json.RawMessage(`{}`), "")
+		}
+	}
+	if claimedCount != count {
+		t.Fatalf("expected to claim %d jobs, claimed %d", count, claimedCount)
+	}
+}
