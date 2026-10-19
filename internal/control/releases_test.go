@@ -235,5 +235,3 @@ func TestReleaseService_ExpiredCacheFailsClosed(t *testing.T) {
 		t.Errorf("expected lookup release error message, got: %v", err)
 	}
 }
-
-

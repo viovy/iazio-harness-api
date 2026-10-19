@@ -1393,7 +1393,6 @@ func TestResumeJobAutoSwitchesAgentToAgyOnAntigravitySessionOrQuota(t *testing.T
 	}
 }
 
-
 func TestRemediateRepo(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("host-1", "permanent")
@@ -2379,5 +2378,3 @@ func TestLocalSchedulePrioritizedOverHigherPriorityGlobalSchedule(t *testing.T) 
 		t.Fatalf("expected Level 1 local schedule %s to take precedence over Level 2 global schedule %s, got %s", localSch.ID, globalSch.ID, leased.ID)
 	}
 }
-
-

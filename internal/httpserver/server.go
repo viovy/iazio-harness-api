@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/viovy/iazio-harness-api/internal/api/handlers"
+	"github.com/viovy/iazio-harness-api/internal/codebase"
 	"github.com/viovy/iazio-harness-api/internal/control"
 	"github.com/viovy/iazio-harness-api/internal/version"
 )
@@ -43,11 +45,21 @@ type Server struct {
 	ClearHistory func(ctx context.Context, hostID, worktreePath string) error
 	// AuthToken, when non-empty, requires Bearer token authentication on control-plane endpoints.
 	AuthToken string
+	// CodebaseStore manages fleet repository discovery and codebase RAG search chunks.
+	CodebaseStore codebase.Store
 }
 
 // Handler returns the HTTP routes.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+
+	codebaseStore := s.CodebaseStore
+	if codebaseStore == nil {
+		codebaseStore = codebase.NewMemStore()
+	}
+	mux.Handle("GET /api/v1/repos", handlers.NewReposHandler(codebaseStore))
+	mux.Handle("POST /api/v1/codebase/search", handlers.NewCodebaseSearchHandler(codebaseStore))
+
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{
 			"status":  "ok",
@@ -711,9 +723,9 @@ func (s *Server) setRepoQueueAllocation(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":                         "ok",
-		"host_id":                        host,
-		"worktree_path":                  targetPath,
+		"status":                          "ok",
+		"host_id":                         host,
+		"worktree_path":                   targetPath,
 		"global_queue_allocation_enabled": enabled,
 	})
 }
@@ -1214,7 +1226,6 @@ func (s *Server) deleteGitCredential(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
-
 
 func (s *Server) repoDetail(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")

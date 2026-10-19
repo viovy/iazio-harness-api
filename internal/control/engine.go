@@ -198,28 +198,28 @@ type Job struct {
 
 // Repo is one registered checkout.
 type Repo struct {
-	HostID              string
-	WorktreePath        string
-	DocsHubPath         string
-	CloneURL            string
-	DefaultBranch       string
-	CurrentBranch       string
-	Queue               string
-	Lock                string
-	Reason              string
-	HealingAttempts     int
-	Porcelain           string
-	DiscardPending         bool
-	DistributionProfile    string
-	RunningJobID           string
-	DirtyStoryID           string
-	DirtyReviewFile        string
-	DetectedConversationID string
-	DetectedVerdict        string
-	LockHolder             string
-	LockExpiresAt          time.Time
+	HostID                       string
+	WorktreePath                 string
+	DocsHubPath                  string
+	CloneURL                     string
+	DefaultBranch                string
+	CurrentBranch                string
+	Queue                        string
+	Lock                         string
+	Reason                       string
+	HealingAttempts              int
+	Porcelain                    string
+	DiscardPending               bool
+	DistributionProfile          string
+	RunningJobID                 string
+	DirtyStoryID                 string
+	DirtyReviewFile              string
+	DetectedConversationID       string
+	DetectedVerdict              string
+	LockHolder                   string
+	LockExpiresAt                time.Time
 	GlobalQueueAllocationEnabled bool
-	RepoAlias              string
+	RepoAlias                    string
 }
 
 // EffectiveAlias returns the configured RepoAlias or falls back to the last directory component of WorktreePath.
@@ -322,26 +322,26 @@ type Host struct {
 
 // Engine is the in-process control plane.
 type Engine struct {
-	mu         sync.Mutex
-	now        func() time.Time
-	seq        int
-	extracting bool
-	ideas      map[string]*Idea
-	prompts    map[string]*Prompt
-	schedules  map[string]*Schedule
-	jobs       map[string]*Job
-	repos      map[string]*Repo
-	hosts      map[string]*Host
-	profiles   map[string]*DistributionProfile
-	cloneLease map[string]string
-	hubLease   string
-	runningRev map[string]bool
-	history    map[string][]HistoryRow
-	requests   []RepoRequest
-	logs         map[string][]LogChunk
-	subs         map[string][]chan LogChunk
-	Releases     *ReleaseService
-	OnRepoChange func(Repo)
+	mu              sync.Mutex
+	now             func() time.Time
+	seq             int
+	extracting      bool
+	ideas           map[string]*Idea
+	prompts         map[string]*Prompt
+	schedules       map[string]*Schedule
+	jobs            map[string]*Job
+	repos           map[string]*Repo
+	hosts           map[string]*Host
+	profiles        map[string]*DistributionProfile
+	cloneLease      map[string]string
+	hubLease        string
+	runningRev      map[string]bool
+	history         map[string][]HistoryRow
+	requests        []RepoRequest
+	logs            map[string][]LogChunk
+	subs            map[string][]chan LogChunk
+	Releases        *ReleaseService
+	OnRepoChange    func(Repo)
 	OnHistoryChange func(host, path string, row HistoryRow)
 	OnHistoryDelete func(host, path string, jobID string)
 }
@@ -2432,4 +2432,3 @@ func (e *Engine) EnqueueGlobalSchedule(promptID string, iterations int, envVars 
 	e.schedules[sid] = sch
 	return *sch, nil
 }
-

@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/viovy/iazio-harness-api/internal/codebase"
 	"github.com/viovy/iazio-harness-api/internal/control"
 	"github.com/viovy/iazio-harness-api/internal/extract"
 	"github.com/viovy/iazio-harness-api/internal/httpserver"
@@ -39,7 +40,11 @@ func main() {
 	if v := os.Getenv("IAZIO_HARNESS_API_ADDR"); v != "" {
 		addr = v
 	}
-	srv := &httpserver.Server{Engine: control.NewEngine(nil)}
+	codebaseStore := codebase.NewMemStore()
+	srv := &httpserver.Server{
+		Engine:        control.NewEngine(nil),
+		CodebaseStore: codebaseStore,
+	}
 	if tok := strings.TrimSpace(os.Getenv("IAZIO_AUTH_TOKEN")); tok != "" {
 		srv.AuthToken = tok
 	} else if tok := strings.TrimSpace(os.Getenv("IAZIO_HARNESS_API_TOKEN")); tok != "" {
@@ -92,7 +97,14 @@ func main() {
 			log.Printf("loaded %d repo history records from database", len(hist))
 		}
 
-		seedDefaults(ctx, srv.Engine, store)
+		seedDefaults(ctx, srv.Engine, store, srv.CodebaseStore)
+
+		if cRepos, err := store.LoadCodebaseRepos(ctx); err == nil && len(cRepos) > 0 {
+			for _, r := range cRepos {
+				_ = srv.CodebaseStore.UpsertRepository(ctx, r)
+			}
+			log.Printf("loaded %d codebase repos from database", len(cRepos))
+		}
 
 		srv.SaveIdea = func(idea control.Idea) {
 			_ = store.SaveIdea(context.Background(), idea)
@@ -143,6 +155,8 @@ func main() {
 			}
 			log.Printf("attached git credentials store to release service")
 		}
+	} else {
+		seedDefaults(context.Background(), srv.Engine, nil, srv.CodebaseStore)
 	}
 	httpServer := &http.Server{
 		Addr:              addr,
@@ -177,7 +191,7 @@ func main() {
 	}
 }
 
-func seedDefaults(ctx context.Context, e *control.Engine, store *pgstore.Store) {
+func seedDefaults(ctx context.Context, e *control.Engine, store *pgstore.Store, cbStore codebase.Store) {
 	if len(e.ListPrompts()) == 0 {
 		seedPrompts := []control.Prompt{
 			{
@@ -199,7 +213,9 @@ func seedDefaults(ctx context.Context, e *control.Engine, store *pgstore.Store) 
 		}
 		for _, p := range seedPrompts {
 			created := e.PutPrompt(p)
-			_ = store.SavePrompt(ctx, created)
+			if store != nil {
+				_ = store.SavePrompt(ctx, created)
+			}
 		}
 		log.Printf("seeded %d default prompts", len(seedPrompts))
 	}
@@ -210,7 +226,9 @@ func seedDefaults(ctx context.Context, e *control.Engine, store *pgstore.Store) 
 			if id != "" {
 				if _, ok := e.GetHostDetail(id); !ok {
 					h := e.RegisterHost(id, "permanent")
-					_ = store.SaveHost(ctx, h)
+					if store != nil {
+						_ = store.SaveHost(ctx, h)
+					}
 				}
 			}
 		}
@@ -232,13 +250,80 @@ func seedDefaults(ctx context.Context, e *control.Engine, store *pgstore.Store) 
 				}
 				if _, ok := e.GetRepo(r.HostID, r.WorktreePath); !ok {
 					_ = e.UpsertRepo(r)
-					_ = store.SaveRepo(ctx, r)
+					if store != nil {
+						_ = store.SaveRepo(ctx, r)
+					}
 					seededCount++
 				}
 			}
 			if seededCount > 0 {
 				log.Printf("seeded %d default repos from environment", seededCount)
 			}
+		}
+	}
+
+	if cbStore != nil {
+		res, _ := cbStore.ListRepositories(ctx, codebase.ListReposRequest{Limit: 1})
+		if res == nil || res.Total == 0 {
+			now := time.Now().UTC()
+			defaultFleet := []codebase.Repository{
+				{
+					Name:          "iazio-mcp",
+					Path:          "iazio-mcp",
+					DefaultBranch: "main",
+					Description:   "MCP server bridging iazio-api and iazio-harness-api",
+					UpdatedAt:     now,
+				},
+				{
+					Name:          "iazio-harness-api",
+					Path:          "iazio-harness-api",
+					DefaultBranch: "main",
+					Description:   "Agent execution control plane and codebase RAG gateway",
+					UpdatedAt:     now,
+				},
+				{
+					Name:          "iazio-api",
+					Path:          "iazio-api",
+					DefaultBranch: "main",
+					Description:   "Conversation history and distilled memory API",
+					UpdatedAt:     now,
+				},
+				{
+					Name:          "iazio-harness",
+					Path:          "iazio-harness",
+					DefaultBranch: "main",
+					Description:   "Local runner execution harness",
+					UpdatedAt:     now,
+				},
+				{
+					Name:          "iazio-agent",
+					Path:          "iazio-agent",
+					DefaultBranch: "main",
+					Description:   "Autonomous host agent",
+					UpdatedAt:     now,
+				},
+				{
+					Name:          "iazio-rag-api",
+					Path:          "iazio-rag-api",
+					DefaultBranch: "main",
+					Description:   "Dedicated webhook-driven codebase RAG indexing service",
+					UpdatedAt:     now,
+				},
+				{
+					Name:          "autopilot",
+					Path:          "autopilot",
+					DefaultBranch: "main",
+					Description:   "Autonomous software development lifecycle engine",
+					UpdatedAt:     now,
+				},
+			}
+			for _, r := range defaultFleet {
+				_ = cbStore.UpsertRepository(ctx, r)
+				if store != nil {
+					_ = store.SaveCodebaseRepo(ctx, r)
+				}
+			}
+			log.Printf("seeded %d default fleet repositories into codebase store", len(defaultFleet))
 		}
 	}
 }
