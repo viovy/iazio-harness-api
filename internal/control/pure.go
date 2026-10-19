@@ -28,7 +28,6 @@ func RequiredMinFreeBytes() uint64 {
 }
 
 const (
-
 	IdeaNew      = "NEW"
 	IdeaTriaged  = "TRIAGED"
 	IdeaRefining = "REFINING"

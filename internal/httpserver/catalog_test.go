@@ -570,5 +570,3 @@ func TestSchedulesAndHistoryEndpoints(t *testing.T) {
 		t.Fatalf("expected trailing slash repo_path to match in /v1/schedules: %s", schedulesTrailingSlash)
 	}
 }
-
-

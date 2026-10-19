@@ -9,6 +9,7 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/viovy/iazio-harness-api/internal/codebase"
 	"github.com/viovy/iazio-harness-api/internal/control"
 )
 
@@ -120,6 +121,32 @@ CREATE TABLE IF NOT EXISTS harness_git_credentials (
   type text NOT NULL DEFAULT 'pat',
   created_at timestamp with time zone NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS codebase_repositories (
+  name text PRIMARY KEY,
+  path text NOT NULL,
+  default_branch text NOT NULL DEFAULT 'main',
+  git_tree_sha text NOT NULL DEFAULT '',
+  description text NOT NULL DEFAULT '',
+  updated_at timestamp with time zone NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS codebase_chunks (
+  id text PRIMARY KEY,
+  repo_name text NOT NULL,
+  file_path text NOT NULL,
+  start_line integer NOT NULL,
+  end_line integer NOT NULL,
+  symbol text NOT NULL DEFAULT '',
+  content text NOT NULL,
+  file_blob_sha text NOT NULL,
+  git_tree_sha text NOT NULL,
+  superseded boolean NOT NULL DEFAULT false,
+  created_at timestamp with time zone NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_codebase_chunks_repo_tree ON codebase_chunks (repo_name, git_tree_sha, superseded);
+CREATE INDEX IF NOT EXISTS idx_codebase_chunks_path ON codebase_chunks (repo_name, file_path);
 `
 
 // Store is a Postgres connection for the control plane.
@@ -632,6 +659,103 @@ ORDER BY created_at ASC;
 	return out, rows.Err()
 }
 
+// LoadCodebaseRepos loads all registered fleet repositories from the database.
+func (s *Store) LoadCodebaseRepos(ctx context.Context) ([]codebase.Repository, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT name, path, default_branch, git_tree_sha, description, updated_at
+FROM codebase_repositories
+ORDER BY name ASC;
+`)
+	if err != nil {
+		return nil, fmt.Errorf("load codebase repos: %w", err)
+	}
+	defer rows.Close()
+
+	var out []codebase.Repository
+	for rows.Next() {
+		var r codebase.Repository
+		if err := rows.Scan(&r.Name, &r.Path, &r.DefaultBranch, &r.GitTreeSHA, &r.Description, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// SaveCodebaseRepo upserts a fleet repository in the database.
+func (s *Store) SaveCodebaseRepo(ctx context.Context, repo codebase.Repository) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	ua := repo.UpdatedAt
+	if ua.IsZero() {
+		ua = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO codebase_repositories (name, path, default_branch, git_tree_sha, description, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (name) DO UPDATE SET
+  path = EXCLUDED.path,
+  default_branch = EXCLUDED.default_branch,
+  git_tree_sha = EXCLUDED.git_tree_sha,
+  description = EXCLUDED.description,
+  updated_at = EXCLUDED.updated_at;
+`, repo.Name, repo.Path, repo.DefaultBranch, repo.GitTreeSHA, repo.Description, ua)
+	return err
+}
+
+// SaveCodebaseChunks upserts code chunks in the database.
+func (s *Store) SaveCodebaseChunks(ctx context.Context, chunks []codebase.CodeChunk) error {
+	if s == nil || s.db == nil || len(chunks) == 0 {
+		return nil
+	}
+	for _, c := range chunks {
+		_, err := s.db.ExecContext(ctx, `
+INSERT INTO codebase_chunks (id, repo_name, file_path, start_line, end_line, symbol, content, file_blob_sha, git_tree_sha, superseded)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+ON CONFLICT (id) DO UPDATE SET
+  content = EXCLUDED.content,
+  file_blob_sha = EXCLUDED.file_blob_sha,
+  git_tree_sha = EXCLUDED.git_tree_sha,
+  superseded = EXCLUDED.superseded;
+`, c.ID, c.RepoName, c.FilePath, c.StartLine, c.EndLine, c.Symbol, c.Content, c.FileBlobSHA, c.GitTreeSHA, c.Superseded)
+		if err != nil {
+			return fmt.Errorf("save chunk %s: %w", c.ID, err)
+		}
+	}
+	return nil
+}
+
+// LoadCodebaseChunks loads active code chunks for a given repository.
+func (s *Store) LoadCodebaseChunks(ctx context.Context, repoName string) ([]codebase.CodeChunk, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, repo_name, file_path, start_line, end_line, symbol, content, file_blob_sha, git_tree_sha, superseded
+FROM codebase_chunks
+WHERE repo_name = $1 AND superseded = false
+ORDER BY file_path ASC, start_line ASC;
+`, repoName)
+	if err != nil {
+		return nil, fmt.Errorf("load codebase chunks: %w", err)
+	}
+	defer rows.Close()
+
+	var out []codebase.CodeChunk
+	for rows.Next() {
+		var c codebase.CodeChunk
+		if err := rows.Scan(&c.ID, &c.RepoName, &c.FilePath, &c.StartLine, &c.EndLine, &c.Symbol, &c.Content, &c.FileBlobSHA, &c.GitTreeSHA, &c.Superseded); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 // Close closes the pool.
 func (s *Store) Close() error {
 	if s == nil || s.db == nil {
@@ -639,4 +763,3 @@ func (s *Store) Close() error {
 	}
 	return s.db.Close()
 }
-

@@ -76,3 +76,30 @@ CREATE TABLE IF NOT EXISTS harness_git_credentials (
   created_at timestamp with time zone NOT NULL DEFAULT now()
 );
 
+-- Fleet repository registry and hybrid codebase RAG chunk store.
+CREATE TABLE IF NOT EXISTS codebase_repositories (
+  name text PRIMARY KEY,
+  path text NOT NULL,
+  default_branch text NOT NULL DEFAULT 'main',
+  git_tree_sha text NOT NULL DEFAULT '',
+  description text NOT NULL DEFAULT '',
+  updated_at timestamp with time zone NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS codebase_chunks (
+  id text PRIMARY KEY,
+  repo_name text NOT NULL,
+  file_path text NOT NULL,
+  start_line integer NOT NULL,
+  end_line integer NOT NULL,
+  symbol text NOT NULL DEFAULT '',
+  content text NOT NULL,
+  file_blob_sha text NOT NULL,
+  git_tree_sha text NOT NULL,
+  superseded boolean NOT NULL DEFAULT false,
+  created_at timestamp with time zone NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_codebase_chunks_repo_tree ON codebase_chunks (repo_name, git_tree_sha, superseded);
+CREATE INDEX IF NOT EXISTS idx_codebase_chunks_path ON codebase_chunks (repo_name, file_path);
+

@@ -936,6 +936,3 @@ func TestRepoQueueAllocationEndpoint(t *testing.T) {
 		t.Fatalf("expected globalQueueAllocationEnabled true after toggle back, got: %+v", det)
 	}
 }
-
-
-

@@ -426,4 +426,3 @@ func (s *ReleaseService) SetCachedRelease(repo, version string, release ToolRele
 		expiresAt: s.now().Add(ttl),
 	}
 }
-
