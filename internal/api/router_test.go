@@ -141,3 +141,109 @@ func TestRouter_StoriesRoute(t *testing.T) {
 		t.Fatalf("expected 201 Created on stories route, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestRouter_AgentSyncRoutes(t *testing.T) {
+	ctx := context.Background()
+	store := codebase.NewMemStore()
+	_ = store.UpsertRepository(ctx, codebase.Repository{
+		Name:          "iazio-mcp",
+		Path:          "iazio-mcp",
+		DefaultBranch: "main",
+		GitTreeSHA:    "tree-initial",
+		UpdatedAt:     time.Now().UTC(),
+	})
+
+	token := "agent-secret-token"
+	router := NewRouter(RouterConfig{
+		Store:     store,
+		AuthToken: token,
+	})
+
+	// 1. Repos sync without auth -> 401 Unauthorized
+	reqNoAuth := httptest.NewRequest(http.MethodPost, "/api/v1/agent/repos/sync", bytes.NewReader([]byte("{}")))
+	recNoAuth := httptest.NewRecorder()
+	router.ServeHTTP(recNoAuth, reqNoAuth)
+	if recNoAuth.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized without auth, got %d", recNoAuth.Code)
+	}
+
+	// 2. Codebase sync without auth -> 401 Unauthorized
+	reqSyncNoAuth := httptest.NewRequest(http.MethodPost, "/api/v1/agent/codebase/sync", bytes.NewReader([]byte("{}")))
+	recSyncNoAuth := httptest.NewRecorder()
+	router.ServeHTTP(recSyncNoAuth, reqSyncNoAuth)
+	if recSyncNoAuth.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized on codebase sync without auth, got %d", recSyncNoAuth.Code)
+	}
+
+	// 3. Repos sync with valid auth -> 200 OK
+	syncReq := map[string]any{
+		"host_id": "test-host",
+		"repos": []map[string]any{
+			{
+				"name":         "iazio-mcp",
+				"path":         "iazio-mcp",
+				"git_tree_sha": "tree-promoted",
+			},
+		},
+	}
+	body, _ := json.Marshal(syncReq)
+	reqRepos := httptest.NewRequest(http.MethodPost, "/api/v1/agent/repos/sync", bytes.NewReader(body))
+	reqRepos.Header.Set("Authorization", "Bearer "+token)
+	recRepos := httptest.NewRecorder()
+	router.ServeHTTP(recRepos, reqRepos)
+
+	if recRepos.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on repos sync, got %d: %s", recRepos.Code, recRepos.Body.String())
+	}
+
+	// 4. Codebase sync with invalid base tree -> 409 Conflict
+	conflictReq := codebase.IngestRequest{
+		RepoName:     "iazio-mcp",
+		BaseTreeSHA:  "wrong-base-tree",
+		GitTreeSHA:   "tree-promoted",
+		IsFinalBatch: true,
+	}
+	conflictBody, _ := json.Marshal(conflictReq)
+	reqConflict := httptest.NewRequest(http.MethodPost, "/api/v1/agent/codebase/sync", bytes.NewReader(conflictBody))
+	reqConflict.Header.Set("Authorization", "Bearer "+token)
+	recConflict := httptest.NewRecorder()
+	router.ServeHTTP(recConflict, reqConflict)
+
+	if recConflict.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on base tree mismatch, got %d: %s", recConflict.Code, recConflict.Body.String())
+	}
+
+	// 5. Codebase sync with matching base tree -> 200 OK
+	codebaseReq := codebase.IngestRequest{
+		RepoName:     "iazio-mcp",
+		BaseTreeSHA:  "tree-initial",
+		GitTreeSHA:   "tree-promoted",
+		IsFinalBatch: true,
+		Chunks: []codebase.CodeChunk{
+			{
+				FilePath:    "main.go",
+				StartLine:   1,
+				EndLine:     10,
+				Content:     "package main",
+				FileBlobSHA: "blob-1",
+			},
+		},
+	}
+	cbBody, _ := json.Marshal(codebaseReq)
+	reqCb := httptest.NewRequest(http.MethodPost, "/api/v1/agent/codebase/sync", bytes.NewReader(cbBody))
+	reqCb.Header.Set("Authorization", "Bearer "+token)
+	recCb := httptest.NewRecorder()
+	router.ServeHTTP(recCb, reqCb)
+
+	if recCb.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on codebase sync, got %d: %s", recCb.Code, recCb.Body.String())
+	}
+
+	var res codebase.IngestResult
+	if err := json.Unmarshal(recCb.Body.Bytes(), &res); err != nil {
+		t.Fatalf("failed to unmarshal ingest result: %v", err)
+	}
+	if !res.TreePromoted || res.IndexedTreeSHA != "tree-promoted" {
+		t.Fatalf("expected TreePromoted == true with IndexedTreeSHA == tree-promoted, got %+v", res)
+	}
+}
