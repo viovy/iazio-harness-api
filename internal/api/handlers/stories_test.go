@@ -117,7 +117,7 @@ func TestStoriesHandler_CompletedWithinWindow(t *testing.T) {
 			return
 		}
 		result := StoryResultPayload{
-			StoryID:      "STORY-IAZIO-0131",
+			StoryID:      "STORY-TEST-001",
 			Submodule:    "iazio-mcp",
 			StoryPath:    "docs/stories/2026-10-19-add-fleet-discovery.story.md",
 			IndexUpdated: true,
@@ -145,8 +145,8 @@ func TestStoriesHandler_CompletedWithinWindow(t *testing.T) {
 	if resp.Status != "completed" {
 		t.Errorf("expected status completed, got %s", resp.Status)
 	}
-	if resp.StoryID != "STORY-IAZIO-0131" {
-		t.Errorf("expected story_id STORY-IAZIO-0131, got %s", resp.StoryID)
+	if resp.StoryID != "STORY-TEST-001" {
+		t.Errorf("expected story_id STORY-TEST-001, got %s", resp.StoryID)
 	}
 	if !resp.IndexUpdated {
 		t.Error("expected index_updated=true")
