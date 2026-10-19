@@ -19,23 +19,25 @@ type Repository struct {
 	DefaultBranch string    `json:"default_branch"`
 	GitTreeSHA    string    `json:"git_tree_sha,omitempty"`
 	Description   string    `json:"description,omitempty"`
+	HostID        string    `json:"host_id,omitempty"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 // CodeChunk describes a snippet of source code indexed for hybrid RAG search.
 type CodeChunk struct {
-	ID          string    `json:"id"`
-	RepoName    string    `json:"repo_name"`
-	FilePath    string    `json:"file_path"`
-	StartLine   int       `json:"start_line"`
-	EndLine     int       `json:"end_line"`
-	Symbol      string    `json:"symbol,omitempty"`
-	Content     string    `json:"content"`
-	FileBlobSHA string    `json:"file_blob_sha"`
-	GitTreeSHA  string    `json:"git_tree_sha,omitempty"`
-	Embedding   []float64 `json:"embedding,omitempty"`
-	Superseded  bool      `json:"superseded,omitempty"`
-	Score       float64   `json:"score"`
+	ID            string    `json:"id"`
+	RepoName      string    `json:"repo_name"`
+	FilePath      string    `json:"file_path"`
+	StartLine     int       `json:"start_line"`
+	EndLine       int       `json:"end_line"`
+	Symbol        string    `json:"symbol,omitempty"`
+	Content       string    `json:"content"`
+	FileBlobSHA   string    `json:"file_blob_sha"`
+	GitTreeSHA    string    `json:"git_tree_sha,omitempty"`
+	ContentSHA256 string    `json:"content_sha256,omitempty"`
+	Embedding     []float64 `json:"embedding,omitempty"`
+	Superseded    bool      `json:"superseded,omitempty"`
+	Score         float64   `json:"score"`
 }
 
 // ListReposRequest specifies query and pagination filters for GET /api/v1/repos.
@@ -82,20 +84,25 @@ type Store interface {
 	UpsertChunks(ctx context.Context, chunks []CodeChunk) error
 	PruneStaleChunks(ctx context.Context, repoName, activeGitTreeSHA string) (int, error)
 	GetChunksForRepo(ctx context.Context, repoName string) ([]CodeChunk, error)
+	FindEmbeddingByContentSHA(ctx context.Context, sha string) ([]float64, bool, error)
+	DeleteChunksForFiles(ctx context.Context, repoName string, filePaths []string) (int, error)
+	PruneFileSupersededChunks(ctx context.Context, repoName, filePath, currentBlobSHA string) (int, error)
 }
 
 // MemStore is a thread-safe, in-memory implementation of Store.
 type MemStore struct {
-	mu     sync.RWMutex
-	repos  map[string]Repository
-	chunks map[string]CodeChunk
+	mu              sync.RWMutex
+	repos           map[string]Repository
+	chunks          map[string]CodeChunk
+	embeddingsBySHA map[string][]float64
 }
 
 // NewMemStore returns an empty in-memory codebase store.
 func NewMemStore() *MemStore {
 	return &MemStore{
-		repos:  make(map[string]Repository),
-		chunks: make(map[string]CodeChunk),
+		repos:           make(map[string]Repository),
+		chunks:          make(map[string]CodeChunk),
+		embeddingsBySHA: make(map[string][]float64),
 	}
 }
 
@@ -246,8 +253,75 @@ func (s *MemStore) UpsertChunks(ctx context.Context, chunks []CodeChunk) error {
 			c.ID = fmt.Sprintf("%s:%s:%d-%d", c.RepoName, c.FilePath, c.StartLine, c.EndLine)
 		}
 		s.chunks[c.ID] = c
+		if c.ContentSHA256 != "" && len(c.Embedding) > 0 {
+			if s.embeddingsBySHA == nil {
+				s.embeddingsBySHA = make(map[string][]float64)
+			}
+			s.embeddingsBySHA[c.ContentSHA256] = c.Embedding
+		}
 	}
 	return nil
+}
+
+// FindEmbeddingByContentSHA retrieves a cached embedding vector by chunk content SHA-256.
+func (s *MemStore) FindEmbeddingByContentSHA(ctx context.Context, sha string) ([]float64, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if sha == "" {
+		return nil, false, nil
+	}
+	if s.embeddingsBySHA != nil {
+		if emb, ok := s.embeddingsBySHA[sha]; ok && len(emb) > 0 {
+			cp := make([]float64, len(emb))
+			copy(cp, emb)
+			return cp, true, nil
+		}
+	}
+	for _, c := range s.chunks {
+		if c.ContentSHA256 == sha && len(c.Embedding) > 0 {
+			cp := make([]float64, len(c.Embedding))
+			copy(cp, c.Embedding)
+			return cp, true, nil
+		}
+	}
+	return nil, false, nil
+}
+
+// DeleteChunksForFiles removes all chunks belonging to specified file paths for a repository.
+func (s *MemStore) DeleteChunksForFiles(ctx context.Context, repoName string, filePaths []string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	targetFiles := make(map[string]bool, len(filePaths))
+	for _, p := range filePaths {
+		targetFiles[NormalizeFilePath(p)] = true
+	}
+
+	deleted := 0
+	for id, c := range s.chunks {
+		if c.RepoName == repoName && targetFiles[NormalizeFilePath(c.FilePath)] {
+			delete(s.chunks, id)
+			deleted++
+		}
+	}
+	return deleted, nil
+}
+
+// PruneFileSupersededChunks removes existing chunks for a file whose file_blob_sha differs from the current active blob.
+func (s *MemStore) PruneFileSupersededChunks(ctx context.Context, repoName, filePath, currentBlobSHA string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	normPath := NormalizeFilePath(filePath)
+	pruned := 0
+	for id, c := range s.chunks {
+		if c.RepoName == repoName && NormalizeFilePath(c.FilePath) == normPath && c.FileBlobSHA != currentBlobSHA {
+			delete(s.chunks, id)
+			pruned++
+		}
+	}
+	return pruned, nil
 }
 
 // PruneStaleChunks marks or deletes chunks for a repository that do not match the active tree SHA.

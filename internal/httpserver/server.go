@@ -60,6 +60,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/v1/repos", handlers.NewReposHandler(codebaseStore))
 	mux.Handle("POST /api/v1/codebase/search", handlers.NewCodebaseSearchHandler(codebaseStore))
 
+	agentSyncHandler := handlers.NewAgentSyncHandler(codebaseStore, codebase.NewIngestor(codebaseStore, nil))
+	mux.HandleFunc("POST /api/v1/agent/repos/sync", agentSyncHandler.SyncRepos)
+	mux.HandleFunc("POST /api/v1/agent/codebase/sync", agentSyncHandler.SyncCodebase)
+
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{
 			"status":  "ok",

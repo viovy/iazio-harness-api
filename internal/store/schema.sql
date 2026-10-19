@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS codebase_repositories (
   default_branch text NOT NULL DEFAULT 'main',
   git_tree_sha text NOT NULL DEFAULT '',
   description text NOT NULL DEFAULT '',
+  host_id text NOT NULL DEFAULT '',
   updated_at timestamp with time zone NOT NULL DEFAULT now()
 );
 
@@ -96,10 +97,16 @@ CREATE TABLE IF NOT EXISTS codebase_chunks (
   content text NOT NULL,
   file_blob_sha text NOT NULL,
   git_tree_sha text NOT NULL,
+  content_sha256 text NOT NULL DEFAULT '',
   superseded boolean NOT NULL DEFAULT false,
   created_at timestamp with time zone NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_codebase_chunks_repo_tree ON codebase_chunks (repo_name, git_tree_sha, superseded);
 CREATE INDEX IF NOT EXISTS idx_codebase_chunks_path ON codebase_chunks (repo_name, file_path);
+CREATE INDEX IF NOT EXISTS idx_codebase_chunks_content_sha ON codebase_chunks (content_sha256) WHERE content_sha256 <> '';
+
+CREATE OR REPLACE VIEW fleet_repos AS
+SELECT name, path, default_branch, git_tree_sha AS indexed_tree_sha, git_tree_sha, description, host_id, updated_at
+FROM codebase_repositories;
 

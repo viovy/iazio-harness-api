@@ -16,6 +16,7 @@ import (
 // RouterConfig contains dependencies and settings for the API router.
 type RouterConfig struct {
 	Store       codebase.Store
+	Ingestor    codebase.Ingestor
 	Queue       dispatch.Queue
 	Idempotency *handlers.IdempotencyStore
 	AuthToken   string
@@ -31,17 +32,23 @@ func NewRouter(cfg RouterConfig) http.Handler {
 	if cfg.Idempotency == nil {
 		cfg.Idempotency = handlers.NewIdempotencyStore(24 * time.Hour)
 	}
+	if cfg.Ingestor == nil {
+		cfg.Ingestor = codebase.NewIngestor(cfg.Store, nil)
+	}
 
 	reposHandler := handlers.NewReposHandler(cfg.Store)
 	searchHandler := handlers.NewCodebaseSearchHandler(cfg.Store)
 	promptsHandler := handlers.NewPromptsHandler(cfg.Store, cfg.Queue, cfg.Idempotency)
 	storiesHandler := handlers.NewStoriesHandler(cfg.Store, cfg.Queue, cfg.Idempotency)
 	agentJobsHandler := handlers.NewAgentJobsHandler(cfg.Queue)
+	agentSyncHandler := handlers.NewAgentSyncHandler(cfg.Store, cfg.Ingestor)
 
 	mux.Handle("/api/v1/repos", reposHandler)
 	mux.Handle("/api/v1/codebase/search", searchHandler)
 	mux.Handle("/api/v1/prompts", promptsHandler)
 	mux.Handle("/api/v1/stories", storiesHandler)
+	mux.HandleFunc("/api/v1/agent/repos/sync", agentSyncHandler.SyncRepos)
+	mux.HandleFunc("/api/v1/agent/codebase/sync", agentSyncHandler.SyncCodebase)
 	mux.HandleFunc("/api/v1/agent/jobs/claim", agentJobsHandler.ClaimHandler)
 	mux.HandleFunc("/api/v1/agent/jobs/", func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/complete") {

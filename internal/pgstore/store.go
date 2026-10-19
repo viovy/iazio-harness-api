@@ -128,8 +128,11 @@ CREATE TABLE IF NOT EXISTS codebase_repositories (
   default_branch text NOT NULL DEFAULT 'main',
   git_tree_sha text NOT NULL DEFAULT '',
   description text NOT NULL DEFAULT '',
+  host_id text NOT NULL DEFAULT '',
   updated_at timestamp with time zone NOT NULL DEFAULT now()
 );
+
+ALTER TABLE codebase_repositories ADD COLUMN IF NOT EXISTS host_id text NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS codebase_chunks (
   id text PRIMARY KEY,
@@ -141,12 +144,20 @@ CREATE TABLE IF NOT EXISTS codebase_chunks (
   content text NOT NULL,
   file_blob_sha text NOT NULL,
   git_tree_sha text NOT NULL,
+  content_sha256 text NOT NULL DEFAULT '',
   superseded boolean NOT NULL DEFAULT false,
   created_at timestamp with time zone NOT NULL DEFAULT now()
 );
 
+ALTER TABLE codebase_chunks ADD COLUMN IF NOT EXISTS content_sha256 text NOT NULL DEFAULT '';
+
 CREATE INDEX IF NOT EXISTS idx_codebase_chunks_repo_tree ON codebase_chunks (repo_name, git_tree_sha, superseded);
 CREATE INDEX IF NOT EXISTS idx_codebase_chunks_path ON codebase_chunks (repo_name, file_path);
+CREATE INDEX IF NOT EXISTS idx_codebase_chunks_content_sha ON codebase_chunks (content_sha256) WHERE content_sha256 <> '';
+
+CREATE OR REPLACE VIEW fleet_repos AS
+SELECT name, path, default_branch, git_tree_sha AS indexed_tree_sha, git_tree_sha, description, host_id, updated_at
+FROM codebase_repositories;
 `
 
 // Store is a Postgres connection for the control plane.
@@ -665,7 +676,7 @@ func (s *Store) LoadCodebaseRepos(ctx context.Context) ([]codebase.Repository, e
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT name, path, default_branch, git_tree_sha, description, updated_at
+SELECT name, path, default_branch, git_tree_sha, description, host_id, updated_at
 FROM codebase_repositories
 ORDER BY name ASC;
 `)
@@ -677,7 +688,7 @@ ORDER BY name ASC;
 	var out []codebase.Repository
 	for rows.Next() {
 		var r codebase.Repository
-		if err := rows.Scan(&r.Name, &r.Path, &r.DefaultBranch, &r.GitTreeSHA, &r.Description, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.Name, &r.Path, &r.DefaultBranch, &r.GitTreeSHA, &r.Description, &r.HostID, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -695,15 +706,16 @@ func (s *Store) SaveCodebaseRepo(ctx context.Context, repo codebase.Repository) 
 		ua = time.Now().UTC()
 	}
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO codebase_repositories (name, path, default_branch, git_tree_sha, description, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6)
+INSERT INTO codebase_repositories (name, path, default_branch, git_tree_sha, description, host_id, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (name) DO UPDATE SET
   path = EXCLUDED.path,
   default_branch = EXCLUDED.default_branch,
   git_tree_sha = EXCLUDED.git_tree_sha,
   description = EXCLUDED.description,
+  host_id = EXCLUDED.host_id,
   updated_at = EXCLUDED.updated_at;
-`, repo.Name, repo.Path, repo.DefaultBranch, repo.GitTreeSHA, repo.Description, ua)
+`, repo.Name, repo.Path, repo.DefaultBranch, repo.GitTreeSHA, repo.Description, repo.HostID, ua)
 	return err
 }
 
@@ -714,14 +726,15 @@ func (s *Store) SaveCodebaseChunks(ctx context.Context, chunks []codebase.CodeCh
 	}
 	for _, c := range chunks {
 		_, err := s.db.ExecContext(ctx, `
-INSERT INTO codebase_chunks (id, repo_name, file_path, start_line, end_line, symbol, content, file_blob_sha, git_tree_sha, superseded)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+INSERT INTO codebase_chunks (id, repo_name, file_path, start_line, end_line, symbol, content, file_blob_sha, git_tree_sha, content_sha256, superseded)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 ON CONFLICT (id) DO UPDATE SET
   content = EXCLUDED.content,
   file_blob_sha = EXCLUDED.file_blob_sha,
   git_tree_sha = EXCLUDED.git_tree_sha,
+  content_sha256 = EXCLUDED.content_sha256,
   superseded = EXCLUDED.superseded;
-`, c.ID, c.RepoName, c.FilePath, c.StartLine, c.EndLine, c.Symbol, c.Content, c.FileBlobSHA, c.GitTreeSHA, c.Superseded)
+`, c.ID, c.RepoName, c.FilePath, c.StartLine, c.EndLine, c.Symbol, c.Content, c.FileBlobSHA, c.GitTreeSHA, c.ContentSHA256, c.Superseded)
 		if err != nil {
 			return fmt.Errorf("save chunk %s: %w", c.ID, err)
 		}
@@ -735,7 +748,7 @@ func (s *Store) LoadCodebaseChunks(ctx context.Context, repoName string) ([]code
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, repo_name, file_path, start_line, end_line, symbol, content, file_blob_sha, git_tree_sha, superseded
+SELECT id, repo_name, file_path, start_line, end_line, symbol, content, file_blob_sha, git_tree_sha, content_sha256, superseded
 FROM codebase_chunks
 WHERE repo_name = $1 AND superseded = false
 ORDER BY file_path ASC, start_line ASC;
@@ -748,7 +761,7 @@ ORDER BY file_path ASC, start_line ASC;
 	var out []codebase.CodeChunk
 	for rows.Next() {
 		var c codebase.CodeChunk
-		if err := rows.Scan(&c.ID, &c.RepoName, &c.FilePath, &c.StartLine, &c.EndLine, &c.Symbol, &c.Content, &c.FileBlobSHA, &c.GitTreeSHA, &c.Superseded); err != nil {
+		if err := rows.Scan(&c.ID, &c.RepoName, &c.FilePath, &c.StartLine, &c.EndLine, &c.Symbol, &c.Content, &c.FileBlobSHA, &c.GitTreeSHA, &c.ContentSHA256, &c.Superseded); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
