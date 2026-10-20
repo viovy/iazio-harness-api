@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-harness-api/internal/control"
+	"github.com/viovy/iazio-harness-api/internal/dispatch"
 )
 
 func TestImportRejectsAppURLAndBusy(t *testing.T) {
@@ -1769,5 +1770,117 @@ func TestServer_DispatchAndStoryRoutesMounted(t *testing.T) {
 	handler.ServeHTTP(rrExec, reqExec)
 	if rrExec.Code != http.StatusCreated {
 		t.Fatalf("expected 201 Created for story execution, got %d: %s", rrExec.Code, rrExec.Body.String())
+	}
+}
+
+func TestServer_DispatchQueueUnifiedWithHarnessRoutes(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	s := &Server{
+		Engine: control.NewEngine(nil),
+		Queue:  q,
+	}
+	handler := s.Handler()
+
+	// 1. Enqueue a pending dispatch job
+	job, err := q.Enqueue(context.Background(), &dispatch.Job{
+		ID:          "job_bedddabcda059343",
+		Type:        dispatch.JobTypePromptExecute,
+		Repo:        ".",
+		TargetAgent: "autopilot",
+		Status:      dispatch.JobStatusPending,
+		Payload:     []byte(`{"title":"Execute Story STORY-GOV-0001","story_id":"STORY-GOV-0001"}`),
+		TraceID:     "10caa73be67f84f18b7c09142b73c767",
+	})
+	if err != nil {
+		t.Fatalf("failed to enqueue: %v", err)
+	}
+
+	// 2. Query GET /v1/schedules -> must contain the dispatch job
+	reqSched := httptest.NewRequest(http.MethodGet, "/v1/schedules", nil)
+	rrSched := httptest.NewRecorder()
+	handler.ServeHTTP(rrSched, reqSched)
+	if rrSched.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /v1/schedules, got %d", rrSched.Code)
+	}
+	var schedResp struct {
+		Schedules []map[string]any `json:"schedules"`
+	}
+	if err := json.Unmarshal(rrSched.Body.Bytes(), &schedResp); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	foundSched := false
+	for _, sc := range schedResp.Schedules {
+		if sc["id"] == job.ID {
+			foundSched = true
+			if sc["engine"] != "autopilot" {
+				t.Errorf("expected engine 'autopilot', got %v", sc["engine"])
+			}
+			if sc["status"] != "QUEUED" {
+				t.Errorf("expected status 'QUEUED', got %v", sc["status"])
+			}
+			if sc["trace_id"] != "10caa73be67f84f18b7c09142b73c767" {
+				t.Errorf("expected trace_id, got %v", sc["trace_id"])
+			}
+		}
+	}
+	if !foundSched {
+		t.Fatalf("job %s not found in /v1/schedules", job.ID)
+	}
+
+	// 3. Query GET /v1/jobs/job_bedddabcda059343 -> must return 200 OK with jobDetailView
+	reqJob := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+job.ID, nil)
+	rrJob := httptest.NewRecorder()
+	handler.ServeHTTP(rrJob, reqJob)
+	if rrJob.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /v1/jobs/%s, got %d: %s", job.ID, rrJob.Code, rrJob.Body.String())
+	}
+	var jobResp map[string]any
+	if err := json.Unmarshal(rrJob.Body.Bytes(), &jobResp); err != nil {
+		t.Fatalf("unmarshal job detail error: %v", err)
+	}
+	if jobResp["id"] != job.ID {
+		t.Errorf("expected id %s, got %v", job.ID, jobResp["id"])
+	}
+	if jobResp["target_agent"] != "autopilot" {
+		t.Errorf("expected target_agent autopilot, got %v", jobResp["target_agent"])
+	}
+	if jobResp["trace_id"] != "10caa73be67f84f18b7c09142b73c767" {
+		t.Errorf("expected trace_id, got %v", jobResp["trace_id"])
+	}
+
+	// 4. Complete the job and verify it appears in /v1/history
+	if err := q.Complete(context.Background(), job.ID, []byte(`{"outcome":"success"}`), ""); err != nil {
+		t.Fatalf("complete error: %v", err)
+	}
+
+	reqHist := httptest.NewRequest(http.MethodGet, "/v1/history", nil)
+	rrHist := httptest.NewRecorder()
+	handler.ServeHTTP(rrHist, reqHist)
+	if rrHist.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /v1/history, got %d", rrHist.Code)
+	}
+	var histResp struct {
+		History []map[string]any `json:"history"`
+	}
+	if err := json.Unmarshal(rrHist.Body.Bytes(), &histResp); err != nil {
+		t.Fatalf("unmarshal history error: %v", err)
+	}
+	foundHist := false
+	for _, h := range histResp.History {
+		if h["job_id"] == job.ID {
+			foundHist = true
+			if h["status"] != "COMPLETED" {
+				t.Errorf("expected status 'COMPLETED', got %v", h["status"])
+			}
+			if h["clean"] != true {
+				t.Errorf("expected clean true, got %v", h["clean"])
+			}
+			if h["trace_id"] != "10caa73be67f84f18b7c09142b73c767" {
+				t.Errorf("expected trace_id, got %v", h["trace_id"])
+			}
+		}
+	}
+	if !foundHist {
+		t.Fatalf("job %s not found in /v1/history", job.ID)
 	}
 }

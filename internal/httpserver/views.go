@@ -1,9 +1,13 @@
 package httpserver
 
 import (
+	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/viovy/iazio-harness-api/internal/control"
+	"github.com/viovy/iazio-harness-api/internal/dispatch"
 )
 
 func ideaView(idea control.Idea) map[string]any {
@@ -272,4 +276,161 @@ func historyItemView(h control.HistoryItem) map[string]any {
 		"remediation":      h.Remediation,
 		"created_at":       h.CreatedAt.UTC().Format(time.RFC3339),
 	}
+}
+
+func parseDispatchPayload(payload []byte) (title, prompt, storyID string) {
+	if len(payload) == 0 {
+		return "", "", ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(payload, &m); err != nil {
+		return "", "", ""
+	}
+	if t, ok := m["title"].(string); ok {
+		title = t
+	}
+	if p, ok := m["prompt"].(string); ok {
+		prompt = p
+	}
+	if s, ok := m["story_id"].(string); ok {
+		storyID = s
+	}
+	return title, prompt, storyID
+}
+
+func dispatchScheduleView(j *dispatch.Job) map[string]any {
+	if j == nil {
+		return map[string]any{}
+	}
+	title, _, storyID := parseDispatchPayload(j.Payload)
+	if title == "" {
+		title = fmt.Sprintf("Dispatch Job %s (%s)", j.ID, j.Type)
+	}
+	engine := j.TargetAgent
+	if engine == "" {
+		engine = "auto"
+	}
+	status := strings.ToUpper(j.Status)
+	if status == "PENDING" {
+		status = "QUEUED"
+	} else if status == "CLAIMED" {
+		status = "RUNNING"
+	}
+
+	return map[string]any{
+		"id":                     j.ID,
+		"prompt_id":              "",
+		"prompt_title":           title,
+		"host_id":                j.TargetHost,
+		"repo_path":              j.Repo,
+		"iterations":             1,
+		"iterations_total":       1,
+		"iterations_remaining":   1,
+		"iterations_completed":   0,
+		"env_keys":               []string{},
+		"kind":                   j.Type,
+		"priority":               5,
+		"status":                 status,
+		"engine":                 engine,
+		"resume_conversation_id": "",
+		"story_id":               storyID,
+		"is_global":              true,
+		"trace_id":               j.TraceID,
+		"parent_id":              j.ParentID,
+	}
+}
+
+func dispatchHistoryView(j *dispatch.Job) map[string]any {
+	if j == nil {
+		return map[string]any{}
+	}
+	title, _, storyID := parseDispatchPayload(j.Payload)
+	if title == "" {
+		title = fmt.Sprintf("Dispatch Job %s (%s)", j.ID, j.Type)
+	}
+	engine := j.TargetAgent
+	if engine == "" {
+		engine = "auto"
+	}
+	status := strings.ToUpper(j.Status)
+	clean := status == "COMPLETED"
+
+	createdAtStr := ""
+	if !j.CreatedAt.IsZero() {
+		createdAtStr = j.CreatedAt.UTC().Format(time.RFC3339)
+	}
+
+	return map[string]any{
+		"host_id":          j.TargetHost,
+		"repo_path":        j.Repo,
+		"job_id":           j.ID,
+		"schedule_id":      "",
+		"prompt_title":     title,
+		"engine":           engine,
+		"status":           status,
+		"clean":            clean,
+		"ase_complete":     clean,
+		"conversation_ids": []string{},
+		"reason":           j.Error,
+		"error_message":    j.Error,
+		"diagnostic_code":  "",
+		"model":            "",
+		"remediation":      "",
+		"created_at":       createdAtStr,
+		"story_id":         storyID,
+		"trace_id":         j.TraceID,
+		"parent_id":        j.ParentID,
+	}
+}
+
+func dispatchJobDetailView(j *dispatch.Job) map[string]any {
+	if j == nil {
+		return map[string]any{}
+	}
+	title, promptText, storyID := parseDispatchPayload(j.Payload)
+	if title == "" {
+		title = fmt.Sprintf("Dispatch Job %s (%s)", j.ID, j.Type)
+	}
+	engine := j.TargetAgent
+	if engine == "" {
+		engine = "auto"
+	}
+	res := map[string]any{
+		"id":                             j.ID,
+		"schedule_id":                    "",
+		"kind":                           j.Type,
+		"status":                         strings.ToUpper(j.Status),
+		"engine":                         engine,
+		"target_agent":                   j.TargetAgent,
+		"target_host":                    j.TargetHost,
+		"prompt":                         promptText,
+		"prompt_title":                   title,
+		"story_id":                       storyID,
+		"worktree_path":                  j.Repo,
+		"docs_hub_path":                  "",
+		"env_vars":                       map[string]string{},
+		"max_execution_duration_seconds": 0,
+		"resume_conversation_id":         "",
+		"conversation_ids":               []string{},
+		"silent_for_seconds":             0,
+		"is_stalled":                     false,
+		"reason":                         j.Error,
+		"error":                          j.Error,
+		"trace_id":                       j.TraceID,
+		"parent_id":                      j.ParentID,
+	}
+	if !j.CreatedAt.IsZero() {
+		res["started_at"] = j.CreatedAt.UTC().Format(time.RFC3339)
+		res["created_at"] = j.CreatedAt.UTC().Format(time.RFC3339)
+	}
+	if j.ClaimedAt != nil {
+		res["claimed_at"] = j.ClaimedAt.UTC().Format(time.RFC3339)
+	}
+	if j.CompletedAt != nil {
+		res["completed_at"] = j.CompletedAt.UTC().Format(time.RFC3339)
+		if !j.CreatedAt.IsZero() {
+			res["duration_ms"] = j.CompletedAt.Sub(j.CreatedAt).Milliseconds()
+		}
+	}
+	return res
 }
