@@ -9,10 +9,13 @@ FROM golang:1.26-bookworm AS build
 ARG GIT_VERSION=0.1.0-dev
 ARG GIT_COMMIT=unknown
 WORKDIR /src
-COPY go.mod ./
-COPY . .
+COPY go.mod go.sum ./
+COPY cmd cmd
+COPY internal internal
 RUN CGO_ENABLED=0 go build -trimpath \
-  -ldflags="-s -w -X github.com/viovy/iazio-harness-api/internal/version.Version=${GIT_VERSION} -X github.com/viovy/iazio-harness-api/internal/version.Commit=${GIT_COMMIT}" \
+  -ldflags="-s -w \
+  -X github.com/viovy/iazio-harness-api/internal/version.Version=${GIT_VERSION} \
+  -X github.com/viovy/iazio-harness-api/internal/version.Commit=${GIT_COMMIT}" \
   -o /out/iazio-harness-api ./cmd/iazio-harness-api
 
 FROM worker

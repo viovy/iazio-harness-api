@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -152,4 +153,52 @@ func TestCodebaseSearchHandler_ValidationsAndErrors(t *testing.T) {
 	if recGet.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("expected 405 Method Not Allowed, got %d", recGet.Code)
 	}
+
+	// 4. Limit clamping: <= 0 and > 50
+	payloadClamp := SearchPayload{Query: "test", Limit: -5}
+	bClamp, _ := json.Marshal(payloadClamp)
+	reqClamp := httptest.NewRequest(http.MethodPost, "/api/v1/codebase/search", bytes.NewReader(bClamp))
+	recClamp := httptest.NewRecorder()
+	handler.ServeHTTP(recClamp, reqClamp)
+	if recClamp.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for clamped limit <= 0, got %d", recClamp.Code)
+	}
+
+	payloadMax := SearchPayload{Query: "test", Limit: 100}
+	bMax, _ := json.Marshal(payloadMax)
+	reqMax := httptest.NewRequest(http.MethodPost, "/api/v1/codebase/search", bytes.NewReader(bMax))
+	recMax := httptest.NewRecorder()
+	handler.ServeHTTP(recMax, reqMax)
+	if recMax.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for clamped limit > 50, got %d", recMax.Code)
+	}
+
+	// 5. Store errors: query error and internal error
+	errStoreQuery := &errSearchStore{Store: store, err: errors.New("query syntax error")}
+	hQueryErr := NewCodebaseSearchHandler(errStoreQuery)
+	reqErrQ := httptest.NewRequest(http.MethodPost, "/api/v1/codebase/search", bytes.NewReader(bClamp))
+	recErrQ := httptest.NewRecorder()
+	hQueryErr.ServeHTTP(recErrQ, reqErrQ)
+	if recErrQ.Code != http.StatusUnprocessableEntity {
+		t.Errorf("expected 422 for query error, got %d", recErrQ.Code)
+	}
+
+	errStoreInternal := &errSearchStore{Store: store, err: errors.New("db connection failure")}
+	hInternalErr := NewCodebaseSearchHandler(errStoreInternal)
+	reqErrI := httptest.NewRequest(http.MethodPost, "/api/v1/codebase/search", bytes.NewReader(bClamp))
+	recErrI := httptest.NewRecorder()
+	hInternalErr.ServeHTTP(recErrI, reqErrI)
+	if recErrI.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500 for db failure, got %d", recErrI.Code)
+	}
 }
+
+type errSearchStore struct {
+	codebase.Store
+	err error
+}
+
+func (m *errSearchStore) SearchChunks(ctx context.Context, req codebase.SearchRequest) (*codebase.SearchResult, error) {
+	return nil, m.err
+}
+

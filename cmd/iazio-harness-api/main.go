@@ -28,13 +28,13 @@ var (
 	branchStamp  = "unknown"
 )
 
-func main() {
+func run(ctx context.Context, args []string) error {
 	version.Version = versionStamp
 	version.Commit = commitStamp
 	version.Branch = branchStamp
-	if len(os.Args) > 1 && os.Args[1] == "version" {
+	if len(args) > 1 && args[1] == "version" {
 		fmt.Println("iazio-harness-api " + version.Informational())
-		return
+		return nil
 	}
 	addr := ":8080"
 	if v := os.Getenv("IAZIO_HARNESS_API_ADDR"); v != "" {
@@ -50,20 +50,19 @@ func main() {
 	} else if tok := strings.TrimSpace(os.Getenv("IAZIO_HARNESS_API_TOKEN")); tok != "" {
 		srv.AuthToken = tok
 	}
-	srv.Engine.StartReaper(context.Background(), 10*time.Second)
+	srv.Engine.StartReaper(ctx, 10*time.Second)
 	if script := os.Getenv("IAZIO_EXTRACT_WORKER"); script != "" {
 		srv.Extract = func(shareURL string) (string, string, error) {
-			return extract.Run(context.Background(), script, shareURL)
+			return extract.Run(ctx, script, shareURL)
 		}
 	}
 	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
-		store, err := pgstore.Open(context.Background(), dsn)
+		store, err := pgstore.Open(ctx, dsn)
 		if err != nil {
-			log.Fatal(err)
+			return fmt.Errorf("pgstore.Open: %w", err)
 		}
 		defer store.Close()
 
-		ctx := context.Background()
 		if ideas, err := store.LoadIdeas(ctx); err == nil {
 			for _, it := range ideas {
 				srv.Engine.PutIdea(it)
@@ -151,7 +150,7 @@ func main() {
 		}
 		if srv.Engine.Releases != nil {
 			if err := srv.Engine.Releases.SetStore(store); err != nil {
-				log.Fatalf("fatal: failed to load git credentials into release service: %v", err)
+				return fmt.Errorf("failed to load git credentials into release service: %w", err)
 			}
 			log.Printf("attached git credentials store to release service")
 		}
@@ -163,9 +162,6 @@ func main() {
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-
-	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	serverErr := make(chan error, 1)
 	go func() {
@@ -179,15 +175,24 @@ func main() {
 	select {
 	case err := <-serverErr:
 		if err != nil {
-			log.Fatalf("server error: %v", err)
+			return fmt.Errorf("server error: %w", err)
 		}
-	case <-sigCtx.Done():
+	case <-ctx.Done():
 		log.Printf("shutting down gracefully...")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			log.Printf("shutdown error: %v", err)
 		}
+	}
+	return nil
+}
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args); err != nil {
+		log.Fatalf("server error: %v", err)
 	}
 }
 

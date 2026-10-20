@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -283,3 +284,57 @@ func TestAgentCodebaseSync_RepoNotFound(t *testing.T) {
 		t.Fatalf("expected 404 Not Found, got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+func TestAgentCodebaseSync_ValidationsAndErrors(t *testing.T) {
+	store := codebase.NewMemStore()
+	handler := NewAgentSyncHandler(store, nil)
+
+	// 1. Method not allowed
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/agent/codebase/sync", nil)
+	w := httptest.NewRecorder()
+	handler.SyncCodebase(w, r)
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405 Method Not Allowed, got %d", w.Code)
+	}
+
+	// 2. Bad JSON
+	r = httptest.NewRequest(http.MethodPost, "/api/v1/agent/codebase/sync", bytes.NewReader([]byte("{bad")))
+	w = httptest.NewRecorder()
+	handler.SyncCodebase(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request, got %d", w.Code)
+	}
+
+	// 3. Missing repo_name
+	reqMissingRepo := codebase.IngestRequest{RepoName: "   "}
+	bMissing, _ := json.Marshal(reqMissingRepo)
+	r = httptest.NewRequest(http.MethodPost, "/api/v1/agent/codebase/sync", bytes.NewReader(bMissing))
+	w = httptest.NewRecorder()
+	handler.SyncCodebase(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for empty repo_name, got %d", w.Code)
+	}
+
+	// 4. Ingest generic internal error
+	errHandler := &AgentSyncHandler{
+		Store:    store,
+		Ingestor: &mockErrIngestor{err: errors.New("unexpected storage error")},
+	}
+	reqValid := codebase.IngestRequest{RepoName: "iazio-api"}
+	bValid, _ := json.Marshal(reqValid)
+	r = httptest.NewRequest(http.MethodPost, "/api/v1/agent/codebase/sync", bytes.NewReader(bValid))
+	w = httptest.NewRecorder()
+	errHandler.SyncCodebase(w, r)
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500 for generic ingest error, got %d", w.Code)
+	}
+}
+
+type mockErrIngestor struct {
+	err error
+}
+
+func (m *mockErrIngestor) Ingest(ctx context.Context, req codebase.IngestRequest) (*codebase.IngestResult, error) {
+	return nil, m.err
+}
+

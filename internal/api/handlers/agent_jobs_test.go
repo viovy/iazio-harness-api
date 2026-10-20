@@ -81,3 +81,73 @@ func TestAgentJobsHandler_ClaimEmpty(t *testing.T) {
 		t.Fatalf("expected 204 No Content when queue empty, got %d", w.Code)
 	}
 }
+
+func TestAgentJobsHandler_Errors(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	handler := NewAgentJobsHandler(q)
+
+	// Claim MethodNotAllowed
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agent/jobs/claim", nil)
+	w := httptest.NewRecorder()
+	handler.ClaimHandler(w, req)
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405, got %d", w.Code)
+	}
+
+	// Claim with nil queue
+	nilHandler := NewAgentJobsHandler(nil)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/agent/jobs/claim", nil)
+	w = httptest.NewRecorder()
+	nilHandler.ClaimHandler(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", w.Code)
+	}
+
+	// Complete MethodNotAllowed
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/agent/jobs/job1/complete", nil)
+	w = httptest.NewRecorder()
+	handler.CompleteHandler(w, req)
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405, got %d", w.Code)
+	}
+
+	// Complete bad path prefix/suffix
+	req = httptest.NewRequest(http.MethodPost, "/wrong/path", bytes.NewReader([]byte("{}")))
+	w = httptest.NewRecorder()
+	handler.CompleteHandler(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+
+	// Complete empty job ID
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/agent/jobs//complete", bytes.NewReader([]byte("{}")))
+	w = httptest.NewRecorder()
+	handler.CompleteHandler(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+
+	// Complete malformed json body
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/agent/jobs/job1/complete", bytes.NewReader([]byte("invalid-json")))
+	w = httptest.NewRecorder()
+	handler.CompleteHandler(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+
+	// Complete nil queue
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/agent/jobs/job1/complete", bytes.NewReader([]byte("{}")))
+	w = httptest.NewRecorder()
+	nilHandler.CompleteHandler(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", w.Code)
+	}
+
+	// Complete job not found (404)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/agent/jobs/job-nonexistent/complete", bytes.NewReader([]byte("{}")))
+	w = httptest.NewRecorder()
+	handler.CompleteHandler(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", w.Code)
+	}
+}

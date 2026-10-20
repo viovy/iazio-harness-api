@@ -1,6 +1,9 @@
 package control
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestValidateShareURL(t *testing.T) {
 	ok := "https://gemini.google.com/share/abc_DEF-1"
@@ -134,5 +137,48 @@ func TestRequiredMinFreeBytes(t *testing.T) {
 	t.Setenv("IAZIO_PREFLIGHT_MIN_FREE_BYTES", "2147483648") // 2 GiB
 	if got := RequiredMinFreeBytes(); got != 2147483648 {
 		t.Fatalf("expected 2147483648, got %d", got)
+	}
+}
+
+func TestPreflightUnmarshalJSON(t *testing.T) {
+	// Standard JSON
+	stdJSON := []byte(`{
+		"kind": "ordinary",
+		"free_bytes": 1000000,
+		"work_porcelain": "clean",
+		"branch": "main"
+	}`)
+	var p1 Preflight
+	if err := json.Unmarshal(stdJSON, &p1); err != nil {
+		t.Fatalf("unmarshal stdJSON: %v", err)
+	}
+	if p1.Kind != "ordinary" || p1.FreeBytes != 1000000 {
+		t.Errorf("unexpected p1: %+v", p1)
+	}
+
+	// Alt PascalCase JSON
+	altJSON := []byte(`{
+		"Kind": "resume",
+		"FreeBytes": 5000000,
+		"WorkPorcelain": "M file",
+		"HubPorcelain": "M hub",
+		"HeadAttached": true,
+		"Branch": "feat",
+		"DefaultBranch": "main",
+		"HasUpstream": true,
+		"DocsHubOK": true,
+		"GitAuthOK": true,
+		"GitWorkTree": true,
+		"DirtyStoryID": "S-1",
+		"DirtyReviewFile": "review.md",
+		"DetectedConversationID": "c-1",
+		"DetectedVerdict": "PASS"
+	}`)
+	var p2 Preflight
+	if err := json.Unmarshal(altJSON, &p2); err != nil {
+		t.Fatalf("unmarshal altJSON: %v", err)
+	}
+	if p2.Kind != "resume" || p2.FreeBytes != 5000000 || p2.DirtyStoryID != "S-1" {
+		t.Errorf("unexpected p2: %+v", p2)
 	}
 }
