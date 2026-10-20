@@ -27,6 +27,8 @@ type CreateStoryRequest struct {
 	TargetFiles          []string `json:"target_files"`
 	DependsOn            []string `json:"depends_on,omitempty"`
 	VerificationCommands []string `json:"verification_commands,omitempty"`
+	Enqueue              bool     `json:"enqueue,omitempty"`
+	TargetAgent          string   `json:"target_agent,omitempty"`
 }
 
 // CreateStoryResponse is the response emitted by POST /api/v1/stories.
@@ -37,6 +39,8 @@ type CreateStoryResponse struct {
 	Submodule        string `json:"submodule"`
 	StoryPath        string `json:"story_path,omitempty"`
 	IndexUpdated     bool   `json:"index_updated,omitempty"`
+	ExecutionJobID   string `json:"execution_job_id,omitempty"`
+	ExecutionStatus  string `json:"execution_status,omitempty"`
 	CreatedAt        string `json:"created_at"`
 	IdempotentReplay bool   `json:"idempotent_replay"`
 }
@@ -241,6 +245,30 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		IndexUpdated:     result.IndexUpdated,
 		CreatedAt:        job.CreatedAt.Format(time.RFC3339),
 		IdempotentReplay: false,
+	}
+
+	if req.Enqueue && result.StoryID != "" {
+		targetAgent := strings.TrimSpace(req.TargetAgent)
+		if targetAgent == "" {
+			targetAgent = "autopilot"
+		}
+		execPayload, _ := json.Marshal(map[string]any{
+			"repo":         req.Submodule,
+			"story_id":     result.StoryID,
+			"title":        fmt.Sprintf("Execute story %s: %s", result.StoryID, req.Title),
+			"prompt":       fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", result.StoryID, result.StoryID, req.Submodule),
+			"target_agent": targetAgent,
+		})
+		execJob, _ := h.queue.Enqueue(r.Context(), &dispatch.Job{
+			Type:        dispatch.JobTypePromptExecute,
+			Repo:        req.Submodule,
+			TargetAgent: targetAgent,
+			Payload:     execPayload,
+		})
+		if execJob != nil {
+			resp.ExecutionJobID = execJob.ID
+			resp.ExecutionStatus = execJob.Status
+		}
 	}
 
 	respBytes, _ := json.Marshal(resp)

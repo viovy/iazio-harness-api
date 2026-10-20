@@ -1,0 +1,180 @@
+package handlers
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/viovy/iazio-harness-api/internal/dispatch"
+)
+
+func TestJobLifecycleHandler_GetJob(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	h := NewJobLifecycleHandler(q)
+
+	job, err := q.Enqueue(context.Background(), &dispatch.Job{
+		Type:        dispatch.JobTypePromptExecute,
+		Repo:        "iazio-mcp",
+		TargetAgent: "autopilot",
+	})
+	if err != nil {
+		t.Fatalf("failed to enqueue: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/jobs/{id}", h.GetJob)
+
+	// Existing job
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/"+job.ID, nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var detail JobDetailResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+	if detail.ID != job.ID || detail.Repo != "iazio-mcp" || detail.Status != dispatch.JobStatusPending {
+		t.Fatalf("unexpected detail: %+v", detail)
+	}
+
+	// Missing job -> 404
+	req404 := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/nonexistent", nil)
+	rr404 := httptest.NewRecorder()
+	mux.ServeHTTP(rr404, req404)
+
+	if rr404.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found, got %d", rr404.Code)
+	}
+}
+
+func TestJobLifecycleHandler_ListQueue(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	h := NewJobLifecycleHandler(q)
+
+	_, _ = q.Enqueue(context.Background(), &dispatch.Job{
+		Type: dispatch.JobTypeStoryCreate,
+		Repo: "repo-1",
+	})
+	_, _ = q.Enqueue(context.Background(), &dispatch.Job{
+		Type: dispatch.JobTypePromptExecute,
+		Repo: "repo-2",
+	})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/queue", h.ListQueue)
+
+	// All jobs
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/queue", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rr.Code)
+	}
+
+	var listResp ListQueueResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if listResp.Total != 2 {
+		t.Fatalf("expected 2 jobs, got %d", listResp.Total)
+	}
+
+	// Filter by repo
+	reqFilter := httptest.NewRequest(http.MethodGet, "/api/v1/queue?repo=repo-1", nil)
+	rrFilter := httptest.NewRecorder()
+	mux.ServeHTTP(rrFilter, reqFilter)
+
+	var listFiltered ListQueueResponse
+	_ = json.Unmarshal(rrFilter.Body.Bytes(), &listFiltered)
+	if listFiltered.Total != 1 || listFiltered.Items[0].Repo != "repo-1" {
+		t.Fatalf("unexpected filtered response: %+v", listFiltered)
+	}
+}
+
+func TestJobLifecycleHandler_CancelJob(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	h := NewJobLifecycleHandler(q)
+
+	job, _ := q.Enqueue(context.Background(), &dispatch.Job{
+		Type: dispatch.JobTypeStoryCreate,
+		Repo: "repo-1",
+	})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/jobs/{id}/cancel", h.CancelJob)
+
+	body := bytes.NewReader([]byte(`{"reason":"user abort"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/"+job.ID+"/cancel", body)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var canceled JobDetailResponse
+	_ = json.Unmarshal(rr.Body.Bytes(), &canceled)
+	if canceled.Status != dispatch.JobStatusCanceled || canceled.Error != "user abort" {
+		t.Fatalf("unexpected canceled job: %+v", canceled)
+	}
+}
+
+func TestJobLifecycleHandler_RetryJob(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	h := NewJobLifecycleHandler(q)
+
+	job, _ := q.Enqueue(context.Background(), &dispatch.Job{
+		Type:        dispatch.JobTypePromptExecute,
+		Repo:        "repo-retry",
+		TargetAgent: "autopilot",
+	})
+	_ = q.Complete(context.Background(), job.ID, nil, "some failure")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/jobs/{id}/retry", h.RetryJob)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/"+job.ID+"/retry", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var retried JobDetailResponse
+	_ = json.Unmarshal(rr.Body.Bytes(), &retried)
+	if retried.ID == job.ID || retried.Status != dispatch.JobStatusPending || retried.Repo != "repo-retry" {
+		t.Fatalf("unexpected retried job: %+v", retried)
+	}
+}
+
+func TestJobLifecycleHandler_ExecuteStory(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	h := NewJobLifecycleHandler(q)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/stories/{id}/execute", h.ExecuteStory)
+
+	body := bytes.NewReader([]byte(`{"submodule":".","target_agent":"autopilot"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/stories/STORY-GOV-9999/execute", body)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var execResp ExecuteStoryResponse
+	_ = json.Unmarshal(rr.Body.Bytes(), &execResp)
+	if execResp.StoryID != "STORY-GOV-9999" || execResp.Submodule != "." || execResp.JobID == "" || execResp.Status != dispatch.JobStatusPending {
+		t.Fatalf("unexpected execute response: %+v", execResp)
+	}
+}

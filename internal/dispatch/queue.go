@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -25,6 +26,7 @@ const (
 	JobStatusClaimed   = "claimed"
 	JobStatusCompleted = "completed"
 	JobStatusFailed    = "failed"
+	JobStatusCanceled  = "canceled"
 )
 
 var (
@@ -55,12 +57,23 @@ type Job struct {
 	doneCh chan struct{}
 }
 
+// JobFilter specifies filtering criteria for listing jobs.
+type JobFilter struct {
+	Repo   string `json:"repo,omitempty"`
+	Status string `json:"status,omitempty"`
+	Type   string `json:"type,omitempty"`
+	Limit  int    `json:"limit,omitempty"`
+}
+
 // Queue defines the contract for enqueuing, claiming, completing, and awaiting agent jobs.
 type Queue interface {
 	Enqueue(ctx context.Context, job *Job) (*Job, error)
 	Claim(ctx context.Context, hostID string, jobTypes []string) (*Job, error)
 	Complete(ctx context.Context, jobID string, result json.RawMessage, errStr string) error
 	Get(jobID string) (*Job, bool)
+	List(ctx context.Context, filter JobFilter) ([]*Job, error)
+	Cancel(ctx context.Context, jobID string, reason string) (*Job, error)
+	Retry(ctx context.Context, jobID string) (*Job, error)
 	Await(ctx context.Context, jobID string, timeout time.Duration) (*Job, error)
 }
 
@@ -176,6 +189,99 @@ func (q *InMemoryQueue) Get(jobID string) (*Job, bool) {
 	defer q.mu.Unlock()
 	j, ok := q.jobs[jobID]
 	return j, ok
+}
+
+// List returns jobs matching the filter, sorted by CreatedAt descending.
+func (q *InMemoryQueue) List(ctx context.Context, filter JobFilter) ([]*Job, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	limit := filter.Limit
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+
+	var matched []*Job
+	for _, j := range q.jobs {
+		if filter.Repo != "" && j.Repo != filter.Repo {
+			continue
+		}
+		if filter.Status != "" && filter.Status != "all" && j.Status != filter.Status {
+			continue
+		}
+		if filter.Type != "" && j.Type != filter.Type {
+			continue
+		}
+		matched = append(matched, j)
+	}
+
+	sort.Slice(matched, func(i, j int) bool {
+		return matched[i].CreatedAt.After(matched[j].CreatedAt)
+	})
+
+	if len(matched) > limit {
+		matched = matched[:limit]
+	}
+	return matched, nil
+}
+
+// Cancel terminates a pending or claimed job.
+func (q *InMemoryQueue) Cancel(ctx context.Context, jobID string, reason string) (*Job, error) {
+	q.mu.Lock()
+	job, exists := q.jobs[jobID]
+	if !exists {
+		q.mu.Unlock()
+		return nil, ErrJobNotFound
+	}
+	if job.Status == JobStatusCompleted || job.Status == JobStatusFailed || job.Status == JobStatusCanceled {
+		q.mu.Unlock()
+		return nil, ErrJobAlreadyCompleted
+	}
+
+	now := time.Now().UTC()
+	job.Status = JobStatusCanceled
+	if reason == "" {
+		reason = "cancelled by user"
+	}
+	job.Error = reason
+	job.CompletedAt = &now
+	done := job.doneCh
+	q.mu.Unlock()
+
+	if done != nil {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	}
+	return job, nil
+}
+
+// Retry re-enqueues a job by creating a fresh pending job with the same parameters.
+func (q *InMemoryQueue) Retry(ctx context.Context, jobID string) (*Job, error) {
+	q.mu.Lock()
+	orig, exists := q.jobs[jobID]
+	if !exists {
+		q.mu.Unlock()
+		return nil, ErrJobNotFound
+	}
+
+	newJob := &Job{
+		ID:          generateJobID(),
+		Type:        orig.Type,
+		Repo:        orig.Repo,
+		TargetHost:  orig.TargetHost,
+		TargetAgent: orig.TargetAgent,
+		Payload:     orig.Payload,
+		Status:      JobStatusPending,
+		CreatedAt:   time.Now().UTC(),
+		doneCh:      make(chan struct{}),
+	}
+	q.jobs[newJob.ID] = newJob
+	q.mu.Unlock()
+
+	return newJob, nil
 }
 
 // Await blocks until the specified job completes, the context is cancelled, or the timeout expires.

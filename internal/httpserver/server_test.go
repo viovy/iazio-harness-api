@@ -1709,6 +1709,10 @@ func TestServerExtendedHandlers(t *testing.T) {
 	}
 
 	// 16. Profile releases
+	e.Releases.SetCachedRelease("viovy/autopilot-plugins-internal", "latest", control.ToolRelease{Name: "autopilot", Repository: "viovy/autopilot-plugins-internal", LatestVersion: "0.1.0", TagName: "v0.1.0"}, 10*time.Minute)
+	e.Releases.SetCachedRelease("viovy/iazio-mcp", "latest", control.ToolRelease{Name: "iazio-mcp", Repository: "viovy/iazio-mcp", LatestVersion: "0.0.42", TagName: "v0.0.42"}, 10*time.Minute)
+	e.Releases.SetCachedRelease("viovy/iazio-agent", "latest", control.ToolRelease{Name: "iazio-agent", Repository: "viovy/iazio-agent", LatestVersion: "0.1.0", TagName: "v0.1.0"}, 10*time.Minute)
+	e.Releases.SetCachedRelease("viovy/iazio-harness", "latest", control.ToolRelease{Name: "iazio-harness", Repository: "viovy/iazio-harness", LatestVersion: "0.1.0", TagName: "v0.1.0"}, 10*time.Minute)
 	req = httptest.NewRequest(http.MethodGet, "/v1/fleet/profiles/generic/releases", nil)
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -1731,3 +1735,39 @@ func TestServerExtendedHandlers(t *testing.T) {
 	_ = deletedProfiles
 }
 
+func TestServer_DispatchAndStoryRoutesMounted(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	handler := s.Handler()
+
+	// 1. Check GET /api/v1/queue -> 200 OK (not 404)
+	reqQueue := httptest.NewRequest(http.MethodGet, "/api/v1/queue", nil)
+	rrQueue := httptest.NewRecorder()
+	handler.ServeHTTP(rrQueue, reqQueue)
+	if rrQueue.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /api/v1/queue, got %d", rrQueue.Code)
+	}
+
+	// 2. Check POST /api/v1/prompts with invalid body -> 422/400 (proves route is mounted, not 404!)
+	reqPrompt := httptest.NewRequest(http.MethodPost, "/api/v1/prompts", bytes.NewBufferString(`{}`))
+	rrPrompt := httptest.NewRecorder()
+	handler.ServeHTTP(rrPrompt, reqPrompt)
+	if rrPrompt.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 Unprocessable Entity for empty prompt body, got %d", rrPrompt.Code)
+	}
+
+	// 3. Check POST /api/v1/stories with invalid body -> 422/400 (proves route is mounted, not 404!)
+	reqStory := httptest.NewRequest(http.MethodPost, "/api/v1/stories", bytes.NewBufferString(`{}`))
+	rrStory := httptest.NewRecorder()
+	handler.ServeHTTP(rrStory, reqStory)
+	if rrStory.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 Unprocessable Entity for empty story body, got %d", rrStory.Code)
+	}
+
+	// 4. Check POST /api/v1/stories/STORY-TEST/execute
+	reqExec := httptest.NewRequest(http.MethodPost, "/api/v1/stories/STORY-TEST/execute", bytes.NewBufferString(`{"submodule":"."}`))
+	rrExec := httptest.NewRecorder()
+	handler.ServeHTTP(rrExec, reqExec)
+	if rrExec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for story execution, got %d: %s", rrExec.Code, rrExec.Body.String())
+	}
+}
