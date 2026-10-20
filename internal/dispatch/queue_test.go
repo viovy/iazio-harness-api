@@ -3,6 +3,7 @@ package dispatch
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -263,17 +264,24 @@ func TestQueue_CompleteAttributionDispatch(t *testing.T) {
 	var mu sync.Mutex
 	relevanceCalls := 0
 	promoteCalls := 0
+	var receivedRelevance map[string]any
+	var receivedPromote map[string]any
+	var relevanceTraceparent string
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
+		body, _ := io.ReadAll(r.Body)
 		if r.URL.Path == "/v1/relevance" {
 			relevanceCalls++
+			relevanceTraceparent = r.Header.Get("traceparent")
+			_ = json.Unmarshal(body, &receivedRelevance)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 		if r.URL.Path == "/v1/memories/promote" {
 			promoteCalls++
+			_ = json.Unmarshal(body, &receivedPromote)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -311,5 +319,31 @@ func TestQueue_CompleteAttributionDispatch(t *testing.T) {
 	}
 	if promoteCalls != 1 {
 		t.Errorf("expected 1 promote call, got %d", promoteCalls)
+	}
+
+	if receivedRelevance == nil {
+		t.Fatal("expected receivedRelevance to be non-nil")
+	}
+	if searchID, ok := receivedRelevance["search_id"].(string); !ok || searchID != "srch-test-12345" {
+		t.Errorf("expected search_id 'srch-test-12345', got %v", receivedRelevance["search_id"])
+	}
+	if outcome, ok := receivedRelevance["outcome"].(string); !ok || outcome != "positive" {
+		t.Errorf("expected outcome 'positive' (string), got %v (type %T)", receivedRelevance["outcome"], receivedRelevance["outcome"])
+	}
+	if traceID, ok := receivedRelevance["trace_id"].(string); !ok || traceID != "trace-test-67890" {
+		t.Errorf("expected trace_id 'trace-test-67890', got %v", receivedRelevance["trace_id"])
+	}
+	if relevanceTraceparent == "" {
+		t.Error("expected traceparent header to be transmitted")
+	}
+
+	if receivedPromote == nil {
+		t.Fatal("expected receivedPromote to be non-nil")
+	}
+	if tier, ok := receivedPromote["tier"].(string); !ok || tier != "canonical" {
+		t.Errorf("expected tier 'canonical', got %v", receivedPromote["tier"])
+	}
+	if _, ok := receivedPromote["target"]; ok {
+		t.Errorf("schema violation: field 'target' should not exist in promotion request")
 	}
 }

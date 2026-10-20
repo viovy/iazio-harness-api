@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"os"
 	"sort"
@@ -242,33 +244,56 @@ func (q *InMemoryQueue) dispatchAttribution(searchID, traceID string, promoted [
 
 	// 1. Emit positive relevance attribution if searchID present
 	if searchID != "" {
-		payload, _ := json.Marshal(map[string]any{
+		payload, err := json.Marshal(map[string]any{
 			"search_id": searchID,
-			"outcome":   1,
+			"outcome":   "positive",
 			"trace_id":  traceID,
 		})
-		req, err := http.NewRequest(http.MethodPost, apiURL+"/v1/relevance", bytes.NewReader(payload))
 		if err == nil {
-			req.Header.Set("Content-Type", "application/json")
-			resp, err := client.Do(req)
+			req, err := http.NewRequest(http.MethodPost, apiURL+"/v1/relevance", bytes.NewReader(payload))
 			if err == nil {
-				_ = resp.Body.Close()
+				req.Header.Set("Content-Type", "application/json")
+				if traceID != "" {
+					req.Header.Set("traceparent", fmt.Sprintf("00-%s-0000000000000001-01", traceID))
+				}
+				resp, err := client.Do(req)
+				if err != nil {
+					log.Printf("[dispatchAttribution] failed to post relevance attribution for search_id %s: %v", searchID, err)
+				} else {
+					defer resp.Body.Close()
+					if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+						body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+						log.Printf("[dispatchAttribution] unexpected status code %d for search_id %s: %s", resp.StatusCode, searchID, string(body))
+					}
+				}
 			}
 		}
 	}
 
 	// 2. Promote verified memories
 	for _, memID := range promoted {
-		payload, _ := json.Marshal(map[string]any{
+		payload, err := json.Marshal(map[string]any{
 			"id":     memID,
-			"target": "canonical",
+			"tier":   "canonical",
+			"reason": "verified harness execution completion",
 		})
-		req, err := http.NewRequest(http.MethodPost, apiURL+"/v1/memories/promote", bytes.NewReader(payload))
 		if err == nil {
-			req.Header.Set("Content-Type", "application/json")
-			resp, err := client.Do(req)
+			req, err := http.NewRequest(http.MethodPost, apiURL+"/v1/memories/promote", bytes.NewReader(payload))
 			if err == nil {
-				_ = resp.Body.Close()
+				req.Header.Set("Content-Type", "application/json")
+				if traceID != "" {
+					req.Header.Set("traceparent", fmt.Sprintf("00-%s-0000000000000001-01", traceID))
+				}
+				resp, err := client.Do(req)
+				if err != nil {
+					log.Printf("[dispatchAttribution] failed to promote memory %s: %v", memID, err)
+				} else {
+					defer resp.Body.Close()
+					if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+						body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+						log.Printf("[dispatchAttribution] unexpected status code %d promoting memory %s: %s", resp.StatusCode, memID, string(body))
+					}
+				}
 			}
 		}
 	}
