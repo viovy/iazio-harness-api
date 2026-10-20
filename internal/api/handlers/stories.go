@@ -188,13 +188,14 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(req.TargetFiles) == 0 {
-		writeJSONError(w, http.StatusUnprocessableEntity, "target_files must not be empty")
-		return
+		req.TargetFiles = []string{req.Submodule}
 	}
 	for _, tf := range req.TargetFiles {
-		if err := validatePath(tf); err != nil {
-			writeJSONError(w, http.StatusUnprocessableEntity, fmt.Sprintf("invalid target_file %q: %v", tf, err))
-			return
+		if tf != "." {
+			if err := validatePath(tf); err != nil {
+				writeJSONError(w, http.StatusUnprocessableEntity, fmt.Sprintf("invalid target_file %q: %v", tf, err))
+				return
+			}
 		}
 	}
 
