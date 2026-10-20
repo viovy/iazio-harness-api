@@ -278,7 +278,9 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if targetAgent == "" {
 			targetAgent = "autopilot"
 		}
+		promptID := fmt.Sprintf("prompt_%s_%d", result.StoryID, time.Now().Unix())
 		execPayload, _ := json.Marshal(map[string]any{
+			"prompt_id":    promptID,
 			"repo":         req.Submodule,
 			"story_id":     result.StoryID,
 			"title":        fmt.Sprintf("Execute story %s: %s", result.StoryID, req.Title),

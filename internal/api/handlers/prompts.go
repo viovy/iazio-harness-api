@@ -16,6 +16,7 @@ import (
 
 // CreatePromptRequest is the payload accepted by POST /api/v1/prompts.
 type CreatePromptRequest struct {
+	PromptID    string `json:"prompt_id,omitempty"`
 	Repo        string `json:"repo"`
 	Title       string `json:"title"`
 	Prompt      string `json:"prompt"`
@@ -132,16 +133,24 @@ func (h *PromptsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	promptID := generateUUIDv4()
+	promptID := strings.TrimSpace(req.PromptID)
+	if promptID == "" {
+		promptID = generateUUIDv4()
+	}
+	req.PromptID = promptID
 	status := "created"
 	harnessJobID := ""
 
 	if req.Enqueue && h.queue != nil {
+		payloadBytes, err := json.Marshal(req)
+		if err != nil {
+			payloadBytes = bodyBytes
+		}
 		job, err := h.queue.Enqueue(r.Context(), &dispatch.Job{
 			Type:        dispatch.JobTypePromptExecute,
 			Repo:        req.Repo,
 			TargetAgent: req.TargetAgent,
-			Payload:     bodyBytes,
+			Payload:     payloadBytes,
 			TraceID:     span.TraceID,
 			ParentID:    span.ID,
 		})
