@@ -2378,3 +2378,41 @@ func TestLocalSchedulePrioritizedOverHigherPriorityGlobalSchedule(t *testing.T) 
 		t.Fatalf("expected Level 1 local schedule %s to take precedence over Level 2 global schedule %s, got %s", localSch.ID, globalSch.ID, leased.ID)
 	}
 }
+
+func TestGlobalStoryScheduleDynamicAllocationMatching(t *testing.T) {
+	e := NewEngine(func() time.Time { return time.Now() })
+	e.RegisterHost("host-idle", "linux")
+	if err := e.UpsertRepo(Repo{
+		HostID:       "host-idle",
+		WorktreePath: "/workspace/fleet/iazio-web",
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = e.SetRepoQueueAllocation("host-idle", "/workspace/fleet/iazio-web", true)
+
+	// Enqueue global story schedule with submodule "iazio-web"
+	sch, err := e.EnqueueGlobalStorySchedule("STORY-GOV-3576", "iazio-web", "agy", "run story")
+	if err != nil {
+		t.Fatalf("failed to enqueue global story schedule: %v", err)
+	}
+	if sch.Status != "QUEUED" || !sch.IsGlobal {
+		t.Fatalf("expected QUEUED and IsGlobal=true, got %+v", sch)
+	}
+
+	// PollHost on host-idle should match the repo /workspace/fleet/iazio-web
+	job, leasedSch, _, ok := e.PollHost("host-idle")
+	if !ok {
+		t.Fatalf("expected host-idle to lease global schedule for iazio-web")
+	}
+	if leasedSch.ID != sch.ID {
+		t.Fatalf("expected leased schedule %s, got %s", sch.ID, leasedSch.ID)
+	}
+	if leasedSch.WorktreePath != "/workspace/fleet/iazio-web" {
+		t.Fatalf("expected resolved worktree /workspace/fleet/iazio-web, got %s", leasedSch.WorktreePath)
+	}
+	if job.ID == "" {
+		t.Fatalf("expected job to be generated")
+	}
+}

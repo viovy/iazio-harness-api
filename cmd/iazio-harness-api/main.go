@@ -19,6 +19,7 @@ import (
 	"github.com/viovy/iazio-harness-api/internal/extract"
 	"github.com/viovy/iazio-harness-api/internal/httpserver"
 	"github.com/viovy/iazio-harness-api/internal/pgstore"
+	"github.com/viovy/iazio-harness-api/internal/telemetry"
 	"github.com/viovy/iazio-harness-api/internal/version"
 )
 
@@ -189,6 +190,9 @@ func run(ctx context.Context, args []string) error {
 }
 
 func main() {
+	flushTracer := telemetry.InitGlobalTracer("iazio-harness-api", "")
+	defer flushTracer()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, os.Args); err != nil {

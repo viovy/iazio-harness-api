@@ -17,6 +17,7 @@ import (
 	"github.com/viovy/iazio-harness-api/internal/control"
 	"github.com/viovy/iazio-harness-api/internal/dispatch"
 	"github.com/viovy/iazio-harness-api/internal/sse"
+	"github.com/viovy/iazio-harness-api/internal/telemetry"
 	"github.com/viovy/iazio-harness-api/internal/version"
 )
 
@@ -88,13 +89,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/agent/codebase/sync", agentSyncHandler.SyncCodebase)
 
 	// Dispatch & Story Lifecycle Endpoints
-	storiesHandler := handlers.NewStoriesHandler(codebaseStore, queue, idempotency)
+	storiesHandler := handlers.NewStoriesHandler(codebaseStore, queue, idempotency, s.Engine)
 	mux.Handle("POST /api/v1/stories", storiesHandler)
 
 	promptsHandler := handlers.NewPromptsHandler(codebaseStore, queue, idempotency)
 	mux.Handle("POST /api/v1/prompts", promptsHandler)
 
 	jobLifecycle := handlers.NewJobLifecycleHandler(queue, codebaseStore)
+	if s.Engine != nil {
+		jobLifecycle.SetScheduler(s.Engine)
+	}
 	mux.HandleFunc("GET /api/v1/jobs/{id}", jobLifecycle.GetJob)
 	mux.HandleFunc("GET /api/v1/queue", jobLifecycle.ListQueue)
 	mux.HandleFunc("GET /api/v1/jobs", jobLifecycle.ListQueue)
@@ -208,7 +212,34 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/fleet/credentials/git", s.listGitCredentials)
 	mux.HandleFunc("POST /v1/fleet/credentials/git", s.registerGitCredential)
 	mux.HandleFunc("DELETE /v1/fleet/credentials/git/{id}", s.deleteGitCredential)
-	return withCORS(withAuth(mux, s.AuthToken))
+	mux.HandleFunc("GET /v1/fleet/tool-priority", s.getToolPriority)
+	mux.HandleFunc("PUT /v1/fleet/tool-priority", s.setToolPriority)
+	mux.HandleFunc("GET /api/v1/tool-priority", s.getToolPriority)
+	mux.HandleFunc("PUT /api/v1/tool-priority", s.setToolPriority)
+	return withTracing(withCORS(withAuth(mux, s.AuthToken)))
+}
+
+func withTracing(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if path == "/healthz" || path == "/readyz" || path == "/version" || r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		traceID, parentID := telemetry.ExtractHTTP(r.Header)
+		var spanOpts []telemetry.SpanOption
+		if traceID != "" {
+			spanOpts = append(spanOpts, telemetry.WithParentTrace(traceID, parentID))
+		}
+		spanOpts = append(spanOpts,
+			telemetry.WithKind("SERVER"),
+			telemetry.WithTag("http.method", r.Method),
+			telemetry.WithTag("http.path", path),
+		)
+		ctx, span := telemetry.StartSpan(r.Context(), r.Method+" "+path, spanOpts...)
+		defer span.End()
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 func withAuth(next http.Handler, token string) http.Handler {
@@ -790,6 +821,37 @@ func (s *Server) setRepoQueueAllocation(w http.ResponseWriter, r *http.Request) 
 		"host_id":                         host,
 		"worktree_path":                   targetPath,
 		"global_queue_allocation_enabled": enabled,
+	})
+}
+
+func (s *Server) getToolPriority(w http.ResponseWriter, r *http.Request) {
+	_, span := telemetry.StartSpan(r.Context(), "getToolPriority")
+	defer span.End()
+
+	priority := s.Engine.GetToolPriority()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"tools": priority,
+	})
+}
+
+func (s *Server) setToolPriority(w http.ResponseWriter, r *http.Request) {
+	_, span := telemetry.StartSpan(r.Context(), "setToolPriority")
+	defer span.End()
+
+	var body struct {
+		Tools []string `json:"tools"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.Engine.SetToolPriority(body.Tools); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "ok",
+		"tools":  s.Engine.GetToolPriority(),
 	})
 }
 
