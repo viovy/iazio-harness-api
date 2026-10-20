@@ -289,6 +289,8 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		Repo:        submodule,
 		TargetAgent: targetAgent,
 		Payload:     execPayload,
+		TraceID:     span.TraceID,
+		ParentID:    span.ID,
 	})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to enqueue story execution: %v", err))

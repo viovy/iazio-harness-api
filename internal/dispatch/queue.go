@@ -49,6 +49,8 @@ type Job struct {
 	Status      string          `json:"status"`
 	Result      json.RawMessage `json:"result,omitempty"`
 	Error       string          `json:"error,omitempty"`
+	TraceID     string          `json:"trace_id,omitempty"`
+	ParentID    string          `json:"parent_id,omitempty"`
 	CreatedAt   time.Time       `json:"created_at"`
 	ClaimedAt   *time.Time      `json:"claimed_at,omitempty"`
 	CompletedAt *time.Time      `json:"completed_at,omitempty"`
