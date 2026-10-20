@@ -41,6 +41,8 @@ func TestReleaseService_GitCredentialsPersistence(t *testing.T) {
 	store := newMockGitCredentialStore()
 	svc.SetStore(store)
 
+	svc.SetCachedRelease("viovy/iazio-agent", "v0.1.0", ToolRelease{Name: "iazio-agent", TagName: "v0.1.0"}, 5*time.Minute)
+
 	cred, err := svc.RegisterCredential(GitCredential{
 		ID:      "cred-1",
 		Name:    "GitHub Personal Token",
@@ -233,5 +235,26 @@ func TestReleaseService_ExpiredCacheFailsClosed(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "lookup release") {
 		t.Errorf("expected lookup release error message, got: %v", err)
+	}
+}
+
+func TestReleaseService_TokenForRepo(t *testing.T) {
+	svc := NewReleaseService()
+	svc.token = "default-token"
+	if tok := svc.tokenForRepo("other/repo"); tok != "default-token" {
+		t.Errorf("expected default-token, got %s", tok)
+	}
+
+	_, _ = svc.RegisterCredential(GitCredential{ID: "c1", Pattern: "viovy/*", Token: "viovy-token"})
+	if tok := svc.tokenForRepo("viovy/app"); tok != "viovy-token" {
+		t.Errorf("expected viovy-token, got %s", tok)
+	}
+	if tok := svc.tokenForRepo("other/app"); tok != "default-token" {
+		t.Errorf("expected default-token, got %s", tok)
+	}
+
+	_, _ = svc.RegisterCredential(GitCredential{ID: "c2", Pattern: "exact/match", Token: "exact-token"})
+	if tok := svc.tokenForRepo("exact/match"); tok != "exact-token" {
+		t.Errorf("expected exact-token, got %s", tok)
 	}
 }

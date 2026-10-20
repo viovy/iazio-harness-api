@@ -154,3 +154,33 @@ func TestProfile_GetManifest(t *testing.T) {
 		t.Errorf("expected no .exe suffix on Linux, got %s", manifestLinux.Tools[0].BinaryName)
 	}
 }
+
+func TestScanRepoProfile_Validation(t *testing.T) {
+	e := NewEngine(time.Now)
+
+	// Empty inputs
+	_, err := e.ScanRepoProfile("", "", "")
+	if err == nil {
+		t.Error("expected error for empty inputs")
+	}
+
+	// Host not registered
+	_, err = e.ScanRepoProfile("h-unknown", "/repo", "p1")
+	if err == nil {
+		t.Error("expected error for unknown host")
+	}
+
+	// Host registered but repo not configured
+	e.RegisterHost("h-known", "permanent")
+	_, err = e.ScanRepoProfile("h-known", "/repo-unconfigured", "p1")
+	if err == nil {
+		t.Error("expected error for unconfigured repo")
+	}
+
+	// Repo configured but metadata.yml not found
+	_ = e.UpsertRepo(Repo{HostID: "h-known", WorktreePath: "/nonexistent/path"})
+	_, err = e.ScanRepoProfile("h-known", "/nonexistent/path", "p1")
+	if err == nil {
+		t.Error("expected error for missing metadata.yml")
+	}
+}

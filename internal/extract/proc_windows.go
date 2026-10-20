@@ -7,6 +7,7 @@ import (
 )
 
 func setSysProcAttr(cmd *exec.Cmd) {
+	// Windows does not require specific process-group attributes for extract workers.
 }
 
 func killProcessGroup(cmd *exec.Cmd) {

@@ -936,3 +936,798 @@ func TestRepoQueueAllocationEndpoint(t *testing.T) {
 		t.Fatalf("expected globalQueueAllocationEnabled true after toggle back, got: %+v", det)
 	}
 }
+
+func TestServerMissingRoutes(t *testing.T) {
+	e := control.NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	_ = e.UpsertRepo(control.Repo{
+		HostID:       "host-1",
+		WorktreePath: "/work/test-repo",
+		DocsHubPath:  "/docs/hub",
+		Queue:        control.QueueOpen,
+		Lock:         control.LockIdle,
+	})
+
+	s := &Server{Engine: e}
+	h := s.Handler()
+
+	// 1. GET /v1/repos/{host}?path=...
+	req := httptest.NewRequest(http.MethodGet, "/v1/repos/host-1?path=/work/test-repo", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("GET /v1/repos/host-1 expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// Missing path param
+	req = httptest.NewRequest(http.MethodGet, "/v1/repos/host-1", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("GET /v1/repos/host-1 without path expected 404, got %d", rr.Code)
+	}
+
+	// 2. POST /v1/jobs/{id}/story-draft (nonexistent job)
+	req = httptest.NewRequest(http.MethodPost, "/v1/jobs/job-unknown/story-draft", bytes.NewReader([]byte("{}")))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Errorf("POST story-draft expected 403, got %d", rr.Code)
+	}
+
+	// 3. POST /v1/jobs/{id}/cancel (nonexistent job)
+	req = httptest.NewRequest(http.MethodPost, "/v1/jobs/job-unknown/cancel", bytes.NewReader([]byte("{}")))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Errorf("POST cancel expected 409, got %d", rr.Code)
+	}
+
+	// 4. POST /v1/jobs/{id}/force-pause (nonexistent job)
+	req = httptest.NewRequest(http.MethodPost, "/v1/jobs/job-unknown/force-pause", bytes.NewReader([]byte("{}")))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("POST force-pause expected 404, got %d", rr.Code)
+	}
+
+	// 5. POST /v1/jobs/{id}/retry-correlation (nonexistent job)
+	req = httptest.NewRequest(http.MethodPost, "/v1/jobs/job-unknown/retry-correlation", bytes.NewReader([]byte("{}")))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("POST retry-correlation expected 404, got %d", rr.Code)
+	}
+
+	// 6. POST /v1/repos/{host}/force-pause
+	pauseBody, _ := json.Marshal(map[string]string{"worktree_path": "/work/test-repo"})
+	req = httptest.NewRequest(http.MethodPost, "/v1/repos/host-1/force-pause", bytes.NewReader(pauseBody))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("POST force-pause expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// 7. POST /v1/hosts/{host}/docs-hub/discard
+	discardBody, _ := json.Marshal(map[string]string{"docs_hub_path": "/docs/hub"})
+	req = httptest.NewRequest(http.MethodPost, "/v1/hosts/host-1/docs-hub/discard", bytes.NewReader(discardBody))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("POST docs-hub/discard expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// 8. POST /v1/repos/intervention (queue is not leasable -> 409)
+	intervBody, _ := json.Marshal(map[string]any{
+		"host_id":       "host-1",
+		"worktree_path": "/work/test-repo",
+		"prompt_title":  "Intervention Test",
+		"prompt_body":   "fix something",
+		"engine":        "agent",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/repos/intervention", bytes.NewReader(intervBody))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Errorf("POST intervention expected 409, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// 9. POST /v1/hosts/{host}/repo-requests
+	repoReqBody, _ := json.Marshal(map[string]string{
+		"path":      "/work/requested-repo",
+		"clone_url": "https://git/requested",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/hosts/host-1/repo-requests", bytes.NewReader(repoReqBody))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusAccepted {
+		t.Errorf("POST repo-requests expected 202 Accepted, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// 10. PUT /v1/fleet/profiles/{name}
+	profBody, _ := json.Marshal(map[string]any{
+		"description": "updated profile",
+		"is_default":  false,
+	})
+	req = httptest.NewRequest(http.MethodPut, "/v1/fleet/profiles/prof-1", bytes.NewReader(profBody))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("PUT profile expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// 11. DecodeLimit and NowUnix helpers
+	var val map[string]string
+	if err := DecodeLimit(strings.NewReader(`{"key":"value"}`), &val); err != nil || val["key"] != "value" {
+		t.Errorf("DecodeLimit failed: %v", err)
+	}
+	if NowUnix().Unix() != 0 {
+		t.Error("expected 0 from NowUnix")
+	}
+}
+
+func TestServerMoreEndpoints(t *testing.T) {
+	e := control.NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	_ = e.UpsertRepo(control.Repo{
+		HostID:       "host-1",
+		WorktreePath: "/work/test-repo",
+		DocsHubPath:  "/docs/hub",
+		Queue:        control.QueueOpen,
+		Lock:         control.LockIdle,
+	})
+	p := e.PutPrompt(control.Prompt{ID: "p-test", Title: "Test Prompt", Body: "run something", Status: "READY"})
+	idea := e.PutIdea(control.Idea{ID: "i-test", Title: "Test Idea", ShareURL: "https://gemini.google.com/share/abc_DEF-1", Status: "NEW"})
+
+	s := &Server{
+		Engine: e,
+		SavePrompt: func(_ control.Prompt) {},
+		DeletePrompt: func(_ string) {},
+		SaveRepo: func(_ control.Repo) {},
+		SaveIdea: func(_ control.Idea) {},
+		Extract: func(_ string) (string, string, error) {
+			return "Imported Title", "Imported Transcript", nil
+		},
+	}
+	h := s.Handler()
+
+	// 1. PUT /v1/prompts/{id}
+	putBody, _ := json.Marshal(map[string]string{"title": "Updated Title", "body": "updated body", "status": "READY"})
+	req := httptest.NewRequest(http.MethodPut, "/v1/prompts/"+p.ID, bytes.NewReader(putBody))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("PUT /v1/prompts expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// Bad JSON to PUT /v1/prompts
+	req = httptest.NewRequest(http.MethodPut, "/v1/prompts/"+p.ID, bytes.NewReader([]byte("invalid")))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("PUT /v1/prompts invalid JSON expected 400, got %d", rr.Code)
+	}
+
+	// 2. POST /v1/prompts/{id}/execute
+	execBody, _ := json.Marshal(map[string]any{
+		"host_id":   "host-1",
+		"repo_path": "/work/test-repo",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/prompts/"+p.ID+"/execute", bytes.NewReader(execBody))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Errorf("POST execute prompt expected 201, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// Get schedule ID created
+	var schedView map[string]any
+	_ = json.Unmarshal(rr.Body.Bytes(), &schedView)
+	schedID, _ := schedView["id"].(string)
+
+	if schedID != "" {
+		// 3. POST /v1/schedules/{id}/increase-priority and decrease-priority
+		req = httptest.NewRequest(http.MethodPost, "/v1/schedules/"+schedID+"/increase-priority", nil)
+		rr = httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Errorf("increase-priority expected 200, got %d", rr.Code)
+		}
+
+		req = httptest.NewRequest(http.MethodPost, "/v1/schedules/"+schedID+"/decrease-priority", nil)
+		rr = httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Errorf("decrease-priority expected 200, got %d", rr.Code)
+		}
+
+		// 4. Cancel schedule: POST and DELETE
+		req = httptest.NewRequest(http.MethodPost, "/v1/schedules/"+schedID+"/cancel", nil)
+		rr = httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Errorf("cancel schedule expected 200, got %d", rr.Code)
+		}
+
+		req = httptest.NewRequest(http.MethodDelete, "/v1/schedules/"+schedID, nil)
+		rr = httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK && rr.Code != http.StatusNotFound {
+			t.Errorf("delete schedule expected 200/404, got %d", rr.Code)
+		}
+	}
+
+	// 5. DELETE /v1/prompts/{id}
+	req = httptest.NewRequest(http.MethodDelete, "/v1/prompts/"+p.ID, nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Errorf("DELETE prompt expected 204, got %d", rr.Code)
+	}
+
+	// 6. POST /v1/ideas/{id}/triage
+	triageBody, _ := json.Marshal(map[string]string{"action": "ARCHIVE"})
+	req = httptest.NewRequest(http.MethodPost, "/v1/ideas/"+idea.ID+"/triage", bytes.NewReader(triageBody))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("POST triage expected 200, got %d", rr.Code)
+	}
+
+	// 7. POST /v1/repos/{host}/resume-in-place
+	resBody, _ := json.Marshal(map[string]string{"worktree_path": "/work/test-repo"})
+	req = httptest.NewRequest(http.MethodPost, "/v1/repos/host-1/resume-in-place", bytes.NewReader(resBody))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK && rr.Code != http.StatusConflict {
+		t.Errorf("POST resume-in-place unexpected %d", rr.Code)
+	}
+
+	// 8. POST /v1/repos/{host}/remediate
+	remBody, _ := json.Marshal(map[string]string{
+		"worktree_path": "/work/test-repo",
+		"story_id":      "STORY-1",
+		"review_file":   "review.md",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/repos/host-1/remediate", bytes.NewReader(remBody))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK && rr.Code != http.StatusConflict {
+		t.Errorf("POST remediate unexpected %d", rr.Code)
+	}
+
+	// 9. POST /v1/jobs/{id}/abandon and resume
+	req = httptest.NewRequest(http.MethodPost, "/v1/jobs/job-unknown/abandon", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("POST abandon expected 404, got %d", rr.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/jobs/job-unknown/resume", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("POST resume expected 404, got %d", rr.Code)
+	}
+
+	// 10. POST /v1/jobs/{id}/conversations
+	convBody, _ := json.Marshal(map[string]string{"conversation_id": "c-123"})
+	req = httptest.NewRequest(http.MethodPost, "/v1/jobs/job-unknown/conversations", bytes.NewReader(convBody))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("POST conversations expected 404, got %d", rr.Code)
+	}
+
+	// 11. POST /v1/ideas/import-gemini
+	importBody, _ := json.Marshal(map[string]string{"share_url": "https://gemini.google.com/share/abc_DEF-1"})
+	req = httptest.NewRequest(http.MethodPost, "/v1/ideas/import-gemini", bytes.NewReader(importBody))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Errorf("POST import-gemini expected 201, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// 12. POST /v1/repos/discard
+	req = httptest.NewRequest(http.MethodPost, "/v1/repos/discard?host=host-1&path=/work/test-repo", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("POST discard expected 200, got %d", rr.Code)
+	}
+
+	// 13. DELETE /v1/fleet/credentials/git/{id}
+	req = httptest.NewRequest(http.MethodDelete, "/v1/fleet/credentials/git/cred-unknown", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("DELETE credential expected 404, got %d", rr.Code)
+	}
+
+	// 14. DELETE /v1/hosts/{host}/repos?path=/work/test-repo
+	req = httptest.NewRequest(http.MethodDelete, "/v1/hosts/host-1/repos?path=/work/test-repo", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Errorf("DELETE repo expected 204, got %d", rr.Code)
+	}
+
+	// 15. POST /v1/hosts/host-1/tools/update
+	toolUpBody, _ := json.Marshal(map[string]any{"tools": []string{"git"}, "force": true})
+	req = httptest.NewRequest(http.MethodPost, "/v1/hosts/host-1/tools/update", bytes.NewReader(toolUpBody))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("POST tools/update expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// 16. GET and POST git credentials
+	regCredBody, _ := json.Marshal(map[string]string{
+		"name":    "test-cred",
+		"pattern": "github.com/*",
+		"token":   "ghp_123",
+		"type":    "pat",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/fleet/credentials/git", bytes.NewReader(regCredBody))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("POST git credentials expected 200, got %d", rr.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/fleet/credentials/git", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("GET git credentials expected 200, got %d", rr.Code)
+	}
+}
+
+func TestServerExtendedHandlers(t *testing.T) {
+	e := control.NewEngine(nil)
+	savedRepos := make([]control.Repo, 0)
+	savedHosts := make([]control.Host, 0)
+	savedPrompts := make([]control.Prompt, 0)
+	deletedPrompts := make([]string, 0)
+	savedProfiles := make([]control.DistributionProfile, 0)
+	deletedProfiles := make([]string, 0)
+
+	s := &Server{
+		Engine: e,
+		SaveRepo: func(r control.Repo) {
+			savedRepos = append(savedRepos, r)
+		},
+		SaveHost: func(h control.Host) {
+			savedHosts = append(savedHosts, h)
+		},
+		SavePrompt: func(p control.Prompt) {
+			savedPrompts = append(savedPrompts, p)
+		},
+		DeletePrompt: func(id string) {
+			deletedPrompts = append(deletedPrompts, id)
+		},
+		SaveProfile: func(p control.DistributionProfile) {
+			savedProfiles = append(savedProfiles, p)
+		},
+		DeleteProfile: func(name string) {
+			deletedProfiles = append(deletedProfiles, name)
+		},
+		DeleteHistory: func(_ context.Context, _ string) error {
+			return nil
+		},
+		ClearHistory: func(_ context.Context, _, _ string) error {
+			return nil
+		},
+	}
+	h := s.Handler()
+
+	// Seed host and repo
+	hostID := "host-ext-1"
+	repoPath := "/work/ext-repo"
+	e.RegisterHost(hostID, "linux")
+	_ = e.UpsertRepo(control.Repo{HostID: hostID, WorktreePath: repoPath, GlobalQueueAllocationEnabled: true})
+
+	// 1. Queue allocation
+	// Invalid JSON
+	req := httptest.NewRequest(http.MethodPost, "/v1/repos/"+hostID+"/queue-allocation", bytes.NewReader([]byte("{invalid")))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for bad json, got %d", rr.Code)
+	}
+
+	// Missing path
+	req = httptest.NewRequest(http.MethodPost, "/v1/repos/"+hostID+"/queue-allocation", bytes.NewReader([]byte(`{}`)))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for missing path, got %d", rr.Code)
+	}
+
+	// Missing enabled
+	req = httptest.NewRequest(http.MethodPost, "/v1/repos/"+hostID+"/queue-allocation", bytes.NewReader([]byte(`{"path":"`+repoPath+`"}`)))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for missing enabled, got %d", rr.Code)
+	}
+
+	// Repo not found
+	req = httptest.NewRequest(http.MethodPost, "/v1/repos/"+hostID+"/queue-allocation", bytes.NewReader([]byte(`{"path":"/not/found","enabled":true}`)))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for missing repo, got %d", rr.Code)
+	}
+
+	// Valid with global_queue_allocation_enabled
+	bodyGlobal, _ := json.Marshal(map[string]any{"path": repoPath, "global_queue_allocation_enabled": true})
+	req = httptest.NewRequest(http.MethodPost, "/v1/repos/"+hostID+"/queue-allocation", bytes.NewReader(bodyGlobal))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 for global queue allocation, got %d", rr.Code)
+	}
+
+	// Valid with enabled
+	bodyEnabled, _ := json.Marshal(map[string]any{"worktree_path": repoPath, "enabled": false})
+	req = httptest.NewRequest(http.MethodPost, "/v1/repos/"+hostID+"/queue-allocation", bytes.NewReader(bodyEnabled))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 for enabled false, got %d", rr.Code)
+	}
+
+	// 2. Resume repo in place
+	// Bad JSON
+	req = httptest.NewRequest(http.MethodPost, "/v1/repos/"+hostID+"/resume-in-place", bytes.NewReader([]byte("{bad")))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for bad json, got %d", rr.Code)
+	}
+
+	// Not found
+	req = httptest.NewRequest(http.MethodPost, "/v1/repos/"+hostID+"/resume-in-place?path=/not/found", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for not found repo, got %d", rr.Code)
+	}
+
+	// Valid resume in place
+	req = httptest.NewRequest(http.MethodPost, "/v1/repos/"+hostID+"/resume-in-place", bytes.NewReader([]byte(`{"worktree_path":"`+repoPath+`","story_id":"STORY-1"}`)))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 for resume in place, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// 3. Remediate repo
+	// Not found
+	req = httptest.NewRequest(http.MethodPost, "/v1/repos/"+hostID+"/remediate?path=/not/found", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for remediate not found, got %d", rr.Code)
+	}
+
+	// Valid remediate
+	req = httptest.NewRequest(http.MethodPost, "/v1/repos/"+hostID+"/remediate", bytes.NewReader([]byte(`{"path":"`+repoPath+`"}`)))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 for remediate, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// 4. Poll host
+	// After resume in place, a job was scheduled!
+	req = httptest.NewRequest(http.MethodPost, "/v1/hosts/"+hostID+"/poll", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 for poll with job, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var polledJob map[string]string
+	_ = json.Unmarshal(rr.Body.Bytes(), &polledJob)
+	activeJobID := polledJob["id"]
+
+	// Next poll is 204
+	req = httptest.NewRequest(http.MethodPost, "/v1/hosts/"+hostID+"/poll", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Errorf("expected 204 for empty poll, got %d", rr.Code)
+	}
+
+	// 5. Heartbeat
+	// Bad JSON
+	req = httptest.NewRequest(http.MethodPost, "/v1/hosts/"+hostID+"/heartbeat", bytes.NewReader([]byte("{bad")))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for heartbeat bad json, got %d", rr.Code)
+	}
+
+	// Not found host
+	req = httptest.NewRequest(http.MethodPost, "/v1/hosts/unknown-host/heartbeat", bytes.NewReader([]byte(`{"presence":"ONLINE"}`)))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for unknown host heartbeat, got %d", rr.Code)
+	}
+
+	// Valid heartbeat with tools and active jobs
+	hbData := map[string]any{
+		"presence":     "ONLINE",
+		"fetch_failed": false,
+		"tools": []map[string]string{
+			{"name": "git", "path": "/usr/bin/git", "version": "2.40", "status": "ok"},
+		},
+		"active_jobs": []map[string]any{
+			{"job_id": activeJobID, "worktree_path": repoPath, "pid": 4567},
+		},
+	}
+	hbBytes, _ := json.Marshal(hbData)
+	req = httptest.NewRequest(http.MethodPost, "/v1/hosts/"+hostID+"/heartbeat", bytes.NewReader(hbBytes))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 for valid heartbeat, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// 6. Force pause job
+	req = httptest.NewRequest(http.MethodPost, "/v1/jobs/unknown-job/force-pause", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for unknown job force-pause, got %d", rr.Code)
+	}
+
+	if activeJobID != "" {
+		req = httptest.NewRequest(http.MethodPost, "/v1/jobs/"+activeJobID+"/force-pause", nil)
+		rr = httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Errorf("expected 200 for valid force-pause, got %d: %s", rr.Code, rr.Body.String())
+		}
+	}
+
+	// 7. Clear repo history & delete history row
+	// Clear history missing host/path
+	req = httptest.NewRequest(http.MethodDelete, "/v1/hosts//repos/history", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	// Query path
+	req = httptest.NewRequest(http.MethodDelete, "/v1/hosts/"+hostID+"/repos/history?path="+repoPath, nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 for clear history, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// Clear history with body
+	req = httptest.NewRequest(http.MethodDelete, "/v1/hosts/"+hostID+"/repos/history", bytes.NewReader([]byte(`{"worktree_path":"`+repoPath+`"}`)))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 for clear history with body, got %d", rr.Code)
+	}
+
+	// Delete history row
+	req = httptest.NewRequest(http.MethodDelete, "/v1/history/"+activeJobID, nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 for delete history row, got %d", rr.Code)
+	}
+
+	// 8. Repo request
+	// Bad JSON
+	req = httptest.NewRequest(http.MethodPost, "/v1/hosts/"+hostID+"/repo-requests", bytes.NewReader([]byte("{bad")))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for bad repo request, got %d", rr.Code)
+	}
+
+	// Valid repo request
+	reqBody, _ := json.Marshal(map[string]string{
+		"mode":      "checkout",
+		"path":      repoPath,
+		"clone_url": "https://github.com/org/repo.git",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/hosts/"+hostID+"/repo-requests", bytes.NewReader(reqBody))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusAccepted {
+		t.Errorf("expected 202 for valid repo request, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// 9. Discard hub
+	req = httptest.NewRequest(http.MethodPost, "/v1/hosts/"+hostID+"/docs-hub/discard", bytes.NewReader([]byte(`{"docs_hub_path":"/nonexistent"}`)))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound && rr.Code != http.StatusOK {
+		t.Errorf("expected 404 or 200 for discard hub, got %d", rr.Code)
+	}
+
+	// 10. Execute prompt
+	p := e.PutPrompt(control.Prompt{Title: "Run Test", Body: "do testing", Status: "READY"})
+	// Bad JSON
+	req = httptest.NewRequest(http.MethodPost, "/v1/prompts/"+p.ID+"/execute", bytes.NewReader([]byte("{bad")))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for bad json in execute prompt, got %d", rr.Code)
+	}
+
+	// Unknown prompt
+	req = httptest.NewRequest(http.MethodPost, "/v1/prompts/unknown-p/execute", bytes.NewReader([]byte(`{"is_global":true}`)))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for unknown prompt execute, got %d", rr.Code)
+	}
+
+	// Execute global
+	execGlobalBody, _ := json.Marshal(map[string]any{"is_global": true, "iterations": 1})
+	req = httptest.NewRequest(http.MethodPost, "/v1/prompts/"+p.ID+"/execute", bytes.NewReader(execGlobalBody))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Errorf("expected 201 for global execute, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// Execute on specific host
+	execHostBody, _ := json.Marshal(map[string]any{"host_id": hostID, "repo_path": repoPath, "iterations": 1})
+	req = httptest.NewRequest(http.MethodPost, "/v1/prompts/"+p.ID+"/execute", bytes.NewReader(execHostBody))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Errorf("expected 201 for host execute, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// 11. Story draft on job
+	// Bad JSON
+	req = httptest.NewRequest(http.MethodPost, "/v1/jobs/unknown-job/story-draft", bytes.NewReader([]byte("{bad")))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for story draft bad json, got %d", rr.Code)
+	}
+
+	// Forbidden / job not found
+	req = httptest.NewRequest(http.MethodPost, "/v1/jobs/unknown-job/story-draft", bytes.NewReader([]byte(`{"story_id":"S1"}`)))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for unknown job story draft, got %d", rr.Code)
+	}
+
+	// 12. Post exit
+	req = httptest.NewRequest(http.MethodPost, "/v1/jobs/unknown-job/exit", bytes.NewReader([]byte(`{"exit_code":0}`)))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Errorf("expected 409 for unknown job exit, got %d", rr.Code)
+	}
+
+	// 13. Decline job
+	// Unknown job
+	req = httptest.NewRequest(http.MethodPost, "/v1/jobs/unknown-job/decline", bytes.NewReader([]byte(`{"reason":"busy"}`)))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for unknown job decline, got %d", rr.Code)
+	}
+
+	// 14. Profiles: create, get, update, delete
+	// Create bad JSON
+	req = httptest.NewRequest(http.MethodPost, "/v1/fleet/profiles", bytes.NewReader([]byte("{bad")))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for profile bad json, got %d", rr.Code)
+	}
+
+	// Create valid profile
+	prof := control.DistributionProfile{Name: "ext-profile", Description: "ext test"}
+	profBytes, _ := json.Marshal(prof)
+	req = httptest.NewRequest(http.MethodPost, "/v1/fleet/profiles", bytes.NewReader(profBytes))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Errorf("expected 201 for create profile, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// Get profile
+	req = httptest.NewRequest(http.MethodGet, "/v1/fleet/profiles/ext-profile", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 for get profile, got %d", rr.Code)
+	}
+
+	// Get profile not found
+	req = httptest.NewRequest(http.MethodGet, "/v1/fleet/profiles/not-found-profile", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for get unknown profile, got %d", rr.Code)
+	}
+
+	// Update profile bad JSON
+	req = httptest.NewRequest(http.MethodPut, "/v1/fleet/profiles/ext-profile", bytes.NewReader([]byte("{bad")))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for update profile bad json, got %d", rr.Code)
+	}
+
+	// Update profile valid
+	prof.Description = "updated description"
+	profBytes, _ = json.Marshal(prof)
+	req = httptest.NewRequest(http.MethodPut, "/v1/fleet/profiles/ext-profile", bytes.NewReader(profBytes))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 for update profile, got %d", rr.Code)
+	}
+
+	// 15. Fleet manifest on existing profile
+	req = httptest.NewRequest(http.MethodGet, "/v1/fleet/manifest?profile=ext-profile", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 for manifest ext-profile, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// Not found profile
+	req = httptest.NewRequest(http.MethodGet, "/v1/fleet/manifest?profile=unknown-profile", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for manifest unknown profile, got %d", rr.Code)
+	}
+
+	// Delete profile not found
+	req = httptest.NewRequest(http.MethodDelete, "/v1/fleet/profiles/unknown-profile", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for delete unknown profile, got %d", rr.Code)
+	}
+
+	// Delete profile valid
+	req = httptest.NewRequest(http.MethodDelete, "/v1/fleet/profiles/ext-profile", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 for delete profile, got %d", rr.Code)
+	}
+
+	// 16. Profile releases
+	req = httptest.NewRequest(http.MethodGet, "/v1/fleet/profiles/generic/releases", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 for generic releases, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/fleet/profiles/unknown-prof/releases", nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for unknown profile releases, got %d", rr.Code)
+	}
+
+	_ = savedRepos
+	_ = savedHosts
+	_ = savedPrompts
+	_ = deletedPrompts
+	_ = savedProfiles
+	_ = deletedProfiles
+}
+
