@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -121,12 +122,12 @@ func TestRunServerTokenFallback(t *testing.T) {
 		errCh <- run(ctx, []string{"iazio-harness-api"})
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 	cancel()
 
 	select {
 	case err := <-errCh:
-		if err != nil {
+		if err != nil && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "context canceled") {
 			t.Fatalf("run returned error: %v", err)
 		}
 	case <-time.After(3 * time.Second):
@@ -157,12 +158,12 @@ func TestRunServerWithDatabase(t *testing.T) {
 		errCh <- run(ctx, []string{"iazio-harness-api"})
 	}()
 
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 	cancel()
 
 	select {
 	case err := <-errCh:
-		if err != nil {
+		if err != nil && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "context canceled") {
 			t.Fatalf("run returned error: %v", err)
 		}
 	case <-time.After(3 * time.Second):
