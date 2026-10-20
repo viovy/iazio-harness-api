@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -176,9 +177,36 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	if _, err := db.ExecContext(ctx, schema); err != nil {
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	defer conn.Close()
+
+	// Acquire an advisory lock during schema migration to serialize DDL execution
+	// across concurrent processes/tests and eliminate pg_type catalog race conditions.
+	_, _ = conn.ExecContext(ctx, "SELECT pg_advisory_lock(847291039)")
+	defer func() {
+		_, _ = conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock(847291039)")
+	}()
+
+	var execErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		_, execErr = conn.ExecContext(ctx, schema)
+		if execErr == nil {
+			break
+		}
+		if strings.Contains(execErr.Error(), "pg_type_typname_nsp_index") || strings.Contains(execErr.Error(), "23505") {
+			time.Sleep(150 * time.Millisecond)
+			continue
+		}
+		break
+	}
+	if execErr != nil {
+		_ = db.Close()
+		return nil, execErr
 	}
 	return &Store{db: db}, nil
 }

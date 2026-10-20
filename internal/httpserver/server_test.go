@@ -1709,6 +1709,10 @@ func TestServerExtendedHandlers(t *testing.T) {
 	}
 
 	// 16. Profile releases
+	e.Releases.SetCachedRelease("viovy/autopilot-plugins-internal", "latest", control.ToolRelease{Name: "autopilot", Repository: "viovy/autopilot-plugins-internal", LatestVersion: "0.1.0", TagName: "v0.1.0"}, 10*time.Minute)
+	e.Releases.SetCachedRelease("viovy/iazio-mcp", "latest", control.ToolRelease{Name: "iazio-mcp", Repository: "viovy/iazio-mcp", LatestVersion: "0.0.42", TagName: "v0.0.42"}, 10*time.Minute)
+	e.Releases.SetCachedRelease("viovy/iazio-agent", "latest", control.ToolRelease{Name: "iazio-agent", Repository: "viovy/iazio-agent", LatestVersion: "0.1.0", TagName: "v0.1.0"}, 10*time.Minute)
+	e.Releases.SetCachedRelease("viovy/iazio-harness", "latest", control.ToolRelease{Name: "iazio-harness", Repository: "viovy/iazio-harness", LatestVersion: "0.1.0", TagName: "v0.1.0"}, 10*time.Minute)
 	req = httptest.NewRequest(http.MethodGet, "/v1/fleet/profiles/generic/releases", nil)
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
