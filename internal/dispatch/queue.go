@@ -3,13 +3,19 @@
 package dispatch
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -51,6 +57,9 @@ type Job struct {
 	Error       string          `json:"error,omitempty"`
 	TraceID     string          `json:"trace_id,omitempty"`
 	ParentID    string          `json:"parent_id,omitempty"`
+	SearchID    string          `json:"search_id,omitempty"`
+	RelevanceEmitted bool       `json:"relevance_emitted"`
+	PromotedMemories []string   `json:"promoted_memories,omitempty"`
 	CreatedAt   time.Time       `json:"created_at"`
 	ClaimedAt   *time.Time      `json:"claimed_at,omitempty"`
 	CompletedAt *time.Time      `json:"completed_at,omitempty"`
@@ -77,12 +86,34 @@ type Queue interface {
 	Cancel(ctx context.Context, jobID string, reason string) (*Job, error)
 	Retry(ctx context.Context, jobID string) (*Job, error)
 	Await(ctx context.Context, jobID string, timeout time.Duration) (*Job, error)
+	GetAttribution(ctx context.Context, jobID string) (JobAttributionResponse, error)
+}
+
+// JobAttributionResponse models the attribution of a job outcome to retrieval context.
+type JobAttributionResponse struct {
+	JobID            string     `json:"job_id"`
+	TraceID          string     `json:"trace_id,omitempty"`
+	SearchID         string     `json:"search_id,omitempty"`
+	Status           string     `json:"status"`
+	RelevanceEmitted bool       `json:"relevance_emitted"`
+	PromotedMemories []string   `json:"promoted_memories"`
+	CompletedAt      *time.Time `json:"completed_at,omitempty"`
 }
 
 // InMemoryQueue is a thread-safe in-memory implementation of Queue.
 type InMemoryQueue struct {
-	mu   sync.Mutex
-	jobs map[string]*Job
+	mu             sync.Mutex
+	jobs           map[string]*Job
+	attributionURL string
+	httpClient     *http.Client
+}
+
+// SetAttributionConfig sets the URL and optional client used for relevance attribution dispatches.
+func (q *InMemoryQueue) SetAttributionConfig(apiURL string, client *http.Client) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.attributionURL = apiURL
+	q.httpClient = client
 }
 
 // NewInMemoryQueue constructs a new thread-safe InMemoryQueue.
@@ -174,6 +205,14 @@ func (q *InMemoryQueue) Complete(ctx context.Context, jobID string, result json.
 	} else {
 		job.Status = JobStatusCompleted
 		job.Result = result
+		// Execution-to-memory attribution: automatically record positive relevance and promote
+		if job.SearchID != "" || job.TraceID != "" {
+			job.RelevanceEmitted = true
+			if len(job.PromotedMemories) == 0 && job.SearchID != "" {
+				job.PromotedMemories = []string{"mem-" + job.SearchID}
+			}
+			go q.dispatchAttribution(job.SearchID, job.TraceID, job.PromotedMemories)
+		}
 	}
 
 	done := job.doneCh
@@ -183,6 +222,81 @@ func (q *InMemoryQueue) Complete(ctx context.Context, jobID string, result json.
 		close(done)
 	}
 	return nil
+}
+
+func (q *InMemoryQueue) dispatchAttribution(searchID, traceID string, promoted []string) {
+	q.mu.Lock()
+	apiURL := q.attributionURL
+	client := q.httpClient
+	q.mu.Unlock()
+
+	if apiURL == "" {
+		apiURL = os.Getenv("IAZIO_API_URL")
+	}
+	if apiURL == "" {
+		apiURL = "http://127.0.0.1:8080"
+	}
+	apiURL = strings.TrimRight(apiURL, "/")
+
+	if client == nil {
+		client = &http.Client{Timeout: 3 * time.Second}
+	}
+
+	// 1. Emit positive relevance attribution if searchID present
+	if searchID != "" {
+		payload, err := json.Marshal(map[string]any{
+			"search_id": searchID,
+			"outcome":   "positive",
+			"trace_id":  traceID,
+		})
+		if err == nil {
+			req, err := http.NewRequest(http.MethodPost, apiURL+"/v1/relevance", bytes.NewReader(payload))
+			if err == nil {
+				req.Header.Set("Content-Type", "application/json")
+				if traceID != "" {
+					req.Header.Set("traceparent", fmt.Sprintf("00-%s-0000000000000001-01", traceID))
+				}
+				resp, err := client.Do(req)
+				if err != nil {
+					log.Printf("[dispatchAttribution] failed to post relevance attribution for search_id %s: %v", searchID, err)
+				} else {
+					defer resp.Body.Close()
+					if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+						body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+						log.Printf("[dispatchAttribution] unexpected status code %d for search_id %s: %s", resp.StatusCode, searchID, string(body))
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Promote verified memories
+	for _, memID := range promoted {
+		payload, err := json.Marshal(map[string]any{
+			"id":     memID,
+			"tier":   "canonical",
+			"reason": "verified harness execution completion",
+		})
+		if err == nil {
+			req, err := http.NewRequest(http.MethodPost, apiURL+"/v1/memories/promote", bytes.NewReader(payload))
+			if err == nil {
+				req.Header.Set("Content-Type", "application/json")
+				if traceID != "" {
+					req.Header.Set("traceparent", fmt.Sprintf("00-%s-0000000000000001-01", traceID))
+				}
+				resp, err := client.Do(req)
+				if err != nil {
+					log.Printf("[dispatchAttribution] failed to promote memory %s: %v", memID, err)
+				} else {
+					defer resp.Body.Close()
+					if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+						body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+						log.Printf("[dispatchAttribution] unexpected status code %d promoting memory %s: %s", resp.StatusCode, memID, string(body))
+					}
+				}
+			}
+		}
+	}
 }
 
 // Get retrieves a job by ID.
@@ -276,6 +390,8 @@ func (q *InMemoryQueue) Retry(ctx context.Context, jobID string) (*Job, error) {
 		TargetHost:  orig.TargetHost,
 		TargetAgent: orig.TargetAgent,
 		Payload:     orig.Payload,
+		TraceID:     orig.TraceID,
+		SearchID:    orig.SearchID,
 		Status:      JobStatusPending,
 		CreatedAt:   time.Now().UTC(),
 		doneCh:      make(chan struct{}),
@@ -314,6 +430,30 @@ func (q *InMemoryQueue) Await(ctx context.Context, jobID string, timeout time.Du
 		defer q.mu.Unlock()
 		return q.jobs[jobID], nil
 	}
+}
+
+// GetAttribution returns attribution details linking a completed job to its retrieval context.
+func (q *InMemoryQueue) GetAttribution(ctx context.Context, jobID string) (JobAttributionResponse, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	job, exists := q.jobs[jobID]
+	if !exists {
+		return JobAttributionResponse{}, ErrJobNotFound
+	}
+	promoted := job.PromotedMemories
+	if promoted == nil {
+		promoted = []string{}
+	}
+	return JobAttributionResponse{
+		JobID:            job.ID,
+		TraceID:          job.TraceID,
+		SearchID:         job.SearchID,
+		Status:           job.Status,
+		RelevanceEmitted: job.RelevanceEmitted,
+		PromotedMemories: promoted,
+		CompletedAt:      job.CompletedAt,
+	}, nil
 }
 
 func generateJobID() string {

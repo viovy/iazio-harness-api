@@ -178,3 +178,51 @@ func TestJobLifecycleHandler_ExecuteStory(t *testing.T) {
 		t.Fatalf("unexpected execute response: %+v", execResp)
 	}
 }
+
+func TestJobLifecycleHandler_Attribution(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	h := NewJobLifecycleHandler(q)
+
+	job, err := q.Enqueue(context.Background(), &dispatch.Job{
+		Type:        dispatch.JobTypePromptExecute,
+		Repo:        "iazio-mcp",
+		TargetAgent: "autopilot",
+		TraceID:     "trace-abc-123",
+		SearchID:    "srch-xyz-789",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Complete the job successfully
+	if err := q.Complete(context.Background(), job.ID, json.RawMessage(`{"status":"ok"}`), ""); err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/jobs/{id}/attribution", h.GetJobAttribution)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/"+job.ID+"/attribution", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var attr dispatch.JobAttributionResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &attr); err != nil {
+		t.Fatal(err)
+	}
+
+	if attr.JobID != job.ID || attr.TraceID != "trace-abc-123" || attr.SearchID != "srch-xyz-789" {
+		t.Fatalf("unexpected attribution: %+v", attr)
+	}
+	if !attr.RelevanceEmitted {
+		t.Fatal("expected relevance_emitted = true on successful completion")
+	}
+	if len(attr.PromotedMemories) == 0 || attr.PromotedMemories[0] != "mem-srch-xyz-789" {
+		t.Fatalf("expected promoted memories, got %+v", attr.PromotedMemories)
+	}
+}
+
