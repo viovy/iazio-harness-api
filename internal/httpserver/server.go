@@ -15,6 +15,7 @@ import (
 	"github.com/viovy/iazio-harness-api/internal/api/handlers"
 	"github.com/viovy/iazio-harness-api/internal/codebase"
 	"github.com/viovy/iazio-harness-api/internal/control"
+	"github.com/viovy/iazio-harness-api/internal/dispatch"
 	"github.com/viovy/iazio-harness-api/internal/sse"
 	"github.com/viovy/iazio-harness-api/internal/version"
 )
@@ -50,6 +51,10 @@ type Server struct {
 	CodebaseStore codebase.Store
 	// EventHub manages cursor-resumable SSE streaming and heartbeat telemetry.
 	EventHub *sse.Hub
+	// Queue manages async job dispatching and execution for prompts and stories.
+	Queue dispatch.Queue
+	// Idempotency manages API idempotency caches.
+	Idempotency *handlers.IdempotencyStore
 }
 
 // Handler returns the HTTP routes.
@@ -64,12 +69,42 @@ func (s *Server) Handler() http.Handler {
 	if eventHub == nil {
 		eventHub = sse.NewHub()
 	}
+	queue := s.Queue
+	if queue == nil {
+		queue = dispatch.NewInMemoryQueue()
+		s.Queue = queue
+	}
+	idempotency := s.Idempotency
+	if idempotency == nil {
+		idempotency = handlers.NewIdempotencyStore(24 * time.Hour)
+		s.Idempotency = idempotency
+	}
+
 	mux.Handle("GET /api/v1/repos", handlers.NewReposHandler(codebaseStore))
 	mux.Handle("POST /api/v1/codebase/search", handlers.NewCodebaseSearchHandler(codebaseStore))
 
 	agentSyncHandler := handlers.NewAgentSyncHandler(codebaseStore, codebase.NewIngestor(codebaseStore, nil))
 	mux.HandleFunc("POST /api/v1/agent/repos/sync", agentSyncHandler.SyncRepos)
 	mux.HandleFunc("POST /api/v1/agent/codebase/sync", agentSyncHandler.SyncCodebase)
+
+	// Dispatch & Story Lifecycle Endpoints
+	storiesHandler := handlers.NewStoriesHandler(codebaseStore, queue, idempotency)
+	mux.Handle("POST /api/v1/stories", storiesHandler)
+
+	promptsHandler := handlers.NewPromptsHandler(codebaseStore, queue, idempotency)
+	mux.Handle("POST /api/v1/prompts", promptsHandler)
+
+	jobLifecycle := handlers.NewJobLifecycleHandler(queue, codebaseStore)
+	mux.HandleFunc("GET /api/v1/jobs/{id}", jobLifecycle.GetJob)
+	mux.HandleFunc("GET /api/v1/queue", jobLifecycle.ListQueue)
+	mux.HandleFunc("GET /api/v1/jobs", jobLifecycle.ListQueue)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/cancel", jobLifecycle.CancelJob)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/retry", jobLifecycle.RetryJob)
+	mux.HandleFunc("POST /api/v1/stories/{id}/execute", jobLifecycle.ExecuteStory)
+
+	agentJobsHandler := handlers.NewAgentJobsHandler(queue)
+	mux.HandleFunc("POST /api/v1/agent/jobs/claim", agentJobsHandler.ClaimHandler)
+	mux.HandleFunc("POST /api/v1/agent/jobs/{id}/complete", agentJobsHandler.CompleteHandler)
 
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{

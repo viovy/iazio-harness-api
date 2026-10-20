@@ -1731,3 +1731,39 @@ func TestServerExtendedHandlers(t *testing.T) {
 	_ = deletedProfiles
 }
 
+func TestServer_DispatchAndStoryRoutesMounted(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	handler := s.Handler()
+
+	// 1. Check GET /api/v1/queue -> 200 OK (not 404)
+	reqQueue := httptest.NewRequest(http.MethodGet, "/api/v1/queue", nil)
+	rrQueue := httptest.NewRecorder()
+	handler.ServeHTTP(rrQueue, reqQueue)
+	if rrQueue.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /api/v1/queue, got %d", rrQueue.Code)
+	}
+
+	// 2. Check POST /api/v1/prompts with invalid body -> 422/400 (proves route is mounted, not 404!)
+	reqPrompt := httptest.NewRequest(http.MethodPost, "/api/v1/prompts", bytes.NewBufferString(`{}`))
+	rrPrompt := httptest.NewRecorder()
+	handler.ServeHTTP(rrPrompt, reqPrompt)
+	if rrPrompt.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 Unprocessable Entity for empty prompt body, got %d", rrPrompt.Code)
+	}
+
+	// 3. Check POST /api/v1/stories with invalid body -> 422/400 (proves route is mounted, not 404!)
+	reqStory := httptest.NewRequest(http.MethodPost, "/api/v1/stories", bytes.NewBufferString(`{}`))
+	rrStory := httptest.NewRecorder()
+	handler.ServeHTTP(rrStory, reqStory)
+	if rrStory.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 Unprocessable Entity for empty story body, got %d", rrStory.Code)
+	}
+
+	// 4. Check POST /api/v1/stories/STORY-TEST/execute
+	reqExec := httptest.NewRequest(http.MethodPost, "/api/v1/stories/STORY-TEST/execute", bytes.NewBufferString(`{"submodule":"."}`))
+	rrExec := httptest.NewRecorder()
+	handler.ServeHTTP(rrExec, reqExec)
+	if rrExec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for story execution, got %d: %s", rrExec.Code, rrExec.Body.String())
+	}
+}

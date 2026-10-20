@@ -182,3 +182,77 @@ func TestQueue_ConcurrentOperations(t *testing.T) {
 		t.Fatalf("expected to claim %d jobs, claimed %d", count, claimedCount)
 	}
 }
+
+func TestQueue_List_Cancel_Retry(t *testing.T) {
+	q := NewInMemoryQueue()
+	ctx := context.Background()
+
+	job1, err := q.Enqueue(ctx, &Job{
+		Type: JobTypeStoryCreate,
+		Repo: "repo-alpha",
+	})
+	if err != nil {
+		t.Fatalf("enqueue error: %v", err)
+	}
+
+	job2, err := q.Enqueue(ctx, &Job{
+		Type: JobTypePromptExecute,
+		Repo: "repo-beta",
+	})
+	if err != nil {
+		t.Fatalf("enqueue error: %v", err)
+	}
+
+	// Test List
+	listAll, err := q.List(ctx, JobFilter{})
+	if err != nil {
+		t.Fatalf("list error: %v", err)
+	}
+	if len(listAll) != 2 {
+		t.Fatalf("expected 2 jobs, got %d", len(listAll))
+	}
+
+	listFiltered, err := q.List(ctx, JobFilter{Repo: "repo-alpha"})
+	if err != nil {
+		t.Fatalf("list error: %v", err)
+	}
+	if len(listFiltered) != 1 || listFiltered[0].ID != job1.ID {
+		t.Fatalf("expected job1 in filtered list, got %+v", listFiltered)
+	}
+
+	// Test Cancel
+	canceled, err := q.Cancel(ctx, job1.ID, "user request")
+	if err != nil {
+		t.Fatalf("cancel error: %v", err)
+	}
+	if canceled.Status != JobStatusCanceled || canceled.Error != "user request" {
+		t.Fatalf("expected canceled status and reason, got %+v", canceled)
+	}
+
+	// Canceling again should return ErrJobAlreadyCompleted
+	_, err = q.Cancel(ctx, job1.ID, "again")
+	if err != ErrJobAlreadyCompleted {
+		t.Fatalf("expected ErrJobAlreadyCompleted, got %v", err)
+	}
+
+	// Test Retry
+	retried, err := q.Retry(ctx, job1.ID)
+	if err != nil {
+		t.Fatalf("retry error: %v", err)
+	}
+	if retried.ID == job1.ID {
+		t.Fatalf("expected new job ID for retried job, got %s", retried.ID)
+	}
+	if retried.Status != JobStatusPending {
+		t.Fatalf("expected pending status, got %s", retried.Status)
+	}
+	if retried.Repo != "repo-alpha" || retried.Type != JobTypeStoryCreate {
+		t.Fatalf("retried job properties mismatch: %+v", retried)
+	}
+
+	// Verify job2 still pending
+	gotJob2, ok := q.Get(job2.ID)
+	if !ok || gotJob2.Status != JobStatusPending {
+		t.Fatalf("expected job2 to be pending, got %+v", gotJob2)
+	}
+}
