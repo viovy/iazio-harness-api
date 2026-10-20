@@ -1,12 +1,14 @@
 package handlers
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -330,4 +332,211 @@ func validatePath(p string) error {
 		return fmt.Errorf("volume prefixes not permitted: %q", p)
 	}
 	return nil
+}
+
+// StoryDetail describes a story for GET /api/v1/stories and GET /api/v1/stories/{id}.
+type StoryDetail struct {
+	ID          string   `json:"id"`
+	Title       string   `json:"title"`
+	Status      string   `json:"status"`
+	Priority    string   `json:"priority"`
+	Path        string   `json:"path"`
+	Submodules  []string `json:"submodules,omitempty"`
+	CompletedAt string   `json:"completed_at,omitempty"`
+	UpdatedAt   string   `json:"updated_at,omitempty"`
+	Content     string   `json:"content,omitempty"`
+}
+
+func findStoriesRoot() string {
+	for _, env := range []string{"STORIES_ROOT", "WORKSPACE_ROOT", "META_REPO_ROOT"} {
+		if val := strings.TrimSpace(os.Getenv(env)); val != "" {
+			if _, err := os.Stat(filepath.Join(val, "docs", "stories", "index.yml")); err == nil {
+				return val
+			}
+		}
+	}
+	dir, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	for i := 0; i < 6; i++ {
+		if _, err := os.Stat(filepath.Join(dir, "docs", "stories", "index.yml")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return "."
+}
+
+func loadIndexStories(root string) []StoryDetail {
+	indexPath := filepath.Join(root, "docs", "stories", "index.yml")
+	f, err := os.Open(indexPath)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var stories []StoryDetail
+	var current *StoryDetail
+	inStories := false
+	inSubmodules := false
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		trimmed := strings.TrimSpace(scanner.Text())
+		if trimmed == "stories:" {
+			inStories = true
+			continue
+		}
+		if !inStories {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "- id:") {
+			if current != nil {
+				stories = append(stories, *current)
+			}
+			current = &StoryDetail{
+				ID: strings.TrimSpace(strings.TrimPrefix(trimmed, "- id:")),
+			}
+			inSubmodules = false
+			continue
+		}
+		if current == nil {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "title:") {
+			current.Title = strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "title:")), `"`)
+			inSubmodules = false
+		} else if strings.HasPrefix(trimmed, "status:") {
+			current.Status = strings.TrimSpace(strings.TrimPrefix(trimmed, "status:"))
+			inSubmodules = false
+		} else if strings.HasPrefix(trimmed, "priority:") {
+			current.Priority = strings.TrimSpace(strings.TrimPrefix(trimmed, "priority:"))
+			inSubmodules = false
+		} else if strings.HasPrefix(trimmed, "path:") {
+			current.Path = strings.TrimSpace(strings.TrimPrefix(trimmed, "path:"))
+			inSubmodules = false
+		} else if strings.HasPrefix(trimmed, "submodules:") {
+			inSubmodules = true
+		} else if inSubmodules && strings.HasPrefix(trimmed, "- ") {
+			current.Submodules = append(current.Submodules, strings.TrimSpace(strings.TrimPrefix(trimmed, "- ")))
+		} else if strings.HasPrefix(trimmed, "completed_at:") {
+			current.CompletedAt = strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "completed_at:")), `"`)
+			inSubmodules = false
+		} else if strings.HasPrefix(trimmed, "updated_at:") {
+			current.UpdatedAt = strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "updated_at:")), `"`)
+			inSubmodules = false
+		}
+	}
+	if current != nil {
+		stories = append(stories, *current)
+	}
+	return stories
+}
+
+// ListStories handles GET /api/v1/stories with query filters.
+func (h *StoriesHandler) ListStories(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	statusFilter := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("status")))
+	categoryFilter := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("category")))
+	submoduleFilter := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("submodule")))
+	limit := 20
+	if lStr := r.URL.Query().Get("limit"); lStr != "" {
+		if l, err := strconv.Atoi(lStr); err == nil && l > 0 {
+			limit = l
+		}
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	root := findStoriesRoot()
+	all := loadIndexStories(root)
+
+	var matched []StoryDetail
+	for _, s := range all {
+		if statusFilter != "" && strings.ToUpper(s.Status) != statusFilter {
+			continue
+		}
+		if categoryFilter != "" && !strings.Contains(strings.ToUpper(s.ID), categoryFilter) {
+			continue
+		}
+		if submoduleFilter != "" {
+			hasSub := false
+			for _, sub := range s.Submodules {
+				if strings.ToLower(sub) == submoduleFilter {
+					hasSub = true
+					break
+				}
+			}
+			if !hasSub {
+				continue
+			}
+		}
+		matched = append(matched, s)
+	}
+
+	total := len(matched)
+	if len(matched) > limit {
+		matched = matched[:limit]
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"items":      matched,
+		"item_count": len(matched),
+		"total":      total,
+	})
+}
+
+// GetStory handles GET /api/v1/stories/{id}.
+func (h *StoriesHandler) GetStory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	id := strings.TrimPrefix(r.URL.Path, "/api/v1/stories/")
+	id = strings.TrimSpace(strings.TrimSuffix(id, "/"))
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "story id is required")
+		return
+	}
+
+	root := findStoriesRoot()
+	all := loadIndexStories(root)
+
+	var found *StoryDetail
+	for _, s := range all {
+		if strings.EqualFold(s.ID, id) {
+			match := s
+			found = &match
+			break
+		}
+	}
+
+	if found == nil {
+		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("story %q not found", id))
+		return
+	}
+
+	if found.Path != "" {
+		contentBytes, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(found.Path)))
+		if err == nil {
+			found.Content = string(contentBytes)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(found)
 }
