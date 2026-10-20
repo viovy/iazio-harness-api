@@ -15,6 +15,7 @@ import (
 	"github.com/viovy/iazio-harness-api/internal/api/handlers"
 	"github.com/viovy/iazio-harness-api/internal/codebase"
 	"github.com/viovy/iazio-harness-api/internal/control"
+	"github.com/viovy/iazio-harness-api/internal/sse"
 	"github.com/viovy/iazio-harness-api/internal/version"
 )
 
@@ -47,6 +48,8 @@ type Server struct {
 	AuthToken string
 	// CodebaseStore manages fleet repository discovery and codebase RAG search chunks.
 	CodebaseStore codebase.Store
+	// EventHub manages cursor-resumable SSE streaming and heartbeat telemetry.
+	EventHub *sse.Hub
 }
 
 // Handler returns the HTTP routes.
@@ -56,6 +59,10 @@ func (s *Server) Handler() http.Handler {
 	codebaseStore := s.CodebaseStore
 	if codebaseStore == nil {
 		codebaseStore = codebase.NewMemStore()
+	}
+	eventHub := s.EventHub
+	if eventHub == nil {
+		eventHub = sse.NewHub()
 	}
 	mux.Handle("GET /api/v1/repos", handlers.NewReposHandler(codebaseStore))
 	mux.Handle("POST /api/v1/codebase/search", handlers.NewCodebaseSearchHandler(codebaseStore))
@@ -112,6 +119,23 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/jobs/{id}/conversations", s.addJobConversation)
 	mux.HandleFunc("GET /v1/jobs/{id}/logs", s.jobLogs)
 	mux.HandleFunc("GET /v1/jobs/{id}/stream", s.jobStream)
+	mux.HandleFunc("GET /v1/jobs/{id}/events", func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		eventHub.ServeHTTP(w, r, id)
+	})
+	mux.HandleFunc("POST /v1/jobs/{id}/events", func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		var body struct {
+			Type string `json:"type"`
+			Data any    `json:"data"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		ev := eventHub.Publish(id, body.Type, body.Data)
+		writeJSON(w, http.StatusCreated, ev)
+	})
 	mux.HandleFunc("POST /v1/hosts/register", s.register)
 	mux.HandleFunc("GET /v1/hosts", s.listHosts)
 	mux.HandleFunc("GET /v1/hosts/{id}", s.hostDetail)
