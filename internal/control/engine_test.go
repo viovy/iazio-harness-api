@@ -2384,13 +2384,13 @@ func TestGlobalStoryScheduleDynamicAllocationMatching(t *testing.T) {
 	e.RegisterHost("host-idle", "linux")
 	if err := e.UpsertRepo(Repo{
 		HostID:       "host-idle",
-		WorktreePath: "/work/meta-repo-02/iazio-web",
+		WorktreePath: "/workspace/fleet/iazio-web",
 		Queue:        QueueOpen,
 		Lock:         LockIdle,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	_ = e.SetRepoQueueAllocation("host-idle", "/work/meta-repo-02/iazio-web", true)
+	_ = e.SetRepoQueueAllocation("host-idle", "/workspace/fleet/iazio-web", true)
 
 	// Enqueue global story schedule with submodule "iazio-web"
 	sch, err := e.EnqueueGlobalStorySchedule("STORY-GOV-3576", "iazio-web", "agy", "run story")
@@ -2401,7 +2401,7 @@ func TestGlobalStoryScheduleDynamicAllocationMatching(t *testing.T) {
 		t.Fatalf("expected QUEUED and IsGlobal=true, got %+v", sch)
 	}
 
-	// PollHost on host-idle should match the repo /work/meta-repo-02/iazio-web
+	// PollHost on host-idle should match the repo /workspace/fleet/iazio-web
 	job, leasedSch, _, ok := e.PollHost("host-idle")
 	if !ok {
 		t.Fatalf("expected host-idle to lease global schedule for iazio-web")
@@ -2409,8 +2409,8 @@ func TestGlobalStoryScheduleDynamicAllocationMatching(t *testing.T) {
 	if leasedSch.ID != sch.ID {
 		t.Fatalf("expected leased schedule %s, got %s", sch.ID, leasedSch.ID)
 	}
-	if leasedSch.WorktreePath != "/work/meta-repo-02/iazio-web" {
-		t.Fatalf("expected resolved worktree /work/meta-repo-02/iazio-web, got %s", leasedSch.WorktreePath)
+	if leasedSch.WorktreePath != "/workspace/fleet/iazio-web" {
+		t.Fatalf("expected resolved worktree /workspace/fleet/iazio-web, got %s", leasedSch.WorktreePath)
 	}
 	if job.ID == "" {
 		t.Fatalf("expected job to be generated")
