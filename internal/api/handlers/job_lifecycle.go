@@ -272,7 +272,9 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		promptText = fmt.Sprintf("# Execute Story %s\n\nExecute autonomous story flow for %s in %s.", storyID, storyID, submodule)
 	}
 
+	promptID := fmt.Sprintf("prompt_%s_%d", storyID, time.Now().Unix())
 	execPayload, err := json.Marshal(map[string]any{
+		"prompt_id":    promptID,
 		"repo":         submodule,
 		"story_id":     storyID,
 		"title":        fmt.Sprintf("Execute story %s", storyID),
