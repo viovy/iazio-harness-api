@@ -1066,6 +1066,19 @@ func (s *Server) listSchedules(w http.ResponseWriter, r *http.Request) {
 	for _, sch := range schedules {
 		out = append(out, scheduleView(sch))
 	}
+	if s.Queue != nil {
+		qJobs, _ := s.Queue.List(r.Context(), dispatch.JobFilter{
+			Repo: repoPath,
+		})
+		for _, qj := range qJobs {
+			if qj.Status == dispatch.JobStatusPending || qj.Status == dispatch.JobStatusClaimed {
+				if status != "" && !strings.EqualFold(status, qj.Status) && !strings.EqualFold(status, "QUEUED") && !strings.EqualFold(status, "RUNNING") {
+					continue
+				}
+				out = append(out, dispatchScheduleView(qj))
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"schedules": out})
 }
 
@@ -1090,16 +1103,36 @@ func (s *Server) listHistory(w http.ResponseWriter, r *http.Request) {
 	for _, h := range items {
 		out = append(out, historyItemView(h))
 	}
+	if s.Queue != nil {
+		qJobs, _ := s.Queue.List(r.Context(), dispatch.JobFilter{
+			Repo: repoPath,
+		})
+		for _, qj := range qJobs {
+			if qj.Status == dispatch.JobStatusCompleted || qj.Status == dispatch.JobStatusFailed || qj.Status == dispatch.JobStatusCanceled {
+				if status != "" && !strings.EqualFold(status, qj.Status) {
+					continue
+				}
+				out = append(out, dispatchHistoryView(qj))
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"history": out})
 }
 
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
-	job, ok := s.Engine.GetJob(r.PathValue("id"))
-	if !ok {
-		writeErr(w, http.StatusNotFound, control.ErrNotFound)
+	id := r.PathValue("id")
+	job, ok := s.Engine.GetJob(id)
+	if ok {
+		writeJSON(w, http.StatusOK, jobDetailView(job))
 		return
 	}
-	writeJSON(w, http.StatusOK, jobDetailView(job))
+	if s.Queue != nil {
+		if qJob, found := s.Queue.Get(id); found && qJob != nil {
+			writeJSON(w, http.StatusOK, dispatchJobDetailView(qJob))
+			return
+		}
+	}
+	writeErr(w, http.StatusNotFound, control.ErrNotFound)
 }
 
 func (s *Server) postExit(w http.ResponseWriter, r *http.Request) {
