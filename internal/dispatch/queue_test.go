@@ -3,6 +3,8 @@ package dispatch
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -254,5 +256,60 @@ func TestQueue_List_Cancel_Retry(t *testing.T) {
 	gotJob2, ok := q.Get(job2.ID)
 	if !ok || gotJob2.Status != JobStatusPending {
 		t.Fatalf("expected job2 to be pending, got %+v", gotJob2)
+	}
+}
+
+func TestQueue_CompleteAttributionDispatch(t *testing.T) {
+	var mu sync.Mutex
+	relevanceCalls := 0
+	promoteCalls := 0
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.URL.Path == "/v1/relevance" {
+			relevanceCalls++
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/v1/memories/promote" {
+			promoteCalls++
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	q := NewInMemoryQueue()
+	q.SetAttributionConfig(srv.URL, srv.Client())
+
+	ctx := context.Background()
+	job, err := q.Enqueue(ctx, &Job{
+		Type:     JobTypePromptExecute,
+		Repo:     "test-repo",
+		SearchID: "srch-test-12345",
+		TraceID:  "trace-test-67890",
+		Payload:  json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("failed to enqueue: %v", err)
+	}
+
+	err = q.Complete(ctx, job.ID, json.RawMessage(`{"status":"ok"}`), "")
+	if err != nil {
+		t.Fatalf("failed to complete: %v", err)
+	}
+
+	// Wait briefly for background goroutine dispatch
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if relevanceCalls != 1 {
+		t.Errorf("expected 1 relevance call, got %d", relevanceCalls)
+	}
+	if promoteCalls != 1 {
+		t.Errorf("expected 1 promote call, got %d", promoteCalls)
 	}
 }

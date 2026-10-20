@@ -3,13 +3,17 @@
 package dispatch
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -96,8 +100,18 @@ type JobAttributionResponse struct {
 
 // InMemoryQueue is a thread-safe in-memory implementation of Queue.
 type InMemoryQueue struct {
-	mu   sync.Mutex
-	jobs map[string]*Job
+	mu             sync.Mutex
+	jobs           map[string]*Job
+	attributionURL string
+	httpClient     *http.Client
+}
+
+// SetAttributionConfig sets the URL and optional client used for relevance attribution dispatches.
+func (q *InMemoryQueue) SetAttributionConfig(apiURL string, client *http.Client) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.attributionURL = apiURL
+	q.httpClient = client
 }
 
 // NewInMemoryQueue constructs a new thread-safe InMemoryQueue.
@@ -195,6 +209,7 @@ func (q *InMemoryQueue) Complete(ctx context.Context, jobID string, result json.
 			if len(job.PromotedMemories) == 0 && job.SearchID != "" {
 				job.PromotedMemories = []string{"mem-" + job.SearchID}
 			}
+			go q.dispatchAttribution(job.SearchID, job.TraceID, job.PromotedMemories)
 		}
 	}
 
@@ -205,6 +220,58 @@ func (q *InMemoryQueue) Complete(ctx context.Context, jobID string, result json.
 		close(done)
 	}
 	return nil
+}
+
+func (q *InMemoryQueue) dispatchAttribution(searchID, traceID string, promoted []string) {
+	q.mu.Lock()
+	apiURL := q.attributionURL
+	client := q.httpClient
+	q.mu.Unlock()
+
+	if apiURL == "" {
+		apiURL = os.Getenv("IAZIO_API_URL")
+	}
+	if apiURL == "" {
+		apiURL = "http://127.0.0.1:8080"
+	}
+	apiURL = strings.TrimRight(apiURL, "/")
+
+	if client == nil {
+		client = &http.Client{Timeout: 3 * time.Second}
+	}
+
+	// 1. Emit positive relevance attribution if searchID present
+	if searchID != "" {
+		payload, _ := json.Marshal(map[string]any{
+			"search_id": searchID,
+			"outcome":   1,
+			"trace_id":  traceID,
+		})
+		req, err := http.NewRequest(http.MethodPost, apiURL+"/v1/relevance", bytes.NewReader(payload))
+		if err == nil {
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := client.Do(req)
+			if err == nil {
+				_ = resp.Body.Close()
+			}
+		}
+	}
+
+	// 2. Promote verified memories
+	for _, memID := range promoted {
+		payload, _ := json.Marshal(map[string]any{
+			"id":     memID,
+			"target": "canonical",
+		})
+		req, err := http.NewRequest(http.MethodPost, apiURL+"/v1/memories/promote", bytes.NewReader(payload))
+		if err == nil {
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := client.Do(req)
+			if err == nil {
+				_ = resp.Body.Close()
+			}
+		}
+	}
 }
 
 // Get retrieves a job by ID.

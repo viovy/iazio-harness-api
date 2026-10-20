@@ -22,6 +22,8 @@ type CreatePromptRequest struct {
 	Prompt      string `json:"prompt"`
 	TargetAgent string `json:"target_agent,omitempty"`
 	Enqueue     bool   `json:"enqueue,omitempty"`
+	TraceID     string `json:"trace_id,omitempty"`
+	SearchID    string `json:"search_id,omitempty"`
 }
 
 // CreatePromptResponse is the response emitted by POST /api/v1/prompts.
@@ -146,13 +148,18 @@ func (h *PromptsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			payloadBytes = bodyBytes
 		}
+		jobTraceID := strings.TrimSpace(req.TraceID)
+		if jobTraceID == "" {
+			jobTraceID = span.TraceID
+		}
 		job, err := h.queue.Enqueue(r.Context(), &dispatch.Job{
 			Type:        dispatch.JobTypePromptExecute,
 			Repo:        req.Repo,
 			TargetAgent: req.TargetAgent,
 			Payload:     payloadBytes,
-			TraceID:     span.TraceID,
+			TraceID:     jobTraceID,
 			ParentID:    span.ID,
+			SearchID:    strings.TrimSpace(req.SearchID),
 		})
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to enqueue prompt: %v", err))

@@ -33,6 +33,8 @@ type CreateStoryRequest struct {
 	VerificationCommands []string `json:"verification_commands,omitempty"`
 	Enqueue              bool     `json:"enqueue,omitempty"`
 	TargetAgent          string   `json:"target_agent,omitempty"`
+	TraceID              string   `json:"trace_id,omitempty"`
+	SearchID             string   `json:"search_id,omitempty"`
 }
 
 // CreateStoryResponse is the response emitted by POST /api/v1/stories.
@@ -219,12 +221,18 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	jobTraceID := strings.TrimSpace(req.TraceID)
+	if jobTraceID == "" {
+		jobTraceID = span.TraceID
+	}
+
 	job, err := h.queue.Enqueue(r.Context(), &dispatch.Job{
 		Type:     dispatch.JobTypeStoryCreate,
 		Repo:     req.Submodule,
 		Payload:  bodyBytes,
-		TraceID:  span.TraceID,
+		TraceID:  jobTraceID,
 		ParentID: span.ID,
+		SearchID: strings.TrimSpace(req.SearchID),
 	})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to enqueue story: %v", err))
@@ -295,8 +303,9 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Repo:        req.Submodule,
 			TargetAgent: targetAgent,
 			Payload:     execPayload,
-			TraceID:     span.TraceID,
+			TraceID:     jobTraceID,
 			ParentID:    span.ID,
+			SearchID:    strings.TrimSpace(req.SearchID),
 		})
 		if execJob != nil {
 			resp.ExecutionJobID = execJob.ID
