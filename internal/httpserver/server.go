@@ -102,6 +102,7 @@ func (s *Server) Handler() http.Handler {
 		jobLifecycle.SetScheduler(s.Engine)
 	}
 	mux.HandleFunc("GET /api/v1/jobs/{id}", jobLifecycle.GetJob)
+	mux.HandleFunc("GET /api/v1/jobs/{id}/attribution", jobLifecycle.GetJobAttribution)
 	mux.HandleFunc("GET /api/v1/queue", jobLifecycle.ListQueue)
 	mux.HandleFunc("GET /api/v1/jobs", jobLifecycle.ListQueue)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/cancel", jobLifecycle.CancelJob)

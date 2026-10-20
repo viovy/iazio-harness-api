@@ -51,6 +51,9 @@ type Job struct {
 	Error       string          `json:"error,omitempty"`
 	TraceID     string          `json:"trace_id,omitempty"`
 	ParentID    string          `json:"parent_id,omitempty"`
+	SearchID    string          `json:"search_id,omitempty"`
+	RelevanceEmitted bool       `json:"relevance_emitted"`
+	PromotedMemories []string   `json:"promoted_memories,omitempty"`
 	CreatedAt   time.Time       `json:"created_at"`
 	ClaimedAt   *time.Time      `json:"claimed_at,omitempty"`
 	CompletedAt *time.Time      `json:"completed_at,omitempty"`
@@ -77,6 +80,18 @@ type Queue interface {
 	Cancel(ctx context.Context, jobID string, reason string) (*Job, error)
 	Retry(ctx context.Context, jobID string) (*Job, error)
 	Await(ctx context.Context, jobID string, timeout time.Duration) (*Job, error)
+	GetAttribution(ctx context.Context, jobID string) (JobAttributionResponse, error)
+}
+
+// JobAttributionResponse models the attribution of a job outcome to retrieval context.
+type JobAttributionResponse struct {
+	JobID            string     `json:"job_id"`
+	TraceID          string     `json:"trace_id,omitempty"`
+	SearchID         string     `json:"search_id,omitempty"`
+	Status           string     `json:"status"`
+	RelevanceEmitted bool       `json:"relevance_emitted"`
+	PromotedMemories []string   `json:"promoted_memories"`
+	CompletedAt      *time.Time `json:"completed_at,omitempty"`
 }
 
 // InMemoryQueue is a thread-safe in-memory implementation of Queue.
@@ -174,6 +189,13 @@ func (q *InMemoryQueue) Complete(ctx context.Context, jobID string, result json.
 	} else {
 		job.Status = JobStatusCompleted
 		job.Result = result
+		// Execution-to-memory attribution: automatically record positive relevance and promote
+		if job.SearchID != "" || job.TraceID != "" {
+			job.RelevanceEmitted = true
+			if len(job.PromotedMemories) == 0 && job.SearchID != "" {
+				job.PromotedMemories = []string{"mem-" + job.SearchID}
+			}
+		}
 	}
 
 	done := job.doneCh
@@ -276,6 +298,8 @@ func (q *InMemoryQueue) Retry(ctx context.Context, jobID string) (*Job, error) {
 		TargetHost:  orig.TargetHost,
 		TargetAgent: orig.TargetAgent,
 		Payload:     orig.Payload,
+		TraceID:     orig.TraceID,
+		SearchID:    orig.SearchID,
 		Status:      JobStatusPending,
 		CreatedAt:   time.Now().UTC(),
 		doneCh:      make(chan struct{}),
@@ -314,6 +338,30 @@ func (q *InMemoryQueue) Await(ctx context.Context, jobID string, timeout time.Du
 		defer q.mu.Unlock()
 		return q.jobs[jobID], nil
 	}
+}
+
+// GetAttribution returns attribution details linking a completed job to its retrieval context.
+func (q *InMemoryQueue) GetAttribution(ctx context.Context, jobID string) (JobAttributionResponse, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	job, exists := q.jobs[jobID]
+	if !exists {
+		return JobAttributionResponse{}, ErrJobNotFound
+	}
+	promoted := job.PromotedMemories
+	if promoted == nil {
+		promoted = []string{}
+	}
+	return JobAttributionResponse{
+		JobID:            job.ID,
+		TraceID:          job.TraceID,
+		SearchID:         job.SearchID,
+		Status:           job.Status,
+		RelevanceEmitted: job.RelevanceEmitted,
+		PromotedMemories: promoted,
+		CompletedAt:      job.CompletedAt,
+	}, nil
 }
 
 func generateJobID() string {

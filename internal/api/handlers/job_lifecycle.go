@@ -49,6 +49,10 @@ type JobDetailResponse struct {
 	Status      string          `json:"status"`
 	Result      json.RawMessage `json:"result,omitempty"`
 	Error       string          `json:"error,omitempty"`
+	TraceID     string          `json:"trace_id,omitempty"`
+	SearchID    string          `json:"search_id,omitempty"`
+	RelevanceEmitted bool       `json:"relevance_emitted"`
+	PromotedMemories []string   `json:"promoted_memories,omitempty"`
 	CreatedAt   string          `json:"created_at"`
 	ClaimedAt   string          `json:"claimed_at,omitempty"`
 	CompletedAt string          `json:"completed_at,omitempty"`
@@ -71,6 +75,8 @@ type ExecuteStoryRequest struct {
 	Submodule   string `json:"submodule,omitempty"`
 	TargetAgent string `json:"target_agent,omitempty"`
 	Prompt      string `json:"prompt,omitempty"`
+	TraceID     string `json:"trace_id,omitempty"`
+	SearchID    string `json:"search_id,omitempty"`
 }
 
 // ExecuteStoryResponse is returned after queuing a story for execution.
@@ -286,13 +292,21 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	if t := strings.TrimSpace(req.TraceID); t != "" {
+		traceID = t
+	}
+	if traceID == "" {
+		traceID = span.TraceID
+	}
+
 	job, err := h.queue.Enqueue(r.Context(), &dispatch.Job{
 		Type:        dispatch.JobTypePromptExecute,
 		Repo:        submodule,
 		TargetAgent: targetAgent,
-		Payload:     execPayload,
-		TraceID:     span.TraceID,
+		TraceID:     traceID,
 		ParentID:    span.ID,
+		SearchID:    strings.TrimSpace(req.SearchID),
+		Payload:     execPayload,
 	})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to enqueue story execution: %v", err))
@@ -322,16 +336,25 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		return JobDetailResponse{}
 	}
 
+	promoted := j.PromotedMemories
+	if promoted == nil {
+		promoted = []string{}
+	}
+
 	resp := JobDetailResponse{
-		ID:          j.ID,
-		Type:        j.Type,
-		Repo:        j.Repo,
-		TargetHost:  j.TargetHost,
-		TargetAgent: j.TargetAgent,
-		Status:      j.Status,
-		Result:      j.Result,
-		Error:       j.Error,
-		CreatedAt:   j.CreatedAt.Format(time.RFC3339),
+		ID:               j.ID,
+		Type:             j.Type,
+		Repo:             j.Repo,
+		TargetHost:       j.TargetHost,
+		TargetAgent:      j.TargetAgent,
+		Status:           j.Status,
+		Result:           j.Result,
+		Error:            j.Error,
+		TraceID:          j.TraceID,
+		SearchID:         j.SearchID,
+		RelevanceEmitted: j.RelevanceEmitted,
+		PromotedMemories: promoted,
+		CreatedAt:        j.CreatedAt.Format(time.RFC3339),
 	}
 
 	if j.ClaimedAt != nil {
@@ -344,4 +367,32 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		}
 	}
 	return resp
+}
+
+// GetJobAttribution serves GET /api/v1/jobs/{id}/attribution.
+func (h *JobLifecycleHandler) GetJobAttribution(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	jobID := strings.TrimSpace(r.PathValue("id"))
+	if jobID == "" {
+		writeJSONError(w, http.StatusBadRequest, "job id is required")
+		return
+	}
+
+	attr, err := h.queue.GetAttribution(r.Context(), jobID)
+	if err != nil {
+		if errors.Is(err, dispatch.ErrJobNotFound) {
+			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("job %q not found", jobID))
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(attr)
 }
