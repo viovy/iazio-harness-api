@@ -5,14 +5,16 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends chromium chromium-driver python3-selenium \
   && rm -rf /var/lib/apt/lists/*
 
-FROM golang:1.26-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
 ARG GIT_VERSION=0.1.0-dev
 ARG GIT_COMMIT=unknown
 WORKDIR /src
 COPY go.mod go.sum ./
 COPY cmd cmd
 COPY internal internal
-RUN CGO_ENABLED=0 go build -trimpath \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
   -ldflags="-s -w \
   -X github.com/viovy/iazio-harness-api/internal/version.Version=${GIT_VERSION} \
   -X github.com/viovy/iazio-harness-api/internal/version.Commit=${GIT_COMMIT}" \

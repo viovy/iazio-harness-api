@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-harness-api/internal/codebase"
+	"github.com/viovy/iazio-harness-api/internal/control"
 	"github.com/viovy/iazio-harness-api/internal/dispatch"
+	"github.com/viovy/iazio-harness-api/internal/telemetry"
 )
 
 const defaultStoryDispatchTimeout = 15 * time.Second
@@ -53,16 +55,22 @@ type StoryResultPayload struct {
 	IndexUpdated bool   `json:"index_updated"`
 }
 
+// GlobalScheduler enqueues autonomous story execution tasks into the global queue.
+type GlobalScheduler interface {
+	EnqueueGlobalStorySchedule(storyID, submodule, targetAgent, promptText string) (control.Schedule, error)
+}
+
 // StoriesHandler handles semantic story validation and dispatch.
 type StoriesHandler struct {
 	store          codebase.Store
 	queue          dispatch.Queue
 	idempotency    *IdempotencyStore
 	dispatchWait   time.Duration
+	scheduler      GlobalScheduler
 }
 
 // NewStoriesHandler constructs a new StoriesHandler.
-func NewStoriesHandler(store codebase.Store, queue dispatch.Queue, idempotency *IdempotencyStore) *StoriesHandler {
+func NewStoriesHandler(store codebase.Store, queue dispatch.Queue, idempotency *IdempotencyStore, scheduler ...GlobalScheduler) *StoriesHandler {
 	if idempotency == nil {
 		idempotency = NewIdempotencyStore(24 * time.Hour)
 	}
@@ -76,11 +84,17 @@ func NewStoriesHandler(store codebase.Store, queue dispatch.Queue, idempotency *
 		}
 	}
 
+	var sched GlobalScheduler
+	if len(scheduler) > 0 {
+		sched = scheduler[0]
+	}
+
 	return &StoriesHandler{
 		store:        store,
 		queue:        queue,
 		idempotency:  idempotency,
 		dispatchWait: timeout,
+		scheduler:    sched,
 	}
 }
 
@@ -90,6 +104,16 @@ func (h *StoriesHandler) SetDispatchWaitTimeout(d time.Duration) {
 }
 
 func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	traceID, parentID := telemetry.ExtractHTTP(r.Header)
+	var spanOpts []telemetry.SpanOption
+	if traceID != "" {
+		spanOpts = append(spanOpts, telemetry.WithParentTrace(traceID, parentID))
+	}
+	spanOpts = append(spanOpts, telemetry.WithKind("SERVER"), telemetry.WithTag("http.method", r.Method), telemetry.WithTag("http.path", r.URL.Path))
+	ctx, span := telemetry.StartSpan(r.Context(), "StoriesHandler.ServeHTTP", spanOpts...)
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -268,6 +292,9 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if execJob != nil {
 			resp.ExecutionJobID = execJob.ID
 			resp.ExecutionStatus = execJob.Status
+		}
+		if h.scheduler != nil {
+			_, _ = h.scheduler.EnqueueGlobalStorySchedule(result.StoryID, req.Submodule, targetAgent, fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", result.StoryID, result.StoryID, req.Submodule))
 		}
 	}
 

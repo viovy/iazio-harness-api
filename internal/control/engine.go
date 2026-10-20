@@ -341,6 +341,7 @@ type Engine struct {
 	logs            map[string][]LogChunk
 	subs            map[string][]chan LogChunk
 	Releases        *ReleaseService
+	toolPriority    []string
 	OnRepoChange    func(Repo)
 	OnHistoryChange func(host, path string, row HistoryRow)
 	OnHistoryDelete func(host, path string, jobID string)
@@ -405,8 +406,9 @@ func NewEngine(now func() time.Time) *Engine {
 		runningRev: map[string]bool{},
 		history:    map[string][]HistoryRow{},
 		logs:       map[string][]LogChunk{},
-		subs:       map[string][]chan LogChunk{},
-		Releases:   NewReleaseService(),
+		subs:         map[string][]chan LogChunk{},
+		Releases:     NewReleaseService(),
+		toolPriority: []string{"agy", "agent", "copilot", "opencode"},
 	}
 }
 
@@ -622,6 +624,77 @@ func (e *Engine) SetRepoQueueAllocation(hostID, worktreePath string, enabled boo
 	}
 	r.GlobalQueueAllocationEnabled = enabled
 	return nil
+}
+
+// GetToolPriority returns an ordered slice of preferred execution tool engines.
+func (e *Engine) GetToolPriority() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.toolPriority) == 0 {
+		return []string{"agy", "agent", "copilot", "opencode"}
+	}
+	cp := make([]string, len(e.toolPriority))
+	copy(cp, e.toolPriority)
+	return cp
+}
+
+// SetToolPriority updates the ordered preferred execution tool priority list.
+func (e *Engine) SetToolPriority(tools []string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(tools) == 0 {
+		return errors.New("tool priority list must not be empty")
+	}
+	cleaned := make([]string, 0, len(tools))
+	seen := make(map[string]bool)
+	for _, t := range tools {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if t != "" && !seen[t] {
+			seen[t] = true
+			cleaned = append(cleaned, t)
+		}
+	}
+	if len(cleaned) == 0 {
+		return errors.New("no valid tools provided")
+	}
+	e.toolPriority = cleaned
+	return nil
+}
+
+// EnqueueGlobalStorySchedule enqueues an autonomous story execution task into the Level 2 Global Queue.
+func (e *Engine) EnqueueGlobalStorySchedule(storyID, submodule, targetAgent, promptText string) (Schedule, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if strings.TrimSpace(storyID) == "" {
+		return Schedule{}, errors.New("story_id is required")
+	}
+	if strings.TrimSpace(submodule) == "" {
+		submodule = "."
+	}
+	targetAgent = strings.TrimSpace(targetAgent)
+	if targetAgent == "" {
+		targetAgent = "auto"
+	}
+	if strings.TrimSpace(promptText) == "" {
+		promptText = fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", storyID, storyID, submodule)
+	}
+
+	id := e.next("sch-")
+	s := &Schedule{
+		ID:                  id,
+		StoryID:             storyID,
+		WorktreePath:        submodule,
+		PromptTitle:         fmt.Sprintf("Execute story %s", storyID),
+		Engine:              targetAgent,
+		Kind:                "story_execution",
+		Status:              "QUEUED",
+		IterationsTotal:     1,
+		IterationsRemaining: 1,
+		Priority:            10,
+		IsGlobal:            true,
+	}
+	e.schedules[id] = s
+	return *s, nil
 }
 
 // RegisterHost records kind, presence, and distribution profile.
@@ -1452,13 +1525,21 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			candidates = append(candidates, sch)
 		} else if sch.IsGlobal || sch.HostID == "global" || sch.HostID == "" {
 			// Level 2: Shared fleet global queue.
-			// Eligible if the target repo (or any repo on this host) has GlobalQueueAllocationEnabled == true.
-			if sch.WorktreePath != "" {
-				repo := e.repos[repoKey(host, sch.WorktreePath)]
-				if repo != nil && repo.GlobalQueueAllocationEnabled {
-					candidates = append(candidates, sch)
+			// Eligible if this host has any repo with GlobalQueueAllocationEnabled == true
+			// (matching the target submodule if specified, or any enabled repo on the host).
+			matched := false
+			if sch.WorktreePath != "" && sch.WorktreePath != "." {
+				for _, r := range e.repos {
+					if r.HostID == host && r.GlobalQueueAllocationEnabled {
+						if r.WorktreePath == sch.WorktreePath || strings.HasSuffix(r.WorktreePath, "/"+sch.WorktreePath) || filepath.Base(r.WorktreePath) == sch.WorktreePath {
+							candidates = append(candidates, sch)
+							matched = true
+							break
+						}
+					}
 				}
-			} else {
+			}
+			if !matched {
 				for _, r := range e.repos {
 					if r.HostID == host && r.GlobalQueueAllocationEnabled {
 						candidates = append(candidates, sch)
@@ -1492,12 +1573,28 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 		repo := e.repos[repoKey(host, sch.WorktreePath)]
 		if repo == nil && (sch.IsGlobal || sch.HostID == "global" || sch.HostID == "") {
 			// Dynamically allocate to an idle repo that has GlobalQueueAllocationEnabled == true
-			for _, r := range e.repos {
-				if r.HostID == host && r.GlobalQueueAllocationEnabled && r.Lock == LockIdle && (r.Queue == QueueOpen || r.Queue == QueueHealing) {
-					repo = r
-					sch.WorktreePath = r.WorktreePath
-					sch.HostID = host
-					break
+			// First try to match target submodule if specified
+			if sch.WorktreePath != "" && sch.WorktreePath != "." {
+				for _, r := range e.repos {
+					if r.HostID == host && r.GlobalQueueAllocationEnabled && r.Lock == LockIdle && (r.Queue == QueueOpen || r.Queue == QueueHealing) {
+						if r.WorktreePath == sch.WorktreePath || strings.HasSuffix(r.WorktreePath, "/"+sch.WorktreePath) || filepath.Base(r.WorktreePath) == sch.WorktreePath {
+							repo = r
+							sch.WorktreePath = r.WorktreePath
+							sch.HostID = host
+							break
+						}
+					}
+				}
+			}
+			// If not matched or target was generic, find any idle repo with GlobalQueueAllocationEnabled == true
+			if repo == nil {
+				for _, r := range e.repos {
+					if r.HostID == host && r.GlobalQueueAllocationEnabled && r.Lock == LockIdle && (r.Queue == QueueOpen || r.Queue == QueueHealing) {
+						repo = r
+						sch.WorktreePath = r.WorktreePath
+						sch.HostID = host
+						break
+					}
 				}
 			}
 		}

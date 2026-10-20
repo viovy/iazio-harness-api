@@ -12,12 +12,14 @@ import (
 
 	"github.com/viovy/iazio-harness-api/internal/codebase"
 	"github.com/viovy/iazio-harness-api/internal/dispatch"
+	"github.com/viovy/iazio-harness-api/internal/telemetry"
 )
 
 // JobLifecycleHandler manages querying, listing, canceling, and retrying agent jobs.
 type JobLifecycleHandler struct {
-	queue dispatch.Queue
-	store codebase.Store
+	queue     dispatch.Queue
+	store     codebase.Store
+	scheduler GlobalScheduler
 }
 
 // NewJobLifecycleHandler constructs a new JobLifecycleHandler.
@@ -30,6 +32,11 @@ func NewJobLifecycleHandler(queue dispatch.Queue, store ...codebase.Store) *JobL
 		queue: queue,
 		store: s,
 	}
+}
+
+// SetScheduler sets the global scheduler.
+func (h *JobLifecycleHandler) SetScheduler(scheduler GlobalScheduler) {
+	h.scheduler = scheduler
 }
 
 // JobDetailResponse is the detailed JSON representation of a dispatch job.
@@ -222,6 +229,16 @@ func (h *JobLifecycleHandler) RetryJob(w http.ResponseWriter, r *http.Request) {
 
 // ExecuteStory serves POST /api/v1/stories/{id}/execute.
 func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Request) {
+	traceID, parentID := telemetry.ExtractHTTP(r.Header)
+	var spanOpts []telemetry.SpanOption
+	if traceID != "" {
+		spanOpts = append(spanOpts, telemetry.WithParentTrace(traceID, parentID))
+	}
+	spanOpts = append(spanOpts, telemetry.WithKind("SERVER"), telemetry.WithTag("http.method", r.Method), telemetry.WithTag("http.path", r.URL.Path))
+	ctx, span := telemetry.StartSpan(r.Context(), "JobLifecycleHandler.ExecuteStory", spanOpts...)
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -276,6 +293,10 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to enqueue story execution: %v", err))
 		return
+	}
+
+	if h.scheduler != nil {
+		_, _ = h.scheduler.EnqueueGlobalStorySchedule(storyID, submodule, targetAgent, promptText)
 	}
 
 	resp := ExecuteStoryResponse{
