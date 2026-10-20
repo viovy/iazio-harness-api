@@ -229,7 +229,7 @@ func (r Repo) EffectiveAlias() string {
 	}
 	clean := filepath.Clean(strings.ReplaceAll(r.WorktreePath, "\\", "/"))
 	base := filepath.Base(clean)
-	if base == "." || base == "/" || base == "" {
+	if base == "." || base == "/" || base == "\\" || base == string(filepath.Separator) || base == "" {
 		return r.WorktreePath
 	}
 	return base
