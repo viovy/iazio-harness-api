@@ -11,6 +11,7 @@ import (
 
 	"github.com/viovy/iazio-harness-api/internal/codebase"
 	"github.com/viovy/iazio-harness-api/internal/dispatch"
+	"github.com/viovy/iazio-harness-api/internal/telemetry"
 )
 
 // CreatePromptRequest is the payload accepted by POST /api/v1/prompts.
@@ -52,6 +53,16 @@ func NewPromptsHandler(store codebase.Store, queue dispatch.Queue, idempotency *
 }
 
 func (h *PromptsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	traceID, parentID := telemetry.ExtractHTTP(r.Header)
+	var spanOpts []telemetry.SpanOption
+	if traceID != "" {
+		spanOpts = append(spanOpts, telemetry.WithParentTrace(traceID, parentID))
+	}
+	spanOpts = append(spanOpts, telemetry.WithKind("SERVER"), telemetry.WithTag("http.method", r.Method), telemetry.WithTag("http.path", r.URL.Path))
+	ctx, span := telemetry.StartSpan(r.Context(), "PromptsHandler.ServeHTTP", spanOpts...)
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -131,6 +142,8 @@ func (h *PromptsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Repo:        req.Repo,
 			TargetAgent: req.TargetAgent,
 			Payload:     bodyBytes,
+			TraceID:     span.TraceID,
+			ParentID:    span.ID,
 		})
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to enqueue prompt: %v", err))

@@ -217,9 +217,11 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	job, err := h.queue.Enqueue(r.Context(), &dispatch.Job{
-		Type:    dispatch.JobTypeStoryCreate,
-		Repo:    req.Submodule,
-		Payload: bodyBytes,
+		Type:     dispatch.JobTypeStoryCreate,
+		Repo:     req.Submodule,
+		Payload:  bodyBytes,
+		TraceID:  span.TraceID,
+		ParentID: span.ID,
 	})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to enqueue story: %v", err))
@@ -288,6 +290,8 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Repo:        req.Submodule,
 			TargetAgent: targetAgent,
 			Payload:     execPayload,
+			TraceID:     span.TraceID,
+			ParentID:    span.ID,
 		})
 		if execJob != nil {
 			resp.ExecutionJobID = execJob.ID
