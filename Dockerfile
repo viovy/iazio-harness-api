@@ -5,7 +5,7 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends chromium chromium-driver python3-selenium \
   && rm -rf /var/lib/apt/lists/*
 
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
+FROM golang:1.26-bookworm AS build
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 ARG GIT_VERSION=0.1.0-dev
