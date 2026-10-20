@@ -258,11 +258,13 @@ func withAuth(next http.Handler, token string) http.Handler {
 		authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
 		const prefix = "Bearer "
 		if !strings.HasPrefix(authHeader, prefix) {
+			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
 		got := strings.TrimSpace(strings.TrimPrefix(authHeader, prefix))
 		if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}

@@ -14,8 +14,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/viovy/iazio-harness-api/internal/api/handlers"
 	"github.com/viovy/iazio-harness-api/internal/codebase"
 	"github.com/viovy/iazio-harness-api/internal/control"
+	"github.com/viovy/iazio-harness-api/internal/dispatch"
 	"github.com/viovy/iazio-harness-api/internal/extract"
 	"github.com/viovy/iazio-harness-api/internal/httpserver"
 	"github.com/viovy/iazio-harness-api/internal/pgstore"
@@ -45,6 +47,8 @@ func run(ctx context.Context, args []string) error {
 	srv := &httpserver.Server{
 		Engine:        control.NewEngine(nil),
 		CodebaseStore: codebaseStore,
+		Queue:         dispatch.NewInMemoryQueue(),
+		Idempotency:   handlers.NewIdempotencyStore(24 * time.Hour),
 	}
 	if tok := strings.TrimSpace(os.Getenv("IAZIO_AUTH_TOKEN")); tok != "" {
 		srv.AuthToken = tok
