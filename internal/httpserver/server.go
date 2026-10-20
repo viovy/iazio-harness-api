@@ -91,6 +91,8 @@ func (s *Server) Handler() http.Handler {
 	// Dispatch & Story Lifecycle Endpoints
 	storiesHandler := handlers.NewStoriesHandler(codebaseStore, queue, idempotency, s.Engine)
 	mux.Handle("POST /api/v1/stories", storiesHandler)
+	mux.HandleFunc("GET /api/v1/stories", storiesHandler.ListStories)
+	mux.HandleFunc("GET /api/v1/stories/", storiesHandler.GetStory)
 
 	promptsHandler := handlers.NewPromptsHandler(codebaseStore, queue, idempotency)
 	mux.Handle("POST /api/v1/prompts", promptsHandler)
@@ -107,7 +109,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/stories/{id}/execute", jobLifecycle.ExecuteStory)
 
 	agentJobsHandler := handlers.NewAgentJobsHandler(queue)
-	mux.HandleFunc("POST /api/v1/agent/jobs/claim", agentJobsHandler.ClaimHandler)
 	mux.HandleFunc("POST /api/v1/agent/jobs/{id}/complete", agentJobsHandler.CompleteHandler)
 
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) {
@@ -258,11 +259,13 @@ func withAuth(next http.Handler, token string) http.Handler {
 		authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
 		const prefix = "Bearer "
 		if !strings.HasPrefix(authHeader, prefix) {
+			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
 		got := strings.TrimSpace(strings.TrimPrefix(authHeader, prefix))
 		if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}

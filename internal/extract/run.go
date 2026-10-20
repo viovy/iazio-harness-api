@@ -48,6 +48,7 @@ func Run(ctx context.Context, script, shareURL string) (title, transcript string
 		return "", "", fmt.Errorf("%s", msg)
 	}
 	text := strings.TrimSpace(stdout.String())
+	text = strings.ReplaceAll(text, "\r\n", "\n")
 	title = "imported"
 	if line, _, ok := strings.Cut(text, "\n"); ok && line != "" {
 		title = line
