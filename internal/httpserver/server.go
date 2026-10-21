@@ -1608,12 +1608,22 @@ func (s *Server) checkFleetStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	probeID := fmt.Sprintf("ephemeral-probe-%d", time.Now().UnixNano())
+	waiterKey, waiterCh := s.Engine.RegisterRepoStatusWaiter(hostID, actualPath)
+	defer s.Engine.DeregisterRepoStatusWaiter(waiterKey)
+
 	_ = s.Engine.QueueCommand(hostID, control.CommandEnvelope{
 		ID:        probeID,
 		Type:      "CHECK_FLEET_GIT_STATUS",
 		Payload:   actualPath,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
 	})
+
+	var liveStatus *control.RepoRuntimeStatus
+	select {
+	case st := <-waiterCh:
+		liveStatus = &st
+	case <-time.After(500 * time.Millisecond):
+	}
 
 	res := control.RepoFleetStatusResult{
 		RepoPath:             actualPath,
@@ -1629,27 +1639,56 @@ func (s *Server) checkFleetStatus(w http.ResponseWriter, r *http.Request) {
 		ActiveConversationID: repo.DetectedConversationID,
 		CheckedAt:            time.Now().UTC().Format(time.RFC3339),
 	}
-	if res.ASEState == "" {
-		if repo.Lock == "RUNNING_HARNESS" {
-			res.ASEState = "RUNNING"
-		} else if repo.Porcelain != "" {
-			res.ASEState = "FAILED_DIRTY"
-		} else {
-			res.ASEState = "IDLE"
+	if liveStatus != nil {
+		if liveStatus.Branch != "" {
+			res.Branch = liveStatus.Branch
 		}
-	}
-	if res.ToolLiveness == "" {
-		if detail.Running != nil {
-			res.ToolLiveness = "LIVE"
-			res.AgentTool = detail.RunningEngine
-			res.ExecutionProvenance = "COORDINATED_HARNESS"
-		} else {
-			res.ToolLiveness = "NONE"
-			res.ExecutionProvenance = "NONE"
+		res.IsClean = liveStatus.Porcelain == ""
+		res.SubmodulesClean = liveStatus.SubmodulesClean
+		res.DirtySubmodules = liveStatus.DirtySubmodules
+		if liveStatus.ASEState != "" {
+			res.ASEState = liveStatus.ASEState
+		}
+		res.ActiveStoryID = liveStatus.ActiveStoryID
+		res.AgentTool = liveStatus.ActiveTool
+		if liveStatus.ToolLiveness != "" {
+			res.ToolLiveness = liveStatus.ToolLiveness
+		}
+		if liveStatus.ExecutionProvenance != "" {
+			res.ExecutionProvenance = liveStatus.ExecutionProvenance
+		}
+		res.ActiveConversationID = liveStatus.ActiveConversationID
+		if !liveStatus.LastCheckedAt.IsZero() {
+			res.CheckedAt = liveStatus.LastCheckedAt.UTC().Format(time.RFC3339)
+		}
+	} else {
+		if res.ASEState == "" {
+			if repo.Lock == "RUNNING_HARNESS" {
+				res.ASEState = "RUNNING"
+			} else if repo.Porcelain != "" {
+				res.ASEState = "FAILED_DIRTY"
+			} else {
+				res.ASEState = "IDLE"
+			}
+		}
+		if res.ToolLiveness == "" {
+			if detail.Running != nil {
+				res.ToolLiveness = "LIVE"
+				res.AgentTool = detail.RunningEngine
+				res.ExecutionProvenance = "COORDINATED_HARNESS"
+			} else {
+				res.ToolLiveness = "NONE"
+				res.ExecutionProvenance = "NONE"
+			}
 		}
 	}
 
 	var sb strings.Builder
+	if liveStatus != nil {
+		sb.WriteString(fmt.Sprintf("[probe %s] Live probe telemetry received from agent\n", probeID))
+	} else {
+		sb.WriteString(fmt.Sprintf("[probe %s] Probe queued to agent; displaying status\n", probeID))
+	}
 	sb.WriteString(fmt.Sprintf("[probe %s] Repository: %s\n", probeID, actualPath))
 	sb.WriteString(fmt.Sprintf("[probe %s] Branch: %s\n", probeID, res.Branch))
 	if res.IsClean {

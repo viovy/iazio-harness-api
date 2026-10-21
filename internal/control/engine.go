@@ -399,6 +399,7 @@ type Engine struct {
 	repos           map[string]*Repo
 	hosts           map[string]*Host
 	pingWaiters     map[string]chan PingAck
+	repoWaiters     map[string]chan RepoRuntimeStatus
 	profiles        map[string]*DistributionProfile
 	cloneLease      map[string]string
 	hubLease        string
@@ -469,6 +470,7 @@ func NewEngine(now func() time.Time) *Engine {
 		repos:      map[string]*Repo{},
 		hosts:       map[string]*Host{},
 		pingWaiters: map[string]chan PingAck{},
+		repoWaiters: map[string]chan RepoRuntimeStatus{},
 		profiles:    map[string]*DistributionProfile{},
 		cloneLease: map[string]string{},
 		runningRev: map[string]bool{},
@@ -1413,11 +1415,38 @@ func (e *Engine) MissHeartbeat(id string, missed int) {
 	}
 }
 
+// RegisterRepoStatusWaiter registers a channel to receive live repo status updates.
+func (e *Engine) RegisterRepoStatusWaiter(hostID, repoPath string) (string, chan RepoRuntimeStatus) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.repoWaiters == nil {
+		e.repoWaiters = make(map[string]chan RepoRuntimeStatus)
+	}
+	key := hostID + ":" + filepath.Clean(repoPath)
+	ch := make(chan RepoRuntimeStatus, 1)
+	e.repoWaiters[key] = ch
+	return key, ch
+}
+
+// DeregisterRepoStatusWaiter unregisters a repo status waiter.
+func (e *Engine) DeregisterRepoStatusWaiter(key string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.repoWaiters, key)
+}
+
 // UpdateRepoRuntimeStatus updates repository fields based on continuous agent telemetry.
 func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeStatus) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for _, st := range statuses {
+		key := hostID + ":" + filepath.Clean(st.RepoPath)
+		if ch, ok := e.repoWaiters[key]; ok {
+			select {
+			case ch <- st:
+			default:
+			}
+		}
 		for _, r := range e.repos {
 			if r.HostID == hostID && (r.WorktreePath == st.RepoPath || r.EffectiveAlias() == st.Alias || filepath.Clean(r.WorktreePath) == filepath.Clean(st.RepoPath)) {
 				if st.Branch != "" {
