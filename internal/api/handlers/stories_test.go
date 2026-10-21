@@ -238,3 +238,84 @@ func TestStoriesHandler_Idempotency(t *testing.T) {
 		t.Fatalf("expected 409 Conflict, got %d", w3.Code)
 	}
 }
+
+func TestStoriesHandler_WorkspaceLocked(t *testing.T) {
+	store := setupTestStore(t)
+	q := dispatch.NewInMemoryQueue()
+	handler := NewStoriesHandler(store, q, nil)
+	handler.SetDispatchWaitTimeout(1 * time.Second)
+
+	payload := validStoryPayload()
+	body, _ := json.Marshal(payload)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/stories", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		job, err := q.Claim(context.Background(), "", []string{dispatch.JobTypeStoryCreate})
+		if err == nil && job != nil {
+			_ = q.Complete(context.Background(), job.ID, nil, "WORKSPACE_LOCKED: checkout iazio-mcp is held by background task")
+		}
+	}()
+
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusLocked {
+		t.Fatalf("expected 423 Locked for WORKSPACE_LOCKED, got %d (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestStoriesHandler_AsyncEnqueueOnTimeout(t *testing.T) {
+	store := setupTestStore(t)
+	q := dispatch.NewInMemoryQueue()
+	handler := NewStoriesHandler(store, q, nil)
+	handler.SetDispatchWaitTimeout(15 * time.Millisecond)
+
+	payload := validStoryPayload()
+	payload["enqueue"] = true
+	payload["target_agent"] = "debian"
+	body, _ := json.Marshal(payload)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/stories", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted on timeout, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	// Now simulate daemon completing the story creation in background
+	job, err := q.Claim(context.Background(), "", []string{dispatch.JobTypeStoryCreate})
+	if err != nil || job == nil {
+		t.Fatalf("expected claimed story.create job, got %v (job=%v)", err, job)
+	}
+
+	resultPayload := StoryResultPayload{
+		StoryID:      "STORY-ASYNC-001",
+		Submodule:    "iazio-mcp",
+		StoryPath:    "docs/stories/2026-10-21-story.md",
+		IndexUpdated: true,
+	}
+	resBytes, _ := json.Marshal(resultPayload)
+	if err := q.Complete(context.Background(), job.ID, resBytes, ""); err != nil {
+		t.Fatalf("failed to complete job: %v", err)
+	}
+
+	// Verify that the async watcher enqueues prompt.execute
+	var execJob *dispatch.Job
+	for i := 0; i < 20; i++ {
+		time.Sleep(20 * time.Millisecond)
+		ej, err := q.Claim(context.Background(), "debian", []string{dispatch.JobTypePromptExecute})
+		if err == nil && ej != nil {
+			execJob = ej
+			break
+		}
+	}
+
+	if execJob == nil {
+		t.Fatal("expected async watcher to enqueue prompt.execute job upon background completion")
+	}
+	if execJob.Type != dispatch.JobTypePromptExecute {
+		t.Errorf("expected JobTypePromptExecute, got %s", execJob.Type)
+	}
+}

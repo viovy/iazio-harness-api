@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,7 +20,7 @@ import (
 	"github.com/viovy/iazio-harness-api/internal/telemetry"
 )
 
-const defaultStoryDispatchTimeout = 15 * time.Second
+const defaultStoryDispatchTimeout = 2500 * time.Millisecond
 
 // CreateStoryRequest defines the semantic parameters for scaffolding an autopilot-governed story.
 type CreateStoryRequest struct {
@@ -250,6 +251,47 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:        job.CreatedAt.Format(time.RFC3339),
 			IdempotentReplay: false,
 		}
+
+		// When enqueue: true is requested, guarantee that execution is dispatched when the scaffolding job completes in the background
+		if req.Enqueue {
+			targetAgent := strings.TrimSpace(req.TargetAgent)
+			if targetAgent == "" {
+				targetAgent = "autopilot"
+			}
+			go func(jobID, submodule, title, agent, sID, pSpanID string) {
+				watchCtx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+				defer cancel()
+
+				cJob, aErr := h.queue.Await(watchCtx, jobID, 15*time.Minute)
+				if aErr == nil && cJob != nil && cJob.Status == dispatch.JobStatusCompleted {
+					var res StoryResultPayload
+					if jErr := json.Unmarshal(cJob.Result, &res); jErr == nil && res.StoryID != "" {
+						promptID := fmt.Sprintf("prompt_%s_%d", res.StoryID, time.Now().Unix())
+						execPayload, _ := json.Marshal(map[string]any{
+							"prompt_id":    promptID,
+							"repo":         submodule,
+							"story_id":     res.StoryID,
+							"title":        fmt.Sprintf("Execute story %s: %s", res.StoryID, title),
+							"prompt":       fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", res.StoryID, res.StoryID, submodule),
+							"target_agent": agent,
+						})
+						_, _ = h.queue.Enqueue(context.Background(), &dispatch.Job{
+							Type:        dispatch.JobTypePromptExecute,
+							Repo:        submodule,
+							TargetAgent: agent,
+							Payload:     execPayload,
+							TraceID:     jobTraceID,
+							ParentID:    pSpanID,
+							SearchID:    sID,
+						})
+						if h.scheduler != nil {
+							_, _ = h.scheduler.EnqueueGlobalStorySchedule(res.StoryID, submodule, agent, fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", res.StoryID, res.StoryID, submodule))
+						}
+					}
+				}
+			}(job.ID, req.Submodule, req.Title, targetAgent, strings.TrimSpace(req.SearchID), span.ID)
+		}
+
 		respBytes, _ := json.Marshal(resp)
 		if idempotencyKey != "" {
 			h.idempotency.Store(idempotencyKey, payloadHash, http.StatusAccepted, respBytes)
@@ -266,6 +308,10 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if completedJob.Status == dispatch.JobStatusFailed {
+		if strings.Contains(completedJob.Error, "WORKSPACE_LOCKED") {
+			writeJSONError(w, http.StatusLocked, fmt.Sprintf("workspace locked: %s", completedJob.Error))
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("story execution failed: %s", completedJob.Error))
 		return
 	}
@@ -312,7 +358,9 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			resp.ExecutionStatus = execJob.Status
 		}
 		if h.scheduler != nil {
-			_, _ = h.scheduler.EnqueueGlobalStorySchedule(result.StoryID, req.Submodule, targetAgent, fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", result.StoryID, result.StoryID, req.Submodule))
+			go func() {
+				_, _ = h.scheduler.EnqueueGlobalStorySchedule(result.StoryID, req.Submodule, targetAgent, fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", result.StoryID, result.StoryID, req.Submodule))
+			}()
 		}
 	}
 
