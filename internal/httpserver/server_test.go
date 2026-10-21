@@ -1081,11 +1081,11 @@ func TestServerMoreEndpoints(t *testing.T) {
 	idea := e.PutIdea(control.Idea{ID: "i-test", Title: "Test Idea", ShareURL: "https://gemini.google.com/share/abc_DEF-1", Status: "NEW"})
 
 	s := &Server{
-		Engine: e,
-		SavePrompt: func(_ control.Prompt) {},
+		Engine:       e,
+		SavePrompt:   func(_ control.Prompt) {},
 		DeletePrompt: func(_ string) {},
-		SaveRepo: func(_ control.Repo) {},
-		SaveIdea: func(_ control.Idea) {},
+		SaveRepo:     func(_ control.Repo) {},
+		SaveIdea:     func(_ control.Idea) {},
 		Extract: func(_ string) (string, string, error) {
 			return "Imported Title", "Imported Transcript", nil
 		},

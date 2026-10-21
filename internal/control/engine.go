@@ -1909,6 +1909,24 @@ func (e *Engine) DeleteHistoryRow(jobID string) bool {
 	return false
 }
 
+// FindHistoryRow returns the history row and repo metadata for a jobID.
+func (e *Engine) FindHistoryRow(jobID string) (HistoryRow, string, string, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for key, rows := range e.history {
+		for _, r := range rows {
+			if r.JobID == jobID {
+				host, path := "", ""
+				if idx := strings.Index(key, "\x00"); idx >= 0 {
+					host, path = key[:idx], key[idx+1:]
+				}
+				return r, host, path, true
+			}
+		}
+	}
+	return HistoryRow{}, "", "", false
+}
+
 // ClearHistory removes all history records for a repo and notifies deletion for each.
 func (e *Engine) ClearHistory(host, path string) int {
 	e.mu.Lock()

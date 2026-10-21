@@ -198,15 +198,15 @@ func TestServer_CheckFleetStatusAndRepoRuntimeStatus(t *testing.T) {
 				if cmd.Type == "CHECK_FLEET_GIT_STATUS" {
 					e.UpdateRepoRuntimeStatus("debian", []control.RepoRuntimeStatus{
 						{
-							RepoPath:             "/work/sample-repo",
-							Branch:               "main",
-							IsClean:              true,
-							SubmodulesClean:      true,
-							ASEState:             "IDLE",
-							ActiveTool:           "autopilot",
-							ToolLiveness:         "LIVE",
-							ExecutionProvenance:  "COORDINATED_HARNESS",
-							LastCheckedAt:        time.Now(),
+							RepoPath:            "/work/sample-repo",
+							Branch:              "main",
+							IsClean:             true,
+							SubmodulesClean:     true,
+							ASEState:            "IDLE",
+							ActiveTool:          "autopilot",
+							ToolLiveness:        "LIVE",
+							ExecutionProvenance: "COORDINATED_HARNESS",
+							LastCheckedAt:       time.Now(),
 						},
 					})
 					return
