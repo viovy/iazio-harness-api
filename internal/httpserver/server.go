@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -2512,18 +2511,6 @@ func (s *Server) healASERepo(w http.ResponseWriter, r *http.Request) {
 			detail.Repo.Reason = ""
 			_ = s.Engine.UpsertRepo(detail.Repo)
 			locksCleared = append(locksCleared, "repo_lock_reset")
-		}
-	}
-
-	for _, lockFile := range []string{
-		filepath.Join(actualPath, ".autopilot", "lock"),
-		filepath.Join(actualPath, ".ase", "active.lock"),
-		filepath.Join(actualPath, ".index.yml.lock"),
-	} {
-		if _, err := os.Stat(lockFile); err == nil {
-			if rErr := os.Remove(lockFile); rErr == nil {
-				locksCleared = append(locksCleared, filepath.Base(filepath.Dir(lockFile))+"/"+filepath.Base(lockFile))
-			}
 		}
 	}
 

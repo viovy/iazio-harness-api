@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -249,7 +248,6 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	storyID := strings.TrimSpace(req.ID)
-	hasExplicitStory := storyID != "" || req.Body != "" || req.ContentPath != ""
 	if storyID == "" {
 		slug := strings.ToUpper(strings.ReplaceAll(req.Submodule, "-", "_"))
 		if slug == "" || slug == "." {
@@ -279,7 +277,9 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = h.engine.SaveStory(st)
 	}
 
-	if hasExplicitStory && req.Enqueue {
+	var execJobID string
+	var executionStatus string
+	if req.Enqueue {
 		targetAgent := strings.TrimSpace(req.TargetAgent)
 		if targetAgent == "" {
 			targetAgent = "autopilot"
@@ -293,7 +293,6 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"prompt":       fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", storyID, storyID, req.Submodule),
 			"target_agent": targetAgent,
 		})
-		var execJobID string
 		if h.queue != nil {
 			ej, _ := h.queue.Enqueue(r.Context(), &dispatch.Job{
 				Type:        dispatch.JobTypePromptExecute,
@@ -306,177 +305,31 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			})
 			if ej != nil {
 				execJobID = ej.ID
+				executionStatus = "pending"
 			}
 		}
 		if h.scheduler != nil {
 			_, _ = h.scheduler.EnqueueGlobalStorySchedule(storyID, req.Submodule, targetAgent, fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", storyID, storyID, req.Submodule))
 		}
-
-		resp := CreateStoryResponse{
-			HarnessJobID:     execJobID,
-			Status:           "created",
-			StoryID:          storyID,
-			Submodule:        req.Submodule,
-			StoryPath:        fmt.Sprintf("docs/stories/%s.story.md", strings.ToLower(storyID)),
-			IndexUpdated:     true,
-			SyncState:        "PENDING_WORKSPACE_MATERIALIZATION",
-			ExecutionJobID:   execJobID,
-			ExecutionStatus:  "pending",
-			CreatedAt:        time.Now().UTC().Format(time.RFC3339),
-			IdempotentReplay: false,
-		}
-		respBytes, _ := json.Marshal(resp)
-		if idempotencyKey != "" {
-			h.idempotency.Store(idempotencyKey, payloadHash, http.StatusCreated, respBytes)
-		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write(respBytes)
-		return
 	}
-
-	job, err := h.queue.Enqueue(r.Context(), &dispatch.Job{
-		Type:     dispatch.JobTypeStoryCreate,
-		Repo:     req.Submodule,
-		Payload:  bodyBytes,
-		TraceID:  jobTraceID,
-		ParentID: span.ID,
-		SearchID: strings.TrimSpace(req.SearchID),
-	})
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to enqueue story: %v", err))
-		return
-	}
-
-	// Bounded Await with Async Fallback
-	completedJob, err := h.queue.Await(r.Context(), job.ID, h.dispatchWait)
-	if errors.Is(err, dispatch.ErrTimeout) {
-		// Timeout reached -> 202 Accepted
-		resp := CreateStoryResponse{
-			HarnessJobID:     job.ID,
-			Status:           "queued",
-			Submodule:        req.Submodule,
-			CreatedAt:        job.CreatedAt.Format(time.RFC3339),
-			IdempotentReplay: false,
-		}
-
-		// When enqueue: true is requested, guarantee that execution is dispatched when the scaffolding job completes in the background
-		if req.Enqueue {
-			targetAgent := strings.TrimSpace(req.TargetAgent)
-			if targetAgent == "" {
-				targetAgent = "autopilot"
-			}
-			go func(jobID, submodule, title, agent, sID, pSpanID string) {
-				watchCtx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-				defer cancel()
-
-				cJob, aErr := h.queue.Await(watchCtx, jobID, 15*time.Minute)
-				if aErr == nil && cJob != nil && cJob.Status == dispatch.JobStatusCompleted {
-					var res StoryResultPayload
-					if jErr := json.Unmarshal(cJob.Result, &res); jErr == nil && res.StoryID != "" {
-						promptID := fmt.Sprintf("prompt_%s_%d", res.StoryID, time.Now().Unix())
-						execPayload, _ := json.Marshal(map[string]any{
-							"prompt_id":    promptID,
-							"repo":         submodule,
-							"story_id":     res.StoryID,
-							"title":        fmt.Sprintf("Execute story %s: %s", res.StoryID, title),
-							"prompt":       fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", res.StoryID, res.StoryID, submodule),
-							"target_agent": agent,
-						})
-						_, _ = h.queue.Enqueue(context.Background(), &dispatch.Job{
-							Type:        dispatch.JobTypePromptExecute,
-							Repo:        submodule,
-							TargetAgent: agent,
-							Payload:     execPayload,
-							TraceID:     jobTraceID,
-							ParentID:    pSpanID,
-							SearchID:    sID,
-						})
-						if h.scheduler != nil {
-							_, _ = h.scheduler.EnqueueGlobalStorySchedule(res.StoryID, submodule, agent, fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", res.StoryID, res.StoryID, submodule))
-						}
-					}
-				}
-			}(job.ID, req.Submodule, req.Title, targetAgent, strings.TrimSpace(req.SearchID), span.ID)
-		}
-
-		respBytes, _ := json.Marshal(resp)
-		if idempotencyKey != "" {
-			h.idempotency.Store(idempotencyKey, payloadHash, http.StatusAccepted, respBytes)
-		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write(respBytes)
-		return
-	}
-
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("error awaiting story execution: %v", err))
-		return
-	}
-
-	if completedJob.Status == dispatch.JobStatusFailed {
-		if strings.Contains(completedJob.Error, "WORKSPACE_LOCKED") {
-			writeJSONError(w, http.StatusLocked, fmt.Sprintf("workspace locked: %s", completedJob.Error))
-			return
-		}
-		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("story execution failed: %s", completedJob.Error))
-		return
-	}
-
-	var result StoryResultPayload
-	_ = json.Unmarshal(completedJob.Result, &result)
 
 	resp := CreateStoryResponse{
-		HarnessJobID:     job.ID,
-		Status:           "completed",
-		StoryID:          result.StoryID,
+		HarnessJobID:     execJobID,
+		Status:           "created",
+		StoryID:          storyID,
 		Submodule:        req.Submodule,
-		StoryPath:        result.StoryPath,
-		IndexUpdated:     result.IndexUpdated,
-		CreatedAt:        job.CreatedAt.Format(time.RFC3339),
+		StoryPath:        fmt.Sprintf("docs/stories/%s.story.md", strings.ToLower(storyID)),
+		IndexUpdated:     true,
+		SyncState:        "PENDING_WORKSPACE_MATERIALIZATION",
+		ExecutionJobID:   execJobID,
+		ExecutionStatus:  executionStatus,
+		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
 		IdempotentReplay: false,
 	}
-
-	if req.Enqueue && result.StoryID != "" {
-		targetAgent := strings.TrimSpace(req.TargetAgent)
-		if targetAgent == "" {
-			targetAgent = "autopilot"
-		}
-		promptID := fmt.Sprintf("prompt_%s_%d", result.StoryID, time.Now().Unix())
-		execPayload, _ := json.Marshal(map[string]any{
-			"prompt_id":    promptID,
-			"repo":         req.Submodule,
-			"story_id":     result.StoryID,
-			"title":        fmt.Sprintf("Execute story %s: %s", result.StoryID, req.Title),
-			"prompt":       fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", result.StoryID, result.StoryID, req.Submodule),
-			"target_agent": targetAgent,
-		})
-		execJob, _ := h.queue.Enqueue(r.Context(), &dispatch.Job{
-			Type:        dispatch.JobTypePromptExecute,
-			Repo:        req.Submodule,
-			TargetAgent: targetAgent,
-			Payload:     execPayload,
-			TraceID:     jobTraceID,
-			ParentID:    span.ID,
-			SearchID:    strings.TrimSpace(req.SearchID),
-		})
-		if execJob != nil {
-			resp.ExecutionJobID = execJob.ID
-			resp.ExecutionStatus = execJob.Status
-		}
-		if h.scheduler != nil {
-			go func() {
-				_, _ = h.scheduler.EnqueueGlobalStorySchedule(result.StoryID, req.Submodule, targetAgent, fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", result.StoryID, result.StoryID, req.Submodule))
-			}()
-		}
-	}
-
 	respBytes, _ := json.Marshal(resp)
 	if idempotencyKey != "" {
 		h.idempotency.Store(idempotencyKey, payloadHash, http.StatusCreated, respBytes)
 	}
-
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusCreated)
 	_, _ = w.Write(respBytes)
@@ -623,31 +476,35 @@ func (h *StoriesHandler) ListStories(w http.ResponseWriter, r *http.Request) {
 		limit = 100
 	}
 
-	root := findStoriesRoot()
-	all := loadIndexStories(root)
+	var all []StoryDetail
+	seen := make(map[string]bool)
 
+	// 1. Database engine is authoritative:
 	if h.engine != nil {
-		seen := make(map[string]bool, len(all))
-		for _, s := range all {
-			seen[s.ID] = true
-		}
 		for _, s := range h.engine.ListStories("") {
-			if !seen[s.ID] {
-				var subs []string
-				if s.Submodule != "" {
-					subs = []string{s.Submodule}
-				}
-				all = append(all, StoryDetail{
-					ID:         s.ID,
-					Title:      s.Title,
-					Status:     s.Status,
-					Priority:   s.Priority,
-					Path:       fmt.Sprintf("docs/stories/%s.story.md", strings.ToLower(s.ID)),
-					Submodules: subs,
-					Content:    s.Body,
-				})
-				seen[s.ID] = true
+			var subs []string
+			if s.Submodule != "" {
+				subs = []string{s.Submodule}
 			}
+			all = append(all, StoryDetail{
+				ID:         s.ID,
+				Title:      s.Title,
+				Status:     s.Status,
+				Priority:   s.Priority,
+				Path:       fmt.Sprintf("docs/stories/%s.story.md", strings.ToLower(s.ID)),
+				Submodules: subs,
+				Content:    s.Body,
+			})
+			seen[strings.ToUpper(s.ID)] = true
+		}
+	}
+
+	// 2. Load disk index as fallback for legacy stories not yet in DB:
+	root := findStoriesRoot()
+	for _, s := range loadIndexStories(root) {
+		if !seen[strings.ToUpper(s.ID)] {
+			all = append(all, s)
+			seen[strings.ToUpper(s.ID)] = true
 		}
 	}
 
@@ -702,40 +559,36 @@ func (h *StoriesHandler) GetStory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	root := findStoriesRoot()
-	all := loadIndexStories(root)
+	var found *StoryDetail
 
+	// 1. Database engine is authoritative:
 	if h.engine != nil {
-		seen := make(map[string]bool, len(all))
-		for _, s := range all {
-			seen[s.ID] = true
-		}
-		for _, s := range h.engine.ListStories("") {
-			if !seen[s.ID] {
-				var subs []string
-				if s.Submodule != "" {
-					subs = []string{s.Submodule}
-				}
-				all = append(all, StoryDetail{
-					ID:         s.ID,
-					Title:      s.Title,
-					Status:     s.Status,
-					Priority:   s.Priority,
-					Path:       fmt.Sprintf("docs/stories/%s.story.md", strings.ToLower(s.ID)),
-					Submodules: subs,
-					Content:    s.Body,
-				})
-				seen[s.ID] = true
+		if s, ok := h.engine.GetStory(id); ok {
+			var subs []string
+			if s.Submodule != "" {
+				subs = []string{s.Submodule}
+			}
+			found = &StoryDetail{
+				ID:         s.ID,
+				Title:      s.Title,
+				Status:     s.Status,
+				Priority:   s.Priority,
+				Path:       fmt.Sprintf("docs/stories/%s.story.md", strings.ToLower(s.ID)),
+				Submodules: subs,
+				Content:    s.Body,
 			}
 		}
 	}
 
-	var found *StoryDetail
-	for _, s := range all {
-		if strings.EqualFold(s.ID, id) {
-			match := s
-			found = &match
-			break
+	// 2. Fallback to disk index:
+	root := findStoriesRoot()
+	if found == nil {
+		for _, s := range loadIndexStories(root) {
+			if strings.EqualFold(s.ID, id) {
+				match := s
+				found = &match
+				break
+			}
 		}
 	}
 
