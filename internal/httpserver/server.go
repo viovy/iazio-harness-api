@@ -112,6 +112,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/stories/{id}/execute", jobLifecycle.ExecuteStory)
 
 	agentJobsHandler := handlers.NewAgentJobsHandler(queue)
+	mux.HandleFunc("POST /api/v1/agent/jobs/claim", agentJobsHandler.ClaimHandler)
+	mux.HandleFunc("POST /v1/agent/jobs/claim", agentJobsHandler.ClaimHandler)
 	mux.HandleFunc("POST /api/v1/agent/jobs/{id}/complete", agentJobsHandler.CompleteHandler)
 
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) {
@@ -1473,6 +1475,29 @@ func (s *Server) refreshProfileReleases(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusBadGateway, err)
 		return
 	}
+
+	updated := false
+	for i := range p.Tools {
+		toolName := strings.ToLower(p.Tools[i].Name)
+		repoName := strings.ToLower(p.Tools[i].Repository)
+		for _, rel := range releases {
+			relTool := strings.ToLower(rel.Name)
+			relRepo := strings.ToLower(rel.Repository)
+			if (relTool == toolName || relRepo == repoName || strings.HasSuffix(relRepo, "/"+toolName)) &&
+				rel.LatestVersion != "" && rel.Error == "" {
+				p.Tools[i].TargetVersion = rel.LatestVersion
+				updated = true
+				break
+			}
+		}
+	}
+	if updated {
+		saved, uErr := s.Engine.UpsertProfile(*p)
+		if uErr == nil && s.SaveProfile != nil && saved != nil {
+			s.SaveProfile(*saved)
+		}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"profile":  name,
 		"releases": releases,

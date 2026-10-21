@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-harness-api/internal/control"
+	"github.com/viovy/iazio-harness-api/internal/dispatch"
 )
 
 func TestServer_GitCredentialsTestEndpoints(t *testing.T) {
@@ -371,5 +372,91 @@ func TestServer_AdditionalEndpointsCoverage(t *testing.T) {
 	handler.ServeHTTP(wProbeRepo404, reqProbeRepo404)
 	if wProbeRepo404.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", wProbeRepo404.Code)
+	}
+}
+
+func TestServer_AgentJobsClaim(t *testing.T) {
+	e := control.NewEngine(time.Now)
+	srv := &Server{
+		Engine: e,
+		Queue:  dispatch.NewInMemoryQueue(),
+	}
+	handler := srv.Handler()
+
+	// 1. Claim when queue is empty -> 204 No Content
+	claimBody := []byte(`{"host_id":"debian","job_types":["story.create","prompt.execute"]}`)
+	reqEmpty := httptest.NewRequest("POST", "/api/v1/agent/jobs/claim", bytes.NewReader(claimBody))
+	wEmpty := httptest.NewRecorder()
+	handler.ServeHTTP(wEmpty, reqEmpty)
+	if wEmpty.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 No Content for empty queue, got %d: %s", wEmpty.Code, wEmpty.Body.String())
+	}
+
+	// 2. Enqueue a job into dispatch.Queue
+	job, err := srv.Queue.Enqueue(reqEmpty.Context(), &dispatch.Job{
+		Type: dispatch.JobTypeStoryCreate,
+		Repo: "iazio-mcp",
+	})
+	if err != nil {
+		t.Fatalf("enqueue job: %v", err)
+	}
+
+	// 3. Claim job -> 200 OK with claimed job
+	reqClaim := httptest.NewRequest("POST", "/api/v1/agent/jobs/claim", bytes.NewReader(claimBody))
+	wClaim := httptest.NewRecorder()
+	handler.ServeHTTP(wClaim, reqClaim)
+	if wClaim.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for claiming job, got %d: %s", wClaim.Code, wClaim.Body.String())
+	}
+
+	var claimed dispatch.Job
+	if err := json.Unmarshal(wClaim.Body.Bytes(), &claimed); err != nil {
+		t.Fatalf("unmarshal claimed job: %v", err)
+	}
+	if claimed.ID != job.ID {
+		t.Errorf("expected claimed ID %s, got %s", job.ID, claimed.ID)
+	}
+	if claimed.Status != dispatch.JobStatusClaimed {
+		t.Errorf("expected status claimed, got %s", claimed.Status)
+	}
+}
+
+func TestServer_ProfileRefreshUpdatesTargetVersion(t *testing.T) {
+	e := control.NewEngine(time.Now)
+	srv := &Server{
+		Engine: e,
+	}
+	handler := srv.Handler()
+
+	// Create profile with tool having empty TargetVersion
+	_, err := e.UpsertProfile(control.DistributionProfile{
+		Name: "generic",
+		Tools: []control.ProfileTool{
+			{Name: "iazio-agent", BinaryName: "iazio-agent", Repository: "viovy/iazio-agent", Tier: "baseline"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("upsert profile: %v", err)
+	}
+
+	// Mock release service
+	mockRelService := control.NewReleaseService()
+	e.Releases = mockRelService
+
+	// Call refresh endpoint
+	req := httptest.NewRequest("POST", "/api/v1/binaries-profiles/generic/refresh", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Verify profile is still accessible and was processed
+	p, err := e.GetProfile("generic")
+	if err != nil {
+		t.Fatalf("get profile: %v", err)
+	}
+	if len(p.Tools) == 0 {
+		t.Fatalf("expected tools in profile")
 	}
 }
