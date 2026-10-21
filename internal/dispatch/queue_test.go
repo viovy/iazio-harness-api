@@ -3,6 +3,7 @@ package dispatch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -481,5 +482,164 @@ func TestQueue_AwaitUnblocksOnExpiration(t *testing.T) {
 	}
 	if completedJob == nil || completedJob.Status != JobStatusFailed {
 		t.Fatalf("expected await to return failed job on expiry, got %+v", completedJob)
+	}
+}
+
+func TestQueue_FencedToken_Validation(t *testing.T) {
+	q := NewInMemoryQueue()
+	ctx := context.Background()
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type: JobTypeStoryCreate,
+		Repo: "repo-fencing",
+	})
+	if err != nil {
+		t.Fatalf("enqueue error: %v", err)
+	}
+
+	// First worker claims job
+	claimed1, err := q.Claim(ctx, "host-1", []string{JobTypeStoryCreate})
+	if err != nil || claimed1 == nil {
+		t.Fatalf("worker 1 claim error: %v", err)
+	}
+	if claimed1.FencingToken != 1 {
+		t.Fatalf("expected fencing token 1, got %d", claimed1.FencingToken)
+	}
+
+	// Valid heartbeat
+	hb, err := q.Heartbeat(ctx, job.ID, claimed1.FencingToken)
+	if err != nil || hb == nil {
+		t.Fatalf("heartbeat with valid token failed: %v", err)
+	}
+
+	// Stale / mismatched heartbeat rejected
+	_, err = q.Heartbeat(ctx, job.ID, 999)
+	if !errors.Is(err, ErrLeaseFenced) {
+		t.Fatalf("expected ErrLeaseFenced on invalid token heartbeat, got %v", err)
+	}
+
+	// Stale complete attempt from superseded token rejected
+	err = q.CompleteWithFencing(ctx, job.ID, 999, []byte(`{"ok":true}`), "")
+	if !errors.Is(err, ErrLeaseFenced) {
+		t.Fatalf("expected ErrLeaseFenced on stale complete attempt, got %v", err)
+	}
+
+	// Valid complete attempt succeeds
+	err = q.CompleteWithFencing(ctx, job.ID, claimed1.FencingToken, []byte(`{"ok":true}`), "")
+	if err != nil {
+		t.Fatalf("valid complete failed: %v", err)
+	}
+
+	finalJob, ok := q.Get(job.ID)
+	if !ok || finalJob.Status != JobStatusCompleted {
+		t.Fatalf("expected completed job, got %+v", finalJob)
+	}
+}
+
+func TestQueue_StalledRunnerReap_RequeuesPending(t *testing.T) {
+	q := NewInMemoryQueue()
+	ctx := context.Background()
+
+	currTime := time.Date(2026, 10, 21, 10, 0, 0, 0, time.UTC)
+	q.SetNowFunc(func() time.Time { return currTime })
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type: JobTypeStoryCreate,
+		Repo: "repo-stall",
+	})
+	if err != nil {
+		t.Fatalf("enqueue error: %v", err)
+	}
+
+	// Worker 1 claims: attempt 1
+	claimed1, err := q.Claim(ctx, "host-1", []string{JobTypeStoryCreate})
+	if err != nil || claimed1 == nil {
+		t.Fatalf("claim 1 error: %v", err)
+	}
+	if claimed1.Attempts != 1 || claimed1.FencingToken != 1 {
+		t.Fatalf("unexpected claim 1 state: attempts=%d, token=%d", claimed1.Attempts, claimed1.FencingToken)
+	}
+	token1 := claimed1.FencingToken
+
+	// Worker 1 stalls: advance time past heartbeat timeout (2 minutes)
+	currTime = currTime.Add(3 * time.Minute)
+
+	// Sweep reaps expired heartbeat: should revert to pending since attempts (1) < DefaultMaxAttempts (3)
+	reaped := q.ReapExpired(currTime)
+	if len(reaped) != 1 || reaped[0] != job.ID {
+		t.Fatalf("expected reaped job %s, got %v", job.ID, reaped)
+	}
+
+	j, ok := q.Get(job.ID)
+	if !ok || j.Status != JobStatusPending {
+		t.Fatalf("expected job to revert to pending for retry, got status=%s", j.Status)
+	}
+
+	// Worker 2 claims the recovered job: attempt 2, monotonic fencing token 2
+	claimed2, err := q.Claim(ctx, "host-2", []string{JobTypeStoryCreate})
+	if err != nil || claimed2 == nil {
+		t.Fatalf("claim 2 error: %v", err)
+	}
+	if claimed2.Attempts != 2 || claimed2.FencingToken != 2 {
+		t.Fatalf("unexpected claim 2 state: attempts=%d, token=%d", claimed2.Attempts, claimed2.FencingToken)
+	}
+	token2 := claimed2.FencingToken
+
+	// Delayed zombie write from Worker 1 (token 1) must be deterministically rejected!
+	err = q.CompleteWithFencing(ctx, job.ID, token1, []byte(`{"mutated":true}`), "")
+	if !errors.Is(err, ErrLeaseFenced) {
+		t.Fatalf("expected ErrLeaseFenced for delayed zombie write, got %v", err)
+	}
+
+	// Empty or zero-token write from caller must also be rejected when job has an active fencing token
+	err = q.CompleteWithFencing(ctx, job.ID, 0, []byte(`{"bypass":true}`), "")
+	if !errors.Is(err, ErrLeaseFenced) {
+		t.Fatalf("expected ErrLeaseFenced for zero-token bypass write, got %v", err)
+	}
+
+	// Zero-token heartbeat must also be rejected
+	_, err = q.Heartbeat(ctx, job.ID, 0)
+	if !errors.Is(err, ErrLeaseFenced) {
+		t.Fatalf("expected ErrLeaseFenced for zero-token heartbeat, got %v", err)
+	}
+
+	// Worker 2 completes successfully with token 2
+	err = q.CompleteWithFencing(ctx, job.ID, token2, []byte(`{"success":true}`), "")
+	if err != nil {
+		t.Fatalf("worker 2 complete failed: %v", err)
+	}
+}
+
+func TestQueue_AgentAffinity(t *testing.T) {
+	q := NewInMemoryQueue()
+	ctx := context.Background()
+
+	_, err := q.Enqueue(ctx, &Job{
+		Type: JobTypeStoryCreate,
+		Repo: "repo-affinity",
+		AgentAffinity: &AgentAffinity{
+			HostID: "host-dedicated",
+		},
+	})
+	if err != nil {
+		t.Fatalf("enqueue error: %v", err)
+	}
+
+	// Other host cannot claim
+	claimedOther, err := q.Claim(ctx, "host-other", []string{JobTypeStoryCreate})
+	if err != nil {
+		t.Fatalf("claim other error: %v", err)
+	}
+	if claimedOther != nil {
+		t.Fatalf("expected nil for mismatched host, got %+v", claimedOther)
+	}
+
+	// Dedicated host claims successfully
+	claimedDedicated, err := q.Claim(ctx, "host-dedicated", []string{JobTypeStoryCreate})
+	if err != nil {
+		t.Fatalf("claim dedicated error: %v", err)
+	}
+	if claimedDedicated == nil {
+		t.Fatal("expected dedicated host to claim job")
 	}
 }
