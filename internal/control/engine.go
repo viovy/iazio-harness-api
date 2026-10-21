@@ -15,11 +15,19 @@ import (
 )
 
 var (
-	storyIDPattern     = regexp.MustCompile(`(?i)\b(STORY-[A-Z0-9]+-[0-9]+)\b`)
-	prefixStoryPattern = regexp.MustCompile(`(?i)\b([a-z0-9]{2,10})-([0-9]{3,5})\b`)
+	storyIDPattern       = regexp.MustCompile(`(?i)\b(STORY-[A-Z0-9]+(?:-[A-Z0-9]+)*-[0-9]+)\b`)
+	prefixStoryPattern   = regexp.MustCompile(`(?i)\b([a-z0-9]{2,10})-([0-9]{3,5})\b`)
+	frontmatterIDPattern = regexp.MustCompile(`(?im)^id:\s*["']?([A-Za-z0-9_-]+)["']?`)
 )
 
 func extractStoryIDFromString(s string) string {
+	if m := frontmatterIDPattern.FindStringSubmatch(s); len(m) > 1 {
+		val := strings.TrimSpace(m[1])
+		if !strings.HasPrefix(strings.ToUpper(val), "STORY-") {
+			val = "STORY-" + strings.ToUpper(val)
+		}
+		return strings.ToUpper(val)
+	}
 	if m := storyIDPattern.FindStringSubmatch(s); len(m) > 1 {
 		return strings.ToUpper(m[1])
 	}

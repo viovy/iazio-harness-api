@@ -596,3 +596,54 @@ func TestServer_ToolPriority(t *testing.T) {
 		t.Fatalf("expected 200 OK, got %d: %s", wGetAPI.Code, wGetAPI.Body.String())
 	}
 }
+
+func TestServer_CheckFleetStatus_DirtyFilesFormatting(t *testing.T) {
+	e := control.NewEngine(time.Now)
+	srv := &Server{
+		Engine: e,
+	}
+	handler := srv.Handler()
+
+	// Ingest repo with dirty porcelain
+	_ = e.UpsertRepo(control.Repo{
+		HostID:       "pc1",
+		WorktreePath: "C:\\work\\meta-repo",
+	})
+	e.ApplyPreflight("pc1", "C:\\work\\meta-repo", control.Preflight{
+		Kind:          control.KindOrdinary,
+		Branch:        "chore/gov-3655",
+		WorkPorcelain: " M docs/stories/index.yml\n?? docs/stories/new.story.md",
+	})
+
+	req := httptest.NewRequest("POST", "/v1/hosts/pc1/repos/check-fleet-status?path=C:\\work\\meta-repo&timeout_ms=10", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var envelope struct {
+		ProbeID string                        `json:"probe_id"`
+		Status  string                        `json:"status"`
+		Result  control.RepoFleetStatusResult `json:"result"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("unmarshal probe response: %v", err)
+	}
+
+	if len(envelope.Result.ModifiedFiles) != 1 || envelope.Result.ModifiedFiles[0] != "docs/stories/index.yml" {
+		t.Errorf("unexpected ModifiedFiles: %+v", envelope.Result.ModifiedFiles)
+	}
+	if len(envelope.Result.UntrackedFiles) != 1 || envelope.Result.UntrackedFiles[0] != "docs/stories/new.story.md" {
+		t.Errorf("unexpected UntrackedFiles: %+v", envelope.Result.UntrackedFiles)
+	}
+	if !strings.Contains(envelope.Result.DiagnosticSummary, "Working Tree: DIRTY (1 modified, 1 untracked)") {
+		t.Errorf("summary missing count line: %s", envelope.Result.DiagnosticSummary)
+	}
+	if !strings.Contains(envelope.Result.DiagnosticSummary, "  M  docs/stories/index.yml") {
+		t.Errorf("summary missing modified file: %s", envelope.Result.DiagnosticSummary)
+	}
+	if !strings.Contains(envelope.Result.DiagnosticSummary, "  ?? docs/stories/new.story.md") {
+		t.Errorf("summary missing untracked file: %s", envelope.Result.DiagnosticSummary)
+	}
+}
