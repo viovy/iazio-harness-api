@@ -70,6 +70,31 @@ func (e *Engine) ConsumePendingToolUpdate(hostID string) *PendingToolUpdate {
 	return res
 }
 
+// QueueCommand registers a command to be delivered to the host on its next check/heartbeat.
+func (e *Engine) QueueCommand(hostID string, cmd CommandEnvelope) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	h, ok := e.hosts[hostID]
+	if !ok {
+		return ErrNotFound
+	}
+	h.PendingCommands = append(h.PendingCommands, cmd)
+	return nil
+}
+
+// ConsumePendingCommands retrieves and clears all pending commands for a host.
+func (e *Engine) ConsumePendingCommands(hostID string) []CommandEnvelope {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	h, ok := e.hosts[hostID]
+	if !ok || len(h.PendingCommands) == 0 {
+		return nil
+	}
+	cmds := h.PendingCommands
+	h.PendingCommands = nil
+	return cmds
+}
+
 // HeartbeatDetailed stores the tool inventory, updates presence, and reconciles active jobs.
 func (e *Engine) HeartbeatDetailed(id, presence string, tools []Tool, fetchFailed bool, activeJobs ...ActiveJob) error {
 	e.mu.Lock()

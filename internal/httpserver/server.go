@@ -1294,9 +1294,13 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	pending := s.Engine.ConsumePendingToolUpdate(hostID)
+	pendingCmds := s.Engine.ConsumePendingCommands(hostID)
 	res := map[string]any{"status": "ok"}
 	if pending != nil {
 		res["pending_tool_update"] = pending
+	}
+	if len(pendingCmds) > 0 {
+		res["pending_commands"] = pendingCmds
 	}
 	writeJSON(w, http.StatusOK, res)
 }
@@ -1495,6 +1499,13 @@ func (s *Server) pingHost(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+	if isOnline {
+		_ = s.Engine.QueueCommand(hostID, control.CommandEnvelope{
+			ID:        fmt.Sprintf("ping-%d", time.Now().UnixNano()),
+			Type:      "PING",
+			CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		})
+	}
 	res := map[string]any{
 		"host_id":       hostID,
 		"reachable":     isOnline,
@@ -1551,6 +1562,12 @@ func (s *Server) checkFleetStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	probeID := fmt.Sprintf("ephemeral-probe-%d", time.Now().UnixNano())
+	_ = s.Engine.QueueCommand(hostID, control.CommandEnvelope{
+		ID:        probeID,
+		Type:      "CHECK_FLEET_GIT_STATUS",
+		Payload:   actualPath,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	})
 
 	res := control.RepoFleetStatusResult{
 		RepoPath:             actualPath,

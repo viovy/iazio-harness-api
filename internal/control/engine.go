@@ -357,6 +357,14 @@ type PendingToolUpdate struct {
 	Force bool     `json:"force,omitempty"`
 }
 
+// CommandEnvelope represents a command sent from the control plane to an agent.
+type CommandEnvelope struct {
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	Payload   string `json:"payload,omitempty"`
+	CreatedAt string `json:"created_at"`
+}
+
 // Host is a registered supervisor.
 type Host struct {
 	ID                  string
@@ -368,6 +376,7 @@ type Host struct {
 	DistributionProfile string
 	Tools               []Tool
 	PendingToolUpdate   *PendingToolUpdate
+	PendingCommands     []CommandEnvelope
 }
 
 // Engine is the in-process control plane.

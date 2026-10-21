@@ -109,7 +109,7 @@ func TestReleaseService_AuthenticatedFetch(t *testing.T) {
 	svc := NewReleaseService()
 	svc.client = ts.Client()
 
-	rel, err := svc.fetchReleaseURL(context.Background(), ts.URL, "viovy/test", "test", "latest", "secret-token-xyz")
+	rel, _, _, err := svc.fetchReleaseURL(context.Background(), ts.URL, "viovy/test", "test", "latest", "secret-token-xyz", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

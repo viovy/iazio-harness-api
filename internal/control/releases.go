@@ -26,6 +26,7 @@ type ToolRelease struct {
 
 type cachedRelease struct {
 	release   ToolRelease
+	etag      string
 	expiresAt time.Time
 }
 
@@ -229,6 +230,24 @@ func (s *ReleaseService) TestCredential(ctx context.Context, token string) (GitC
 		}
 	}
 
+	// Query /rate_limit endpoint to confirm full rate limits
+	if rlReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/rate_limit", nil); err == nil {
+		rlReq.Header.Set("Authorization", "Bearer "+cleanToken)
+		rlReq.Header.Set("Accept", "application/vnd.github.v3+json")
+		rlReq.Header.Set("User-Agent", "iazio-harness-api/1.0")
+		if rlResp, err := s.client.Do(rlReq); err == nil {
+			defer rlResp.Body.Close()
+			var rlPayload struct {
+				Rate struct {
+					Remaining int `json:"remaining"`
+				} `json:"rate"`
+			}
+			if json.NewDecoder(rlResp.Body).Decode(&rlPayload) == nil && rlPayload.Rate.Remaining > 0 {
+				rateLimitRemaining = rlPayload.Rate.Remaining
+			}
+		}
+	}
+
 	return GitCredentialTestResult{
 		Valid:              true,
 		Username:           userPayload.Login,
@@ -295,12 +314,27 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 		url = fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", repo, tag)
 	}
 
+	var cachedEtag string
+	if ok {
+		cachedEtag = cached.etag
+	}
+
 	var lastErr error
-	rel, err := s.fetchReleaseURL(ctx, url, repo, toolName, targetVersion, token)
+	rel, newEtag, notModified, err := s.fetchReleaseURL(ctx, url, repo, toolName, targetVersion, token, cachedEtag)
+	if notModified && ok {
+		s.mu.Lock()
+		cached.expiresAt = now.Add(10 * time.Minute)
+		s.cache[cacheKey] = cached
+		s.mu.Unlock()
+		r := cached.release
+		r.Name = toolName
+		return r, nil
+	}
 	if err == nil && rel.LatestVersion != "" {
 		s.mu.Lock()
 		s.cache[cacheKey] = cachedRelease{
 			release:   rel,
+			etag:      newEtag,
 			expiresAt: now.Add(10 * time.Minute),
 		}
 		s.mu.Unlock()
@@ -350,26 +384,35 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 	return ToolRelease{Name: toolName, Repository: repo}, fmt.Errorf("no releases or tags found for repository %s", repo)
 }
 
-func (s *ReleaseService) fetchReleaseURL(ctx context.Context, url, repo, toolName, targetVersion, token string) (ToolRelease, error) {
+func (s *ReleaseService) fetchReleaseURL(ctx context.Context, url, repo, toolName, targetVersion, token, ifNoneMatch string) (ToolRelease, string, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return ToolRelease{Name: toolName, Repository: repo, LatestVersion: targetVersion, TagName: targetVersion}, err
+		return ToolRelease{Name: toolName, Repository: repo, LatestVersion: targetVersion, TagName: targetVersion}, "", false, err
 	}
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 	req.Header.Set("User-Agent", "iazio-harness-api/1.0")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	if ifNoneMatch != "" {
+		req.Header.Set("If-None-Match", ifNoneMatch)
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return ToolRelease{Name: toolName, Repository: repo, LatestVersion: targetVersion, TagName: targetVersion}, err
+		return ToolRelease{Name: toolName, Repository: repo, LatestVersion: targetVersion, TagName: targetVersion}, "", false, err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return ToolRelease{Name: toolName, Repository: repo, LatestVersion: targetVersion, TagName: targetVersion}, fmt.Errorf("status %d", resp.StatusCode)
+	if resp.StatusCode == http.StatusNotModified {
+		return ToolRelease{Name: toolName, Repository: repo}, ifNoneMatch, true, nil
 	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return ToolRelease{Name: toolName, Repository: repo, LatestVersion: targetVersion, TagName: targetVersion}, "", false, fmt.Errorf("status %d", resp.StatusCode)
+	}
+
+	etag := resp.Header.Get("ETag")
 
 	var ghRel struct {
 		TagName     string    `json:"tag_name"`
@@ -377,7 +420,7 @@ func (s *ReleaseService) fetchReleaseURL(ctx context.Context, url, repo, toolNam
 		PublishedAt time.Time `json:"published_at"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&ghRel); err != nil {
-		return ToolRelease{Name: toolName, Repository: repo, LatestVersion: targetVersion, TagName: targetVersion}, err
+		return ToolRelease{Name: toolName, Repository: repo, LatestVersion: targetVersion, TagName: targetVersion}, "", false, err
 	}
 
 	ver := strings.TrimPrefix(ghRel.TagName, "v")
@@ -388,7 +431,7 @@ func (s *ReleaseService) fetchReleaseURL(ctx context.Context, url, repo, toolNam
 		TagName:       ghRel.TagName,
 		PublishedAt:   ghRel.PublishedAt,
 		HTMLURL:       ghRel.HTMLURL,
-	}, nil
+	}, etag, false, nil
 }
 
 func (s *ReleaseService) fetchReleaseListURL(ctx context.Context, url, repo, toolName, token string) (ToolRelease, error) {
