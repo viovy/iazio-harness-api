@@ -371,7 +371,7 @@ func (q *InMemoryQueue) Heartbeat(ctx context.Context, jobID string, fencingToke
 	if job.Status != JobStatusClaimed {
 		return nil, fmt.Errorf("job %s is not currently claimed (status: %s)", jobID, job.Status)
 	}
-	if fencingToken > 0 && job.FencingToken != 0 && job.FencingToken != fencingToken {
+	if job.FencingToken > 0 && fencingToken != job.FencingToken {
 		return nil, ErrLeaseFenced
 	}
 
@@ -384,7 +384,14 @@ func (q *InMemoryQueue) Heartbeat(ctx context.Context, jobID string, fencingToke
 
 // Complete updates a job with final result or error and signals any awaiting callers.
 func (q *InMemoryQueue) Complete(ctx context.Context, jobID string, result json.RawMessage, errStr string) error {
-	return q.CompleteWithFencing(ctx, jobID, 0, result, errStr)
+	q.mu.Lock()
+	job, exists := q.jobs[jobID]
+	fencingToken := int64(0)
+	if exists && job != nil {
+		fencingToken = job.FencingToken
+	}
+	q.mu.Unlock()
+	return q.CompleteWithFencing(ctx, jobID, fencingToken, result, errStr)
 }
 
 // CompleteWithFencing validates the fencing token and updates the job with final result or error.
@@ -399,7 +406,7 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 		q.mu.Unlock()
 		return ErrJobAlreadyCompleted
 	}
-	if fencingToken > 0 && job.FencingToken != 0 && job.FencingToken != fencingToken {
+	if job.FencingToken > 0 && fencingToken != job.FencingToken {
 		q.mu.Unlock()
 		return ErrLeaseFenced
 	}

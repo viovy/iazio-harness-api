@@ -47,9 +47,10 @@ func TestAgentJobsHandler_ClaimAndComplete(t *testing.T) {
 		t.Errorf("expected claimed ID %s, got %s", job.ID, claimed.ID)
 	}
 
-	// 2. Complete job
+	// 2. Complete job with valid fencing token
 	completeBody, _ := json.Marshal(CompleteJobRequest{
-		Result: json.RawMessage(`{"story_id":"STORY-001"}`),
+		FencingToken: claimed.FencingToken,
+		Result:       json.RawMessage(`{"story_id":"STORY-001"}`),
 	})
 	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/agent/jobs/"+job.ID+"/complete", bytes.NewReader(completeBody))
 	w2 := httptest.NewRecorder()

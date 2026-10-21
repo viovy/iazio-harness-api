@@ -591,6 +591,18 @@ func TestQueue_StalledRunnerReap_RequeuesPending(t *testing.T) {
 		t.Fatalf("expected ErrLeaseFenced for delayed zombie write, got %v", err)
 	}
 
+	// Empty or zero-token write from caller must also be rejected when job has an active fencing token
+	err = q.CompleteWithFencing(ctx, job.ID, 0, []byte(`{"bypass":true}`), "")
+	if !errors.Is(err, ErrLeaseFenced) {
+		t.Fatalf("expected ErrLeaseFenced for zero-token bypass write, got %v", err)
+	}
+
+	// Zero-token heartbeat must also be rejected
+	_, err = q.Heartbeat(ctx, job.ID, 0)
+	if !errors.Is(err, ErrLeaseFenced) {
+		t.Fatalf("expected ErrLeaseFenced for zero-token heartbeat, got %v", err)
+	}
+
 	// Worker 2 completes successfully with token 2
 	err = q.CompleteWithFencing(ctx, job.ID, token2, []byte(`{"success":true}`), "")
 	if err != nil {
