@@ -607,15 +607,15 @@ func TestServer_CheckFleetStatus_DirtyFilesFormatting(t *testing.T) {
 	// Ingest repo with dirty porcelain
 	_ = e.UpsertRepo(control.Repo{
 		HostID:       "pc1",
-		WorktreePath: "C:\\work\\meta-repo",
+		WorktreePath: "C:\\work\\sample-repo",
 	})
-	e.ApplyPreflight("pc1", "C:\\work\\meta-repo", control.Preflight{
+	e.ApplyPreflight("pc1", "C:\\work\\sample-repo", control.Preflight{
 		Kind:          control.KindOrdinary,
 		Branch:        "chore/gov-3655",
 		WorkPorcelain: " M docs/stories/index.yml\n?? docs/stories/new.story.md",
 	})
 
-	req := httptest.NewRequest("POST", "/v1/hosts/pc1/repos/check-fleet-status?path=C:\\work\\meta-repo&timeout_ms=10", nil)
+	req := httptest.NewRequest("POST", "/v1/hosts/pc1/repos/check-fleet-status?path=C:\\work\\sample-repo&timeout_ms=10", nil)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
