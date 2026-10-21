@@ -61,6 +61,8 @@ type Server struct {
 	Queue dispatch.Queue
 	// Idempotency manages API idempotency caches.
 	Idempotency *handlers.IdempotencyStore
+	// StoryValidator validates story existence before execution.
+	StoryValidator handlers.StoryValidator
 
 	notificationsMu sync.RWMutex
 	notifications   []NotificationRecord
@@ -155,6 +157,9 @@ func (s *Server) Handler() http.Handler {
 	if s.Engine != nil {
 		jobLifecycle.SetScheduler(s.Engine)
 		jobLifecycle.SetHistoryFinder(s.Engine)
+	}
+	if s.StoryValidator != nil {
+		jobLifecycle.SetStoryValidator(s.StoryValidator)
 	}
 	mux.HandleFunc("GET /api/v1/jobs/{id}", jobLifecycle.GetJob)
 	mux.HandleFunc("GET /api/v1/jobs/{id}/attribution", jobLifecycle.GetJobAttribution)

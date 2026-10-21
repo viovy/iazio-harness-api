@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -21,12 +23,18 @@ type HistoryFinder interface {
 	FindHistoryRow(jobID string) (control.HistoryRow, string, string, bool)
 }
 
+// StoryValidator validates story existence before execution dispatch.
+type StoryValidator interface {
+	StoryExists(storyID, submodule string) bool
+}
+
 // JobLifecycleHandler manages querying, listing, canceling, and retrying agent jobs.
 type JobLifecycleHandler struct {
-	queue         dispatch.Queue
-	store         codebase.Store
-	scheduler     GlobalScheduler
-	historyFinder HistoryFinder
+	queue          dispatch.Queue
+	store          codebase.Store
+	scheduler      GlobalScheduler
+	historyFinder  HistoryFinder
+	storyValidator StoryValidator
 }
 
 // NewJobLifecycleHandler constructs a new JobLifecycleHandler.
@@ -49,6 +57,50 @@ func (h *JobLifecycleHandler) SetScheduler(scheduler GlobalScheduler) {
 // SetHistoryFinder sets the historical job lookup handler.
 func (h *JobLifecycleHandler) SetHistoryFinder(finder HistoryFinder) {
 	h.historyFinder = finder
+}
+
+// SetStoryValidator sets the story validation provider.
+func (h *JobLifecycleHandler) SetStoryValidator(v StoryValidator) {
+	h.storyValidator = v
+}
+
+func (h *JobLifecycleHandler) isStoryAvailable(storyID, submodule string) bool {
+	if h.storyValidator != nil {
+		return h.storyValidator.StoryExists(storyID, submodule)
+	}
+
+	root := findStoriesRoot()
+	all := loadIndexStories(root)
+	for _, s := range all {
+		if strings.EqualFold(s.ID, storyID) {
+			return true
+		}
+	}
+
+	// Also check if any .story.md file matches this storyID in docs/stories or submodule/docs/stories
+	storyCandidates := []string{
+		filepath.Join(root, "docs", "stories"),
+	}
+	if submodule != "" && submodule != "." {
+		storyCandidates = append(storyCandidates,
+			filepath.Join(root, submodule, "docs", "stories"),
+			filepath.Join(submodule, "docs", "stories"),
+		)
+	}
+
+	for _, dir := range storyCandidates {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if strings.Contains(strings.ToUpper(e.Name()), strings.ToUpper(storyID)) && strings.HasSuffix(e.Name(), ".story.md") {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 // JobDetailResponse is the detailed JSON representation of a dispatch job.
@@ -294,6 +346,12 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 	if submodule == "" {
 		submodule = "."
 	}
+
+	if !h.isStoryAvailable(storyID, submodule) {
+		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("story %q not found in backlog: cannot execute nonexistent story. Create it first using create_story or verify it exists in docs/stories/.", storyID))
+		return
+	}
+
 	targetAgent := strings.TrimSpace(req.TargetAgent)
 	if targetAgent == "" {
 		targetAgent = "autopilot"
@@ -304,6 +362,13 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		promptText = fmt.Sprintf("# Execute Story %s\n\nExecute autonomous story flow for %s in %s.", storyID, storyID, submodule)
 	}
 
+	if t := strings.TrimSpace(req.TraceID); t != "" {
+		traceID = t
+	}
+	if traceID == "" {
+		traceID = span.TraceID
+	}
+
 	promptID := fmt.Sprintf("prompt_%s_%d", storyID, time.Now().Unix())
 	execPayload, err := json.Marshal(map[string]any{
 		"prompt_id":    promptID,
@@ -312,17 +377,11 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		"title":        fmt.Sprintf("Execute story %s", storyID),
 		"prompt":       promptText,
 		"target_agent": targetAgent,
+		"trace_id":     traceID,
 	})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to marshal execution payload: %v", err))
 		return
-	}
-
-	if t := strings.TrimSpace(req.TraceID); t != "" {
-		traceID = t
-	}
-	if traceID == "" {
-		traceID = span.TraceID
 	}
 
 	job, err := h.queue.Enqueue(r.Context(), &dispatch.Job{

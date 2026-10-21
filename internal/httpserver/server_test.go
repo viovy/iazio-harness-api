@@ -1736,8 +1736,21 @@ func TestServerExtendedHandlers(t *testing.T) {
 	_ = deletedProfiles
 }
 
+type testStoryValidator struct {
+	stories map[string]bool
+}
+
+func (v *testStoryValidator) StoryExists(storyID, submodule string) bool {
+	return v.stories[storyID]
+}
+
 func TestServer_DispatchAndStoryRoutesMounted(t *testing.T) {
-	s := &Server{Engine: control.NewEngine(nil)}
+	s := &Server{
+		Engine: control.NewEngine(nil),
+		StoryValidator: &testStoryValidator{
+			stories: map[string]bool{"STORY-TEST": true},
+		},
+	}
 	handler := s.Handler()
 
 	// 1. Check GET /api/v1/queue -> 200 OK (not 404)
