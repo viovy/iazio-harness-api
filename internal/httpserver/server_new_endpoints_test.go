@@ -145,12 +145,12 @@ func TestServer_CheckFleetStatusAndRepoRuntimeStatus(t *testing.T) {
 	_ = e.RegisterHost("debian", "linux", "generic")
 	err := e.UpsertRepo(control.Repo{
 		HostID:        "debian",
-		WorktreePath:  "/home/romeo/work/meta-repo",
-		DocsHubPath:   "/home/romeo/work/docs",
-		CloneURL:      "https://github.com/viovy/meta-repo.git",
+		WorktreePath:  "/work/sample-repo",
+		DocsHubPath:   "/work/docs",
+		CloneURL:      "https://github.com/example/sample-repo.git",
 		DefaultBranch: "main",
 		CurrentBranch: "main",
-		RepoAlias:     "meta-repo",
+		RepoAlias:     "sample-repo",
 	})
 	if err != nil {
 		t.Fatalf("register repo: %v", err)
@@ -159,8 +159,8 @@ func TestServer_CheckFleetStatusAndRepoRuntimeStatus(t *testing.T) {
 	// 1. Post Repo Runtime Status from agent
 	runtimePayload := `[
 		{
-			"repo_path": "/home/romeo/work/meta-repo",
-			"alias": "meta-repo",
+			"repo_path": "/work/sample-repo",
+			"alias": "sample-repo",
 			"is_clean": true,
 			"branch": "main",
 			"submodules_clean": true,
@@ -178,7 +178,7 @@ func TestServer_CheckFleetStatusAndRepoRuntimeStatus(t *testing.T) {
 	}
 
 	// Verify repo contains updated telemetry
-	r, ok := e.GetRepo("debian", "meta-repo")
+	r, ok := e.GetRepo("debian", "sample-repo")
 	if !ok {
 		t.Fatalf("repo not found")
 	}
@@ -197,7 +197,7 @@ func TestServer_CheckFleetStatusAndRepoRuntimeStatus(t *testing.T) {
 				if cmd.Type == "CHECK_FLEET_GIT_STATUS" {
 					e.UpdateRepoRuntimeStatus("debian", []control.RepoRuntimeStatus{
 						{
-							RepoPath:             "/home/romeo/work/meta-repo",
+							RepoPath:             "/work/sample-repo",
 							Branch:               "main",
 							IsClean:              true,
 							SubmodulesClean:      true,
@@ -215,7 +215,7 @@ func TestServer_CheckFleetStatusAndRepoRuntimeStatus(t *testing.T) {
 		}
 	}()
 
-	reqProbe := httptest.NewRequest("POST", "/v1/hosts/debian/repos/check-fleet-status?path=meta-repo&timeout_ms=500", nil)
+	reqProbe := httptest.NewRequest("POST", "/v1/hosts/debian/repos/check-fleet-status?path=sample-repo&timeout_ms=500", nil)
 	wProbe := httptest.NewRecorder()
 	handler.ServeHTTP(wProbe, reqProbe)
 	if wProbe.Code != http.StatusOK {
@@ -249,7 +249,7 @@ func TestServer_CheckFleetStatusAndRepoRuntimeStatus(t *testing.T) {
 	}
 
 	// 3. Test probe timeout fallback to cached Repo
-	reqFallback := httptest.NewRequest("POST", "/v1/hosts/debian/repos/check-fleet-status?path=meta-repo&timeout_ms=50", nil)
+	reqFallback := httptest.NewRequest("POST", "/v1/hosts/debian/repos/check-fleet-status?path=sample-repo&timeout_ms=50", nil)
 	wFallback := httptest.NewRecorder()
 	handler.ServeHTTP(wFallback, reqFallback)
 	if wFallback.Code != http.StatusOK {
