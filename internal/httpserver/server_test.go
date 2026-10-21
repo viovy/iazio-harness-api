@@ -1884,3 +1884,58 @@ func TestServer_DispatchQueueUnifiedWithHarnessRoutes(t *testing.T) {
 		t.Fatalf("job %s not found in /v1/history", job.ID)
 	}
 }
+
+func TestServer_CancelDispatchScheduleBridge(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	s := &Server{
+		Engine: control.NewEngine(nil),
+		Queue:  q,
+	}
+	handler := s.Handler()
+
+	job, err := q.Enqueue(context.Background(), &dispatch.Job{
+		ID:     "job_cancel_bridge_123",
+		Type:   dispatch.JobTypePromptExecute,
+		Repo:   "repo-test",
+		Status: dispatch.JobStatusPending,
+	})
+	if err != nil {
+		t.Fatalf("failed to enqueue: %v", err)
+	}
+
+	// Cancel via /v1/schedules/{id}/cancel
+	reqCancel := httptest.NewRequest(http.MethodPost, "/v1/schedules/"+job.ID+"/cancel", strings.NewReader("{}"))
+	rrCancel := httptest.NewRecorder()
+	handler.ServeHTTP(rrCancel, reqCancel)
+
+	if rrCancel.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for cancel schedule bridge, got %d: %s", rrCancel.Code, rrCancel.Body.String())
+	}
+
+	// Verify job is marked canceled in dispatch queue
+	j, ok := q.Get(job.ID)
+	if !ok {
+		t.Fatal("expected job to be in queue")
+	}
+	if j.Status != dispatch.JobStatusCanceled {
+		t.Fatalf("expected status canceled, got %s", j.Status)
+	}
+
+	// Also verify POST /v1/jobs/{id}/cancel on a dispatch job
+	job2, _ := q.Enqueue(context.Background(), &dispatch.Job{
+		ID:     "job_cancel_job_route_456",
+		Type:   dispatch.JobTypePromptExecute,
+		Repo:   "repo-test-2",
+		Status: dispatch.JobStatusPending,
+	})
+	reqCancel2 := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job2.ID+"/cancel", strings.NewReader("{}"))
+	rrCancel2 := httptest.NewRecorder()
+	handler.ServeHTTP(rrCancel2, reqCancel2)
+	if rrCancel2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for cancel job route, got %d: %s", rrCancel2.Code, rrCancel2.Body.String())
+	}
+	j2, ok := q.Get(job2.ID)
+	if !ok || j2.Status != dispatch.JobStatusCanceled {
+		t.Fatalf("expected job2 canceled, got %+v", j2)
+	}
+}
