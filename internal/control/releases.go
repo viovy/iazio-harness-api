@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -155,6 +156,86 @@ func (s *ReleaseService) DeleteCredential(id string) error {
 	delete(s.credentials, id)
 	s.mu.Unlock()
 	return nil
+}
+
+// GitCredentialTestResult contains the verification metrics from GitHub API.
+type GitCredentialTestResult struct {
+	Valid              bool     `json:"valid"`
+	Username           string   `json:"username,omitempty"`
+	Scopes             []string `json:"scopes,omitempty"`
+	RateLimitRemaining int      `json:"rate_limit_remaining"`
+	LatencyMs          int64    `json:"latency_ms"`
+	Error              string   `json:"error,omitempty"`
+}
+
+// GetCredential returns a registered credential including unmasked token for testing.
+func (s *ReleaseService) GetCredential(id string) (GitCredential, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	c, ok := s.credentials[id]
+	return c, ok
+}
+
+// TestCredential validates a token against GitHub /user and /rate_limit endpoints.
+func (s *ReleaseService) TestCredential(ctx context.Context, token string) (GitCredentialTestResult, error) {
+	start := s.now()
+	cleanToken := strings.TrimSpace(token)
+	if cleanToken == "" {
+		return GitCredentialTestResult{Valid: false, Error: "token is empty"}, nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/user", nil)
+	if err != nil {
+		return GitCredentialTestResult{Valid: false, Error: err.Error()}, nil
+	}
+	req.Header.Set("Authorization", "Bearer "+cleanToken)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	req.Header.Set("User-Agent", "iazio-harness-api/1.0")
+
+	resp, err := s.client.Do(req)
+	latency := s.now().Sub(start).Milliseconds()
+	if err != nil {
+		return GitCredentialTestResult{Valid: false, LatencyMs: latency, Error: err.Error()}, nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return GitCredentialTestResult{
+			Valid:     false,
+			LatencyMs: latency,
+			Error:     fmt.Sprintf("GitHub authentication failed: HTTP %d", resp.StatusCode),
+		}, nil
+	}
+
+	var userPayload struct {
+		Login string `json:"login"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&userPayload)
+
+	scopesHeader := resp.Header.Get("X-OAuth-Scopes")
+	var scopes []string
+	if scopesHeader != "" {
+		for _, sc := range strings.Split(scopesHeader, ",") {
+			if trimmed := strings.TrimSpace(sc); trimmed != "" {
+				scopes = append(scopes, trimmed)
+			}
+		}
+	}
+
+	rateLimitRemaining := 0
+	if rem := resp.Header.Get("X-RateLimit-Remaining"); rem != "" {
+		if n, err := strconv.Atoi(rem); err == nil {
+			rateLimitRemaining = n
+		}
+	}
+
+	return GitCredentialTestResult{
+		Valid:              true,
+		Username:           userPayload.Login,
+		Scopes:             scopes,
+		RateLimitRemaining: rateLimitRemaining,
+		LatencyMs:          latency,
+	}, nil
 }
 
 func (s *ReleaseService) tokenForRepo(repo string) string {
@@ -409,6 +490,28 @@ func (s *ReleaseService) GetProfileReleases(ctx context.Context, p DistributionP
 		return out, fmt.Errorf("failed to fetch releases for %d tools: %s", len(errs), strings.Join(errs, "; "))
 	}
 	return out, nil
+}
+
+// RefreshProfileReleases purges cached releases for all tools in a profile and fetches fresh releases.
+func (s *ReleaseService) RefreshProfileReleases(ctx context.Context, p DistributionProfile) ([]ToolRelease, error) {
+	s.mu.Lock()
+	for _, t := range p.Tools {
+		repo := t.Repository
+		if repo == "" {
+			repo = "viovy/" + t.Name
+		}
+		if !strings.Contains(repo, "/") {
+			repo = "viovy/" + repo
+		}
+		targetVersion := t.TargetVersion
+		if targetVersion == "" {
+			targetVersion = "latest"
+		}
+		delete(s.cache, repo+":"+targetVersion)
+		delete(s.cache, repo+":latest")
+	}
+	s.mu.Unlock()
+	return s.GetProfileReleases(ctx, p)
 }
 
 // SetCachedRelease manually injects a cached release (useful for testing and deterministic offline mocking).

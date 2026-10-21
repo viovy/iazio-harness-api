@@ -222,6 +222,12 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 		"global_schedules":                globalSchedules,
 		"history":                         history,
 		"global_queue_allocation_enabled": d.Repo.GlobalQueueAllocationEnabled,
+		"submodules_clean":                d.Repo.SubmodulesClean,
+		"dirty_submodules":                d.Repo.DirtySubmodules,
+		"ase_state":                       d.Repo.ASEState,
+		"active_tool":                     d.Repo.ActiveTool,
+		"tool_liveness":                   d.Repo.ToolLiveness,
+		"execution_provenance":            d.Repo.ExecutionProvenance,
 	}
 }
 

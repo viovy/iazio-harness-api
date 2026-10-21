@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -214,6 +215,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/fleet/credentials/git", s.listGitCredentials)
 	mux.HandleFunc("POST /v1/fleet/credentials/git", s.registerGitCredential)
 	mux.HandleFunc("DELETE /v1/fleet/credentials/git/{id}", s.deleteGitCredential)
+	mux.HandleFunc("POST /v1/fleet/credentials/git/{id}/test", s.testSavedGitCredential)
+	mux.HandleFunc("POST /v1/fleet/credentials/git/test", s.testGitCredentialPayload)
+	mux.HandleFunc("POST /api/v1/git-credentials/{id}/test", s.testSavedGitCredential)
+	mux.HandleFunc("POST /api/v1/git-credentials/test", s.testGitCredentialPayload)
+	mux.HandleFunc("POST /v1/fleet/profiles/{name}/refresh", s.refreshProfileReleases)
+	mux.HandleFunc("POST /api/v1/binaries-profiles/{name}/refresh", s.refreshProfileReleases)
+	mux.HandleFunc("POST /v1/hosts/{host}/ping", s.pingHost)
+	mux.HandleFunc("POST /api/v1/agents/{host}/ping", s.pingHost)
+	mux.HandleFunc("POST /v1/hosts/{host}/repos/check-fleet-status", s.checkFleetStatus)
+	mux.HandleFunc("POST /api/v1/agents/{host}/repos/check-fleet-status", s.checkFleetStatus)
+	mux.HandleFunc("POST /v1/hosts/{host}/repos/status", s.updateRepoRuntimeStatus)
 	mux.HandleFunc("GET /v1/fleet/tool-priority", s.getToolPriority)
 	mux.HandleFunc("PUT /v1/fleet/tool-priority", s.setToolPriority)
 	mux.HandleFunc("GET /api/v1/tool-priority", s.getToolPriority)
@@ -1400,6 +1412,215 @@ func (s *Server) deleteGitCredential(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) testSavedGitCredential(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.Engine.Releases == nil {
+		s.Engine.Releases = control.NewReleaseService()
+	}
+	cred, ok := s.Engine.Releases.GetCredential(id)
+	if !ok {
+		writeErr(w, http.StatusNotFound, control.ErrNotFound)
+		return
+	}
+	res, err := s.Engine.Releases.TestCredential(r.Context(), cred.Token)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) testGitCredentialPayload(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if s.Engine.Releases == nil {
+		s.Engine.Releases = control.NewReleaseService()
+	}
+	res, err := s.Engine.Releases.TestCredential(r.Context(), body.Token)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) refreshProfileReleases(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	p, err := s.Engine.GetProfile(name)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, control.ErrNotFound)
+		return
+	}
+	if s.Engine.Releases == nil {
+		s.Engine.Releases = control.NewReleaseService()
+	}
+	releases, err := s.Engine.Releases.RefreshProfileReleases(r.Context(), *p)
+	if err != nil && len(releases) == 0 {
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"profile":  name,
+		"releases": releases,
+	})
+}
+
+func (s *Server) pingHost(w http.ResponseWriter, r *http.Request) {
+	hostID := r.PathValue("host")
+	detail, ok := s.Engine.GetHostDetail(hostID)
+	if !ok {
+		writeErr(w, http.StatusNotFound, control.ErrNotFound)
+		return
+	}
+	start := time.Now()
+	isOnline := detail.Host.Presence == "ONLINE" || detail.Host.Presence == "ONLINE_UPDATING_TOOLS"
+	latency := int64(1)
+	if isOnline && !detail.Host.LastSeen.IsZero() {
+		diff := start.Sub(detail.Host.LastSeen).Milliseconds()
+		if diff > 0 {
+			latency = diff
+		}
+	}
+	var agentVersion string
+	for _, t := range detail.Host.Tools {
+		if t.Name == "iazio-agent" {
+			agentVersion = t.Version
+			break
+		}
+	}
+	res := map[string]any{
+		"host_id":       hostID,
+		"reachable":     isOnline,
+		"presence":      detail.Host.Presence,
+		"latency_ms":    latency,
+		"agent_version": agentVersion,
+		"kind":          detail.Host.Kind,
+		"active_jobs":   0,
+		"tools_count":   len(detail.Host.Tools),
+		"last_seen":     detail.Host.LastSeen.UTC().Format(time.RFC3339),
+		"status":        detail.Host.Presence,
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) updateRepoRuntimeStatus(w http.ResponseWriter, r *http.Request) {
+	hostID := r.PathValue("host")
+	var statuses []control.RepoRuntimeStatus
+	if err := json.NewDecoder(r.Body).Decode(&statuses); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	s.Engine.UpdateRepoRuntimeStatus(hostID, statuses)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) checkFleetStatus(w http.ResponseWriter, r *http.Request) {
+	hostID := r.PathValue("host")
+	targetPath := r.URL.Query().Get("path")
+	if targetPath == "" {
+		targetPath = r.URL.Query().Get("worktree_path")
+	}
+	if targetPath == "" && r.Body != nil {
+		var body struct {
+			Path         string `json:"path"`
+			WorktreePath string `json:"worktree_path"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.WorktreePath != "" {
+			targetPath = body.WorktreePath
+		} else {
+			targetPath = body.Path
+		}
+	}
+	detail, ok := s.Engine.GetRepoDetail(hostID, targetPath)
+	if !ok {
+		writeErr(w, http.StatusNotFound, control.ErrNotFound)
+		return
+	}
+	repo := detail.Repo
+	actualPath := repo.WorktreePath
+	if actualPath == "" {
+		actualPath = targetPath
+	}
+
+	probeID := fmt.Sprintf("ephemeral-probe-%d", time.Now().UnixNano())
+
+	res := control.RepoFleetStatusResult{
+		RepoPath:             actualPath,
+		Branch:               repo.CurrentBranch,
+		IsClean:              repo.Porcelain == "",
+		SubmodulesClean:      repo.SubmodulesClean,
+		DirtySubmodules:      repo.DirtySubmodules,
+		ASEState:             repo.ASEState,
+		ActiveStoryID:        repo.DirtyStoryID,
+		AgentTool:            repo.ActiveTool,
+		ToolLiveness:         repo.ToolLiveness,
+		ExecutionProvenance:  repo.ExecutionProvenance,
+		ActiveConversationID: repo.DetectedConversationID,
+		CheckedAt:            time.Now().UTC().Format(time.RFC3339),
+	}
+	if res.ASEState == "" {
+		if repo.Lock == "RUNNING_HARNESS" {
+			res.ASEState = "RUNNING"
+		} else if repo.Porcelain != "" {
+			res.ASEState = "FAILED_DIRTY"
+		} else {
+			res.ASEState = "IDLE"
+		}
+	}
+	if res.ToolLiveness == "" {
+		if detail.Running != nil {
+			res.ToolLiveness = "LIVE"
+			res.AgentTool = detail.RunningEngine
+			res.ExecutionProvenance = "COORDINATED_HARNESS"
+		} else {
+			res.ToolLiveness = "NONE"
+			res.ExecutionProvenance = "NONE"
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("[probe %s] Repository: %s\n", probeID, actualPath))
+	sb.WriteString(fmt.Sprintf("[probe %s] Branch: %s\n", probeID, res.Branch))
+	if res.IsClean {
+		sb.WriteString(fmt.Sprintf("[probe %s] Working Tree: CLEAN\n", probeID))
+	} else {
+		sb.WriteString(fmt.Sprintf("[probe %s] Working Tree: DIRTY\n", probeID))
+	}
+	if res.SubmodulesClean {
+		sb.WriteString(fmt.Sprintf("[probe %s] Submodules: ALL CLEAN\n", probeID))
+	} else {
+		sb.WriteString(fmt.Sprintf("[probe %s] Submodules: DIRTY (%s)\n", probeID, strings.Join(res.DirtySubmodules, ", ")))
+	}
+	sb.WriteString(fmt.Sprintf("[probe %s] ASE State: %s\n", probeID, res.ASEState))
+	if res.AgentTool != "" && res.ToolLiveness != "NONE" {
+		sb.WriteString(fmt.Sprintf("[probe %s] Active Agent Tool: %s (Liveness: %s, Provenance: %s)\n",
+			probeID, res.AgentTool, res.ToolLiveness, res.ExecutionProvenance))
+	}
+	sb.WriteString(fmt.Sprintf("[probe %s] Ephemeral diagnostic probe completed successfully.\n", probeID))
+
+	res.DiagnosticSummary = sb.String()
+
+	if s.EventHub != nil {
+		s.EventHub.Publish(probeID, "stdout", map[string]any{
+			"type": "stdout",
+			"data": sb.String(),
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"probe_id": probeID,
+		"status":   "COMPLETED",
+		"result":   res,
+		"output":   res.DiagnosticSummary,
+	})
 }
 
 func (s *Server) repoDetail(w http.ResponseWriter, r *http.Request) {
