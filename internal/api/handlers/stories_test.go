@@ -238,3 +238,29 @@ func TestStoriesHandler_Idempotency(t *testing.T) {
 		t.Fatalf("expected 409 Conflict, got %d", w3.Code)
 	}
 }
+
+func TestStoriesHandler_WorkspaceLocked(t *testing.T) {
+	store := setupTestStore(t)
+	q := dispatch.NewInMemoryQueue()
+	handler := NewStoriesHandler(store, q, nil)
+	handler.SetDispatchWaitTimeout(1 * time.Second)
+
+	payload := validStoryPayload()
+	body, _ := json.Marshal(payload)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/stories", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		job, err := q.Claim(context.Background(), "", []string{dispatch.JobTypeStoryCreate})
+		if err == nil && job != nil {
+			_ = q.Complete(context.Background(), job.ID, nil, "WORKSPACE_LOCKED: checkout iazio-mcp is held by background task")
+		}
+	}()
+
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusLocked {
+		t.Fatalf("expected 423 Locked for WORKSPACE_LOCKED, got %d (body: %s)", w.Code, w.Body.String())
+	}
+}

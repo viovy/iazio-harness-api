@@ -19,7 +19,7 @@ import (
 	"github.com/viovy/iazio-harness-api/internal/telemetry"
 )
 
-const defaultStoryDispatchTimeout = 15 * time.Second
+const defaultStoryDispatchTimeout = 2500 * time.Millisecond
 
 // CreateStoryRequest defines the semantic parameters for scaffolding an autopilot-governed story.
 type CreateStoryRequest struct {
@@ -266,6 +266,10 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if completedJob.Status == dispatch.JobStatusFailed {
+		if strings.Contains(completedJob.Error, "WORKSPACE_LOCKED") {
+			writeJSONError(w, http.StatusLocked, fmt.Sprintf("workspace locked: %s", completedJob.Error))
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("story execution failed: %s", completedJob.Error))
 		return
 	}
@@ -312,7 +316,9 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			resp.ExecutionStatus = execJob.Status
 		}
 		if h.scheduler != nil {
-			_, _ = h.scheduler.EnqueueGlobalStorySchedule(result.StoryID, req.Submodule, targetAgent, fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", result.StoryID, result.StoryID, req.Submodule))
+			go func() {
+				_, _ = h.scheduler.EnqueueGlobalStorySchedule(result.StoryID, req.Submodule, targetAgent, fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", result.StoryID, result.StoryID, req.Submodule))
+			}()
 		}
 	}
 
