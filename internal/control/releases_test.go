@@ -258,3 +258,87 @@ func TestReleaseService_TokenForRepo(t *testing.T) {
 		t.Errorf("expected exact-token, got %s", tok)
 	}
 }
+
+func TestReleaseService_GetCredentialAndTestCredential(t *testing.T) {
+	svc := NewReleaseService()
+	_, _ = svc.RegisterCredential(GitCredential{ID: "c1", Name: "token", Token: "tok-123"})
+	c, ok := svc.GetCredential("c1")
+	if !ok || c.Token != "tok-123" {
+		t.Fatalf("expected c1, got %v", c)
+	}
+	_, ok = svc.GetCredential("nonexistent")
+	if ok {
+		t.Fatalf("expected not found")
+	}
+
+	// Test empty token
+	res, err := svc.TestCredential(context.Background(), "")
+	if err != nil || res.Valid {
+		t.Fatalf("expected invalid for empty token")
+	}
+}
+
+func TestControl_FleetStatusAndCommandsCoverage(t *testing.T) {
+	e := NewEngine(time.Now)
+
+	// 1. QueueCommand & ConsumePendingCommands
+	e.RegisterHost("host-1", "linux", "generic")
+	cmd := CommandEnvelope{ID: "cmd-1", Type: "PING"}
+	err := e.QueueCommand("host-1", cmd)
+	if err != nil {
+		t.Fatalf("queue command: %v", err)
+	}
+	err = e.QueueCommand("unknown-host", cmd)
+	if err == nil {
+		t.Fatalf("expected error for unknown host")
+	}
+
+	cmds := e.ConsumePendingCommands("host-1")
+	if len(cmds) != 1 || cmds[0].ID != "cmd-1" {
+		t.Fatalf("expected cmd-1, got %v", cmds)
+	}
+	cmds2 := e.ConsumePendingCommands("host-1")
+	if len(cmds2) != 0 {
+		t.Fatalf("expected empty after consume, got %v", cmds2)
+	}
+
+	// 2. Ping waiter lifecycle
+	ch := e.RegisterPingWaiter("ping-test-1")
+	e.NotifyPingAck("ping-test-1", "1.2.3")
+	select {
+	case ack := <-ch:
+		if ack.AgentVersion != "1.2.3" {
+			t.Fatalf("expected 1.2.3, got %s", ack.AgentVersion)
+		}
+	default:
+		t.Fatalf("expected ack received")
+	}
+	e.DeregisterPingWaiter("ping-test-1")
+
+	// 3. RepoStatus waiter lifecycle
+	key, statusCh := e.RegisterRepoStatusWaiter("host-1", "/test/repo")
+	e.UpdateRepoRuntimeStatus("host-1", []RepoRuntimeStatus{
+		{RepoPath: "/test/repo", Branch: "main", IsClean: true},
+	})
+	e.DeregisterRepoStatusWaiter(key)
+	_ = statusCh
+
+	// 4. Tool priority
+	e.SetToolPriority([]string{"autopilot", "agy"})
+	prios := e.GetToolPriority()
+	if len(prios) != 2 {
+		t.Fatalf("expected 2 prios, got %v", prios)
+	}
+
+	// 5. RefreshProfileReleases
+	p := DistributionProfile{
+		Name: "test-prof",
+		Tools: []ProfileTool{
+			{Name: "iazio-agent", Repository: "viovy/iazio-agent"},
+		},
+	}
+	e.Releases.SetCachedRelease("viovy/iazio-agent", "latest", ToolRelease{Name: "iazio-agent", TagName: "v1.0.0"}, time.Hour)
+	rels, _ := e.Releases.RefreshProfileReleases(context.Background(), p)
+	_ = rels
+}
+

@@ -273,3 +273,103 @@ func TestServer_CheckFleetStatusAndRepoRuntimeStatus(t *testing.T) {
 		t.Fatalf("expected TIMEOUT_CACHED_FALLBACK, got %v", fallbackResultObj["probe_status"])
 	}
 }
+
+func TestServer_AdditionalEndpointsCoverage(t *testing.T) {
+	e := control.NewEngine(time.Now)
+	srv := &Server{Engine: e}
+	handler := srv.Handler()
+
+	// 1. Tool Priority coverage
+	e.SetToolPriority([]string{"autopilot", "agy"})
+	prio := e.GetToolPriority()
+	if len(prio) != 2 || prio[0] != "autopilot" {
+		t.Fatalf("expected tool priority [autopilot agy], got %v", prio)
+	}
+
+	// 2. pingAck endpoint coverage
+	// a. Valid ack
+	ackBody := bytes.NewReader([]byte(`{"ping_id":"p-1","agent_version":"2.0.0"}`))
+	reqAck := httptest.NewRequest("POST", "/v1/hosts/debian/ping-ack", ackBody)
+	wAck := httptest.NewRecorder()
+	handler.ServeHTTP(wAck, reqAck)
+	if wAck.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", wAck.Code)
+	}
+
+	// b. Empty body ack
+	reqAckEmpty := httptest.NewRequest("POST", "/v1/hosts/debian/ping-ack", nil)
+	wAckEmpty := httptest.NewRecorder()
+	handler.ServeHTTP(wAckEmpty, reqAckEmpty)
+	if wAckEmpty.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", wAckEmpty.Code)
+	}
+
+	// 3. Ping non-existent host -> 404
+	reqPing404 := httptest.NewRequest("POST", "/v1/hosts/non-existent/ping", nil)
+	wPing404 := httptest.NewRecorder()
+	handler.ServeHTTP(wPing404, reqPing404)
+	if wPing404.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown host ping, got %d", wPing404.Code)
+	}
+
+	// 4. Git Credentials list, register, delete
+	reqListCreds := httptest.NewRequest("GET", "/v1/fleet/credentials/git", nil)
+	wListCreds := httptest.NewRecorder()
+	handler.ServeHTTP(wListCreds, reqListCreds)
+	if wListCreds.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", wListCreds.Code)
+	}
+
+	cred, _ := e.Releases.RegisterCredential(control.GitCredential{
+		Name:    "delete-me",
+		Pattern: "*",
+		Token:   "tok",
+	})
+	reqDelCred := httptest.NewRequest("DELETE", "/v1/fleet/credentials/git/"+cred.ID, nil)
+	wDelCred := httptest.NewRecorder()
+	handler.ServeHTTP(wDelCred, reqDelCred)
+	if wDelCred.Code != http.StatusNoContent && wDelCred.Code != http.StatusOK {
+		t.Fatalf("expected 204 or 200, got %d", wDelCred.Code)
+	}
+
+	// Delete unknown cred -> 404
+	reqDel404 := httptest.NewRequest("DELETE", "/v1/fleet/credentials/git/unknown-id", nil)
+	wDel404 := httptest.NewRecorder()
+	handler.ServeHTTP(wDel404, reqDel404)
+	if wDel404.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", wDel404.Code)
+	}
+
+	// Test saved unknown cred -> 404
+	reqTestSaved404 := httptest.NewRequest("POST", "/v1/fleet/credentials/git/unknown-id/test", nil)
+	wTestSaved404 := httptest.NewRecorder()
+	handler.ServeHTTP(wTestSaved404, reqTestSaved404)
+	if wTestSaved404.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", wTestSaved404.Code)
+	}
+
+	// Refresh unknown profile -> 404
+	reqRefresh404 := httptest.NewRequest("POST", "/v1/fleet/profiles/non-existent-profile/refresh", nil)
+	wRefresh404 := httptest.NewRecorder()
+	handler.ServeHTTP(wRefresh404, reqRefresh404)
+	if wRefresh404.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", wRefresh404.Code)
+	}
+
+	// Check fleet status unknown host -> 404
+	reqProbeHost404 := httptest.NewRequest("POST", "/v1/hosts/unknown-host/repos/check-fleet-status?path=sample", nil)
+	wProbeHost404 := httptest.NewRecorder()
+	handler.ServeHTTP(wProbeHost404, reqProbeHost404)
+	if wProbeHost404.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", wProbeHost404.Code)
+	}
+
+	// Check fleet status unknown repo -> 404
+	e.RegisterHost("host-ok", "linux", "generic")
+	reqProbeRepo404 := httptest.NewRequest("POST", "/v1/hosts/host-ok/repos/check-fleet-status?path=unknown-repo", nil)
+	wProbeRepo404 := httptest.NewRecorder()
+	handler.ServeHTTP(wProbeRepo404, reqProbeRepo404)
+	if wProbeRepo404.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", wProbeRepo404.Code)
+	}
+}
