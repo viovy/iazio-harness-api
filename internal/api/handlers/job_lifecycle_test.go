@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/viovy/iazio-harness-api/internal/control"
 	"github.com/viovy/iazio-harness-api/internal/dispatch"
 )
 
@@ -223,6 +225,60 @@ func TestJobLifecycleHandler_Attribution(t *testing.T) {
 	}
 	if len(attr.PromotedMemories) == 0 || attr.PromotedMemories[0] != "mem-srch-xyz-789" {
 		t.Fatalf("expected promoted memories, got %+v", attr.PromotedMemories)
+	}
+}
+
+type mockHistoryFinder struct {
+	row   control.HistoryRow
+	host  string
+	path  string
+	found bool
+}
+
+func (m *mockHistoryFinder) FindHistoryRow(jobID string) (control.HistoryRow, string, string, bool) {
+	if m.found && m.row.JobID == jobID {
+		return m.row, m.host, m.path, true
+	}
+	return control.HistoryRow{}, "", "", false
+}
+
+func TestJobLifecycleHandler_GetJob_HistoryFallback(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	h := NewJobLifecycleHandler(q)
+	h.SetScheduler(nil)
+
+	now := time.Now().UTC()
+	finder := &mockHistoryFinder{
+		row: control.HistoryRow{
+			JobID:        "job-hist-123",
+			Engine:       "autopilot",
+			Status:       "completed",
+			ErrorMessage: "",
+			CreatedAt:    now,
+		},
+		host:  "debian",
+		path:  "/work/meta-repo",
+		found: true,
+	}
+	h.SetHistoryFinder(finder)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/jobs/{id}", h.GetJob)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/job-hist-123", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var detail JobDetailResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+	if detail.ID != "job-hist-123" || detail.TargetHost != "debian" || detail.Repo != "/work/meta-repo" {
+		t.Fatalf("unexpected detail: %+v", detail)
 	}
 }
 

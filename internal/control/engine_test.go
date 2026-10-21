@@ -2416,3 +2416,130 @@ func TestGlobalStoryScheduleDynamicAllocationMatching(t *testing.T) {
 		t.Fatalf("expected job to be generated")
 	}
 }
+
+func TestEngine_StoryOperations(t *testing.T) {
+	e := NewEngine(nil)
+
+	// 1. SaveStory with empty ID -> error
+	err := e.SaveStory(Story{})
+	if err == nil {
+		t.Fatal("expected error saving story with empty ID")
+	}
+
+	// Channel for OnStoryChange verification
+	changedCh := make(chan Story, 5)
+	e.OnStoryChange = func(s Story) {
+		changedCh <- s
+	}
+
+	// 2. Save valid story
+	st1 := Story{
+		ID:        "STORY-ENG-1",
+		Repo:      "meta-repo",
+		Submodule: "iazio-harness",
+		Title:     "Engine Story 1",
+	}
+	if err := e.SaveStory(st1); err != nil {
+		t.Fatalf("failed to save story 1: %v", err)
+	}
+
+	select {
+	case changed := <-changedCh:
+		if changed.ID != "STORY-ENG-1" || changed.SyncState != "PENDING_WORKSPACE_MATERIALIZATION" || changed.Status != "pending" {
+			t.Errorf("unexpected story in change callback: %+v", changed)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for OnStoryChange")
+	}
+
+	// 3. GetStory
+	got, ok := e.GetStory("STORY-ENG-1")
+	if !ok || got.ID != "STORY-ENG-1" || got.SyncState != "PENDING_WORKSPACE_MATERIALIZATION" {
+		t.Fatalf("expected to get story 1, got %+v (ok=%v)", got, ok)
+	}
+
+	_, ok = e.GetStory("STORY-NONEXISTENT")
+	if ok {
+		t.Fatal("expected ok=false for non-existent story")
+	}
+
+	// 4. Save second story with different repo
+	st2 := Story{
+		ID:        "STORY-ENG-2",
+		Repo:      "other-repo",
+		Submodule: "other-sub",
+		Title:     "Engine Story 2",
+		CreatedAt: time.Now().Add(-1 * time.Hour),
+	}
+	if err := e.SaveStory(st2); err != nil {
+		t.Fatalf("failed to save story 2: %v", err)
+	}
+	<-changedCh
+
+	// 5. ListStories (unfiltered and filtered)
+	all := e.ListStories("")
+	if len(all) != 2 {
+		t.Fatalf("expected 2 stories, got %d", len(all))
+	}
+	if all[0].ID != "STORY-ENG-1" { // CreatedAt is newer
+		t.Errorf("expected STORY-ENG-1 first, got %s", all[0].ID)
+	}
+
+	filtered := e.ListStories("meta-repo")
+	if len(filtered) != 1 || filtered[0].ID != "STORY-ENG-1" {
+		t.Fatalf("expected 1 filtered story, got %+v", filtered)
+	}
+
+	// 6. UpdateStorySyncState
+	if err := e.UpdateStorySyncState("STORY-ENG-1", "MATERIALIZED"); err != nil {
+		t.Fatalf("failed to update sync state: %v", err)
+	}
+	select {
+	case changed := <-changedCh:
+		if changed.SyncState != "MATERIALIZED" {
+			t.Errorf("expected SyncState MATERIALIZED, got %s", changed.SyncState)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for OnStoryChange after sync state update")
+	}
+
+	// Update non-existent story
+	if err := e.UpdateStorySyncState("STORY-NONEXISTENT", "MATERIALIZED"); err == nil {
+		t.Fatal("expected error updating non-existent story")
+	}
+}
+
+func TestEngine_FindHistoryRow(t *testing.T) {
+	e := NewEngine(nil)
+
+	// Add host and repo
+	e.RegisterHost("host-1", "linux", "generic")
+	_ = e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app", Queue: QueueOpen, Lock: LockIdle})
+
+	// Inject a history row directly into e.history
+	e.mu.Lock()
+	key := repoKey("host-1", "/work/app")
+	e.history[key] = []HistoryRow{
+		{
+			JobID:        "job-find-999",
+			Engine:       "opencode",
+			Status:       "success",
+			ErrorMessage: "",
+			CreatedAt:    time.Now().UTC(),
+		},
+	}
+	e.mu.Unlock()
+
+	row, host, path, found := e.FindHistoryRow("job-find-999")
+	if !found {
+		t.Fatal("expected to find history row")
+	}
+	if row.JobID != "job-find-999" || host != "host-1" || path != "/work/app" {
+		t.Fatalf("unexpected history row: %+v, host=%s, path=%s", row, host, path)
+	}
+
+	_, _, _, found = e.FindHistoryRow("job-unknown")
+	if found {
+		t.Fatal("expected found=false for unknown job ID")
+	}
+}

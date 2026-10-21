@@ -319,3 +319,68 @@ func TestStoriesHandler_GetAndListStories_DBAuthoritative(t *testing.T) {
 		t.Errorf("expected STORY-DB-9999 to be present in ListStories response")
 	}
 }
+
+func TestStoriesHandler_MaterializeStory(t *testing.T) {
+	store := setupTestStore(t)
+	q := dispatch.NewInMemoryQueue()
+	engine := control.NewEngine(nil)
+	handler := NewStoriesHandler(store, q, nil)
+	handler.SetEngine(engine)
+	handler.SetDispatchWaitTimeout(10 * time.Millisecond)
+
+	// 1. Wrong method
+	reqWrong := httptest.NewRequest(http.MethodGet, "/api/v1/stories/STORY-MAT-1/materialize", nil)
+	wWrong := httptest.NewRecorder()
+	handler.MaterializeStory(wWrong, reqWrong)
+	if wWrong.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 Method Not Allowed, got %d", wWrong.Code)
+	}
+
+	// 2. Empty story ID
+	reqEmpty := httptest.NewRequest(http.MethodPost, "/api/v1/stories//materialize", nil)
+	wEmpty := httptest.NewRecorder()
+	handler.MaterializeStory(wEmpty, reqEmpty)
+	if wEmpty.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for empty ID, got %d", wEmpty.Code)
+	}
+
+	// 3. Story not found in engine
+	reqNotFound := httptest.NewRequest(http.MethodPost, "/api/v1/stories/STORY-NONEXISTENT/materialize", nil)
+	wNotFound := httptest.NewRecorder()
+	handler.MaterializeStory(wNotFound, reqNotFound)
+	if wNotFound.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found, got %d", wNotFound.Code)
+	}
+
+	// 4. Successful materialization
+	testStory := control.Story{
+		ID:        "STORY-MAT-1",
+		Title:     "Materialize Me",
+		Submodule: "iazio-mcp",
+		SyncState: "PENDING_WORKSPACE_MATERIALIZATION",
+	}
+	if err := engine.SaveStory(testStory); err != nil {
+		t.Fatalf("failed to save story: %v", err)
+	}
+
+	reqSuccess := httptest.NewRequest(http.MethodPost, "/api/v1/stories/STORY-MAT-1/materialize", nil)
+	wSuccess := httptest.NewRecorder()
+	handler.MaterializeStory(wSuccess, reqSuccess)
+	if wSuccess.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", wSuccess.Code, wSuccess.Body.String())
+	}
+
+	var res map[string]any
+	if err := json.Unmarshal(wSuccess.Body.Bytes(), &res); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if res["sync_state"] != "MATERIALIZED" {
+		t.Errorf("expected sync_state MATERIALIZED, got %v", res["sync_state"])
+	}
+
+	// Verify engine state was updated
+	st, ok := engine.GetStory("STORY-MAT-1")
+	if !ok || st.SyncState != "MATERIALIZED" {
+		t.Errorf("expected engine story sync_state MATERIALIZED, got %s", st.SyncState)
+	}
+}
