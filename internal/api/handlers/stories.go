@@ -19,7 +19,7 @@ import (
 	"github.com/viovy/iazio-harness-api/internal/telemetry"
 )
 
-const defaultStoryDispatchTimeout = 2500 * time.Millisecond
+const defaultStoryDispatchTimeout = 10 * time.Second
 
 // CreateStoryRequest defines the semantic parameters for scaffolding an autopilot-governed story.
 type CreateStoryRequest struct {
