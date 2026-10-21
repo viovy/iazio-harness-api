@@ -180,7 +180,7 @@ func TestJobLifecycleHandler_ExecuteStory(t *testing.T) {
 
 	// 1. Non-existent story -> 404 Not Found with descriptive error message
 	bodyNonExistent := bytes.NewReader([]byte(`{"submodule":".","target_agent":"autopilot"}`))
-	reqNonExistent := httptest.NewRequest(http.MethodPost, "/api/v1/stories/STORY-IAZIO-0006/execute", bodyNonExistent)
+	reqNonExistent := httptest.NewRequest(http.MethodPost, "/api/v1/stories/STORY-TEST-0006/execute", bodyNonExistent)
 	rrNonExistent := httptest.NewRecorder()
 	mux.ServeHTTP(rrNonExistent, reqNonExistent)
 
