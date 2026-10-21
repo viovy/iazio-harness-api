@@ -6,8 +6,10 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -214,6 +216,19 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/fleet/credentials/git", s.listGitCredentials)
 	mux.HandleFunc("POST /v1/fleet/credentials/git", s.registerGitCredential)
 	mux.HandleFunc("DELETE /v1/fleet/credentials/git/{id}", s.deleteGitCredential)
+	mux.HandleFunc("POST /v1/fleet/credentials/git/{id}/test", s.testSavedGitCredential)
+	mux.HandleFunc("POST /v1/fleet/credentials/git/test", s.testGitCredentialPayload)
+	mux.HandleFunc("POST /api/v1/git-credentials/{id}/test", s.testSavedGitCredential)
+	mux.HandleFunc("POST /api/v1/git-credentials/test", s.testGitCredentialPayload)
+	mux.HandleFunc("POST /v1/fleet/profiles/{name}/refresh", s.refreshProfileReleases)
+	mux.HandleFunc("POST /api/v1/binaries-profiles/{name}/refresh", s.refreshProfileReleases)
+	mux.HandleFunc("POST /v1/hosts/{host}/ping", s.pingHost)
+	mux.HandleFunc("POST /api/v1/agents/{host}/ping", s.pingHost)
+	mux.HandleFunc("POST /v1/hosts/{host}/ping-ack", s.pingAck)
+	mux.HandleFunc("POST /api/v1/agents/{host}/ping-ack", s.pingAck)
+	mux.HandleFunc("POST /v1/hosts/{host}/repos/check-fleet-status", s.checkFleetStatus)
+	mux.HandleFunc("POST /api/v1/agents/{host}/repos/check-fleet-status", s.checkFleetStatus)
+	mux.HandleFunc("POST /v1/hosts/{host}/repos/status", s.updateRepoRuntimeStatus)
 	mux.HandleFunc("GET /v1/fleet/tool-priority", s.getToolPriority)
 	mux.HandleFunc("PUT /v1/fleet/tool-priority", s.setToolPriority)
 	mux.HandleFunc("GET /api/v1/tool-priority", s.getToolPriority)
@@ -1282,9 +1297,13 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	pending := s.Engine.ConsumePendingToolUpdate(hostID)
+	pendingCmds := s.Engine.ConsumePendingCommands(hostID)
 	res := map[string]any{"status": "ok"}
 	if pending != nil {
 		res["pending_tool_update"] = pending
+	}
+	if len(pendingCmds) > 0 {
+		res["pending_commands"] = pendingCmds
 	}
 	writeJSON(w, http.StatusOK, res)
 }
@@ -1400,6 +1419,342 @@ func (s *Server) deleteGitCredential(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) testSavedGitCredential(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.Engine.Releases == nil {
+		s.Engine.Releases = control.NewReleaseService()
+	}
+	cred, ok := s.Engine.Releases.GetCredential(id)
+	if !ok {
+		writeErr(w, http.StatusNotFound, control.ErrNotFound)
+		return
+	}
+	res, err := s.Engine.Releases.TestCredential(r.Context(), cred.Token)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) testGitCredentialPayload(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if s.Engine.Releases == nil {
+		s.Engine.Releases = control.NewReleaseService()
+	}
+	res, err := s.Engine.Releases.TestCredential(r.Context(), body.Token)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) refreshProfileReleases(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	p, err := s.Engine.GetProfile(name)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, control.ErrNotFound)
+		return
+	}
+	if s.Engine.Releases == nil {
+		s.Engine.Releases = control.NewReleaseService()
+	}
+	releases, err := s.Engine.Releases.RefreshProfileReleases(r.Context(), *p)
+	if err != nil && len(releases) == 0 {
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"profile":  name,
+		"releases": releases,
+	})
+}
+
+func (s *Server) pingAck(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		PingID       string `json:"ping_id"`
+		AgentVersion string `json:"agent_version"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
+	if body.PingID != "" {
+		s.Engine.NotifyPingAck(body.PingID, body.AgentVersion)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) pingHost(w http.ResponseWriter, r *http.Request) {
+	hostID := r.PathValue("host")
+	detail, ok := s.Engine.GetHostDetail(hostID)
+	if !ok {
+		writeErr(w, http.StatusNotFound, control.ErrNotFound)
+		return
+	}
+	start := time.Now()
+	pingID := fmt.Sprintf("ping-%d", time.Now().UnixNano())
+	ackChan := s.Engine.RegisterPingWaiter(pingID)
+	defer s.Engine.DeregisterPingWaiter(pingID)
+
+	// Queue the live PING command to the agent stream
+	_ = s.Engine.QueueCommand(hostID, control.CommandEnvelope{
+		ID:        pingID,
+		Type:      "PING",
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+
+	var agentVersion string
+	for _, t := range detail.Host.Tools {
+		if t.Name == "iazio-agent" {
+			agentVersion = t.Version
+			break
+		}
+	}
+
+	waitTimeout := 4 * time.Second
+	if tStr := r.URL.Query().Get("timeout_sec"); tStr != "" {
+		if sec, err := strconv.Atoi(tStr); err == nil && sec > 0 && sec <= 30 {
+			waitTimeout = time.Duration(sec) * time.Second
+		}
+	} else if tMsStr := r.URL.Query().Get("timeout_ms"); tMsStr != "" {
+		if ms, err := strconv.Atoi(tMsStr); err == nil && ms > 0 && ms <= 30000 {
+			waitTimeout = time.Duration(ms) * time.Millisecond
+		}
+	}
+
+	reachable := false
+	liveAck := false
+	latency := int64(1)
+
+	// Wait for live agent ack round-trip
+	select {
+	case ack := <-ackChan:
+		reachable = true
+		liveAck = true
+		latency = ack.ReceivedAt.Sub(start).Milliseconds()
+		if latency <= 0 {
+			latency = 1
+		}
+		if ack.AgentVersion != "" {
+			agentVersion = ack.AgentVersion
+		}
+	case <-time.After(waitTimeout):
+		fmt.Fprintf(os.Stderr, "[SIR: PROBE_TIMEOUT] live ping to host %s timed out after %v without agent ack\n", hostID, waitTimeout)
+	}
+
+	presence := "OFFLINE"
+	statusStr := "TIMEOUT"
+	if reachable {
+		presence = "ONLINE"
+		statusStr = "ONLINE"
+	}
+
+	res := map[string]any{
+		"host_id":       hostID,
+		"reachable":     reachable,
+		"live_ack":      liveAck,
+		"presence":      presence,
+		"latency_ms":    latency,
+		"agent_version": agentVersion,
+		"kind":          detail.Host.Kind,
+		"active_jobs":   0,
+		"tools_count":   len(detail.Host.Tools),
+		"last_seen":     detail.Host.LastSeen.UTC().Format(time.RFC3339),
+		"status":        statusStr,
+	}
+	if !reachable {
+		res["error"] = fmt.Sprintf("ping timed out after %v waiting for live agent ack", waitTimeout)
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) updateRepoRuntimeStatus(w http.ResponseWriter, r *http.Request) {
+	hostID := r.PathValue("host")
+	var statuses []control.RepoRuntimeStatus
+	if err := json.NewDecoder(r.Body).Decode(&statuses); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	s.Engine.UpdateRepoRuntimeStatus(hostID, statuses)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) checkFleetStatus(w http.ResponseWriter, r *http.Request) {
+	hostID := r.PathValue("host")
+	targetPath := r.URL.Query().Get("path")
+	if targetPath == "" {
+		targetPath = r.URL.Query().Get("worktree_path")
+	}
+	if targetPath == "" && r.Body != nil {
+		var body struct {
+			Path         string `json:"path"`
+			WorktreePath string `json:"worktree_path"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.WorktreePath != "" {
+			targetPath = body.WorktreePath
+		} else {
+			targetPath = body.Path
+		}
+	}
+	detail, ok := s.Engine.GetRepoDetail(hostID, targetPath)
+	if !ok {
+		writeErr(w, http.StatusNotFound, control.ErrNotFound)
+		return
+	}
+	repo := detail.Repo
+	actualPath := repo.WorktreePath
+	if actualPath == "" {
+		actualPath = targetPath
+	}
+
+	probeID := fmt.Sprintf("ephemeral-probe-%d", time.Now().UnixNano())
+	waiterKey, waiterCh := s.Engine.RegisterRepoStatusWaiter(hostID, actualPath)
+	defer s.Engine.DeregisterRepoStatusWaiter(waiterKey)
+
+	_ = s.Engine.QueueCommand(hostID, control.CommandEnvelope{
+		ID:        probeID,
+		Type:      "CHECK_FLEET_GIT_STATUS",
+		Payload:   actualPath,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+
+	waitTimeout := 4 * time.Second
+	if tStr := r.URL.Query().Get("timeout_sec"); tStr != "" {
+		if sec, err := strconv.Atoi(tStr); err == nil && sec > 0 && sec <= 30 {
+			waitTimeout = time.Duration(sec) * time.Second
+		}
+	} else if tMsStr := r.URL.Query().Get("timeout_ms"); tMsStr != "" {
+		if ms, err := strconv.Atoi(tMsStr); err == nil && ms > 0 && ms <= 30000 {
+			waitTimeout = time.Duration(ms) * time.Millisecond
+		}
+	}
+
+	var liveStatus *control.RepoRuntimeStatus
+	isLiveProbe := false
+	stale := false
+	probeStatus := "LIVE_ACK"
+
+	select {
+	case st := <-waiterCh:
+		liveStatus = &st
+		isLiveProbe = true
+	case <-time.After(waitTimeout):
+		fmt.Fprintf(os.Stderr, "[SIR: PROBE_TIMEOUT] repo status probe for host %s repo %s timed out after %v; falling back to cache\n", hostID, actualPath, waitTimeout)
+		stale = true
+		probeStatus = "TIMEOUT_CACHED_FALLBACK"
+	}
+
+	res := control.RepoFleetStatusResult{
+		RepoPath:             actualPath,
+		Branch:               repo.CurrentBranch,
+		IsClean:              repo.Porcelain == "",
+		SubmodulesClean:      repo.SubmodulesClean,
+		DirtySubmodules:      repo.DirtySubmodules,
+		ASEState:             repo.ASEState,
+		ActiveStoryID:        repo.DirtyStoryID,
+		AgentTool:            repo.ActiveTool,
+		ToolLiveness:         repo.ToolLiveness,
+		ExecutionProvenance:  repo.ExecutionProvenance,
+		ActiveConversationID: repo.DetectedConversationID,
+		IsLiveProbe:          isLiveProbe,
+		Stale:                stale,
+		ProbeStatus:          probeStatus,
+		CheckedAt:            time.Now().UTC().Format(time.RFC3339),
+	}
+	if liveStatus != nil {
+		if liveStatus.Branch != "" {
+			res.Branch = liveStatus.Branch
+		}
+		res.IsClean = liveStatus.Porcelain == ""
+		res.SubmodulesClean = liveStatus.SubmodulesClean
+		res.DirtySubmodules = liveStatus.DirtySubmodules
+		if liveStatus.ASEState != "" {
+			res.ASEState = liveStatus.ASEState
+		}
+		res.ActiveStoryID = liveStatus.ActiveStoryID
+		res.AgentTool = liveStatus.ActiveTool
+		if liveStatus.ToolLiveness != "" {
+			res.ToolLiveness = liveStatus.ToolLiveness
+		}
+		if liveStatus.ExecutionProvenance != "" {
+			res.ExecutionProvenance = liveStatus.ExecutionProvenance
+		}
+		res.ActiveConversationID = liveStatus.ActiveConversationID
+		if !liveStatus.LastCheckedAt.IsZero() {
+			res.CheckedAt = liveStatus.LastCheckedAt.UTC().Format(time.RFC3339)
+		}
+	} else {
+		if res.ASEState == "" {
+			if repo.Lock == "RUNNING_HARNESS" {
+				res.ASEState = "RUNNING"
+			} else if repo.Porcelain != "" {
+				res.ASEState = "FAILED_DIRTY"
+			} else {
+				res.ASEState = "IDLE"
+			}
+		}
+		if res.ToolLiveness == "" {
+			if detail.Running != nil {
+				res.ToolLiveness = "LIVE"
+				res.AgentTool = detail.RunningEngine
+				res.ExecutionProvenance = "COORDINATED_HARNESS"
+			} else {
+				res.ToolLiveness = "NONE"
+				res.ExecutionProvenance = "NONE"
+			}
+		}
+	}
+
+	var sb strings.Builder
+	if liveStatus != nil {
+		sb.WriteString(fmt.Sprintf("[probe %s] Live probe telemetry received from agent\n", probeID))
+	} else {
+		sb.WriteString(fmt.Sprintf("[probe %s] [SIR: PROBE_TIMEOUT] Live probe timed out after %v; displaying cached status\n", probeID, waitTimeout))
+	}
+	sb.WriteString(fmt.Sprintf("[probe %s] Repository: %s\n", probeID, actualPath))
+	sb.WriteString(fmt.Sprintf("[probe %s] Branch: %s\n", probeID, res.Branch))
+	if res.IsClean {
+		sb.WriteString(fmt.Sprintf("[probe %s] Working Tree: CLEAN\n", probeID))
+	} else {
+		sb.WriteString(fmt.Sprintf("[probe %s] Working Tree: DIRTY\n", probeID))
+	}
+	if res.SubmodulesClean {
+		sb.WriteString(fmt.Sprintf("[probe %s] Submodules: ALL CLEAN\n", probeID))
+	} else {
+		sb.WriteString(fmt.Sprintf("[probe %s] Submodules: DIRTY (%s)\n", probeID, strings.Join(res.DirtySubmodules, ", ")))
+	}
+	sb.WriteString(fmt.Sprintf("[probe %s] ASE State: %s\n", probeID, res.ASEState))
+	if res.AgentTool != "" && res.ToolLiveness != "NONE" {
+		sb.WriteString(fmt.Sprintf("[probe %s] Active Agent Tool: %s (Liveness: %s, Provenance: %s)\n",
+			probeID, res.AgentTool, res.ToolLiveness, res.ExecutionProvenance))
+	}
+	sb.WriteString(fmt.Sprintf("[probe %s] Ephemeral diagnostic probe completed successfully.\n", probeID))
+
+	res.DiagnosticSummary = sb.String()
+
+	if s.EventHub != nil {
+		s.EventHub.Publish(probeID, "stdout", map[string]any{
+			"type": "stdout",
+			"data": sb.String(),
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"probe_id": probeID,
+		"status":   "COMPLETED",
+		"result":   res,
+		"output":   res.DiagnosticSummary,
+	})
 }
 
 func (s *Server) repoDetail(w http.ResponseWriter, r *http.Request) {

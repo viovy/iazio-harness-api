@@ -220,6 +220,59 @@ type Repo struct {
 	LockExpiresAt                time.Time
 	GlobalQueueAllocationEnabled bool
 	RepoAlias                    string
+	SubmodulesClean              bool
+	DirtySubmodules              []string
+	ASEState                     string
+	ActiveTool                   string
+	ToolLiveness                 string
+	ExecutionProvenance          string
+	LastRuntimeCheck             time.Time
+}
+
+// RepoRuntimeStatus contains near real-time git and ASE telemetry for a repository.
+type RepoRuntimeStatus struct {
+	RepoPath             string    `json:"repo_path"`
+	Alias                string    `json:"alias,omitempty"`
+	IsClean              bool      `json:"is_clean"`
+	Branch               string    `json:"branch,omitempty"`
+	Porcelain            string    `json:"porcelain,omitempty"`
+	SubmodulesClean      bool      `json:"submodules_clean"`
+	DirtySubmodules      []string  `json:"dirty_submodules,omitempty"`
+	ASEState             string    `json:"ase_state,omitempty"`
+	ActiveStoryID        string    `json:"active_story_id,omitempty"`
+	ActiveTool           string    `json:"active_tool,omitempty"`
+	ToolLiveness         string    `json:"tool_liveness,omitempty"`
+	ExecutionProvenance  string    `json:"execution_provenance,omitempty"`
+	ActiveConversationID string    `json:"active_conversation_id,omitempty"`
+	LastCheckedAt        time.Time `json:"last_checked_at"`
+}
+
+// RepoFleetStatusResult contains the complete diagnostic posture of a repository and active agent tooling.
+type RepoFleetStatusResult struct {
+	RepoPath             string   `json:"repo_path"`
+	Branch               string   `json:"branch"`
+	HeadSHA              string   `json:"head_sha,omitempty"`
+	IsClean              bool     `json:"is_clean"`
+	Ahead                int      `json:"ahead,omitempty"`
+	Behind               int      `json:"behind,omitempty"`
+	ModifiedFiles        []string `json:"modified_files,omitempty"`
+	UntrackedFiles       []string `json:"untracked_files,omitempty"`
+	SubmodulesClean      bool     `json:"submodules_clean"`
+	DirtySubmodules      []string `json:"dirty_submodules,omitempty"`
+	ASEState             string   `json:"ase_state"`
+	ActiveStoryID        string   `json:"active_story_id,omitempty"`
+	CurrentPhase         string   `json:"current_phase,omitempty"`
+	LockDetails          string   `json:"lock_details,omitempty"`
+	AgentTool            string   `json:"agent_tool,omitempty"`
+	AgentPID             int      `json:"agent_pid,omitempty"`
+	ToolLiveness         string   `json:"tool_liveness"`
+	ExecutionProvenance  string   `json:"execution_provenance"`
+	ActiveConversationID string   `json:"active_conversation_id,omitempty"`
+	IsLiveProbe          bool     `json:"is_live_probe"`
+	Stale                bool     `json:"stale"`
+	ProbeStatus          string   `json:"probe_status"`
+	DiagnosticSummary    string   `json:"diagnostic_summary"`
+	CheckedAt            string   `json:"checked_at"`
 }
 
 // EffectiveAlias returns the configured RepoAlias or falls back to the last directory component of WorktreePath.
@@ -307,6 +360,14 @@ type PendingToolUpdate struct {
 	Force bool     `json:"force,omitempty"`
 }
 
+// CommandEnvelope represents a command sent from the control plane to an agent.
+type CommandEnvelope struct {
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	Payload   string `json:"payload,omitempty"`
+	CreatedAt string `json:"created_at"`
+}
+
 // Host is a registered supervisor.
 type Host struct {
 	ID                  string
@@ -318,6 +379,14 @@ type Host struct {
 	DistributionProfile string
 	Tools               []Tool
 	PendingToolUpdate   *PendingToolUpdate
+	PendingCommands     []CommandEnvelope
+}
+
+// PingAck is a live acknowledgment from an agent responding to a PING command.
+type PingAck struct {
+	PingID       string
+	AgentVersion string
+	ReceivedAt   time.Time
 }
 
 // Engine is the in-process control plane.
@@ -332,6 +401,8 @@ type Engine struct {
 	jobs            map[string]*Job
 	repos           map[string]*Repo
 	hosts           map[string]*Host
+	pingWaiters     map[string]chan PingAck
+	repoWaiters     map[string]chan RepoRuntimeStatus
 	profiles        map[string]*DistributionProfile
 	cloneLease      map[string]string
 	hubLease        string
@@ -400,8 +471,10 @@ func NewEngine(now func() time.Time) *Engine {
 		schedules:  map[string]*Schedule{},
 		jobs:       map[string]*Job{},
 		repos:      map[string]*Repo{},
-		hosts:      map[string]*Host{},
-		profiles:   map[string]*DistributionProfile{},
+		hosts:       map[string]*Host{},
+		pingWaiters: map[string]chan PingAck{},
+		repoWaiters: map[string]chan RepoRuntimeStatus{},
+		profiles:    map[string]*DistributionProfile{},
 		cloneLease: map[string]string{},
 		runningRev: map[string]bool{},
 		history:    map[string][]HistoryRow{},
@@ -1342,6 +1415,62 @@ func (e *Engine) MissHeartbeat(id string, missed int) {
 	if missed >= 2 {
 		h.Presence = "OFFLINE"
 		h.LastSeen = e.now().Add(-EphemeralGrace)
+	}
+}
+
+// RegisterRepoStatusWaiter registers a channel to receive live repo status updates.
+func (e *Engine) RegisterRepoStatusWaiter(hostID, repoPath string) (string, chan RepoRuntimeStatus) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.repoWaiters == nil {
+		e.repoWaiters = make(map[string]chan RepoRuntimeStatus)
+	}
+	key := hostID + ":" + filepath.Clean(repoPath)
+	ch := make(chan RepoRuntimeStatus, 1)
+	e.repoWaiters[key] = ch
+	return key, ch
+}
+
+// DeregisterRepoStatusWaiter unregisters a repo status waiter.
+func (e *Engine) DeregisterRepoStatusWaiter(key string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.repoWaiters, key)
+}
+
+// UpdateRepoRuntimeStatus updates repository fields based on continuous agent telemetry.
+func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeStatus) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, st := range statuses {
+		key := hostID + ":" + filepath.Clean(st.RepoPath)
+		if ch, ok := e.repoWaiters[key]; ok {
+			select {
+			case ch <- st:
+			default:
+			}
+		}
+		for _, r := range e.repos {
+			if r.HostID == hostID && (r.WorktreePath == st.RepoPath || r.EffectiveAlias() == st.Alias || filepath.Clean(r.WorktreePath) == filepath.Clean(st.RepoPath)) {
+				if st.Branch != "" {
+					r.CurrentBranch = st.Branch
+				}
+				r.Porcelain = st.Porcelain
+				if st.ActiveStoryID != "" {
+					r.DirtyStoryID = st.ActiveStoryID
+				}
+				if st.ActiveConversationID != "" {
+					r.DetectedConversationID = st.ActiveConversationID
+				}
+				r.SubmodulesClean = st.SubmodulesClean
+				r.DirtySubmodules = st.DirtySubmodules
+				r.ASEState = st.ASEState
+				r.ActiveTool = st.ActiveTool
+				r.ToolLiveness = st.ToolLiveness
+				r.ExecutionProvenance = st.ExecutionProvenance
+				r.LastRuntimeCheck = st.LastCheckedAt
+			}
+		}
 	}
 }
 

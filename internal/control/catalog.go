@@ -70,6 +70,62 @@ func (e *Engine) ConsumePendingToolUpdate(hostID string) *PendingToolUpdate {
 	return res
 }
 
+// QueueCommand registers a command to be delivered to the host on its next check/heartbeat.
+func (e *Engine) QueueCommand(hostID string, cmd CommandEnvelope) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	h, ok := e.hosts[hostID]
+	if !ok {
+		return ErrNotFound
+	}
+	h.PendingCommands = append(h.PendingCommands, cmd)
+	return nil
+}
+
+// ConsumePendingCommands retrieves and clears all pending commands for a host.
+func (e *Engine) ConsumePendingCommands(hostID string) []CommandEnvelope {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	h, ok := e.hosts[hostID]
+	if !ok || len(h.PendingCommands) == 0 {
+		return nil
+	}
+	cmds := h.PendingCommands
+	h.PendingCommands = nil
+	return cmds
+}
+
+// RegisterPingWaiter registers a channel to receive a live ping acknowledgment.
+func (e *Engine) RegisterPingWaiter(pingID string) chan PingAck {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.pingWaiters == nil {
+		e.pingWaiters = make(map[string]chan PingAck)
+	}
+	ch := make(chan PingAck, 1)
+	e.pingWaiters[pingID] = ch
+	return ch
+}
+
+// DeregisterPingWaiter unregisters a ping acknowledgment channel.
+func (e *Engine) DeregisterPingWaiter(pingID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.pingWaiters, pingID)
+}
+
+// NotifyPingAck notifies any registered waiter of a received live ping acknowledgment.
+func (e *Engine) NotifyPingAck(pingID, version string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if ch, ok := e.pingWaiters[pingID]; ok {
+		select {
+		case ch <- PingAck{PingID: pingID, AgentVersion: version, ReceivedAt: time.Now()}:
+		default:
+		}
+	}
+}
+
 // HeartbeatDetailed stores the tool inventory, updates presence, and reconciles active jobs.
 func (e *Engine) HeartbeatDetailed(id, presence string, tools []Tool, fetchFailed bool, activeJobs ...ActiveJob) error {
 	e.mu.Lock()
