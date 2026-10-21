@@ -390,6 +390,25 @@ type PingAck struct {
 }
 
 // Engine is the in-process control plane.
+// Story represents a canonical story stored in the control-plane ledger.
+type Story struct {
+	ID                   string    `json:"id"`
+	Repo                 string    `json:"repo"`
+	Submodule            string    `json:"submodule,omitempty"`
+	Title                string    `json:"title"`
+	Priority             string    `json:"priority,omitempty"`
+	Status               string    `json:"status,omitempty"`
+	SyncState            string    `json:"sync_state"` // PENDING_WORKSPACE_MATERIALIZATION, MATERIALIZED, FAILED
+	Body                 string    `json:"body,omitempty"`
+	Problem              string    `json:"problem,omitempty"`
+	AcceptanceCriteria   []string  `json:"acceptance_criteria,omitempty"`
+	TargetFiles          []string  `json:"target_files,omitempty"`
+	DependsOn            []string  `json:"depends_on,omitempty"`
+	VerificationCommands []string  `json:"verification_commands,omitempty"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
+}
+
 type Engine struct {
 	mu              sync.Mutex
 	now             func() time.Time
@@ -401,6 +420,7 @@ type Engine struct {
 	jobs            map[string]*Job
 	repos           map[string]*Repo
 	hosts           map[string]*Host
+	stories         map[string]*Story
 	pingWaiters     map[string]chan PingAck
 	repoWaiters     map[string]chan RepoRuntimeStatus
 	profiles        map[string]*DistributionProfile
@@ -414,6 +434,7 @@ type Engine struct {
 	Releases        *ReleaseService
 	toolPriority    []string
 	OnRepoChange    func(Repo)
+	OnStoryChange   func(Story)
 	OnHistoryChange func(host, path string, row HistoryRow)
 	OnHistoryDelete func(host, path string, jobID string)
 }
@@ -472,6 +493,7 @@ func NewEngine(now func() time.Time) *Engine {
 		jobs:       map[string]*Job{},
 		repos:      map[string]*Repo{},
 		hosts:       map[string]*Host{},
+		stories:     map[string]*Story{},
 		pingWaiters: map[string]chan PingAck{},
 		repoWaiters: map[string]chan RepoRuntimeStatus{},
 		profiles:    map[string]*DistributionProfile{},
@@ -2675,4 +2697,76 @@ func (e *Engine) EnqueueGlobalSchedule(promptID string, iterations int, envVars 
 	}
 	e.schedules[sid] = sch
 	return *sch, nil
+}
+
+// SaveStory inserts or updates a story in memory and triggers OnStoryChange.
+func (e *Engine) SaveStory(s Story) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if s.ID == "" {
+		return errors.New("story id required")
+	}
+	if s.CreatedAt.IsZero() {
+		s.CreatedAt = e.now().UTC()
+	}
+	s.UpdatedAt = e.now().UTC()
+	if s.SyncState == "" {
+		s.SyncState = "PENDING_WORKSPACE_MATERIALIZATION"
+	}
+	if s.Status == "" {
+		s.Status = "pending"
+	}
+	e.stories[s.ID] = &s
+	if e.OnStoryChange != nil {
+		cp := s
+		go e.OnStoryChange(cp)
+	}
+	return nil
+}
+
+// GetStory retrieves a story by ID.
+func (e *Engine) GetStory(id string) (Story, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	s, ok := e.stories[id]
+	if !ok || s == nil {
+		return Story{}, false
+	}
+	return *s, true
+}
+
+// ListStories retrieves all stories, optionally filtered by repo.
+func (e *Engine) ListStories(repo string) []Story {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var out []Story
+	for _, s := range e.stories {
+		if s == nil {
+			continue
+		}
+		if repo == "" || s.Repo == repo {
+			out = append(out, *s)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out
+}
+
+// UpdateStorySyncState updates the synchronization state of a story.
+func (e *Engine) UpdateStorySyncState(id, syncState string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	s, ok := e.stories[id]
+	if !ok || s == nil {
+		return errors.New("story not found")
+	}
+	s.SyncState = syncState
+	s.UpdatedAt = e.now().UTC()
+	if e.OnStoryChange != nil {
+		cp := *s
+		go e.OnStoryChange(cp)
+	}
+	return nil
 }

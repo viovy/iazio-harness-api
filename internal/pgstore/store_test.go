@@ -99,6 +99,16 @@ func TestNilStore(t *testing.T) {
 		t.Fatalf("expected nil chunks, got %v, %v", chunks, err)
 	}
 
+	if err := s.SaveStory(ctx, control.Story{}); err != nil {
+		t.Fatal(err)
+	}
+	if stories, err := s.LoadStories(ctx); err != nil || stories != nil {
+		t.Fatalf("expected nil stories, got %v, %v", stories, err)
+	}
+	if err := s.UpdateStorySyncState(ctx, "s1", "MATERIALIZED"); err != nil {
+		t.Fatal(err)
+	}
+
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -374,5 +384,37 @@ func TestLiveStoreIfConfigured(t *testing.T) {
 	}
 	if len(chunks) == 0 {
 		t.Fatal("expected codebase chunks")
+	}
+
+	// 10. Stories round-trip
+	st := control.Story{
+		ID:                   "story-pg-1",
+		Repo:                 "meta-repo",
+		Submodule:            "iazio-mcp",
+		Title:                "Test Story PG",
+		Priority:             "P1",
+		Status:               "pending",
+		SyncState:            "PENDING_WORKSPACE_MATERIALIZATION",
+		Body:                 "# Content",
+		Problem:              "Problem desc",
+		AcceptanceCriteria:   []string{"ac1"},
+		TargetFiles:          []string{"f1.go"},
+		DependsOn:            []string{"dep1"},
+		VerificationCommands: []string{"make test"},
+		CreatedAt:            now,
+		UpdatedAt:            now,
+	}
+	if err := store.SaveStory(ctx, st); err != nil {
+		t.Fatalf("SaveStory: %v", err)
+	}
+	stories, err := store.LoadStories(ctx)
+	if err != nil {
+		t.Fatalf("LoadStories: %v", err)
+	}
+	if len(stories) == 0 {
+		t.Fatal("expected stories")
+	}
+	if err := store.UpdateStorySyncState(ctx, "story-pg-1", "MATERIALIZED"); err != nil {
+		t.Fatalf("UpdateStorySyncState: %v", err)
 	}
 }

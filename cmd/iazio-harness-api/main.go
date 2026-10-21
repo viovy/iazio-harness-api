@@ -103,6 +103,12 @@ func run(ctx context.Context, args []string) error {
 			}
 			log.Printf("loaded %d repo history records from database", len(hist))
 		}
+		if stories, err := store.LoadStories(ctx); err == nil {
+			for _, st := range stories {
+				_ = srv.Engine.SaveStory(st)
+			}
+			log.Printf("loaded %d stories from database", len(stories))
+		}
 
 		seedDefaults(ctx, srv.Engine, store, srv.CodebaseStore)
 
@@ -126,6 +132,9 @@ func run(ctx context.Context, args []string) error {
 			_ = store.SaveRepo(context.Background(), r)
 		}
 		srv.Engine.OnRepoChange = srv.SaveRepo
+		srv.Engine.OnStoryChange = func(s control.Story) {
+			_ = store.SaveStory(context.Background(), s)
+		}
 		srv.Engine.OnHistoryChange = func(host, path string, row control.HistoryRow) {
 			if err := store.SaveHistory(context.Background(), host, path, row); err != nil {
 				log.Printf("warn: save history for %s %s: %v", host, path, err)

@@ -110,3 +110,21 @@ CREATE OR REPLACE VIEW fleet_repos AS
 SELECT name, path, default_branch, git_tree_sha AS indexed_tree_sha, git_tree_sha, description, host_id, updated_at
 FROM codebase_repositories;
 
+CREATE TABLE IF NOT EXISTS harness_stories (
+  id text PRIMARY KEY,
+  repo text NOT NULL,
+  submodule text NOT NULL DEFAULT '',
+  title text NOT NULL,
+  priority text NOT NULL DEFAULT 'P1',
+  status text NOT NULL DEFAULT 'pending',
+  sync_state text NOT NULL DEFAULT 'PENDING_WORKSPACE_MATERIALIZATION',
+  body text NOT NULL DEFAULT '',
+  problem text NOT NULL DEFAULT '',
+  acceptance_criteria jsonb NOT NULL DEFAULT '[]'::jsonb,
+  target_files jsonb NOT NULL DEFAULT '[]'::jsonb,
+  depends_on jsonb NOT NULL DEFAULT '[]'::jsonb,
+  verification_commands jsonb NOT NULL DEFAULT '[]'::jsonb,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  updated_at timestamp with time zone NOT NULL DEFAULT now()
+);
+

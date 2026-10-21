@@ -460,3 +460,139 @@ func TestServer_ProfileRefreshUpdatesTargetVersion(t *testing.T) {
 		t.Fatalf("expected tools in profile")
 	}
 }
+
+func TestServer_HealASERepo(t *testing.T) {
+	e := control.NewEngine(time.Now)
+	srv := &Server{
+		Engine: e,
+	}
+	handler := srv.Handler()
+
+	// 1. Method not allowed
+	reqWrongMethod := httptest.NewRequest(http.MethodGet, "/v1/hosts/debian/repos/heal-ase", nil)
+	wWrongMethod := httptest.NewRecorder()
+	handler.ServeHTTP(wWrongMethod, reqWrongMethod)
+	if wWrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 Method Not Allowed, got %d", wWrongMethod.Code)
+	}
+
+	// 2. Empty host
+	reqEmptyHost := httptest.NewRequest(http.MethodPost, "/v1/hosts//repos/heal-ase", nil)
+	wEmptyHost := httptest.NewRecorder()
+	srv.healASERepo(wEmptyHost, reqEmptyHost)
+	if wEmptyHost.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for empty host, got %d", wEmptyHost.Code)
+	}
+
+	// 3. Register host and repo with active lock
+	e.RegisterHost("debian", "linux", "generic")
+	repo := control.Repo{
+		HostID:       "debian",
+		WorktreePath: "/work/repo",
+		Lock:         control.LockASE,
+		Reason:       "ase story running",
+	}
+	if err := e.UpsertRepo(repo); err != nil {
+		t.Fatalf("upsert repo: %v", err)
+	}
+
+	// POST /v1/hosts/debian/repos/heal-ase?path=/work/repo
+	req := httptest.NewRequest(http.MethodPost, "/v1/hosts/debian/repos/heal-ase?path=/work/repo", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp["host_id"] != "debian" {
+		t.Errorf("expected host_id debian, got %v", resp["host_id"])
+	}
+	if resp["repo_path"] != "/work/repo" {
+		t.Errorf("expected repo_path /work/repo, got %v", resp["repo_path"])
+	}
+	if resp["status"] != "dispatched" {
+		t.Errorf("expected status dispatched, got %v", resp["status"])
+	}
+	locksCleared, ok := resp["locks_cleared"].([]any)
+	if !ok || len(locksCleared) == 0 || locksCleared[0] != "repo_lock_reset" {
+		t.Errorf("expected locks_cleared to contain repo_lock_reset, got %v", resp["locks_cleared"])
+	}
+
+	// Verify repo lock was reset in engine
+	detail, ok := e.GetRepoDetail("debian", "/work/repo")
+	if !ok || detail.Repo.Lock != control.LockIdle {
+		t.Errorf("expected repo lock to be LockIdle, got %v", detail.Repo.Lock)
+	}
+
+	// Verify command was queued
+	cmds := e.ConsumePendingCommands("debian")
+	if len(cmds) != 1 {
+		t.Fatalf("expected 1 command queued, got %d", len(cmds))
+	}
+	if cmds[0].Type != "REAP_ORPHANS_AND_RESET_ASE" {
+		t.Errorf("expected command REAP_ORPHANS_AND_RESET_ASE, got %s", cmds[0].Type)
+	}
+	if cmds[0].Payload != "/work/repo" {
+		t.Errorf("expected command payload /work/repo, got %v", cmds[0].Payload)
+	}
+
+	// 4. Test alternate route POST /api/v1/agents/debian/repos/heal-ase with JSON body
+	body := bytes.NewReader([]byte(`{"path":"/work/repo2"}`))
+	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/agents/debian/repos/heal-ase", body)
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for alternate route, got %d: %s", w2.Code, w2.Body.String())
+	}
+	var resp2 map[string]any
+	if err := json.Unmarshal(w2.Body.Bytes(), &resp2); err != nil {
+		t.Fatalf("unmarshal response 2: %v", err)
+	}
+	if resp2["repo_path"] != "/work/repo2" {
+		t.Errorf("expected repo_path /work/repo2, got %v", resp2["repo_path"])
+	}
+}
+
+func TestServer_ToolPriority(t *testing.T) {
+	e := control.NewEngine(time.Now)
+	srv := &Server{
+		Engine: e,
+	}
+	handler := srv.Handler()
+
+	// GET /v1/fleet/tool-priority
+	reqGet := httptest.NewRequest(http.MethodGet, "/v1/fleet/tool-priority", nil)
+	wGet := httptest.NewRecorder()
+	handler.ServeHTTP(wGet, reqGet)
+	if wGet.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", wGet.Code, wGet.Body.String())
+	}
+
+	// PUT /v1/fleet/tool-priority with invalid json
+	reqPutInvalid := httptest.NewRequest(http.MethodPut, "/v1/fleet/tool-priority", bytes.NewReader([]byte(`invalid-json`)))
+	wPutInvalid := httptest.NewRecorder()
+	handler.ServeHTTP(wPutInvalid, reqPutInvalid)
+	if wPutInvalid.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request, got %d", wPutInvalid.Code)
+	}
+
+	// PUT /v1/fleet/tool-priority with valid tools
+	reqPut := httptest.NewRequest(http.MethodPut, "/v1/fleet/tool-priority", bytes.NewReader([]byte(`{"tools":["opencode","agy"]}`)))
+	wPut := httptest.NewRecorder()
+	handler.ServeHTTP(wPut, reqPut)
+	if wPut.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", wPut.Code, wPut.Body.String())
+	}
+
+	// GET /api/v1/tool-priority
+	reqGetAPI := httptest.NewRequest(http.MethodGet, "/api/v1/tool-priority", nil)
+	wGetAPI := httptest.NewRecorder()
+	handler.ServeHTTP(wGetAPI, reqGetAPI)
+	if wGetAPI.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", wGetAPI.Code, wGetAPI.Body.String())
+	}
+}

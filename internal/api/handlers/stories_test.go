@@ -2,13 +2,13 @@ package handlers
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/viovy/iazio-harness-api/internal/control"
 	"github.com/viovy/iazio-harness-api/internal/dispatch"
 )
 
@@ -103,28 +103,12 @@ func TestStoriesHandler_SemanticValidation(t *testing.T) {
 	}
 }
 
-func TestStoriesHandler_CompletedWithinWindow(t *testing.T) {
+func TestStoriesHandler_ControlPlaneFirstCreation(t *testing.T) {
 	store := setupTestStore(t)
 	q := dispatch.NewInMemoryQueue()
+	engine := control.NewEngine(nil)
 	handler := NewStoriesHandler(store, q, nil)
-	handler.SetDispatchWaitTimeout(1 * time.Second)
-
-	// Simulate background agent claiming and completing the job
-	go func() {
-		time.Sleep(30 * time.Millisecond)
-		job, err := q.Claim(context.Background(), "", []string{dispatch.JobTypeStoryCreate})
-		if err != nil || job == nil {
-			return
-		}
-		result := StoryResultPayload{
-			StoryID:      "STORY-TEST-001",
-			Submodule:    "iazio-mcp",
-			StoryPath:    "docs/stories/2026-10-19-add-fleet-discovery.story.md",
-			IndexUpdated: true,
-		}
-		resBytes, _ := json.Marshal(result)
-		_ = q.Complete(context.Background(), job.ID, resBytes, "")
-	}()
+	handler.SetEngine(engine)
 
 	payload := validStoryPayload()
 	body, _ := json.Marshal(payload)
@@ -142,33 +126,44 @@ func TestStoriesHandler_CompletedWithinWindow(t *testing.T) {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 
-	if resp.Status != "completed" {
-		t.Errorf("expected status completed, got %s", resp.Status)
+	if resp.Status != "created" {
+		t.Errorf("expected status created, got %s", resp.Status)
 	}
-	if resp.StoryID != "STORY-TEST-001" {
-		t.Errorf("expected story_id STORY-TEST-001, got %s", resp.StoryID)
+	if resp.SyncState != "PENDING_WORKSPACE_MATERIALIZATION" {
+		t.Errorf("expected sync_state PENDING_WORKSPACE_MATERIALIZATION, got %s", resp.SyncState)
 	}
-	if !resp.IndexUpdated {
-		t.Error("expected index_updated=true")
+	if resp.StoryID == "" {
+		t.Error("expected non-empty story_id")
+	}
+
+	// Verify persistence in control engine
+	st, ok := engine.GetStory(resp.StoryID)
+	if !ok {
+		t.Fatalf("expected story %s to be stored in control engine", resp.StoryID)
+	}
+	if st.Title != payload["title"] {
+		t.Errorf("expected title %s, got %s", payload["title"], st.Title)
 	}
 }
 
-func TestStoriesHandler_TimeoutFallback(t *testing.T) {
+func TestStoriesHandler_ControlPlaneFirstWithEnqueue(t *testing.T) {
 	store := setupTestStore(t)
 	q := dispatch.NewInMemoryQueue()
+	engine := control.NewEngine(nil)
 	handler := NewStoriesHandler(store, q, nil)
-	// Set very short wait to trigger 202 Accepted
-	handler.SetDispatchWaitTimeout(30 * time.Millisecond)
+	handler.SetEngine(engine)
 
 	payload := validStoryPayload()
+	payload["enqueue"] = true
+	payload["target_agent"] = "debian"
 	body, _ := json.Marshal(payload)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/stories", bytes.NewReader(body))
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
-	if w.Code != http.StatusAccepted {
-		t.Fatalf("expected 202 Accepted on timeout, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created with enqueue, got %d: %s", w.Code, w.Body.String())
 	}
 
 	var resp CreateStoryResponse
@@ -176,38 +171,48 @@ func TestStoriesHandler_TimeoutFallback(t *testing.T) {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 
-	if resp.Status != "queued" {
-		t.Errorf("expected status queued, got %s", resp.Status)
+	if resp.Status != "created" {
+		t.Errorf("expected status created, got %s", resp.Status)
 	}
-	if resp.HarnessJobID == "" {
-		t.Error("expected non-empty harness_job_id")
+	if resp.ExecutionJobID == "" {
+		t.Fatal("expected non-empty execution_job_id")
+	}
+	if resp.ExecutionStatus != "pending" {
+		t.Errorf("expected execution_status pending, got %s", resp.ExecutionStatus)
 	}
 
-	// Verify job remains in queue
-	job, ok := q.Get(resp.HarnessJobID)
+	// Verify that the execution job was enqueued in dispatch queue
+	job, ok := q.Get(resp.ExecutionJobID)
 	if !ok || job == nil {
-		t.Fatalf("expected job %s to remain in queue", resp.HarnessJobID)
+		t.Fatalf("expected execution job %s in queue", resp.ExecutionJobID)
+	}
+	if job.Type != dispatch.JobTypePromptExecute {
+		t.Errorf("expected JobTypePromptExecute, got %s", job.Type)
+	}
+	if job.TargetAgent != "debian" {
+		t.Errorf("expected target_agent debian, got %s", job.TargetAgent)
 	}
 }
 
 func TestStoriesHandler_Idempotency(t *testing.T) {
 	store := setupTestStore(t)
 	q := dispatch.NewInMemoryQueue()
+	engine := control.NewEngine(nil)
 	idemStore := NewIdempotencyStore(1 * time.Hour)
 	handler := NewStoriesHandler(store, q, idemStore)
-	handler.SetDispatchWaitTimeout(10 * time.Millisecond)
+	handler.SetEngine(engine)
 
 	payload := validStoryPayload()
 	body, _ := json.Marshal(payload)
 
-	// Call 1
+	// Call 1: Fast 201 Created
 	req1 := httptest.NewRequest(http.MethodPost, "/api/v1/stories", bytes.NewReader(body))
 	req1.Header.Set("Idempotency-Key", "story-key-999")
 	w1 := httptest.NewRecorder()
 	handler.ServeHTTP(w1, req1)
 
-	if w1.Code != http.StatusAccepted {
-		t.Fatalf("expected 202 Accepted, got %d", w1.Code)
+	if w1.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d: %s", w1.Code, w1.Body.String())
 	}
 
 	// Call 2: Identical replay -> 200 OK replay
@@ -217,7 +222,7 @@ func TestStoriesHandler_Idempotency(t *testing.T) {
 	handler.ServeHTTP(w2, req2)
 
 	if w2.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK on replay, got %d", w2.Code)
+		t.Fatalf("expected 200 OK on replay, got %d: %s", w2.Code, w2.Body.String())
 	}
 
 	var resp2 CreateStoryResponse
@@ -239,83 +244,143 @@ func TestStoriesHandler_Idempotency(t *testing.T) {
 	}
 }
 
-func TestStoriesHandler_WorkspaceLocked(t *testing.T) {
+func TestStoriesHandler_GetAndListStories_DBAuthoritative(t *testing.T) {
 	store := setupTestStore(t)
 	q := dispatch.NewInMemoryQueue()
+	engine := control.NewEngine(nil)
 	handler := NewStoriesHandler(store, q, nil)
-	handler.SetDispatchWaitTimeout(1 * time.Second)
+	handler.SetEngine(engine)
 
-	payload := validStoryPayload()
-	body, _ := json.Marshal(payload)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/stories", bytes.NewReader(body))
-	w := httptest.NewRecorder()
-
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		job, err := q.Claim(context.Background(), "", []string{dispatch.JobTypeStoryCreate})
-		if err == nil && job != nil {
-			_ = q.Complete(context.Background(), job.ID, nil, "WORKSPACE_LOCKED: checkout iazio-mcp is held by background task")
-		}
-	}()
-
-	handler.ServeHTTP(w, req)
-	if w.Code != http.StatusLocked {
-		t.Fatalf("expected 423 Locked for WORKSPACE_LOCKED, got %d (body: %s)", w.Code, w.Body.String())
+	testStory := control.Story{
+		ID:         "STORY-DB-9999",
+		Title:      "DB Authoritative Title",
+		Submodule:  "iazio-mcp",
+		Status:     "in_progress",
+		Priority:   "P0",
+		Body:       "# DB Story Body\n\nMust take precedence over disk.",
+		CreatedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
 	}
-}
-
-func TestStoriesHandler_AsyncEnqueueOnTimeout(t *testing.T) {
-	store := setupTestStore(t)
-	q := dispatch.NewInMemoryQueue()
-	handler := NewStoriesHandler(store, q, nil)
-	handler.SetDispatchWaitTimeout(15 * time.Millisecond)
-
-	payload := validStoryPayload()
-	payload["enqueue"] = true
-	payload["target_agent"] = "debian"
-	body, _ := json.Marshal(payload)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/stories", bytes.NewReader(body))
-	w := httptest.NewRecorder()
-
-	handler.ServeHTTP(w, req)
-	if w.Code != http.StatusAccepted {
-		t.Fatalf("expected 202 Accepted on timeout, got %d (body: %s)", w.Code, w.Body.String())
+	if err := engine.SaveStory(testStory); err != nil {
+		t.Fatalf("failed to save story in engine: %v", err)
 	}
 
-	// Now simulate daemon completing the story creation in background
-	job, err := q.Claim(context.Background(), "", []string{dispatch.JobTypeStoryCreate})
-	if err != nil || job == nil {
-		t.Fatalf("expected claimed story.create job, got %v (job=%v)", err, job)
+	// Test GetStory
+	reqGet := httptest.NewRequest(http.MethodGet, "/api/v1/stories/STORY-DB-9999", nil)
+	wGet := httptest.NewRecorder()
+	handler.GetStory(wGet, reqGet)
+
+	if wGet.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from GetStory, got %d: %s", wGet.Code, wGet.Body.String())
 	}
 
-	resultPayload := StoryResultPayload{
-		StoryID:      "STORY-ASYNC-001",
-		Submodule:    "iazio-mcp",
-		StoryPath:    "docs/stories/2026-10-21-story.md",
-		IndexUpdated: true,
+	var gotStory StoryDetail
+	if err := json.NewDecoder(wGet.Body).Decode(&gotStory); err != nil {
+		t.Fatalf("failed to decode GetStory response: %v", err)
 	}
-	resBytes, _ := json.Marshal(resultPayload)
-	if err := q.Complete(context.Background(), job.ID, resBytes, ""); err != nil {
-		t.Fatalf("failed to complete job: %v", err)
+	if gotStory.ID != "STORY-DB-9999" {
+		t.Errorf("expected ID STORY-DB-9999, got %s", gotStory.ID)
+	}
+	if gotStory.Title != "DB Authoritative Title" {
+		t.Errorf("expected Title DB Authoritative Title, got %s", gotStory.Title)
+	}
+	if gotStory.Content != testStory.Body {
+		t.Errorf("expected Content %s, got %s", testStory.Body, gotStory.Content)
 	}
 
-	// Verify that the async watcher enqueues prompt.execute
-	var execJob *dispatch.Job
-	for i := 0; i < 20; i++ {
-		time.Sleep(20 * time.Millisecond)
-		ej, err := q.Claim(context.Background(), "debian", []string{dispatch.JobTypePromptExecute})
-		if err == nil && ej != nil {
-			execJob = ej
+	// Test ListStories
+	reqList := httptest.NewRequest(http.MethodGet, "/api/v1/stories", nil)
+	wList := httptest.NewRecorder()
+	handler.ListStories(wList, reqList)
+
+	if wList.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from ListStories, got %d: %s", wList.Code, wList.Body.String())
+	}
+
+	var listResp struct {
+		Stories []StoryDetail `json:"items"`
+		Total   int           `json:"total"`
+	}
+	if err := json.NewDecoder(wList.Body).Decode(&listResp); err != nil {
+		t.Fatalf("failed to decode ListStories response: %v", err)
+	}
+
+	var found bool
+	for _, s := range listResp.Stories {
+		if s.ID == "STORY-DB-9999" {
+			found = true
+			if s.Title != "DB Authoritative Title" {
+				t.Errorf("expected listed story Title DB Authoritative Title, got %s", s.Title)
+			}
 			break
 		}
 	}
-
-	if execJob == nil {
-		t.Fatal("expected async watcher to enqueue prompt.execute job upon background completion")
+	if !found {
+		t.Errorf("expected STORY-DB-9999 to be present in ListStories response")
 	}
-	if execJob.Type != dispatch.JobTypePromptExecute {
-		t.Errorf("expected JobTypePromptExecute, got %s", execJob.Type)
+}
+
+func TestStoriesHandler_MaterializeStory(t *testing.T) {
+	store := setupTestStore(t)
+	q := dispatch.NewInMemoryQueue()
+	engine := control.NewEngine(nil)
+	handler := NewStoriesHandler(store, q, nil)
+	handler.SetEngine(engine)
+	handler.SetDispatchWaitTimeout(10 * time.Millisecond)
+
+	// 1. Wrong method
+	reqWrong := httptest.NewRequest(http.MethodGet, "/api/v1/stories/STORY-MAT-1/materialize", nil)
+	wWrong := httptest.NewRecorder()
+	handler.MaterializeStory(wWrong, reqWrong)
+	if wWrong.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 Method Not Allowed, got %d", wWrong.Code)
+	}
+
+	// 2. Empty story ID
+	reqEmpty := httptest.NewRequest(http.MethodPost, "/api/v1/stories//materialize", nil)
+	wEmpty := httptest.NewRecorder()
+	handler.MaterializeStory(wEmpty, reqEmpty)
+	if wEmpty.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for empty ID, got %d", wEmpty.Code)
+	}
+
+	// 3. Story not found in engine
+	reqNotFound := httptest.NewRequest(http.MethodPost, "/api/v1/stories/STORY-NONEXISTENT/materialize", nil)
+	wNotFound := httptest.NewRecorder()
+	handler.MaterializeStory(wNotFound, reqNotFound)
+	if wNotFound.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found, got %d", wNotFound.Code)
+	}
+
+	// 4. Successful materialization
+	testStory := control.Story{
+		ID:        "STORY-MAT-1",
+		Title:     "Materialize Me",
+		Submodule: "iazio-mcp",
+		SyncState: "PENDING_WORKSPACE_MATERIALIZATION",
+	}
+	if err := engine.SaveStory(testStory); err != nil {
+		t.Fatalf("failed to save story: %v", err)
+	}
+
+	reqSuccess := httptest.NewRequest(http.MethodPost, "/api/v1/stories/STORY-MAT-1/materialize", nil)
+	wSuccess := httptest.NewRecorder()
+	handler.MaterializeStory(wSuccess, reqSuccess)
+	if wSuccess.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", wSuccess.Code, wSuccess.Body.String())
+	}
+
+	var res map[string]any
+	if err := json.Unmarshal(wSuccess.Body.Bytes(), &res); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if res["sync_state"] != "MATERIALIZED" {
+		t.Errorf("expected sync_state MATERIALIZED, got %v", res["sync_state"])
+	}
+
+	// Verify engine state was updated
+	st, ok := engine.GetStory("STORY-MAT-1")
+	if !ok || st.SyncState != "MATERIALIZED" {
+		t.Errorf("expected engine story sync_state MATERIALIZED, got %s", st.SyncState)
 	}
 }
