@@ -293,8 +293,8 @@ func (e *Engine) GetRepoDetail(host, path string) (RepoDetail, bool) {
 			detail.RunningEngine = sch.Engine
 			detail.RunningStartedAt = job.StartedAt
 			lastAct := job.StartedAt
-			if !job.LastChunkAt.IsZero() && job.LastChunkAt.After(lastAct) {
-				lastAct = job.LastChunkAt
+			if !job.LastOutputAt.IsZero() && job.LastOutputAt.After(lastAct) {
+				lastAct = job.LastOutputAt
 			}
 			detail.RunningSilentSeconds = int(e.now().Sub(lastAct).Seconds())
 			if job.Status == "RUNNING" && detail.RunningSilentSeconds > 120 {
@@ -619,6 +619,8 @@ func (e *Engine) AppendLog(jobID string, chunk LogChunk) {
 		job.LastChunkAt = e.now()
 		if chunk.Type != "OUTPUT_TICK" {
 			job.LastOutputAt = e.now()
+		} else if chunk.SilentForMs > 0 {
+			job.LastOutputAt = e.now().Add(-time.Duration(chunk.SilentForMs) * time.Millisecond)
 		}
 	}
 	for _, ch := range e.subs[jobID] {

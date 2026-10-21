@@ -2076,8 +2076,8 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 	if !job.StartedAt.IsZero() {
 		detail.StartedAt = job.StartedAt.UTC().Format(time.RFC3339)
 		lastAct := job.StartedAt
-		if !job.LastChunkAt.IsZero() && job.LastChunkAt.After(lastAct) {
-			lastAct = job.LastChunkAt
+		if !job.LastOutputAt.IsZero() && job.LastOutputAt.After(lastAct) {
+			lastAct = job.LastOutputAt
 		}
 		detail.SilentForSeconds = int(e.now().Sub(lastAct).Seconds())
 		if job.Status == "RUNNING" && detail.SilentForSeconds > 120 {
