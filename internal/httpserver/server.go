@@ -2015,10 +2015,40 @@ func (s *Server) checkFleetStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	sb.WriteString(fmt.Sprintf("[probe %s] Repository: %s\n", probeID, actualPath))
 	sb.WriteString(fmt.Sprintf("[probe %s] Branch: %s\n", probeID, res.Branch))
-	if res.IsClean {
+	porcelain := repo.Porcelain
+	if liveStatus != nil && liveStatus.Porcelain != "" {
+		porcelain = liveStatus.Porcelain
+	}
+	var modifiedFiles []string
+	var untrackedFiles []string
+	if strings.TrimSpace(porcelain) != "" {
+		for _, line := range strings.Split(porcelain, "\n") {
+			line = strings.TrimRight(line, "\r")
+			if len(line) < 3 {
+				continue
+			}
+			status := line[:2]
+			file := strings.TrimSpace(line[2:])
+			if strings.HasPrefix(status, "??") {
+				untrackedFiles = append(untrackedFiles, file)
+			} else {
+				modifiedFiles = append(modifiedFiles, file)
+			}
+		}
+	}
+	res.ModifiedFiles = modifiedFiles
+	res.UntrackedFiles = untrackedFiles
+
+	if res.IsClean && len(modifiedFiles) == 0 && len(untrackedFiles) == 0 {
 		sb.WriteString(fmt.Sprintf("[probe %s] Working Tree: CLEAN\n", probeID))
 	} else {
-		sb.WriteString(fmt.Sprintf("[probe %s] Working Tree: DIRTY\n", probeID))
+		sb.WriteString(fmt.Sprintf("[probe %s] Working Tree: DIRTY (%d modified, %d untracked)\n", probeID, len(modifiedFiles), len(untrackedFiles)))
+		for _, f := range modifiedFiles {
+			sb.WriteString(fmt.Sprintf("  M  %s\n", f))
+		}
+		for _, f := range untrackedFiles {
+			sb.WriteString(fmt.Sprintf("  ?? %s\n", f))
+		}
 	}
 	if res.SubmodulesClean {
 		sb.WriteString(fmt.Sprintf("[probe %s] Submodules: ALL CLEAN\n", probeID))
