@@ -223,6 +223,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/binaries-profiles/{name}/refresh", s.refreshProfileReleases)
 	mux.HandleFunc("POST /v1/hosts/{host}/ping", s.pingHost)
 	mux.HandleFunc("POST /api/v1/agents/{host}/ping", s.pingHost)
+	mux.HandleFunc("POST /v1/hosts/{host}/ping-ack", s.pingAck)
+	mux.HandleFunc("POST /api/v1/agents/{host}/ping-ack", s.pingAck)
 	mux.HandleFunc("POST /v1/hosts/{host}/repos/check-fleet-status", s.checkFleetStatus)
 	mux.HandleFunc("POST /api/v1/agents/{host}/repos/check-fleet-status", s.checkFleetStatus)
 	mux.HandleFunc("POST /v1/hosts/{host}/repos/status", s.updateRepoRuntimeStatus)
@@ -1476,6 +1478,20 @@ func (s *Server) refreshProfileReleases(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+func (s *Server) pingAck(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		PingID       string `json:"ping_id"`
+		AgentVersion string `json:"agent_version"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
+	if body.PingID != "" {
+		s.Engine.NotifyPingAck(body.PingID, body.AgentVersion)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
 func (s *Server) pingHost(w http.ResponseWriter, r *http.Request) {
 	hostID := r.PathValue("host")
 	detail, ok := s.Engine.GetHostDetail(hostID)
@@ -1484,14 +1500,17 @@ func (s *Server) pingHost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	start := time.Now()
-	isOnline := detail.Host.Presence == "ONLINE" || detail.Host.Presence == "ONLINE_UPDATING_TOOLS"
-	latency := int64(1)
-	if isOnline && !detail.Host.LastSeen.IsZero() {
-		diff := start.Sub(detail.Host.LastSeen).Milliseconds()
-		if diff > 0 {
-			latency = diff
-		}
-	}
+	pingID := fmt.Sprintf("ping-%d", time.Now().UnixNano())
+	ackChan := s.Engine.RegisterPingWaiter(pingID)
+	defer s.Engine.DeregisterPingWaiter(pingID)
+
+	// Queue the live PING command to the agent stream
+	_ = s.Engine.QueueCommand(hostID, control.CommandEnvelope{
+		ID:        pingID,
+		Type:      "PING",
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+
 	var agentVersion string
 	for _, t := range detail.Host.Tools {
 		if t.Name == "iazio-agent" {
@@ -1499,24 +1518,51 @@ func (s *Server) pingHost(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	if isOnline {
-		_ = s.Engine.QueueCommand(hostID, control.CommandEnvelope{
-			ID:        fmt.Sprintf("ping-%d", time.Now().UnixNano()),
-			Type:      "PING",
-			CreatedAt: time.Now().UTC().Format(time.RFC3339),
-		})
+
+	reachable := false
+	latency := int64(1)
+
+	// Wait up to 1 second for live agent ack round-trip
+	select {
+	case ack := <-ackChan:
+		reachable = true
+		latency = ack.ReceivedAt.Sub(start).Milliseconds()
+		if latency <= 0 {
+			latency = 1
+		}
+		if ack.AgentVersion != "" {
+			agentVersion = ack.AgentVersion
+		}
+	case <-time.After(1 * time.Second):
+		// If agent didn't ack within 1s, check if host is recently online
+		if (detail.Host.Presence == "ONLINE" || detail.Host.Presence == "ONLINE_UPDATING_TOOLS") &&
+			!detail.Host.LastSeen.IsZero() && time.Since(detail.Host.LastSeen) < 30*time.Second {
+			reachable = true
+			latency = time.Since(detail.Host.LastSeen).Milliseconds()
+			if latency <= 0 {
+				latency = 1
+			}
+		}
 	}
+
+	presence := detail.Host.Presence
+	if reachable && presence == "OFFLINE" {
+		presence = "ONLINE"
+	} else if !reachable {
+		presence = "OFFLINE"
+	}
+
 	res := map[string]any{
 		"host_id":       hostID,
-		"reachable":     isOnline,
-		"presence":      detail.Host.Presence,
+		"reachable":     reachable,
+		"presence":      presence,
 		"latency_ms":    latency,
 		"agent_version": agentVersion,
 		"kind":          detail.Host.Kind,
 		"active_jobs":   0,
 		"tools_count":   len(detail.Host.Tools),
 		"last_seen":     detail.Host.LastSeen.UTC().Format(time.RFC3339),
-		"status":        detail.Host.Presence,
+		"status":        presence,
 	}
 	writeJSON(w, http.StatusOK, res)
 }

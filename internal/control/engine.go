@@ -379,6 +379,13 @@ type Host struct {
 	PendingCommands     []CommandEnvelope
 }
 
+// PingAck is a live acknowledgment from an agent responding to a PING command.
+type PingAck struct {
+	PingID       string
+	AgentVersion string
+	ReceivedAt   time.Time
+}
+
 // Engine is the in-process control plane.
 type Engine struct {
 	mu              sync.Mutex
@@ -391,6 +398,7 @@ type Engine struct {
 	jobs            map[string]*Job
 	repos           map[string]*Repo
 	hosts           map[string]*Host
+	pingWaiters     map[string]chan PingAck
 	profiles        map[string]*DistributionProfile
 	cloneLease      map[string]string
 	hubLease        string
@@ -459,8 +467,9 @@ func NewEngine(now func() time.Time) *Engine {
 		schedules:  map[string]*Schedule{},
 		jobs:       map[string]*Job{},
 		repos:      map[string]*Repo{},
-		hosts:      map[string]*Host{},
-		profiles:   map[string]*DistributionProfile{},
+		hosts:       map[string]*Host{},
+		pingWaiters: map[string]chan PingAck{},
+		profiles:    map[string]*DistributionProfile{},
 		cloneLease: map[string]string{},
 		runningRev: map[string]bool{},
 		history:    map[string][]HistoryRow{},

@@ -95,6 +95,37 @@ func (e *Engine) ConsumePendingCommands(hostID string) []CommandEnvelope {
 	return cmds
 }
 
+// RegisterPingWaiter registers a channel to receive a live ping acknowledgment.
+func (e *Engine) RegisterPingWaiter(pingID string) chan PingAck {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.pingWaiters == nil {
+		e.pingWaiters = make(map[string]chan PingAck)
+	}
+	ch := make(chan PingAck, 1)
+	e.pingWaiters[pingID] = ch
+	return ch
+}
+
+// DeregisterPingWaiter unregisters a ping acknowledgment channel.
+func (e *Engine) DeregisterPingWaiter(pingID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.pingWaiters, pingID)
+}
+
+// NotifyPingAck notifies any registered waiter of a received live ping acknowledgment.
+func (e *Engine) NotifyPingAck(pingID, version string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if ch, ok := e.pingWaiters[pingID]; ok {
+		select {
+		case ch <- PingAck{PingID: pingID, AgentVersion: version, ReceivedAt: time.Now()}:
+		default:
+		}
+	}
+}
+
 // HeartbeatDetailed stores the tool inventory, updates presence, and reconciles active jobs.
 func (e *Engine) HeartbeatDetailed(id, presence string, tools []Tool, fetchFailed bool, activeJobs ...ActiveJob) error {
 	e.mu.Lock()
