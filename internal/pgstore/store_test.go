@@ -389,7 +389,7 @@ func TestLiveStoreIfConfigured(t *testing.T) {
 	// 10. Stories round-trip
 	st := control.Story{
 		ID:                   "story-pg-1",
-		Repo:                 "meta-repo",
+		Repo:                 "app-repo",
 		Submodule:            "iazio-mcp",
 		Title:                "Test Story PG",
 		Priority:             "P1",
