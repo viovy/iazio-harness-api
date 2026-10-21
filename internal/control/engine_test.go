@@ -2435,7 +2435,7 @@ func TestEngine_StoryOperations(t *testing.T) {
 	// 2. Save valid story
 	st1 := Story{
 		ID:        "STORY-ENG-1",
-		Repo:      "meta-repo",
+		Repo:      "test-repo",
 		Submodule: "iazio-harness",
 		Title:     "Engine Story 1",
 	}
@@ -2485,7 +2485,7 @@ func TestEngine_StoryOperations(t *testing.T) {
 		t.Errorf("expected STORY-ENG-1 first, got %s", all[0].ID)
 	}
 
-	filtered := e.ListStories("meta-repo")
+	filtered := e.ListStories("test-repo")
 	if len(filtered) != 1 || filtered[0].ID != "STORY-ENG-1" {
 		t.Fatalf("expected 1 filtered story, got %+v", filtered)
 	}

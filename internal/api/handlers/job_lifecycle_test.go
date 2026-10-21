@@ -295,7 +295,7 @@ func TestJobLifecycleHandler_GetJob_HistoryFallback(t *testing.T) {
 			CreatedAt:    now,
 		},
 		host:  "debian",
-		path:  "/work/meta-repo",
+		path:  "/work/test-repo",
 		found: true,
 	}
 	h.SetHistoryFinder(finder)
@@ -315,7 +315,7 @@ func TestJobLifecycleHandler_GetJob_HistoryFallback(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &detail); err != nil {
 		t.Fatalf("failed to unmarshal: %v", err)
 	}
-	if detail.ID != "job-hist-123" || detail.TargetHost != "debian" || detail.Repo != "/work/meta-repo" {
+	if detail.ID != "job-hist-123" || detail.TargetHost != "debian" || detail.Repo != "/work/test-repo" {
 		t.Fatalf("unexpected detail: %+v", detail)
 	}
 }
