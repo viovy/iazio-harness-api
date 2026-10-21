@@ -1736,8 +1736,21 @@ func TestServerExtendedHandlers(t *testing.T) {
 	_ = deletedProfiles
 }
 
+type testStoryValidator struct {
+	stories map[string]bool
+}
+
+func (v *testStoryValidator) StoryExists(storyID, submodule string) bool {
+	return v.stories[storyID]
+}
+
 func TestServer_DispatchAndStoryRoutesMounted(t *testing.T) {
-	s := &Server{Engine: control.NewEngine(nil)}
+	s := &Server{
+		Engine: control.NewEngine(nil),
+		StoryValidator: &testStoryValidator{
+			stories: map[string]bool{"STORY-TEST": true},
+		},
+	}
 	handler := s.Handler()
 
 	// 1. Check GET /api/v1/queue -> 200 OK (not 404)
@@ -1939,3 +1952,59 @@ func TestServer_CancelDispatchScheduleBridge(t *testing.T) {
 		t.Fatalf("expected job2 canceled, got %+v", j2)
 	}
 }
+
+func TestGetScheduleEndpointAndJobFallback(t *testing.T) {
+	e := control.NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	_ = e.UpsertRepo(control.Repo{HostID: "host-1", WorktreePath: "/work/app"})
+	p := e.PutPrompt(control.Prompt{Title: "Task", Body: "run", Status: "READY"})
+	sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Server{Engine: e}
+	handler := s.Handler()
+
+	// 2. Query GET /v1/schedules/{id} -> must return 200 OK with schedule details
+	reqSched := httptest.NewRequest(http.MethodGet, "/v1/schedules/"+sch.ID, nil)
+	rrSched := httptest.NewRecorder()
+	handler.ServeHTTP(rrSched, reqSched)
+	if rrSched.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /v1/schedules/%s, got %d: %s", sch.ID, rrSched.Code, rrSched.Body.String())
+	}
+	var schedMap map[string]any
+	if err := json.Unmarshal(rrSched.Body.Bytes(), &schedMap); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if schedMap["id"] != sch.ID {
+		t.Errorf("expected schedule ID %s, got %v", sch.ID, schedMap["id"])
+	}
+	if schedMap["host_id"] != "host-1" {
+		t.Errorf("expected host_id 'host-1', got %v", schedMap["host_id"])
+	}
+
+	// 3. Query GET /v1/jobs/{id} using the schedule ID -> must gracefully return 200 OK without 404
+	reqJob := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+sch.ID, nil)
+	rrJob := httptest.NewRecorder()
+	handler.ServeHTTP(rrJob, reqJob)
+	if rrJob.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for fallback /v1/jobs/%s, got %d: %s", sch.ID, rrJob.Code, rrJob.Body.String())
+	}
+	var jobMap map[string]any
+	if err := json.Unmarshal(rrJob.Body.Bytes(), &jobMap); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if jobMap["id"] != sch.ID {
+		t.Errorf("expected job ID %s, got %v", sch.ID, jobMap["id"])
+	}
+
+	// 4. Query GET /v1/schedules/nonexistent -> must return 404 Not Found
+	req404 := httptest.NewRequest(http.MethodGet, "/v1/schedules/sch-nonexistent", nil)
+	rr404 := httptest.NewRecorder()
+	handler.ServeHTTP(rr404, req404)
+	if rr404.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for nonexistent schedule, got %d", rr404.Code)
+	}
+}
+

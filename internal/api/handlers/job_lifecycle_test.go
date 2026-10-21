@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -158,14 +159,42 @@ func TestJobLifecycleHandler_RetryJob(t *testing.T) {
 	}
 }
 
+type mockStoryValidator struct {
+	availableStories map[string]bool
+}
+
+func (m *mockStoryValidator) StoryExists(storyID, submodule string) bool {
+	return m.availableStories[storyID]
+}
+
 func TestJobLifecycleHandler_ExecuteStory(t *testing.T) {
 	q := dispatch.NewInMemoryQueue()
 	h := NewJobLifecycleHandler(q)
+	v := &mockStoryValidator{
+		availableStories: map[string]bool{
+			"STORY-GOV-9999": true,
+		},
+	}
+	h.SetStoryValidator(v)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/v1/stories/{id}/execute", h.ExecuteStory)
 
-	body := bytes.NewReader([]byte(`{"submodule":".","target_agent":"autopilot"}`))
+	// 1. Non-existent story -> 404 Not Found with descriptive error message
+	bodyNonExistent := bytes.NewReader([]byte(`{"submodule":".","target_agent":"autopilot"}`))
+	reqNonExistent := httptest.NewRequest(http.MethodPost, "/api/v1/stories/STORY-TEST-0006/execute", bodyNonExistent)
+	rrNonExistent := httptest.NewRecorder()
+	mux.ServeHTTP(rrNonExistent, reqNonExistent)
+
+	if rrNonExistent.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found for nonexistent story, got %d: %s", rrNonExistent.Code, rrNonExistent.Body.String())
+	}
+	if !strings.Contains(rrNonExistent.Body.String(), "cannot execute nonexistent story") {
+		t.Fatalf("expected guidance to create story in error, got: %s", rrNonExistent.Body.String())
+	}
+
+	// 2. Existing story with TraceID -> 201 Created and properly queued
+	body := bytes.NewReader([]byte(`{"submodule":".","target_agent":"autopilot","trace_id":"trace-zipkin-test-123"}`))
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/stories/STORY-GOV-9999/execute", body)
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
@@ -178,6 +207,15 @@ func TestJobLifecycleHandler_ExecuteStory(t *testing.T) {
 	_ = json.Unmarshal(rr.Body.Bytes(), &execResp)
 	if execResp.StoryID != "STORY-GOV-9999" || execResp.Submodule != "." || execResp.JobID == "" || execResp.Status != dispatch.JobStatusPending {
 		t.Fatalf("unexpected execute response: %+v", execResp)
+	}
+
+	// Verify enqueued job has TraceID
+	job, found := q.Get(execResp.JobID)
+	if !found || job == nil {
+		t.Fatalf("job %s not found in queue", execResp.JobID)
+	}
+	if job.TraceID != "trace-zipkin-test-123" {
+		t.Errorf("expected TraceID trace-zipkin-test-123, got %s", job.TraceID)
 	}
 }
 
