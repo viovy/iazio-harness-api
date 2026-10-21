@@ -268,6 +268,9 @@ type RepoFleetStatusResult struct {
 	ToolLiveness         string   `json:"tool_liveness"`
 	ExecutionProvenance  string   `json:"execution_provenance"`
 	ActiveConversationID string   `json:"active_conversation_id,omitempty"`
+	IsLiveProbe          bool     `json:"is_live_probe"`
+	Stale                bool     `json:"stale"`
+	ProbeStatus          string   `json:"probe_status"`
 	DiagnosticSummary    string   `json:"diagnostic_summary"`
 	CheckedAt            string   `json:"checked_at"`
 }

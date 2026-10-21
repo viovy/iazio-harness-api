@@ -84,8 +84,21 @@ func TestServer_ProfileRefreshAndHostPing(t *testing.T) {
 		t.Fatalf("heartbeat: %v", err)
 	}
 
-	// 2. Ping host
-	reqPing := httptest.NewRequest("POST", "/v1/hosts/debian/ping", nil)
+	// 2. Ping host with simulated live agent ack round-trip
+	go func() {
+		for i := 0; i < 20; i++ {
+			cmds := e.ConsumePendingCommands("debian")
+			for _, cmd := range cmds {
+				if cmd.Type == "PING" {
+					e.NotifyPingAck(cmd.ID, "1.0.0")
+					return
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	reqPing := httptest.NewRequest("POST", "/v1/hosts/debian/ping?timeout_ms=500", nil)
 	wPing := httptest.NewRecorder()
 	handler.ServeHTTP(wPing, reqPing)
 	if wPing.Code != http.StatusOK {
@@ -98,8 +111,29 @@ func TestServer_ProfileRefreshAndHostPing(t *testing.T) {
 	if pingRes["reachable"] != true {
 		t.Fatalf("expected reachable host, got %v", pingRes)
 	}
+	if pingRes["live_ack"] != true {
+		t.Fatalf("expected live_ack true, got %v", pingRes["live_ack"])
+	}
 	if pingRes["agent_version"] != "1.0.0" {
 		t.Fatalf("expected agent_version 1.0.0, got %v", pingRes["agent_version"])
+	}
+
+	// 3. Ping timeout test: host without agent ack must fail live check (reachable: false, live_ack: false)
+	reqTimeout := httptest.NewRequest("POST", "/v1/hosts/debian/ping?timeout_ms=50", nil)
+	wTimeout := httptest.NewRecorder()
+	handler.ServeHTTP(wTimeout, reqTimeout)
+	if wTimeout.Code != http.StatusOK {
+		t.Fatalf("expected 200 for ping timeout, got %d", wTimeout.Code)
+	}
+	var timeoutRes map[string]any
+	if err := json.Unmarshal(wTimeout.Body.Bytes(), &timeoutRes); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if timeoutRes["reachable"] == true {
+		t.Fatalf("expected reachable false when live ack times out, got %v", timeoutRes)
+	}
+	if timeoutRes["live_ack"] == true {
+		t.Fatalf("expected live_ack false when live ack times out, got %v", timeoutRes)
 	}
 }
 
@@ -155,8 +189,33 @@ func TestServer_CheckFleetStatusAndRepoRuntimeStatus(t *testing.T) {
 		t.Fatalf("expected tool autopilot, got %s", r.ActiveTool)
 	}
 
-	// 2. Ephemeral Check Fleet Git Status
-	reqProbe := httptest.NewRequest("POST", "/v1/hosts/debian/repos/check-fleet-status?path=meta-repo", nil)
+	// 2. Ephemeral Check Fleet Git Status with live agent telemetry response
+	go func() {
+		for i := 0; i < 20; i++ {
+			cmds := e.ConsumePendingCommands("debian")
+			for _, cmd := range cmds {
+				if cmd.Type == "CHECK_FLEET_GIT_STATUS" {
+					e.UpdateRepoRuntimeStatus("debian", []control.RepoRuntimeStatus{
+						{
+							RepoPath:             "/home/romeo/work/meta-repo",
+							Branch:               "main",
+							IsClean:              true,
+							SubmodulesClean:      true,
+							ASEState:             "IDLE",
+							ActiveTool:           "autopilot",
+							ToolLiveness:         "LIVE",
+							ExecutionProvenance:  "COORDINATED_HARNESS",
+							LastCheckedAt:        time.Now(),
+						},
+					})
+					return
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	reqProbe := httptest.NewRequest("POST", "/v1/hosts/debian/repos/check-fleet-status?path=meta-repo&timeout_ms=500", nil)
 	wProbe := httptest.NewRecorder()
 	handler.ServeHTTP(wProbe, reqProbe)
 	if wProbe.Code != http.StatusOK {
@@ -169,6 +228,16 @@ func TestServer_CheckFleetStatusAndRepoRuntimeStatus(t *testing.T) {
 	if probeRes["status"] != "COMPLETED" {
 		t.Fatalf("expected status COMPLETED, got %v", probeRes["status"])
 	}
+	resultObj, ok := probeRes["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected result object in probe response, got %T", probeRes["result"])
+	}
+	if resultObj["is_live_probe"] != true {
+		t.Fatalf("expected is_live_probe == true for live probe response, got %v", resultObj["is_live_probe"])
+	}
+	if resultObj["probe_status"] != "LIVE_ACK" {
+		t.Fatalf("expected probe_status LIVE_ACK, got %v", resultObj["probe_status"])
+	}
 	if !strings.HasPrefix(probeRes["probe_id"].(string), "ephemeral-probe-") {
 		t.Fatalf("expected ephemeral probe ID, got %v", probeRes["probe_id"])
 	}
@@ -177,5 +246,30 @@ func TestServer_CheckFleetStatusAndRepoRuntimeStatus(t *testing.T) {
 	probeID := probeRes["probe_id"].(string)
 	if _, found := e.GetJob(probeID); found {
 		t.Fatalf("ephemeral probe leaked into persistent jobs table!")
+	}
+
+	// 3. Test probe timeout fallback to cached Repo
+	reqFallback := httptest.NewRequest("POST", "/v1/hosts/debian/repos/check-fleet-status?path=meta-repo&timeout_ms=50", nil)
+	wFallback := httptest.NewRecorder()
+	handler.ServeHTTP(wFallback, reqFallback)
+	if wFallback.Code != http.StatusOK {
+		t.Fatalf("expected 200 for fallback probe, got %d", wFallback.Code)
+	}
+	var fallbackRes map[string]any
+	if err := json.Unmarshal(wFallback.Body.Bytes(), &fallbackRes); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	fallbackResultObj, ok := fallbackRes["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected result object in fallback probe response, got %T", fallbackRes["result"])
+	}
+	if fallbackResultObj["is_live_probe"] == true {
+		t.Fatalf("expected is_live_probe == false when timed out")
+	}
+	if fallbackResultObj["stale"] != true {
+		t.Fatalf("expected stale == true when timed out")
+	}
+	if fallbackResultObj["probe_status"] != "TIMEOUT_CACHED_FALLBACK" {
+		t.Fatalf("expected TIMEOUT_CACHED_FALLBACK, got %v", fallbackResultObj["probe_status"])
 	}
 }

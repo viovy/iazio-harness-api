@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -1519,13 +1520,26 @@ func (s *Server) pingHost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	waitTimeout := 4 * time.Second
+	if tStr := r.URL.Query().Get("timeout_sec"); tStr != "" {
+		if sec, err := strconv.Atoi(tStr); err == nil && sec > 0 && sec <= 30 {
+			waitTimeout = time.Duration(sec) * time.Second
+		}
+	} else if tMsStr := r.URL.Query().Get("timeout_ms"); tMsStr != "" {
+		if ms, err := strconv.Atoi(tMsStr); err == nil && ms > 0 && ms <= 30000 {
+			waitTimeout = time.Duration(ms) * time.Millisecond
+		}
+	}
+
 	reachable := false
+	liveAck := false
 	latency := int64(1)
 
-	// Wait up to 1 second for live agent ack round-trip
+	// Wait for live agent ack round-trip
 	select {
 	case ack := <-ackChan:
 		reachable = true
+		liveAck = true
 		latency = ack.ReceivedAt.Sub(start).Milliseconds()
 		if latency <= 0 {
 			latency = 1
@@ -1533,28 +1547,21 @@ func (s *Server) pingHost(w http.ResponseWriter, r *http.Request) {
 		if ack.AgentVersion != "" {
 			agentVersion = ack.AgentVersion
 		}
-	case <-time.After(1 * time.Second):
-		// If agent didn't ack within 1s, check if host is recently online
-		if (detail.Host.Presence == "ONLINE" || detail.Host.Presence == "ONLINE_UPDATING_TOOLS") &&
-			!detail.Host.LastSeen.IsZero() && time.Since(detail.Host.LastSeen) < 30*time.Second {
-			reachable = true
-			latency = time.Since(detail.Host.LastSeen).Milliseconds()
-			if latency <= 0 {
-				latency = 1
-			}
-		}
+	case <-time.After(waitTimeout):
+		fmt.Fprintf(os.Stderr, "[SIR: PROBE_TIMEOUT] live ping to host %s timed out after %v without agent ack\n", hostID, waitTimeout)
 	}
 
-	presence := detail.Host.Presence
-	if reachable && presence == "OFFLINE" {
+	presence := "OFFLINE"
+	statusStr := "TIMEOUT"
+	if reachable {
 		presence = "ONLINE"
-	} else if !reachable {
-		presence = "OFFLINE"
+		statusStr = "ONLINE"
 	}
 
 	res := map[string]any{
 		"host_id":       hostID,
 		"reachable":     reachable,
+		"live_ack":      liveAck,
 		"presence":      presence,
 		"latency_ms":    latency,
 		"agent_version": agentVersion,
@@ -1562,7 +1569,10 @@ func (s *Server) pingHost(w http.ResponseWriter, r *http.Request) {
 		"active_jobs":   0,
 		"tools_count":   len(detail.Host.Tools),
 		"last_seen":     detail.Host.LastSeen.UTC().Format(time.RFC3339),
-		"status":        presence,
+		"status":        statusStr,
+	}
+	if !reachable {
+		res["error"] = fmt.Sprintf("ping timed out after %v waiting for live agent ack", waitTimeout)
 	}
 	writeJSON(w, http.StatusOK, res)
 }
@@ -1618,11 +1628,30 @@ func (s *Server) checkFleetStatus(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
 	})
 
+	waitTimeout := 4 * time.Second
+	if tStr := r.URL.Query().Get("timeout_sec"); tStr != "" {
+		if sec, err := strconv.Atoi(tStr); err == nil && sec > 0 && sec <= 30 {
+			waitTimeout = time.Duration(sec) * time.Second
+		}
+	} else if tMsStr := r.URL.Query().Get("timeout_ms"); tMsStr != "" {
+		if ms, err := strconv.Atoi(tMsStr); err == nil && ms > 0 && ms <= 30000 {
+			waitTimeout = time.Duration(ms) * time.Millisecond
+		}
+	}
+
 	var liveStatus *control.RepoRuntimeStatus
+	isLiveProbe := false
+	stale := false
+	probeStatus := "LIVE_ACK"
+
 	select {
 	case st := <-waiterCh:
 		liveStatus = &st
-	case <-time.After(500 * time.Millisecond):
+		isLiveProbe = true
+	case <-time.After(waitTimeout):
+		fmt.Fprintf(os.Stderr, "[SIR: PROBE_TIMEOUT] repo status probe for host %s repo %s timed out after %v; falling back to cache\n", hostID, actualPath, waitTimeout)
+		stale = true
+		probeStatus = "TIMEOUT_CACHED_FALLBACK"
 	}
 
 	res := control.RepoFleetStatusResult{
@@ -1637,6 +1666,9 @@ func (s *Server) checkFleetStatus(w http.ResponseWriter, r *http.Request) {
 		ToolLiveness:         repo.ToolLiveness,
 		ExecutionProvenance:  repo.ExecutionProvenance,
 		ActiveConversationID: repo.DetectedConversationID,
+		IsLiveProbe:          isLiveProbe,
+		Stale:                stale,
+		ProbeStatus:          probeStatus,
 		CheckedAt:            time.Now().UTC().Format(time.RFC3339),
 	}
 	if liveStatus != nil {
@@ -1687,7 +1719,7 @@ func (s *Server) checkFleetStatus(w http.ResponseWriter, r *http.Request) {
 	if liveStatus != nil {
 		sb.WriteString(fmt.Sprintf("[probe %s] Live probe telemetry received from agent\n", probeID))
 	} else {
-		sb.WriteString(fmt.Sprintf("[probe %s] Probe queued to agent; displaying status\n", probeID))
+		sb.WriteString(fmt.Sprintf("[probe %s] [SIR: PROBE_TIMEOUT] Live probe timed out after %v; displaying cached status\n", probeID, waitTimeout))
 	}
 	sb.WriteString(fmt.Sprintf("[probe %s] Repository: %s\n", probeID, actualPath))
 	sb.WriteString(fmt.Sprintf("[probe %s] Branch: %s\n", probeID, res.Branch))
