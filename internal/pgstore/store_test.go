@@ -132,7 +132,7 @@ func TestLiveStoreIfConfigured(t *testing.T) {
 		t.Skip("DATABASE_URL not set and 127.0.0.1:55432 unreachable; skipping live postgres store tests")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
 	store, err := Open(ctx, dsn)
