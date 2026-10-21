@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1205,6 +1206,38 @@ func (s *Server) listHistory(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
+	// Sort unified history chronologically: newest first (created_at DESC)
+	sort.SliceStable(out, func(i, j int) bool {
+		strI, _ := out[i]["created_at"].(string)
+		strJ, _ := out[j]["created_at"].(string)
+		if strI == "" && strJ == "" {
+			return false
+		}
+		if strI == "" {
+			return false
+		}
+		if strJ == "" {
+			return true
+		}
+		ti, errI := time.Parse(time.RFC3339, strI)
+		tj, errJ := time.Parse(time.RFC3339, strJ)
+		if errI != nil && errJ != nil {
+			return strI > strJ
+		}
+		if errI != nil {
+			return false
+		}
+		if errJ != nil {
+			return true
+		}
+		return ti.After(tj)
+	})
+
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{"history": out})
 }
 
