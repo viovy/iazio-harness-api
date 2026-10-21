@@ -254,3 +254,43 @@ func TestServer_RepoAliasAndGitCredentials(t *testing.T) {
 		t.Fatalf("expected 0 credentials after deletion, got %d", len(listAfter))
 	}
 }
+
+func TestServer_NotificationsAndToolUpdateQueue(t *testing.T) {
+	e := control.NewEngine(time.Now)
+	srv := &Server{Engine: e}
+	handler := srv.Handler()
+
+	e.RegisterHost("host-notif", "runner", "generic")
+
+	// 1. Queue tool update
+	reqBody := `{"tools": ["autopilot"], "force": true}`
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/hosts/host-notif/tools/update", bytes.NewReader([]byte(reqBody))))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on tool update queue, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// 2. Check GET /v1/notifications contains tool update notification
+	recNotifs := httptest.NewRecorder()
+	handler.ServeHTTP(recNotifs, httptest.NewRequest("GET", "/v1/notifications", nil))
+	if recNotifs.Code != http.StatusOK {
+		t.Fatalf("expected 200 on GET /v1/notifications, got %d: %s", recNotifs.Code, recNotifs.Body.String())
+	}
+	var notifsRes struct {
+		Notifications []NotificationRecord `json:"notifications"`
+		Count         int                  `json:"count"`
+	}
+	if err := json.Unmarshal(recNotifs.Body.Bytes(), &notifsRes); err != nil {
+		t.Fatalf("unmarshal notifications error: %v", err)
+	}
+	if notifsRes.Count == 0 || len(notifsRes.Notifications) == 0 {
+		t.Fatal("expected notifications to be recorded")
+	}
+
+	// 3. Test POST /v1/fleet/tools/update-all
+	recUpAll := httptest.NewRecorder()
+	handler.ServeHTTP(recUpAll, httptest.NewRequest("POST", "/v1/fleet/tools/update-all", bytes.NewReader([]byte(`{"tools":["autopilot"]}`))))
+	if recUpAll.Code != http.StatusOK {
+		t.Fatalf("expected 200 on update-all, got %d: %s", recUpAll.Code, recUpAll.Body.String())
+	}
+}

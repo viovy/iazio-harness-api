@@ -41,22 +41,27 @@ func (h *JobLifecycleHandler) SetScheduler(scheduler GlobalScheduler) {
 
 // JobDetailResponse is the detailed JSON representation of a dispatch job.
 type JobDetailResponse struct {
-	ID          string          `json:"id"`
-	Type        string          `json:"type"`
-	Repo        string          `json:"repo"`
-	TargetHost  string          `json:"target_host,omitempty"`
-	TargetAgent string          `json:"target_agent,omitempty"`
-	Status      string          `json:"status"`
-	Result      json.RawMessage `json:"result,omitempty"`
-	Error       string          `json:"error,omitempty"`
-	TraceID     string          `json:"trace_id,omitempty"`
-	SearchID    string          `json:"search_id,omitempty"`
-	RelevanceEmitted bool       `json:"relevance_emitted"`
-	PromotedMemories []string   `json:"promoted_memories,omitempty"`
-	CreatedAt   string          `json:"created_at"`
-	ClaimedAt   string          `json:"claimed_at,omitempty"`
-	CompletedAt string          `json:"completed_at,omitempty"`
-	DurationMs  int64           `json:"duration_ms,omitempty"`
+	ID               string                  `json:"id"`
+	Type             string                  `json:"type"`
+	Repo             string                  `json:"repo"`
+	TargetHost       string                  `json:"target_host,omitempty"`
+	TargetAgent      string                  `json:"target_agent,omitempty"`
+	Status           string                  `json:"status"`
+	Result           json.RawMessage         `json:"result,omitempty"`
+	Error            string                  `json:"error,omitempty"`
+	TraceID          string                  `json:"trace_id,omitempty"`
+	SearchID         string                  `json:"search_id,omitempty"`
+	RelevanceEmitted bool                    `json:"relevance_emitted"`
+	PromotedMemories []string                `json:"promoted_memories,omitempty"`
+	FencingToken     int64                   `json:"fencing_token,omitempty"`
+	Attempts         int                     `json:"attempts,omitempty"`
+	HeartbeatAt      string                  `json:"heartbeat_at,omitempty"`
+	LeaseExpiresAt   string                  `json:"lease_expires_at,omitempty"`
+	AgentAffinity    *dispatch.AgentAffinity `json:"agent_affinity,omitempty"`
+	CreatedAt        string                  `json:"created_at"`
+	ClaimedAt        string                  `json:"claimed_at,omitempty"`
+	CompletedAt      string                  `json:"completed_at,omitempty"`
+	DurationMs       int64                   `json:"duration_ms,omitempty"`
 }
 
 // ListQueueResponse contains the list of jobs matching a filter.
@@ -354,7 +359,17 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		SearchID:         j.SearchID,
 		RelevanceEmitted: j.RelevanceEmitted,
 		PromotedMemories: promoted,
+		FencingToken:     j.FencingToken,
+		Attempts:         j.Attempts,
+		AgentAffinity:    j.AgentAffinity,
 		CreatedAt:        j.CreatedAt.Format(time.RFC3339),
+	}
+
+	if j.HeartbeatAt != nil {
+		resp.HeartbeatAt = j.HeartbeatAt.Format(time.RFC3339)
+	}
+	if j.LeaseExpiresAt != nil {
+		resp.LeaseExpiresAt = j.LeaseExpiresAt.Format(time.RFC3339)
 	}
 
 	if j.ClaimedAt != nil {

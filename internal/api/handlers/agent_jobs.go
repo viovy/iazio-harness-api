@@ -17,8 +17,14 @@ type ClaimJobRequest struct {
 
 // CompleteJobRequest is sent by an iazio-agent daemon to report job outcome.
 type CompleteJobRequest struct {
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  string          `json:"error,omitempty"`
+	FencingToken int64           `json:"fencing_token,omitempty"`
+	Result       json.RawMessage `json:"result,omitempty"`
+	Error        string          `json:"error,omitempty"`
+}
+
+// HeartbeatJobRequest is sent by an iazio-agent daemon to extend its execution lease.
+type HeartbeatJobRequest struct {
+	FencingToken int64 `json:"fencing_token"`
 }
 
 // AgentJobsHandler manages agent job claims and completion reports.
@@ -71,17 +77,20 @@ func (h *AgentJobsHandler) CompleteHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	path := r.URL.Path
-	prefix := "/api/v1/agent/jobs/"
-	suffix := "/complete"
-	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
-		writeJSONError(w, http.StatusBadRequest, "invalid complete path")
-		return
+	jobID := r.PathValue("id")
+	if jobID == "" {
+		path := r.URL.Path
+		prefix := "/api/v1/agent/jobs/"
+		if !strings.HasPrefix(path, prefix) {
+			prefix = "/v1/agent/jobs/"
+		}
+		suffix := "/complete"
+		if strings.HasPrefix(path, prefix) && strings.HasSuffix(path, suffix) {
+			jobID = strings.TrimPrefix(path, prefix)
+			jobID = strings.TrimSuffix(jobID, suffix)
+			jobID = strings.TrimSpace(jobID)
+		}
 	}
-
-	jobID := strings.TrimPrefix(path, prefix)
-	jobID = strings.TrimSuffix(jobID, suffix)
-	jobID = strings.TrimSpace(jobID)
 
 	if jobID == "" {
 		writeJSONError(w, http.StatusBadRequest, "missing job_id")
@@ -99,7 +108,7 @@ func (h *AgentJobsHandler) CompleteHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	err := h.queue.Complete(r.Context(), jobID, req.Result, req.Error)
+	err := h.queue.CompleteWithFencing(r.Context(), jobID, req.FencingToken, req.Result, req.Error)
 	if err != nil {
 		if err == dispatch.ErrJobNotFound {
 			writeJSONError(w, http.StatusNotFound, "job not found")
@@ -109,6 +118,10 @@ func (h *AgentJobsHandler) CompleteHandler(w http.ResponseWriter, r *http.Reques
 			writeJSONError(w, http.StatusConflict, "job already completed")
 			return
 		}
+		if err == dispatch.ErrLeaseFenced {
+			writeJSONError(w, http.StatusConflict, "LEASE_FENCED: stale fencing token presented")
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -116,4 +129,65 @@ func (h *AgentJobsHandler) CompleteHandler(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// HeartbeatHandler handles POST /api/v1/agent/jobs/{id}/heartbeat.
+func (h *AgentJobsHandler) HeartbeatHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	jobID := r.PathValue("id")
+	if jobID == "" {
+		path := r.URL.Path
+		prefix := "/api/v1/agent/jobs/"
+		if !strings.HasPrefix(path, prefix) {
+			prefix = "/v1/agent/jobs/"
+		}
+		suffix := "/heartbeat"
+		if strings.HasPrefix(path, prefix) && strings.HasSuffix(path, suffix) {
+			jobID = strings.TrimPrefix(path, prefix)
+			jobID = strings.TrimSuffix(jobID, suffix)
+			jobID = strings.TrimSpace(jobID)
+		}
+	}
+
+	if jobID == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing job_id")
+		return
+	}
+
+	var req HeartbeatJobRequest
+	if r.Body != nil {
+		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req)
+	}
+
+	if h.queue == nil {
+		writeJSONError(w, http.StatusInternalServerError, "dispatch queue not available")
+		return
+	}
+
+	job, err := h.queue.Heartbeat(r.Context(), jobID, req.FencingToken)
+	if err != nil {
+		if err == dispatch.ErrJobNotFound {
+			writeJSONError(w, http.StatusNotFound, "job not found")
+			return
+		}
+		if err == dispatch.ErrLeaseFenced {
+			writeJSONError(w, http.StatusConflict, "LEASE_FENCED: stale fencing token presented")
+			return
+		}
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":           "ok",
+		"job_id":           job.ID,
+		"fencing_token":    job.FencingToken,
+		"lease_expires_at": job.LeaseExpiresAt,
+	})
 }

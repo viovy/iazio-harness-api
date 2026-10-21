@@ -33,13 +33,18 @@ const (
 	JobStatusCompleted = "completed"
 	JobStatusFailed    = "failed"
 	JobStatusCanceled  = "canceled"
+	JobStatusStalled   = "stalled"
 )
 
 const (
 	// DefaultClaimTimeout is the duration a claimed job can remain active before lease expiration.
 	DefaultClaimTimeout = 30 * time.Minute
+	// DefaultHeartbeatTimeout is the maximum duration between runner heartbeats before considering a runner stalled.
+	DefaultHeartbeatTimeout = 2 * time.Minute
 	// DefaultJobTimeout is the maximum total duration of a job before execution timeout.
 	DefaultJobTimeout = 60 * time.Minute
+	// DefaultMaxAttempts is the maximum number of times a stalled job may be reclaimed.
+	DefaultMaxAttempts = 3
 )
 
 var (
@@ -49,7 +54,16 @@ var (
 	ErrJobAlreadyCompleted = errors.New("job already completed")
 	// ErrTimeout indicates an await operation timed out before job completion.
 	ErrTimeout = errors.New("dispatch await timeout")
+	// ErrLeaseFenced indicates a superseded worker attempted to mutate job state.
+	ErrLeaseFenced = errors.New("lease fenced: stale fencing token presented")
 )
+
+// AgentAffinity defines binding constraints for workers claiming jobs.
+type AgentAffinity struct {
+	HostID               string   `json:"host_id,omitempty"`
+	AgentName            string   `json:"agent_name,omitempty"`
+	RequiredCapabilities []string `json:"required_capabilities,omitempty"`
+}
 
 // Job represents an asynchronous task dispatched to an iazio-agent daemon.
 type Job struct {
@@ -58,6 +72,7 @@ type Job struct {
 	Repo             string          `json:"repo"`
 	TargetHost       string          `json:"target_host,omitempty"`
 	TargetAgent      string          `json:"target_agent,omitempty"`
+	AgentAffinity    *AgentAffinity  `json:"agent_affinity,omitempty"`
 	Payload          json.RawMessage `json:"payload"`
 	Status           string          `json:"status"`
 	Result           json.RawMessage `json:"result,omitempty"`
@@ -67,8 +82,12 @@ type Job struct {
 	SearchID         string          `json:"search_id,omitempty"`
 	RelevanceEmitted bool            `json:"relevance_emitted"`
 	PromotedMemories []string        `json:"promoted_memories,omitempty"`
+	FencingToken     int64           `json:"fencing_token"`
+	Attempts         int             `json:"attempts"`
 	CreatedAt        time.Time       `json:"created_at"`
 	ClaimedAt        *time.Time      `json:"claimed_at,omitempty"`
+	HeartbeatAt      *time.Time      `json:"heartbeat_at,omitempty"`
+	LeaseExpiresAt   *time.Time      `json:"lease_expires_at,omitempty"`
 	CompletedAt      *time.Time      `json:"completed_at,omitempty"`
 
 	// doneCh signals when the job has been completed or failed.
@@ -87,7 +106,9 @@ type JobFilter struct {
 type Queue interface {
 	Enqueue(ctx context.Context, job *Job) (*Job, error)
 	Claim(ctx context.Context, hostID string, jobTypes []string) (*Job, error)
+	Heartbeat(ctx context.Context, jobID string, fencingToken int64) (*Job, error)
 	Complete(ctx context.Context, jobID string, result json.RawMessage, errStr string) error
+	CompleteWithFencing(ctx context.Context, jobID string, fencingToken int64, result json.RawMessage, errStr string) error
 	Get(jobID string) (*Job, bool)
 	List(ctx context.Context, filter JobFilter) ([]*Job, error)
 	Cancel(ctx context.Context, jobID string, reason string) (*Job, error)
@@ -113,6 +134,7 @@ type JobAttributionResponse struct {
 type InMemoryQueue struct {
 	mu             sync.Mutex
 	jobs           map[string]*Job
+	fencingSeq     int64
 	attributionURL string
 	httpClient     *http.Client
 	claimTimeout   time.Duration
@@ -191,17 +213,40 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 			continue
 		}
 
-		// 2. Claim lease timeout: from ClaimedAt
-		if j.Status == JobStatusClaimed && q.claimTimeout > 0 && j.ClaimedAt != nil && !j.ClaimedAt.IsZero() && now.Sub(*j.ClaimedAt) > q.claimTimeout {
-			j.Status = JobStatusFailed
-			j.Error = "LEASE_EXPIRED: execution lease expired without completion"
-			completedAt := now
-			j.CompletedAt = &completedAt
-			expiredIDs = append(expiredIDs, j.ID)
-			if j.doneCh != nil {
-				doneChannels = append(doneChannels, j.doneCh)
+		// 2. Claim lease & heartbeat timeout:
+		if j.Status == JobStatusClaimed {
+			if q.claimTimeout > 0 && j.ClaimedAt != nil && !j.ClaimedAt.IsZero() && now.Sub(*j.ClaimedAt) > q.claimTimeout {
+				j.Status = JobStatusFailed
+				j.Error = "LEASE_EXPIRED: execution lease expired without completion"
+				completedAt := now
+				j.CompletedAt = &completedAt
+				expiredIDs = append(expiredIDs, j.ID)
+				if j.doneCh != nil {
+					doneChannels = append(doneChannels, j.doneCh)
+				}
+				continue
 			}
-			continue
+
+			if j.LeaseExpiresAt != nil && !j.LeaseExpiresAt.IsZero() && now.After(*j.LeaseExpiresAt) {
+				if j.Attempts < DefaultMaxAttempts {
+					// Safe runner recovery: revert to pending for retry without duplicate execution
+					j.Status = JobStatusPending
+					j.ClaimedAt = nil
+					j.HeartbeatAt = nil
+					j.LeaseExpiresAt = nil
+					expiredIDs = append(expiredIDs, j.ID)
+				} else {
+					j.Status = JobStatusFailed
+					j.Error = "HEARTBEAT_TIMEOUT: runner heartbeat stopped, max retry attempts exceeded"
+					completedAt := now
+					j.CompletedAt = &completedAt
+					expiredIDs = append(expiredIDs, j.ID)
+					if j.doneCh != nil {
+						doneChannels = append(doneChannels, j.doneCh)
+					}
+				}
+				continue
+			}
 		}
 	}
 
@@ -290,6 +335,9 @@ func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []str
 		if j.TargetHost != "" && hostID != "" && j.TargetHost != hostID {
 			continue
 		}
+		if j.AgentAffinity != nil && j.AgentAffinity.HostID != "" && hostID != "" && j.AgentAffinity.HostID != hostID {
+			continue
+		}
 		if oldest == nil || j.CreatedAt.Before(oldest.CreatedAt) {
 			oldest = j
 		}
@@ -300,22 +348,60 @@ func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []str
 	}
 
 	now := q.now()
+	q.fencingSeq++
+	oldest.FencingToken = q.fencingSeq
+	oldest.Attempts++
 	oldest.Status = JobStatusClaimed
 	oldest.ClaimedAt = &now
+	oldest.HeartbeatAt = &now
+	expires := now.Add(DefaultHeartbeatTimeout)
+	oldest.LeaseExpiresAt = &expires
 	return oldest, nil
+}
+
+// Heartbeat extends the lease expiration of an in-flight claimed job, validating the worker's fencing token.
+func (q *InMemoryQueue) Heartbeat(ctx context.Context, jobID string, fencingToken int64) (*Job, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	job, exists := q.jobs[jobID]
+	if !exists {
+		return nil, ErrJobNotFound
+	}
+	if job.Status != JobStatusClaimed {
+		return nil, fmt.Errorf("job %s is not currently claimed (status: %s)", jobID, job.Status)
+	}
+	if fencingToken > 0 && job.FencingToken != 0 && job.FencingToken != fencingToken {
+		return nil, ErrLeaseFenced
+	}
+
+	now := q.now()
+	job.HeartbeatAt = &now
+	expires := now.Add(DefaultHeartbeatTimeout)
+	job.LeaseExpiresAt = &expires
+	return job, nil
 }
 
 // Complete updates a job with final result or error and signals any awaiting callers.
 func (q *InMemoryQueue) Complete(ctx context.Context, jobID string, result json.RawMessage, errStr string) error {
+	return q.CompleteWithFencing(ctx, jobID, 0, result, errStr)
+}
+
+// CompleteWithFencing validates the fencing token and updates the job with final result or error.
+func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, fencingToken int64, result json.RawMessage, errStr string) error {
 	q.mu.Lock()
 	job, exists := q.jobs[jobID]
 	if !exists {
 		q.mu.Unlock()
 		return ErrJobNotFound
 	}
-	if job.Status == JobStatusCompleted || job.Status == JobStatusFailed {
+	if job.Status == JobStatusCompleted || job.Status == JobStatusFailed || job.Status == JobStatusCanceled {
 		q.mu.Unlock()
 		return ErrJobAlreadyCompleted
+	}
+	if fencingToken > 0 && job.FencingToken != 0 && job.FencingToken != fencingToken {
+		q.mu.Unlock()
+		return ErrLeaseFenced
 	}
 
 	now := q.now()

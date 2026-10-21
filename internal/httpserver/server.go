@@ -3,6 +3,7 @@ package httpserver
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/viovy/iazio-harness-api/internal/api/handlers"
@@ -58,6 +60,55 @@ type Server struct {
 	Queue dispatch.Queue
 	// Idempotency manages API idempotency caches.
 	Idempotency *handlers.IdempotencyStore
+
+	notificationsMu sync.RWMutex
+	notifications   []NotificationRecord
+}
+
+// NotificationRecord captures system events, releases refreshes, and agent tool execution events.
+type NotificationRecord struct {
+	ID        string         `json:"id"`
+	Title     string         `json:"title"`
+	Message   string         `json:"message"`
+	Category  string         `json:"category"` // "info", "success", "warning", "error", "userAction"
+	Timestamp time.Time      `json:"timestamp"`
+	Source    string         `json:"source,omitempty"`
+	JobID     string         `json:"job_id,omitempty"`
+	HostID    string         `json:"host_id,omitempty"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
+}
+
+// RecordNotification records a notification in memory, capped to 500 entries.
+func (s *Server) RecordNotification(rec NotificationRecord) {
+	s.notificationsMu.Lock()
+	defer s.notificationsMu.Unlock()
+	if rec.ID == "" {
+		b := make([]byte, 8)
+		_, _ = rand.Read(b)
+		rec.ID = fmt.Sprintf("notif_%x", b)
+	}
+	if rec.Timestamp.IsZero() {
+		rec.Timestamp = time.Now().UTC()
+	}
+	if rec.Category == "" {
+		rec.Category = "info"
+	}
+	s.notifications = append([]NotificationRecord{rec}, s.notifications...)
+	if len(s.notifications) > 500 {
+		s.notifications = s.notifications[:500]
+	}
+}
+
+// GetNotifications returns recent notifications up to limit.
+func (s *Server) GetNotifications(limit int) []NotificationRecord {
+	s.notificationsMu.RLock()
+	defer s.notificationsMu.RUnlock()
+	if limit <= 0 || limit > len(s.notifications) {
+		limit = len(s.notifications)
+	}
+	res := make([]NotificationRecord, limit)
+	copy(res, s.notifications[:limit])
+	return res
 }
 
 // Handler returns the HTTP routes.
@@ -115,6 +166,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/agent/jobs/claim", agentJobsHandler.ClaimHandler)
 	mux.HandleFunc("POST /v1/agent/jobs/claim", agentJobsHandler.ClaimHandler)
 	mux.HandleFunc("POST /api/v1/agent/jobs/{id}/complete", agentJobsHandler.CompleteHandler)
+	mux.HandleFunc("POST /v1/agent/jobs/{id}/complete", agentJobsHandler.CompleteHandler)
+	mux.HandleFunc("POST /api/v1/agent/jobs/{id}/heartbeat", agentJobsHandler.HeartbeatHandler)
+	mux.HandleFunc("POST /v1/agent/jobs/{id}/heartbeat", agentJobsHandler.HeartbeatHandler)
+	mux.HandleFunc("GET /v1/notifications", s.getNotifications)
+	mux.HandleFunc("GET /api/v1/notifications", s.getNotifications)
+	mux.HandleFunc("POST /v1/fleet/tools/update-all", s.queueAllToolsUpdate)
+	mux.HandleFunc("POST /v1/hosts/all/tools/update", s.queueAllToolsUpdate)
 
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{
@@ -1310,6 +1368,20 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+func (s *Server) getNotifications(w http.ResponseWriter, r *http.Request) {
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if val, err := strconv.Atoi(l); err == nil && val > 0 {
+			limit = val
+		}
+	}
+	notifs := s.GetNotifications(limit)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"notifications": notifs,
+		"count":         len(notifs),
+	})
+}
+
 func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 	hostID := r.PathValue("id")
 	var body struct {
@@ -1323,11 +1395,117 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, err)
 		return
 	}
+
+	var jobID string
+	if s.Queue != nil {
+		payload, _ := json.Marshal(map[string]any{
+			"host_id": hostID,
+			"tools":   body.Tools,
+			"force":   body.Force,
+		})
+		job := &dispatch.Job{
+			Type:       "agent.tools.update",
+			Repo:       "fleet",
+			TargetHost: hostID,
+			AgentAffinity: &dispatch.AgentAffinity{
+				HostID:    hostID,
+				AgentName: "iazio-agent",
+			},
+			Payload: payload,
+			Status:  dispatch.JobStatusPending,
+		}
+		if enqJob, err := s.Queue.Enqueue(r.Context(), job); err == nil && enqJob != nil {
+			jobID = enqJob.ID
+		}
+	}
+
+	s.RecordNotification(NotificationRecord{
+		Title:    "Tool Update Queued",
+		Message:  fmt.Sprintf("Tool update queued for host %s (job: %s)", hostID, jobID),
+		Category: "userAction",
+		Source:   "harness-api",
+		JobID:    jobID,
+		HostID:   hostID,
+		Metadata: map[string]any{
+			"tools": body.Tools,
+			"force": body.Force,
+		},
+	})
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":  "queued",
 		"host_id": hostID,
+		"job_id":  jobID,
 		"tools":   body.Tools,
 		"force":   body.Force,
+	})
+}
+
+func (s *Server) queueAllToolsUpdate(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Tools []string `json:"tools"`
+		Force bool     `json:"force"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
+
+	hosts := s.Engine.ListHosts()
+	queuedHosts := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		hostID := h.Host.ID
+		_ = s.Engine.QueueToolUpdate(hostID, body.Tools, body.Force)
+		var jobID string
+		if s.Queue != nil {
+			payload, _ := json.Marshal(map[string]any{
+				"host_id": hostID,
+				"tools":   body.Tools,
+				"force":   body.Force,
+			})
+			job := &dispatch.Job{
+				Type:       "agent.tools.update",
+				Repo:       "fleet",
+				TargetHost: hostID,
+				AgentAffinity: &dispatch.AgentAffinity{
+					HostID:    hostID,
+					AgentName: "iazio-agent",
+				},
+				Payload: payload,
+				Status:  dispatch.JobStatusPending,
+			}
+			if enqJob, err := s.Queue.Enqueue(r.Context(), job); err == nil && enqJob != nil {
+				jobID = enqJob.ID
+			}
+		}
+		queuedHosts = append(queuedHosts, hostID)
+		s.RecordNotification(NotificationRecord{
+			Title:    "Tool Update Queued",
+			Message:  fmt.Sprintf("Tool update queued for host %s across fleet (job: %s)", hostID, jobID),
+			Category: "info",
+			Source:   "harness-api",
+			JobID:    jobID,
+			HostID:   hostID,
+		})
+	}
+
+	s.RecordNotification(NotificationRecord{
+		Title:    "Fleet Tool Update Initiated",
+		Message:  fmt.Sprintf("Enqueued tool updates across %d hosts", len(queuedHosts)),
+		Category: "userAction",
+		Source:   "harness-api",
+		Metadata: map[string]any{
+			"hosts": queuedHosts,
+			"tools": body.Tools,
+			"force": body.Force,
+		},
+	})
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "queued",
+		"hosts":  queuedHosts,
+		"count":  len(queuedHosts),
+		"tools":  body.Tools,
+		"force":  body.Force,
 	})
 }
 
@@ -1498,6 +1676,18 @@ func (s *Server) refreshProfileReleases(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
+	s.RecordNotification(NotificationRecord{
+		Title:    "Profile Releases Refreshed",
+		Message:  fmt.Sprintf("Refreshed release versions for profile '%s'. Updated target versions: %v", name, updated),
+		Category: "info",
+		Source:   "harness-api",
+		Metadata: map[string]any{
+			"profile": name,
+			"updated": updated,
+			"tools":   len(releases),
+		},
+	})
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"profile":  name,
 		"releases": releases,
@@ -1545,7 +1735,7 @@ func (s *Server) pingHost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	waitTimeout := 4 * time.Second
+	waitTimeout := 8 * time.Second
 	if tStr := r.URL.Query().Get("timeout_sec"); tStr != "" {
 		if sec, err := strconv.Atoi(tStr); err == nil && sec > 0 && sec <= 30 {
 			waitTimeout = time.Duration(sec) * time.Second
@@ -1653,7 +1843,7 @@ func (s *Server) checkFleetStatus(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
 	})
 
-	waitTimeout := 4 * time.Second
+	waitTimeout := 8 * time.Second
 	if tStr := r.URL.Query().Get("timeout_sec"); tStr != "" {
 		if sec, err := strconv.Atoi(tStr); err == nil && sec > 0 && sec <= 30 {
 			waitTimeout = time.Duration(sec) * time.Second
@@ -1682,7 +1872,7 @@ func (s *Server) checkFleetStatus(w http.ResponseWriter, r *http.Request) {
 	res := control.RepoFleetStatusResult{
 		RepoPath:             actualPath,
 		Branch:               repo.CurrentBranch,
-		IsClean:              repo.Porcelain == "",
+		IsClean:              repo.Porcelain == "" && repo.SubmodulesClean && len(repo.DirtySubmodules) == 0,
 		SubmodulesClean:      repo.SubmodulesClean,
 		DirtySubmodules:      repo.DirtySubmodules,
 		ASEState:             repo.ASEState,
@@ -1700,7 +1890,7 @@ func (s *Server) checkFleetStatus(w http.ResponseWriter, r *http.Request) {
 		if liveStatus.Branch != "" {
 			res.Branch = liveStatus.Branch
 		}
-		res.IsClean = liveStatus.Porcelain == ""
+		res.IsClean = liveStatus.IsClean && liveStatus.SubmodulesClean && len(liveStatus.DirtySubmodules) == 0 && (liveStatus.Porcelain == "")
 		res.SubmodulesClean = liveStatus.SubmodulesClean
 		res.DirtySubmodules = liveStatus.DirtySubmodules
 		if liveStatus.ASEState != "" {

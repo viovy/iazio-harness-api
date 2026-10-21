@@ -151,3 +151,74 @@ func TestAgentJobsHandler_Errors(t *testing.T) {
 		t.Errorf("expected 404, got %d", w.Code)
 	}
 }
+
+func TestAgentJobsHandler_HeartbeatAndFencing(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	handler := NewAgentJobsHandler(q)
+
+	job, err := q.Enqueue(context.Background(), &dispatch.Job{
+		Type:       dispatch.JobTypeStoryCreate,
+		Repo:       "iazio-mcp",
+		TargetHost: "host-alpha",
+	})
+	if err != nil {
+		t.Fatalf("enqueue error: %v", err)
+	}
+
+	// 1. Claim job
+	claimBody, _ := json.Marshal(ClaimJobRequest{HostID: "host-alpha"})
+	reqClaim := httptest.NewRequest(http.MethodPost, "/api/v1/agent/jobs/claim", bytes.NewReader(claimBody))
+	wClaim := httptest.NewRecorder()
+	handler.ClaimHandler(wClaim, reqClaim)
+	if wClaim.Code != http.StatusOK {
+		t.Fatalf("claim failed: %d", wClaim.Code)
+	}
+
+	var claimed dispatch.Job
+	_ = json.NewDecoder(wClaim.Body).Decode(&claimed)
+	if claimed.FencingToken != 1 {
+		t.Fatalf("expected fencing token 1, got %d", claimed.FencingToken)
+	}
+
+	// 2. Valid heartbeat
+	hbBody, _ := json.Marshal(HeartbeatJobRequest{FencingToken: claimed.FencingToken})
+	reqHb := httptest.NewRequest(http.MethodPost, "/api/v1/agent/jobs/"+job.ID+"/heartbeat", bytes.NewReader(hbBody))
+	wHb := httptest.NewRecorder()
+	handler.HeartbeatHandler(wHb, reqHb)
+	if wHb.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK heartbeat, got %d: %s", wHb.Code, wHb.Body.String())
+	}
+
+	// 3. Stale token heartbeat -> 409 Conflict
+	hbStaleBody, _ := json.Marshal(HeartbeatJobRequest{FencingToken: 999})
+	reqStaleHb := httptest.NewRequest(http.MethodPost, "/api/v1/agent/jobs/"+job.ID+"/heartbeat", bytes.NewReader(hbStaleBody))
+	wStaleHb := httptest.NewRecorder()
+	handler.HeartbeatHandler(wStaleHb, reqStaleHb)
+	if wStaleHb.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for stale heartbeat token, got %d", wStaleHb.Code)
+	}
+
+	// 4. Stale complete -> 409 Conflict
+	compStaleBody, _ := json.Marshal(CompleteJobRequest{
+		FencingToken: 999,
+		Result:       json.RawMessage(`{"failed":true}`),
+	})
+	reqStaleComp := httptest.NewRequest(http.MethodPost, "/api/v1/agent/jobs/"+job.ID+"/complete", bytes.NewReader(compStaleBody))
+	wStaleComp := httptest.NewRecorder()
+	handler.CompleteHandler(wStaleComp, reqStaleComp)
+	if wStaleComp.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for stale complete token, got %d", wStaleComp.Code)
+	}
+
+	// 5. Valid complete -> 200 OK
+	compValidBody, _ := json.Marshal(CompleteJobRequest{
+		FencingToken: claimed.FencingToken,
+		Result:       json.RawMessage(`{"story_id":"STORY-OK"}`),
+	})
+	reqValidComp := httptest.NewRequest(http.MethodPost, "/api/v1/agent/jobs/"+job.ID+"/complete", bytes.NewReader(compValidBody))
+	wValidComp := httptest.NewRecorder()
+	handler.CompleteHandler(wValidComp, reqValidComp)
+	if wValidComp.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for valid complete, got %d: %s", wValidComp.Code, wValidComp.Body.String())
+	}
+}

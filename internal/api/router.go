@@ -55,6 +55,10 @@ func NewRouter(cfg RouterConfig) http.Handler {
 			agentJobsHandler.CompleteHandler(w, r)
 			return
 		}
+		if strings.HasSuffix(r.URL.Path, "/heartbeat") {
+			agentJobsHandler.HeartbeatHandler(w, r)
+			return
+		}
 		http.NotFound(w, r)
 	})
 
