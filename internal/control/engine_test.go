@@ -2543,3 +2543,23 @@ func TestEngine_FindHistoryRow(t *testing.T) {
 		t.Fatal("expected found=false for unknown job ID")
 	}
 }
+
+func TestEngine_GetRepo(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "linux")
+	r := Repo{
+		HostID:       "host-1",
+		WorktreePath: "/work/repo1",
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	}
+	e.UpsertRepo(r)
+
+	// GetRepo hit and miss
+	if got, ok := e.GetRepo("host-1", "/work/repo1"); !ok || got.HostID != "host-1" {
+		t.Fatalf("expected repo host-1, got %v (ok=%v)", got, ok)
+	}
+	if _, ok := e.GetRepo("host-1", "/nonexistent"); ok {
+		t.Fatal("expected ok=false for nonexistent repo")
+	}
+}
