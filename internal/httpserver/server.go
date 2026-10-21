@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -144,9 +145,13 @@ func (s *Server) Handler() http.Handler {
 
 	// Dispatch & Story Lifecycle Endpoints
 	storiesHandler := handlers.NewStoriesHandler(codebaseStore, queue, idempotency, s.Engine)
+	if s.Engine != nil {
+		storiesHandler.SetEngine(s.Engine)
+	}
 	mux.Handle("POST /api/v1/stories", storiesHandler)
 	mux.HandleFunc("GET /api/v1/stories", storiesHandler.ListStories)
 	mux.HandleFunc("GET /api/v1/stories/", storiesHandler.GetStory)
+	mux.HandleFunc("POST /api/v1/stories/{id}/materialize", storiesHandler.MaterializeStory)
 
 	promptsHandler := handlers.NewPromptsHandler(codebaseStore, queue, idempotency)
 	mux.Handle("POST /api/v1/prompts", promptsHandler)
@@ -291,6 +296,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/agents/{host}/ping-ack", s.pingAck)
 	mux.HandleFunc("POST /v1/hosts/{host}/repos/check-fleet-status", s.checkFleetStatus)
 	mux.HandleFunc("POST /api/v1/agents/{host}/repos/check-fleet-status", s.checkFleetStatus)
+	mux.HandleFunc("POST /v1/hosts/{host}/repos/heal-ase", s.healASERepo)
+	mux.HandleFunc("POST /api/v1/agents/{host}/repos/heal-ase", s.healASERepo)
 	mux.HandleFunc("POST /v1/hosts/{host}/repos/status", s.updateRepoRuntimeStatus)
 	mux.HandleFunc("GET /v1/fleet/tool-priority", s.getToolPriority)
 	mux.HandleFunc("PUT /v1/fleet/tool-priority", s.setToolPriority)
@@ -2452,6 +2459,84 @@ func (s *Server) getFleetManifest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, manifest)
+}
+
+func (s *Server) healASERepo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	hostID := r.PathValue("host")
+	if hostID == "" {
+		hostID = strings.TrimPrefix(r.URL.Path, "/v1/hosts/")
+		hostID = strings.TrimPrefix(hostID, "/api/v1/agents/")
+		if idx := strings.Index(hostID, "/"); idx != -1 {
+			hostID = hostID[:idx]
+		}
+	}
+	if hostID == "" {
+		http.Error(w, "host is required", http.StatusBadRequest)
+		return
+	}
+
+	targetPath := strings.TrimSpace(r.URL.Query().Get("path"))
+	if targetPath == "" {
+		var req struct {
+			Path string `json:"path"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		targetPath = strings.TrimSpace(req.Path)
+	}
+	if targetPath == "" {
+		targetPath = "."
+	}
+
+	actualPath := targetPath
+	detail, ok := s.Engine.GetRepoDetail(hostID, targetPath)
+	if ok && detail.Repo.WorktreePath != "" {
+		actualPath = detail.Repo.WorktreePath
+	}
+
+	cmdID := fmt.Sprintf("heal-ase-%d", time.Now().UnixNano())
+	_ = s.Engine.QueueCommand(hostID, control.CommandEnvelope{
+		ID:        cmdID,
+		Type:      "REAP_ORPHANS_AND_RESET_ASE",
+		Payload:   actualPath,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+
+	var locksCleared []string
+	if ok {
+		if detail.Repo.Lock != control.LockIdle {
+			detail.Repo.Lock = control.LockIdle
+			detail.Repo.Reason = ""
+			_ = s.Engine.UpsertRepo(detail.Repo)
+			locksCleared = append(locksCleared, "repo_lock_reset")
+		}
+	}
+
+	for _, lockFile := range []string{
+		filepath.Join(actualPath, ".autopilot", "lock"),
+		filepath.Join(actualPath, ".ase", "active.lock"),
+		filepath.Join(actualPath, ".index.yml.lock"),
+	} {
+		if _, err := os.Stat(lockFile); err == nil {
+			if rErr := os.Remove(lockFile); rErr == nil {
+				locksCleared = append(locksCleared, filepath.Base(filepath.Dir(lockFile))+"/"+filepath.Base(lockFile))
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"host_id":       hostID,
+		"repo_path":     actualPath,
+		"command_id":    cmdID,
+		"locks_cleared": locksCleared,
+		"status":        "dispatched",
+		"healed_at":     time.Now().UTC().Format(time.RFC3339),
+	})
 }
 
 // DecodeLimit reads a small JSON body.

@@ -804,3 +804,88 @@ func (s *Store) Close() error {
 	}
 	return s.db.Close()
 }
+
+// SaveStory inserts or updates a story in harness_stories.
+func (s *Store) SaveStory(ctx context.Context, st control.Story) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	acBytes, _ := json.Marshal(st.AcceptanceCriteria)
+	tfBytes, _ := json.Marshal(st.TargetFiles)
+	dpBytes, _ := json.Marshal(st.DependsOn)
+	vcBytes, _ := json.Marshal(st.VerificationCommands)
+
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO harness_stories (
+  id, repo, submodule, title, priority, status, sync_state, body, problem,
+  acceptance_criteria, target_files, depends_on, verification_commands, created_at, updated_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+ON CONFLICT (id) DO UPDATE SET
+  repo = EXCLUDED.repo,
+  submodule = EXCLUDED.submodule,
+  title = EXCLUDED.title,
+  priority = EXCLUDED.priority,
+  status = EXCLUDED.status,
+  sync_state = EXCLUDED.sync_state,
+  body = EXCLUDED.body,
+  problem = EXCLUDED.problem,
+  acceptance_criteria = EXCLUDED.acceptance_criteria,
+  target_files = EXCLUDED.target_files,
+  depends_on = EXCLUDED.depends_on,
+  verification_commands = EXCLUDED.verification_commands,
+  updated_at = EXCLUDED.updated_at;
+`, st.ID, st.Repo, st.Submodule, st.Title, st.Priority, st.Status, st.SyncState, st.Body, st.Problem,
+		string(acBytes), string(tfBytes), string(dpBytes), string(vcBytes), st.CreatedAt, st.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("save story: %w", err)
+	}
+	return nil
+}
+
+// LoadStories loads all stories from the database.
+func (s *Store) LoadStories(ctx context.Context) ([]control.Story, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, repo, submodule, title, priority, status, sync_state, body, problem,
+       acceptance_criteria, target_files, depends_on, verification_commands, created_at, updated_at
+FROM harness_stories
+ORDER BY created_at DESC;
+`)
+	if err != nil {
+		return nil, fmt.Errorf("load stories: %w", err)
+	}
+	defer rows.Close()
+
+	var out []control.Story
+	for rows.Next() {
+		var st control.Story
+		var acBytes, tfBytes, dpBytes, vcBytes []byte
+		if err := rows.Scan(
+			&st.ID, &st.Repo, &st.Submodule, &st.Title, &st.Priority, &st.Status, &st.SyncState, &st.Body, &st.Problem,
+			&acBytes, &tfBytes, &dpBytes, &vcBytes, &st.CreatedAt, &st.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal(acBytes, &st.AcceptanceCriteria)
+		_ = json.Unmarshal(tfBytes, &st.TargetFiles)
+		_ = json.Unmarshal(dpBytes, &st.DependsOn)
+		_ = json.Unmarshal(vcBytes, &st.VerificationCommands)
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
+// UpdateStorySyncState updates sync_state for a story.
+func (s *Store) UpdateStorySyncState(ctx context.Context, id, syncState string) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+UPDATE harness_stories
+SET sync_state = $1, updated_at = now()
+WHERE id = $2;
+`, syncState, id)
+	return err
+}

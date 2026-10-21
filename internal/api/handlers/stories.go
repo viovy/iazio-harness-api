@@ -24,6 +24,8 @@ const defaultStoryDispatchTimeout = 2500 * time.Millisecond
 
 // CreateStoryRequest defines the semantic parameters for scaffolding an autopilot-governed story.
 type CreateStoryRequest struct {
+	ID                   string   `json:"id,omitempty"`
+	Repo                 string   `json:"repo,omitempty"`
 	Submodule            string   `json:"submodule"`
 	Title                string   `json:"title"`
 	Priority             string   `json:"priority,omitempty"`
@@ -32,6 +34,8 @@ type CreateStoryRequest struct {
 	TargetFiles          []string `json:"target_files"`
 	DependsOn            []string `json:"depends_on,omitempty"`
 	VerificationCommands []string `json:"verification_commands,omitempty"`
+	Body                 string   `json:"body,omitempty"`
+	ContentPath          string   `json:"content_path,omitempty"`
 	Enqueue              bool     `json:"enqueue,omitempty"`
 	TargetAgent          string   `json:"target_agent,omitempty"`
 	TraceID              string   `json:"trace_id,omitempty"`
@@ -46,6 +50,7 @@ type CreateStoryResponse struct {
 	Submodule        string `json:"submodule"`
 	StoryPath        string `json:"story_path,omitempty"`
 	IndexUpdated     bool   `json:"index_updated,omitempty"`
+	SyncState        string `json:"sync_state,omitempty"`
 	ExecutionJobID   string `json:"execution_job_id,omitempty"`
 	ExecutionStatus  string `json:"execution_status,omitempty"`
 	CreatedAt        string `json:"created_at"`
@@ -72,6 +77,12 @@ type StoriesHandler struct {
 	idempotency    *IdempotencyStore
 	dispatchWait   time.Duration
 	scheduler      GlobalScheduler
+	engine         *control.Engine
+}
+
+// SetEngine injects the control plane engine for story persistence.
+func (h *StoriesHandler) SetEngine(e *control.Engine) {
+	h.engine = e
 }
 
 // NewStoriesHandler constructs a new StoriesHandler.
@@ -180,6 +191,16 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req.Priority = strings.ToUpper(strings.TrimSpace(req.Priority))
+	switch req.Priority {
+	case "CRITICAL":
+		req.Priority = "P0"
+	case "HIGH":
+		req.Priority = "P1"
+	case "MEDIUM":
+		req.Priority = "P2"
+	case "LOW":
+		req.Priority = "P3"
+	}
 	if req.Priority == "" {
 		req.Priority = "P2"
 	}
@@ -225,6 +246,93 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	jobTraceID := strings.TrimSpace(req.TraceID)
 	if jobTraceID == "" {
 		jobTraceID = span.TraceID
+	}
+
+	storyID := strings.TrimSpace(req.ID)
+	hasExplicitStory := storyID != "" || req.Body != "" || req.ContentPath != ""
+	if storyID == "" {
+		slug := strings.ToUpper(strings.ReplaceAll(req.Submodule, "-", "_"))
+		if slug == "" || slug == "." {
+			slug = "ROOT"
+		}
+		storyID = fmt.Sprintf("STORY-%s-%d", slug, time.Now().Unix()%100000)
+	}
+
+	st := control.Story{
+		ID:                   storyID,
+		Repo:                 req.Repo,
+		Submodule:            req.Submodule,
+		Title:                req.Title,
+		Priority:             req.Priority,
+		Status:               "pending",
+		SyncState:            "PENDING_WORKSPACE_MATERIALIZATION",
+		Body:                 req.Body,
+		Problem:              req.Problem,
+		AcceptanceCriteria:   req.AcceptanceCriteria,
+		TargetFiles:          req.TargetFiles,
+		DependsOn:            req.DependsOn,
+		VerificationCommands: req.VerificationCommands,
+		CreatedAt:            time.Now().UTC(),
+		UpdatedAt:            time.Now().UTC(),
+	}
+	if h.engine != nil {
+		_ = h.engine.SaveStory(st)
+	}
+
+	if hasExplicitStory && req.Enqueue {
+		targetAgent := strings.TrimSpace(req.TargetAgent)
+		if targetAgent == "" {
+			targetAgent = "autopilot"
+		}
+		promptID := fmt.Sprintf("prompt_%s_%d", storyID, time.Now().Unix())
+		execPayload, _ := json.Marshal(map[string]any{
+			"prompt_id":    promptID,
+			"repo":         req.Submodule,
+			"story_id":     storyID,
+			"title":        fmt.Sprintf("Execute story %s: %s", storyID, req.Title),
+			"prompt":       fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", storyID, storyID, req.Submodule),
+			"target_agent": targetAgent,
+		})
+		var execJobID string
+		if h.queue != nil {
+			ej, _ := h.queue.Enqueue(r.Context(), &dispatch.Job{
+				Type:        dispatch.JobTypePromptExecute,
+				Repo:        req.Submodule,
+				TargetAgent: targetAgent,
+				Payload:     execPayload,
+				TraceID:     jobTraceID,
+				ParentID:    span.ID,
+				SearchID:    strings.TrimSpace(req.SearchID),
+			})
+			if ej != nil {
+				execJobID = ej.ID
+			}
+		}
+		if h.scheduler != nil {
+			_, _ = h.scheduler.EnqueueGlobalStorySchedule(storyID, req.Submodule, targetAgent, fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", storyID, storyID, req.Submodule))
+		}
+
+		resp := CreateStoryResponse{
+			HarnessJobID:     execJobID,
+			Status:           "created",
+			StoryID:          storyID,
+			Submodule:        req.Submodule,
+			StoryPath:        fmt.Sprintf("docs/stories/%s.story.md", strings.ToLower(storyID)),
+			IndexUpdated:     true,
+			SyncState:        "PENDING_WORKSPACE_MATERIALIZATION",
+			ExecutionJobID:   execJobID,
+			ExecutionStatus:  "pending",
+			CreatedAt:        time.Now().UTC().Format(time.RFC3339),
+			IdempotentReplay: false,
+		}
+		respBytes, _ := json.Marshal(resp)
+		if idempotencyKey != "" {
+			h.idempotency.Store(idempotencyKey, payloadHash, http.StatusCreated, respBytes)
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write(respBytes)
+		return
 	}
 
 	job, err := h.queue.Enqueue(r.Context(), &dispatch.Job{
@@ -518,6 +626,31 @@ func (h *StoriesHandler) ListStories(w http.ResponseWriter, r *http.Request) {
 	root := findStoriesRoot()
 	all := loadIndexStories(root)
 
+	if h.engine != nil {
+		seen := make(map[string]bool, len(all))
+		for _, s := range all {
+			seen[s.ID] = true
+		}
+		for _, s := range h.engine.ListStories("") {
+			if !seen[s.ID] {
+				var subs []string
+				if s.Submodule != "" {
+					subs = []string{s.Submodule}
+				}
+				all = append(all, StoryDetail{
+					ID:         s.ID,
+					Title:      s.Title,
+					Status:     s.Status,
+					Priority:   s.Priority,
+					Path:       fmt.Sprintf("docs/stories/%s.story.md", strings.ToLower(s.ID)),
+					Submodules: subs,
+					Content:    s.Body,
+				})
+				seen[s.ID] = true
+			}
+		}
+	}
+
 	var matched []StoryDetail
 	for _, s := range all {
 		if statusFilter != "" && strings.ToUpper(s.Status) != statusFilter {
@@ -572,6 +705,31 @@ func (h *StoriesHandler) GetStory(w http.ResponseWriter, r *http.Request) {
 	root := findStoriesRoot()
 	all := loadIndexStories(root)
 
+	if h.engine != nil {
+		seen := make(map[string]bool, len(all))
+		for _, s := range all {
+			seen[s.ID] = true
+		}
+		for _, s := range h.engine.ListStories("") {
+			if !seen[s.ID] {
+				var subs []string
+				if s.Submodule != "" {
+					subs = []string{s.Submodule}
+				}
+				all = append(all, StoryDetail{
+					ID:         s.ID,
+					Title:      s.Title,
+					Status:     s.Status,
+					Priority:   s.Priority,
+					Path:       fmt.Sprintf("docs/stories/%s.story.md", strings.ToLower(s.ID)),
+					Submodules: subs,
+					Content:    s.Body,
+				})
+				seen[s.ID] = true
+			}
+		}
+	}
+
 	var found *StoryDetail
 	for _, s := range all {
 		if strings.EqualFold(s.ID, id) {
@@ -596,4 +754,35 @@ func (h *StoriesHandler) GetStory(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(found)
+}
+
+// MaterializeStory handles POST /api/v1/stories/{id}/materialize.
+func (h *StoriesHandler) MaterializeStory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	id := strings.TrimPrefix(r.URL.Path, "/api/v1/stories/")
+	id = strings.TrimSuffix(id, "/materialize")
+	id = strings.TrimSpace(strings.TrimSuffix(id, "/"))
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "story id is required")
+		return
+	}
+
+	if h.engine != nil {
+		if err := h.engine.UpdateStorySyncState(id, "MATERIALIZED"); err != nil {
+			writeJSONError(w, http.StatusNotFound, err.Error())
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"story_id":   id,
+		"sync_state": "MATERIALIZED",
+		"updated_at": time.Now().UTC().Format(time.RFC3339),
+	})
 }
