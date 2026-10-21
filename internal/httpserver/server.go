@@ -402,7 +402,14 @@ func (s *Server) storyDraft(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) cancel(w http.ResponseWriter, r *http.Request) {
-	if err := s.Engine.Cancel(r.PathValue("id"), "cancelled"); err != nil {
+	id := r.PathValue("id")
+	if err := s.Engine.Cancel(id, "cancelled"); err != nil {
+		if s.Queue != nil {
+			if _, qErr := s.Queue.Cancel(r.Context(), id, "cancelled"); qErr == nil {
+				writeJSON(w, http.StatusOK, map[string]string{"status": "CANCELLED"})
+				return
+			}
+		}
 		writeErr(w, http.StatusConflict, err)
 		return
 	}
@@ -1038,6 +1045,12 @@ func (s *Server) cancelSchedule(w http.ResponseWriter, r *http.Request) {
 	sch, err := s.Engine.CancelSchedule(id)
 	if err != nil {
 		if errors.Is(err, control.ErrNotFound) {
+			if s.Queue != nil {
+				if job, qErr := s.Queue.Cancel(r.Context(), id, "cancelled by operator from schedule view"); qErr == nil && job != nil {
+					writeJSON(w, http.StatusOK, map[string]string{"status": "CANCELLED", "id": id})
+					return
+				}
+			}
 			writeErr(w, http.StatusNotFound, err)
 			return
 		}

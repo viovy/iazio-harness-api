@@ -347,3 +347,139 @@ func TestQueue_CompleteAttributionDispatch(t *testing.T) {
 		t.Errorf("schema violation: field 'target' should not exist in promotion request")
 	}
 }
+
+func TestQueue_ClaimLeaseExpiry(t *testing.T) {
+	q := NewInMemoryQueue()
+	ctx := context.Background()
+
+	currTime := time.Date(2026, 10, 21, 10, 0, 0, 0, time.UTC)
+	q.SetNowFunc(func() time.Time { return currTime })
+	q.SetTimeouts(10*time.Minute, 60*time.Minute)
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type: JobTypeStoryCreate,
+		Repo: "repo-expire",
+	})
+	if err != nil {
+		t.Fatalf("enqueue error: %v", err)
+	}
+
+	claimed, err := q.Claim(ctx, "host-1", []string{JobTypeStoryCreate})
+	if err != nil || claimed == nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+	if claimed.Status != JobStatusClaimed {
+		t.Fatalf("expected claimed, got %s", claimed.Status)
+	}
+
+	// Advance time past claimTimeout (11 minutes)
+	currTime = currTime.Add(11 * time.Minute)
+
+	// Lazy reap via Get
+	reaped, ok := q.Get(job.ID)
+	if !ok {
+		t.Fatal("expected job to be found")
+	}
+	if reaped.Status != JobStatusFailed {
+		t.Fatalf("expected status failed after lease expiry, got %s", reaped.Status)
+	}
+	if reaped.Error == "" || reaped.CompletedAt == nil {
+		t.Fatalf("expected error and CompletedAt set, got err=%q, completedAt=%v", reaped.Error, reaped.CompletedAt)
+	}
+}
+
+func TestQueue_MaxExecutionTimeout(t *testing.T) {
+	q := NewInMemoryQueue()
+	ctx := context.Background()
+
+	currTime := time.Date(2026, 10, 21, 10, 0, 0, 0, time.UTC)
+	q.SetNowFunc(func() time.Time { return currTime })
+	q.SetTimeouts(30*time.Minute, 60*time.Minute)
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type: JobTypePromptExecute,
+		Repo: "repo-max-exec",
+	})
+	if err != nil {
+		t.Fatalf("enqueue error: %v", err)
+	}
+
+	// Advance time past max execution timeout (65 minutes) without claim
+	currTime = currTime.Add(65 * time.Minute)
+
+	list, err := q.List(ctx, JobFilter{})
+	if err != nil {
+		t.Fatalf("list error: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 job, got %d", len(list))
+	}
+	if list[0].ID != job.ID {
+		t.Fatalf("expected job %s, got %s", job.ID, list[0].ID)
+	}
+	if list[0].Status != JobStatusFailed {
+		t.Fatalf("expected failed status due to max execution timeout, got %s", list[0].Status)
+	}
+}
+
+func TestQueue_StartReaperBackground(t *testing.T) {
+	q := NewInMemoryQueue()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	q.SetTimeouts(20*time.Millisecond, 50*time.Millisecond)
+	q.StartReaper(ctx, 10*time.Millisecond)
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type: JobTypeStoryCreate,
+		Repo: "repo-bg",
+	})
+	if err != nil {
+		t.Fatalf("enqueue error: %v", err)
+	}
+
+	_, err = q.Claim(ctx, "host-1", []string{JobTypeStoryCreate})
+	if err != nil {
+		t.Fatalf("claim error: %v", err)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+
+	j, ok := q.Get(job.ID)
+	if !ok {
+		t.Fatal("expected job to exist")
+	}
+	if j.Status != JobStatusFailed {
+		t.Fatalf("expected background reaper to mark job failed, got %s", j.Status)
+	}
+}
+
+func TestQueue_AwaitUnblocksOnExpiration(t *testing.T) {
+	q := NewInMemoryQueue()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	q.SetTimeouts(25*time.Millisecond, 100*time.Millisecond)
+	q.StartReaper(ctx, 10*time.Millisecond)
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type: JobTypeStoryCreate,
+		Repo: "repo-await",
+	})
+	if err != nil {
+		t.Fatalf("enqueue error: %v", err)
+	}
+
+	_, err = q.Claim(ctx, "host-1", []string{JobTypeStoryCreate})
+	if err != nil {
+		t.Fatalf("claim error: %v", err)
+	}
+
+	completedJob, err := q.Await(ctx, job.ID, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("await returned error: %v", err)
+	}
+	if completedJob == nil || completedJob.Status != JobStatusFailed {
+		t.Fatalf("expected await to return failed job on expiry, got %+v", completedJob)
+	}
+}

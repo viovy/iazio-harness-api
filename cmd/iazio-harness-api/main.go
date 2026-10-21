@@ -56,6 +56,9 @@ func run(ctx context.Context, args []string) error {
 		srv.AuthToken = tok
 	}
 	srv.Engine.StartReaper(ctx, 10*time.Second)
+	if srv.Queue != nil {
+		srv.Queue.StartReaper(ctx, 10*time.Second)
+	}
 	if script := os.Getenv("IAZIO_EXTRACT_WORKER"); script != "" {
 		srv.Extract = func(shareURL string) (string, string, error) {
 			return extract.Run(ctx, script, shareURL)

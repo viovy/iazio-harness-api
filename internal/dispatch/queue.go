@@ -35,6 +35,13 @@ const (
 	JobStatusCanceled  = "canceled"
 )
 
+const (
+	// DefaultClaimTimeout is the duration a claimed job can remain active before lease expiration.
+	DefaultClaimTimeout = 30 * time.Minute
+	// DefaultJobTimeout is the maximum total duration of a job before execution timeout.
+	DefaultJobTimeout = 60 * time.Minute
+)
+
 var (
 	// ErrJobNotFound indicates the requested job ID was not found.
 	ErrJobNotFound = errors.New("job not found")
@@ -46,23 +53,23 @@ var (
 
 // Job represents an asynchronous task dispatched to an iazio-agent daemon.
 type Job struct {
-	ID          string          `json:"id"`
-	Type        string          `json:"type"`
-	Repo        string          `json:"repo"`
-	TargetHost  string          `json:"target_host,omitempty"`
-	TargetAgent string          `json:"target_agent,omitempty"`
-	Payload     json.RawMessage `json:"payload"`
-	Status      string          `json:"status"`
-	Result      json.RawMessage `json:"result,omitempty"`
-	Error       string          `json:"error,omitempty"`
-	TraceID     string          `json:"trace_id,omitempty"`
-	ParentID    string          `json:"parent_id,omitempty"`
-	SearchID    string          `json:"search_id,omitempty"`
-	RelevanceEmitted bool       `json:"relevance_emitted"`
-	PromotedMemories []string   `json:"promoted_memories,omitempty"`
-	CreatedAt   time.Time       `json:"created_at"`
-	ClaimedAt   *time.Time      `json:"claimed_at,omitempty"`
-	CompletedAt *time.Time      `json:"completed_at,omitempty"`
+	ID               string          `json:"id"`
+	Type             string          `json:"type"`
+	Repo             string          `json:"repo"`
+	TargetHost       string          `json:"target_host,omitempty"`
+	TargetAgent      string          `json:"target_agent,omitempty"`
+	Payload          json.RawMessage `json:"payload"`
+	Status           string          `json:"status"`
+	Result           json.RawMessage `json:"result,omitempty"`
+	Error            string          `json:"error,omitempty"`
+	TraceID          string          `json:"trace_id,omitempty"`
+	ParentID         string          `json:"parent_id,omitempty"`
+	SearchID         string          `json:"search_id,omitempty"`
+	RelevanceEmitted bool            `json:"relevance_emitted"`
+	PromotedMemories []string        `json:"promoted_memories,omitempty"`
+	CreatedAt        time.Time       `json:"created_at"`
+	ClaimedAt        *time.Time      `json:"claimed_at,omitempty"`
+	CompletedAt      *time.Time      `json:"completed_at,omitempty"`
 
 	// doneCh signals when the job has been completed or failed.
 	doneCh chan struct{}
@@ -87,6 +94,8 @@ type Queue interface {
 	Retry(ctx context.Context, jobID string) (*Job, error)
 	Await(ctx context.Context, jobID string, timeout time.Duration) (*Job, error)
 	GetAttribution(ctx context.Context, jobID string) (JobAttributionResponse, error)
+	ReapExpired(now time.Time) []string
+	StartReaper(ctx context.Context, interval time.Duration)
 }
 
 // JobAttributionResponse models the attribution of a job outcome to retrieval context.
@@ -106,6 +115,9 @@ type InMemoryQueue struct {
 	jobs           map[string]*Job
 	attributionURL string
 	httpClient     *http.Client
+	claimTimeout   time.Duration
+	jobTimeout     time.Duration
+	nowFunc        func() time.Time
 }
 
 // SetAttributionConfig sets the URL and optional client used for relevance attribution dispatches.
@@ -119,8 +131,115 @@ func (q *InMemoryQueue) SetAttributionConfig(apiURL string, client *http.Client)
 // NewInMemoryQueue constructs a new thread-safe InMemoryQueue.
 func NewInMemoryQueue() *InMemoryQueue {
 	return &InMemoryQueue{
-		jobs: make(map[string]*Job),
+		jobs:         make(map[string]*Job),
+		claimTimeout: DefaultClaimTimeout,
+		jobTimeout:   DefaultJobTimeout,
+		nowFunc:      func() time.Time { return time.Now().UTC() },
 	}
+}
+
+// SetTimeouts overrides default lease and execution timeouts for this queue.
+func (q *InMemoryQueue) SetTimeouts(claimTimeout, jobTimeout time.Duration) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if claimTimeout > 0 {
+		q.claimTimeout = claimTimeout
+	}
+	if jobTimeout > 0 {
+		q.jobTimeout = jobTimeout
+	}
+}
+
+// SetNowFunc overrides the clock for testing deterministic lease expiration.
+func (q *InMemoryQueue) SetNowFunc(fn func() time.Time) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if fn != nil {
+		q.nowFunc = fn
+	}
+}
+
+func (q *InMemoryQueue) now() time.Time {
+	if q.nowFunc != nil {
+		return q.nowFunc()
+	}
+	return time.Now().UTC()
+}
+
+func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
+	if now.IsZero() {
+		now = q.now()
+	}
+	var expiredIDs []string
+	var doneChannels []chan struct{}
+
+	for _, j := range q.jobs {
+		if j.Status != JobStatusPending && j.Status != JobStatusClaimed {
+			continue
+		}
+
+		// 1. Max execution timeout: from CreatedAt
+		if q.jobTimeout > 0 && !j.CreatedAt.IsZero() && now.Sub(j.CreatedAt) > q.jobTimeout {
+			j.Status = JobStatusFailed
+			j.Error = "EXECUTION_TIMEOUT: job exceeded max execution duration"
+			completedAt := now
+			j.CompletedAt = &completedAt
+			expiredIDs = append(expiredIDs, j.ID)
+			if j.doneCh != nil {
+				doneChannels = append(doneChannels, j.doneCh)
+			}
+			continue
+		}
+
+		// 2. Claim lease timeout: from ClaimedAt
+		if j.Status == JobStatusClaimed && q.claimTimeout > 0 && j.ClaimedAt != nil && !j.ClaimedAt.IsZero() && now.Sub(*j.ClaimedAt) > q.claimTimeout {
+			j.Status = JobStatusFailed
+			j.Error = "LEASE_EXPIRED: execution lease expired without completion"
+			completedAt := now
+			j.CompletedAt = &completedAt
+			expiredIDs = append(expiredIDs, j.ID)
+			if j.doneCh != nil {
+				doneChannels = append(doneChannels, j.doneCh)
+			}
+			continue
+		}
+	}
+
+	for _, ch := range doneChannels {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	}
+
+	return expiredIDs
+}
+
+// ReapExpired runs an expiration sweep across all pending and claimed jobs.
+func (q *InMemoryQueue) ReapExpired(now time.Time) []string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.reapExpiredLocked(now)
+}
+
+// StartReaper runs background expiration sweeps periodically until context is cancelled.
+func (q *InMemoryQueue) StartReaper(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				q.ReapExpired(now.UTC())
+			}
+		}
+	}()
 }
 
 // Enqueue adds a new job to the queue. If ID is empty, a random ID is generated.
@@ -139,7 +258,7 @@ func (q *InMemoryQueue) Enqueue(ctx context.Context, job *Job) (*Job, error) {
 		job.Status = JobStatusPending
 	}
 	if job.CreatedAt.IsZero() {
-		job.CreatedAt = time.Now().UTC()
+		job.CreatedAt = q.now()
 	}
 	job.doneCh = make(chan struct{})
 
@@ -152,6 +271,8 @@ func (q *InMemoryQueue) Enqueue(ctx context.Context, job *Job) (*Job, error) {
 func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []string) (*Job, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+
+	q.reapExpiredLocked(q.now())
 
 	typeFilter := make(map[string]bool)
 	for _, t := range jobTypes {
@@ -178,7 +299,7 @@ func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []str
 		return nil, nil
 	}
 
-	now := time.Now().UTC()
+	now := q.now()
 	oldest.Status = JobStatusClaimed
 	oldest.ClaimedAt = &now
 	return oldest, nil
@@ -197,7 +318,7 @@ func (q *InMemoryQueue) Complete(ctx context.Context, jobID string, result json.
 		return ErrJobAlreadyCompleted
 	}
 
-	now := time.Now().UTC()
+	now := q.now()
 	job.CompletedAt = &now
 	if errStr != "" {
 		job.Status = JobStatusFailed
@@ -205,14 +326,29 @@ func (q *InMemoryQueue) Complete(ctx context.Context, jobID string, result json.
 	} else {
 		job.Status = JobStatusCompleted
 		job.Result = result
-		// Execution-to-memory attribution: automatically record positive relevance and promote
-		if job.SearchID != "" || job.TraceID != "" {
-			job.RelevanceEmitted = true
-			if len(job.PromotedMemories) == 0 && job.SearchID != "" {
-				job.PromotedMemories = []string{"mem-" + job.SearchID}
+	}
+
+	searchID := job.SearchID
+	traceID := job.TraceID
+	var promoted []string
+	if job.Status == JobStatusCompleted && len(result) > 0 {
+		var resMap map[string]any
+		if err := json.Unmarshal(result, &resMap); err == nil {
+			if mems, ok := resMap["promoted_memories"].([]any); ok {
+				for _, m := range mems {
+					if str, ok := m.(string); ok && str != "" {
+						promoted = append(promoted, str)
+					}
+				}
 			}
-			go q.dispatchAttribution(job.SearchID, job.TraceID, job.PromotedMemories)
 		}
+	}
+	if len(promoted) == 0 && searchID != "" && job.Status == JobStatusCompleted {
+		promoted = []string{"mem-" + searchID}
+	}
+	job.PromotedMemories = promoted
+	if searchID != "" && job.Status == JobStatusCompleted {
+		job.RelevanceEmitted = true
 	}
 
 	done := job.doneCh
@@ -221,6 +357,11 @@ func (q *InMemoryQueue) Complete(ctx context.Context, jobID string, result json.
 	if done != nil {
 		close(done)
 	}
+
+	if (searchID != "" && job.Status == JobStatusCompleted) || len(promoted) > 0 {
+		go q.dispatchAttribution(searchID, traceID, promoted)
+	}
+
 	return nil
 }
 
@@ -299,18 +440,21 @@ func (q *InMemoryQueue) dispatchAttribution(searchID, traceID string, promoted [
 	}
 }
 
-// Get retrieves a job by ID.
+// Get retrieves a job by ID, lazily reaping any expired jobs.
 func (q *InMemoryQueue) Get(jobID string) (*Job, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	q.reapExpiredLocked(q.now())
 	j, ok := q.jobs[jobID]
 	return j, ok
 }
 
-// List returns jobs matching the filter, sorted by CreatedAt descending.
+// List returns jobs matching the filter, sorted by CreatedAt descending, lazily reaping expired jobs.
 func (q *InMemoryQueue) List(ctx context.Context, filter JobFilter) ([]*Job, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+
+	q.reapExpiredLocked(q.now())
 
 	limit := filter.Limit
 	if limit <= 0 || limit > 100 {
@@ -354,7 +498,7 @@ func (q *InMemoryQueue) Cancel(ctx context.Context, jobID string, reason string)
 		return nil, ErrJobAlreadyCompleted
 	}
 
-	now := time.Now().UTC()
+	now := q.now()
 	job.Status = JobStatusCanceled
 	if reason == "" {
 		reason = "cancelled by user"
@@ -393,7 +537,7 @@ func (q *InMemoryQueue) Retry(ctx context.Context, jobID string) (*Job, error) {
 		TraceID:     orig.TraceID,
 		SearchID:    orig.SearchID,
 		Status:      JobStatusPending,
-		CreatedAt:   time.Now().UTC(),
+		CreatedAt:   q.now(),
 		doneCh:      make(chan struct{}),
 	}
 	q.jobs[newJob.ID] = newJob
@@ -405,6 +549,7 @@ func (q *InMemoryQueue) Retry(ctx context.Context, jobID string) (*Job, error) {
 // Await blocks until the specified job completes, the context is cancelled, or the timeout expires.
 func (q *InMemoryQueue) Await(ctx context.Context, jobID string, timeout time.Duration) (*Job, error) {
 	q.mu.Lock()
+	q.reapExpiredLocked(q.now())
 	job, exists := q.jobs[jobID]
 	if !exists {
 		q.mu.Unlock()
