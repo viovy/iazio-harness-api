@@ -354,7 +354,7 @@ func dispatchScheduleView(j *dispatch.Job) map[string]any {
 	if status == "PENDING" {
 		status = "QUEUED"
 	} else if status == "CLAIMED" {
-		status = "RUNNING"
+		status = "PENDING_EXECUTION"
 	}
 
 	return map[string]any{

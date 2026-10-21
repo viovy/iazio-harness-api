@@ -1971,6 +1971,17 @@ func (e *Engine) SetSchedulePriority(scheduleID string, priority int) (Schedule,
 	return *sch, nil
 }
 
+// GetSchedule retrieves a schedule by ID.
+func (e *Engine) GetSchedule(scheduleID string) (Schedule, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	sch, ok := e.schedules[scheduleID]
+	if !ok {
+		return Schedule{}, false
+	}
+	return *sch, true
+}
+
 // CancelSchedule cancels a schedule by ID and aborts any active running job for it.
 func (e *Engine) CancelSchedule(scheduleID string) (Schedule, error) {
 	e.mu.Lock()

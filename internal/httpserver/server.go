@@ -205,6 +205,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/prompts/{id}", s.deletePrompt)
 	mux.HandleFunc("POST /v1/prompts/{id}/execute", s.executePrompt)
 	mux.HandleFunc("GET /v1/schedules", s.listSchedules)
+	mux.HandleFunc("GET /v1/schedules/{id}", s.getSchedule)
 	mux.HandleFunc("POST /v1/schedules/{id}/priority", s.changePriority)
 	mux.HandleFunc("POST /v1/schedules/{id}/increase-priority", s.increasePriority)
 	mux.HandleFunc("POST /v1/schedules/{id}/decrease-priority", s.decreasePriority)
@@ -1164,7 +1165,7 @@ func (s *Server) listSchedules(w http.ResponseWriter, r *http.Request) {
 		})
 		for _, qj := range qJobs {
 			if qj.Status == dispatch.JobStatusPending || qj.Status == dispatch.JobStatusClaimed {
-				if status != "" && !strings.EqualFold(status, qj.Status) && !strings.EqualFold(status, "QUEUED") && !strings.EqualFold(status, "RUNNING") {
+				if status != "" && !strings.EqualFold(status, qj.Status) && !strings.EqualFold(status, "QUEUED") && !strings.EqualFold(status, "RUNNING") && !strings.EqualFold(status, "PENDING_EXECUTION") {
 					continue
 				}
 				out = append(out, dispatchScheduleView(qj))
@@ -1172,6 +1173,23 @@ func (s *Server) listSchedules(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"schedules": out})
+}
+
+func (s *Server) getSchedule(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.Engine != nil {
+		if sch, ok := s.Engine.GetSchedule(id); ok {
+			writeJSON(w, http.StatusOK, scheduleView(sch))
+			return
+		}
+	}
+	if s.Queue != nil {
+		if qJob, found := s.Queue.Get(id); found && qJob != nil {
+			writeJSON(w, http.StatusOK, dispatchScheduleView(qJob))
+			return
+		}
+	}
+	writeErr(w, http.StatusNotFound, control.ErrNotFound)
 }
 
 func (s *Server) listHistory(w http.ResponseWriter, r *http.Request) {
@@ -1259,6 +1277,13 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 	if s.Engine != nil {
 		if row, host, path, found := s.Engine.FindHistoryRow(id); found {
 			writeJSON(w, http.StatusOK, historyJobDetailView(row, host, path))
+			return
+		}
+		if sch, found := s.Engine.GetSchedule(id); found {
+			sv := scheduleView(sch)
+			sv["prompt"] = sch.PromptTitle
+			sv["worktree_path"] = sch.WorktreePath
+			writeJSON(w, http.StatusOK, sv)
 			return
 		}
 	}
