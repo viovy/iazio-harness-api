@@ -154,6 +154,7 @@ func (s *Server) Handler() http.Handler {
 	jobLifecycle := handlers.NewJobLifecycleHandler(queue, codebaseStore)
 	if s.Engine != nil {
 		jobLifecycle.SetScheduler(s.Engine)
+		jobLifecycle.SetHistoryFinder(s.Engine)
 	}
 	mux.HandleFunc("GET /api/v1/jobs/{id}", jobLifecycle.GetJob)
 	mux.HandleFunc("GET /api/v1/jobs/{id}/attribution", jobLifecycle.GetJobAttribution)
@@ -250,6 +251,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/hosts/{host}/repos", s.unregisterRepo)
 	mux.HandleFunc("DELETE /v1/hosts/{host}/repos/history", s.clearRepoHistory)
 	mux.HandleFunc("DELETE /v1/history/{id}", s.deleteHistoryRow)
+	mux.HandleFunc("GET /v1/history/{id}", s.getJob)
 	mux.HandleFunc("POST /v1/hosts/{host}/repo-requests", s.repoRequest)
 	mux.HandleFunc("POST /v1/hosts/{host}/docs-hub/discard", s.discardHub)
 	mux.HandleFunc("POST /v1/repos", s.upsertRepo)
@@ -1251,6 +1253,12 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 	if s.Queue != nil {
 		if qJob, found := s.Queue.Get(id); found && qJob != nil {
 			writeJSON(w, http.StatusOK, dispatchJobDetailView(qJob))
+			return
+		}
+	}
+	if s.Engine != nil {
+		if row, host, path, found := s.Engine.FindHistoryRow(id); found {
+			writeJSON(w, http.StatusOK, historyJobDetailView(row, host, path))
 			return
 		}
 	}

@@ -11,15 +11,22 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-harness-api/internal/codebase"
+	"github.com/viovy/iazio-harness-api/internal/control"
 	"github.com/viovy/iazio-harness-api/internal/dispatch"
 	"github.com/viovy/iazio-harness-api/internal/telemetry"
 )
 
+// HistoryFinder provides lookup of historical job records.
+type HistoryFinder interface {
+	FindHistoryRow(jobID string) (control.HistoryRow, string, string, bool)
+}
+
 // JobLifecycleHandler manages querying, listing, canceling, and retrying agent jobs.
 type JobLifecycleHandler struct {
-	queue     dispatch.Queue
-	store     codebase.Store
-	scheduler GlobalScheduler
+	queue         dispatch.Queue
+	store         codebase.Store
+	scheduler     GlobalScheduler
+	historyFinder HistoryFinder
 }
 
 // NewJobLifecycleHandler constructs a new JobLifecycleHandler.
@@ -37,6 +44,11 @@ func NewJobLifecycleHandler(queue dispatch.Queue, store ...codebase.Store) *JobL
 // SetScheduler sets the global scheduler.
 func (h *JobLifecycleHandler) SetScheduler(scheduler GlobalScheduler) {
 	h.scheduler = scheduler
+}
+
+// SetHistoryFinder sets the historical job lookup handler.
+func (h *JobLifecycleHandler) SetHistoryFinder(finder HistoryFinder) {
+	h.historyFinder = finder
 }
 
 // JobDetailResponse is the detailed JSON representation of a dispatch job.
@@ -109,6 +121,15 @@ func (h *JobLifecycleHandler) GetJob(w http.ResponseWriter, r *http.Request) {
 
 	job, found := h.queue.Get(jobID)
 	if !found || job == nil {
+		if h.historyFinder != nil {
+			if row, host, path, hFound := h.historyFinder.FindHistoryRow(jobID); hFound {
+				resp := formatHistoryRowToJobDetail(row, host, path)
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(resp)
+				return
+			}
+		}
 		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("job %q not found", jobID))
 		return
 	}
@@ -334,6 +355,20 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func formatHistoryRowToJobDetail(row control.HistoryRow, host, path string) JobDetailResponse {
+	return JobDetailResponse{
+		ID:               row.JobID,
+		Type:             "story_execution",
+		Repo:             path,
+		TargetHost:       host,
+		TargetAgent:      row.Engine,
+		Status:           row.Status,
+		Error:            row.ErrorMessage,
+		CreatedAt:        row.CreatedAt.Format(time.RFC3339),
+		PromotedMemories: []string{},
+	}
 }
 
 func formatJobDetail(j *dispatch.Job) JobDetailResponse {

@@ -259,6 +259,40 @@ func jobDetailView(j control.JobDetail) map[string]any {
 	}
 }
 
+func historyJobDetailView(r control.HistoryRow, host, path string) map[string]any {
+	cids := r.ConversationIDs
+	if cids == nil {
+		cids = []string{}
+	}
+	return map[string]any{
+		"id":                             r.JobID,
+		"schedule_id":                    r.ScheduleID,
+		"kind":                           "story_execution",
+		"status":                         r.Status,
+		"engine":                         r.Engine,
+		"prompt":                         r.PromptTitle,
+		"story_id":                       r.PromptTitle,
+		"source_idea_id":                 "",
+		"transcript":                     "",
+		"worktree_path":                  path,
+		"docs_hub_path":                  "",
+		"env_vars":                       map[string]string{},
+		"max_execution_duration_seconds": 0,
+		"resume_conversation_id":         "",
+		"conversation_ids":               cids,
+		"silent_for_seconds":             0,
+		"is_stalled":                     false,
+		"started_at":                     r.CreatedAt,
+		"reason":                         r.Reason,
+		"clean":                          r.Clean,
+		"ase_complete":                   r.ASEComplete,
+		"error_message":                  r.ErrorMessage,
+		"diagnostic_code":                r.DiagnosticCode,
+		"model":                          r.Model,
+		"remediation":                    r.Remediation,
+	}
+}
+
 func historyItemView(h control.HistoryItem) map[string]any {
 	ids := h.ConversationIDs
 	if ids == nil {
