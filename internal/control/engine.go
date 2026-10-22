@@ -2252,6 +2252,19 @@ func (e *Engine) AbandonJob(jobID, reason string) error {
 	if reason == "" {
 		reason = "MANUAL_ABANDON"
 	}
+	if reason == "REPO_BUSY" {
+		job.Status = "FAILED"
+		job.ExitPosted = true
+		job.Reason = reason
+		if sch, ok := e.schedules[job.ScheduleID]; ok {
+			sch.Status = "QUEUED"
+			sch.IterationsRemaining++
+			if sch.IterationsCompleted > 0 {
+				sch.IterationsCompleted--
+			}
+		}
+		return nil
+	}
 	job.Status = "FAILED"
 	job.ExitPosted = true
 	job.Reason = reason

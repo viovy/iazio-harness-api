@@ -2613,3 +2613,48 @@ func TestEngine_GetRepo(t *testing.T) {
 		t.Fatal("expected ok=false for nonexistent repo")
 	}
 }
+
+func TestAbandonJob_RepoBusyRefundsAndKeepsQueueOpen(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "linux")
+	r := Repo{
+		HostID:       "host-1",
+		WorktreePath: "/work/repo1",
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	}
+	e.UpsertRepo(r)
+
+	p := &Prompt{ID: "p1", Title: "test prompt", Engine: "agy", Body: "prompt text", Status: "READY"}
+	e.prompts["p1"] = p
+
+	sch, err := e.ExecutePrompt("p1", "host-1", "/work/repo1", 1, nil)
+	if err != nil {
+		t.Fatalf("ExecutePrompt failed: %v", err)
+	}
+
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("expected job to be leased")
+	}
+
+	// Host agent encounters busy lock and abandons with REPO_BUSY
+	if err := e.AbandonJob(job.ID, "REPO_BUSY"); err != nil {
+		t.Fatalf("AbandonJob failed: %v", err)
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	j := e.jobs[job.ID]
+	if j.Status != "FAILED" || j.Reason != "REPO_BUSY" {
+		t.Fatalf("expected job FAILED/REPO_BUSY, got status=%s, reason=%s", j.Status, j.Reason)
+	}
+	s := e.schedules[sch.ID]
+	if s.Status != "QUEUED" || s.IterationsRemaining != 1 {
+		t.Fatalf("expected schedule retained QUEUED with 1 iteration remaining, got status=%s, remaining=%d", s.Status, s.IterationsRemaining)
+	}
+	repo := e.repos[repoKey("host-1", "/work/repo1")]
+	if repo.Queue != QueueOpen {
+		t.Fatalf("expected queue to remain OPEN, got: %s", repo.Queue)
+	}
+}
