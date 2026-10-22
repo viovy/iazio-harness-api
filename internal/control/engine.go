@@ -15,11 +15,19 @@ import (
 )
 
 var (
-	storyIDPattern     = regexp.MustCompile(`(?i)\b(STORY-[A-Z0-9]+-[0-9]+)\b`)
-	prefixStoryPattern = regexp.MustCompile(`(?i)\b([a-z0-9]{2,10})-([0-9]{3,5})\b`)
+	storyIDPattern       = regexp.MustCompile(`(?i)\b(STORY-[A-Z0-9]+(?:-[A-Z0-9]+)*-[0-9]+)\b`)
+	prefixStoryPattern   = regexp.MustCompile(`(?i)\b([a-z0-9]{2,10})-([0-9]{3,5})\b`)
+	frontmatterIDPattern = regexp.MustCompile(`(?im)^id:\s*["']?([A-Za-z0-9_-]+)["']?`)
 )
 
 func extractStoryIDFromString(s string) string {
+	if m := frontmatterIDPattern.FindStringSubmatch(s); len(m) > 1 {
+		val := strings.TrimSpace(m[1])
+		if !strings.HasPrefix(strings.ToUpper(val), "STORY-") {
+			val = "STORY-" + strings.ToUpper(val)
+		}
+		return strings.ToUpper(val)
+	}
 	if m := storyIDPattern.FindStringSubmatch(s); len(m) > 1 {
 		return strings.ToUpper(m[1])
 	}
@@ -27,6 +35,14 @@ func extractStoryIDFromString(s string) string {
 		return "STORY-" + strings.ToUpper(m[1]) + "-" + m[2]
 	}
 	return ""
+}
+
+func isStoryID(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" || strings.EqualFold(s, "STORY-RESUME-INPLACE") || strings.EqualFold(s, "resume complete current ase flow") {
+		return false
+	}
+	return extractStoryIDFromString(s) != ""
 }
 
 func extractStoryIDFromPorcelain(porcelain string) (storyID, reviewFile string) {
@@ -879,7 +895,9 @@ func (e *Engine) LeaseExternal(host, path, holderID, storyID string, ttl time.Du
 	repo.LockHolder = holderID
 	repo.LockExpiresAt = now.Add(ttl)
 	if strings.TrimSpace(storyID) != "" {
-		repo.DirtyStoryID = storyID
+		if isStoryID(storyID) {
+			repo.DirtyStoryID = storyID
+		}
 		repo.RunningJobID = storyID
 	}
 	e.notifyRepoLocked(repo)
@@ -928,22 +946,24 @@ func (e *Engine) ApplyPreflight(host, path string, p Preflight) Halt {
 		repo.CurrentBranch = p.Branch
 	}
 
-	if p.DirtyStoryID != "" {
+	if p.DirtyStoryID != "" && isStoryID(p.DirtyStoryID) {
 		repo.DirtyStoryID = p.DirtyStoryID
 		repo.DirtyReviewFile = p.DirtyReviewFile
 		repo.DetectedConversationID = p.DetectedConversationID
 		repo.DetectedVerdict = p.DetectedVerdict
 	} else if repo.Porcelain != "" {
 		sid, rfile := extractStoryIDFromPorcelain(repo.Porcelain)
-		if sid != "" {
+		if isStoryID(sid) {
 			repo.DirtyStoryID = sid
+		} else {
+			repo.DirtyStoryID = ""
 		}
 		if rfile != "" {
 			repo.DirtyReviewFile = rfile
 		}
 	}
-	if repo.DirtyStoryID == "" && repo.CurrentBranch != "" {
-		if sid := extractStoryIDFromString(repo.CurrentBranch); sid != "" {
+	if (repo.DirtyStoryID == "" || !isStoryID(repo.DirtyStoryID)) && repo.CurrentBranch != "" {
+		if sid := extractStoryIDFromString(repo.CurrentBranch); isStoryID(sid) {
 			repo.DirtyStoryID = sid
 		}
 	}
@@ -1220,22 +1240,22 @@ func (e *Engine) ApplyFinish(host, path string, jobID string, in FinishInput) Fi
 			repo.Porcelain = in.WorkPorcelain
 		}
 		if d.Reason == ReasonDirty {
-			if repo.DirtyStoryID == "" {
-				if sid, rfile := extractStoryIDFromPorcelain(in.WorkPorcelain); sid != "" {
+			if repo.DirtyStoryID == "" || !isStoryID(repo.DirtyStoryID) {
+				if sid, rfile := extractStoryIDFromPorcelain(in.WorkPorcelain); isStoryID(sid) {
 					repo.DirtyStoryID = sid
 					if rfile != "" {
 						repo.DirtyReviewFile = rfile
 					}
 				}
 			}
-			if repo.DirtyStoryID == "" && repo.CurrentBranch != "" {
-				if sid := extractStoryIDFromString(repo.CurrentBranch); sid != "" {
+			if (repo.DirtyStoryID == "" || !isStoryID(repo.DirtyStoryID)) && repo.CurrentBranch != "" {
+				if sid := extractStoryIDFromString(repo.CurrentBranch); isStoryID(sid) {
 					repo.DirtyStoryID = sid
 				}
 			}
-			if repo.DirtyStoryID == "" {
+			if repo.DirtyStoryID == "" || !isStoryID(repo.DirtyStoryID) {
 				if job, ok := e.jobs[jobID]; ok {
-					if sch, ok := e.schedules[job.ScheduleID]; ok && sch.StoryID != "" {
+					if sch, ok := e.schedules[job.ScheduleID]; ok && isStoryID(sch.StoryID) {
 						repo.DirtyStoryID = sch.StoryID
 					}
 				}
@@ -1478,7 +1498,7 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 					r.CurrentBranch = st.Branch
 				}
 				r.Porcelain = st.Porcelain
-				if st.ActiveStoryID != "" {
+				if isStoryID(st.ActiveStoryID) {
 					r.DirtyStoryID = st.ActiveStoryID
 				}
 				if st.ActiveConversationID != "" {
@@ -2276,7 +2296,10 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 
 	// 1. Resolve target story ID: explicit opt -> repo.DirtyStoryID -> extract from active branch -> extract from porcelain (F5)
 	targetStoryID := opt.StoryID
-	if targetStoryID == "" {
+	if !isStoryID(targetStoryID) {
+		targetStoryID = ""
+	}
+	if targetStoryID == "" && isStoryID(repo.DirtyStoryID) {
 		targetStoryID = repo.DirtyStoryID
 	}
 	if targetStoryID == "" && repo.CurrentBranch != "" {
@@ -2288,7 +2311,7 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 	if targetStoryID == "" {
 		if rows := e.history[repoKey(host, path)]; len(rows) > 0 {
 			for i := len(rows) - 1; i >= 0; i-- {
-				if sid := extractStoryIDFromString(rows[i].PromptTitle); sid != "" {
+				if sid := extractStoryIDFromString(rows[i].PromptTitle); isStoryID(sid) {
 					targetStoryID = sid
 					break
 				}
@@ -2403,8 +2426,10 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 	repo.Reason = ""
 	repo.Porcelain = ""
 	repo.DiscardPending = false
-	if targetStoryID != "" && repo.DirtyStoryID == "" {
+	if isStoryID(targetStoryID) {
 		repo.DirtyStoryID = targetStoryID
+	} else {
+		repo.DirtyStoryID = ""
 	}
 	if resumeConvID != "" && repo.DetectedConversationID == "" {
 		repo.DetectedConversationID = resumeConvID

@@ -182,3 +182,34 @@ func TestPreflightUnmarshalJSON(t *testing.T) {
 		t.Errorf("unexpected p2: %+v", p2)
 	}
 }
+
+func TestIsStoryID(t *testing.T) {
+	valid := []string{
+		"STORY-GOV-3655",
+		"story-gov-3655",
+		"gov-3655",
+		"STORY-CORE-123",
+		"feat-999",
+	}
+	for _, s := range valid {
+		if !isStoryID(s) {
+			t.Errorf("expected %q to be recognized as valid story ID", s)
+		}
+	}
+
+	invalid := []string{
+		"",
+		"   ",
+		"resume complete current ase flow",
+		"Resume Complete Current ASE Flow",
+		"STORY-RESUME-INPLACE",
+		"story-resume-inplace",
+		"main",
+		"random text without story",
+	}
+	for _, s := range invalid {
+		if isStoryID(s) {
+			t.Errorf("expected %q to be rejected as invalid story ID", s)
+		}
+	}
+}
