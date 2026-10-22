@@ -1811,6 +1811,56 @@ func TestResumeRepoInPlaceEngineSelection(t *testing.T) {
 	}
 }
 
+func TestResumeRepoInPlace_ConversationIsolationAcrossStories(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-mac", "permanent")
+	repoPath := "/work/app-isolated"
+	if err := e.UpsertRepo(Repo{
+		HostID:                 "host-mac",
+		WorktreePath:           repoPath,
+		CloneURL:               "https://example.test/app-isolated.git",
+		DirtyStoryID:           "STORY-OLD-001",
+		DetectedConversationID: "0ddc4208-8d7a-490b-86bb-1dee2e91ae82",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Also simulate history rows from STORY-OLD-001
+	e.history[repoKey("host-mac", repoPath)] = []HistoryRow{
+		{
+			JobID:           "job-old-1",
+			PromptTitle:     "Execute STORY-OLD-001",
+			ConversationIDs: []string{"0ddc4208-8d7a-490b-86bb-1dee2e91ae82"},
+			Status:          "FAILED",
+		},
+	}
+
+	// 1. Resuming for a completely DIFFERENT story must NOT inherit the old conversation ID
+	schNew, err := e.ResumeRepoInPlace("host-mac", repoPath, ResumeOptions{
+		StoryID: "STORY-NEW-002",
+	})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace failed: %v", err)
+	}
+	if schNew.ResumeConversationID != "" {
+		t.Fatalf("expected empty ResumeConversationID for new story, got %q", schNew.ResumeConversationID)
+	}
+	if schNew.StoryID != "STORY-NEW-002" {
+		t.Fatalf("expected StoryID STORY-NEW-002, got %q", schNew.StoryID)
+	}
+
+	// 2. Resuming for the SAME story SHOULD inherit the conversation ID
+	schSame, err := e.ResumeRepoInPlace("host-mac", repoPath, ResumeOptions{
+		StoryID: "STORY-OLD-001",
+	})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace failed: %v", err)
+	}
+	if schSame.ResumeConversationID != "0ddc4208-8d7a-490b-86bb-1dee2e91ae82" {
+		t.Fatalf("expected ResumeConversationID 0ddc4208..., got %q", schSame.ResumeConversationID)
+	}
+}
+
 func TestDeclineJobCancellationSafetyAndCircuitBreaker(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("host-1", "permanent")

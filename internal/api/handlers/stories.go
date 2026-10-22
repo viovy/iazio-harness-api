@@ -256,6 +256,21 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		storyID = fmt.Sprintf("STORY-%s-%d", slug, time.Now().Unix()%100000)
 	}
 
+	body := req.Body
+	if strings.TrimSpace(body) == "" {
+		body = renderStoryMarkdown(control.Story{
+			ID:                   storyID,
+			Title:                req.Title,
+			Status:               "pending",
+			Priority:             req.Priority,
+			Submodule:            req.Submodule,
+			Problem:              req.Problem,
+			AcceptanceCriteria:   req.AcceptanceCriteria,
+			TargetFiles:          req.TargetFiles,
+			VerificationCommands: req.VerificationCommands,
+		})
+	}
+
 	st := control.Story{
 		ID:                   storyID,
 		Repo:                 req.Repo,
@@ -264,7 +279,7 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Priority:             req.Priority,
 		Status:               "pending",
 		SyncState:            "PENDING_WORKSPACE_MATERIALIZATION",
-		Body:                 req.Body,
+		Body:                 body,
 		Problem:              req.Problem,
 		AcceptanceCriteria:   req.AcceptanceCriteria,
 		TargetFiles:          req.TargetFiles,
@@ -568,6 +583,10 @@ func (h *StoriesHandler) GetStory(w http.ResponseWriter, r *http.Request) {
 			if s.Submodule != "" {
 				subs = []string{s.Submodule}
 			}
+			content := s.Body
+			if strings.TrimSpace(content) == "" {
+				content = renderStoryMarkdown(s)
+			}
 			found = &StoryDetail{
 				ID:         s.ID,
 				Title:      s.Title,
@@ -575,7 +594,7 @@ func (h *StoriesHandler) GetStory(w http.ResponseWriter, r *http.Request) {
 				Priority:   s.Priority,
 				Path:       fmt.Sprintf("docs/stories/%s.story.md", strings.ToLower(s.ID)),
 				Submodules: subs,
-				Content:    s.Body,
+				Content:    content,
 			}
 		}
 	}
@@ -638,4 +657,44 @@ func (h *StoriesHandler) MaterializeStory(w http.ResponseWriter, r *http.Request
 		"sync_state": "MATERIALIZED",
 		"updated_at": time.Now().UTC().Format(time.RFC3339),
 	})
+}
+
+func renderStoryMarkdown(st control.Story) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("# %s: %s\n\n", st.ID, st.Title))
+	sb.WriteString(fmt.Sprintf("Status: %s  \n", strings.ToUpper(st.Status)))
+	if st.Priority != "" {
+		sb.WriteString(fmt.Sprintf("Priority: %s  \n", st.Priority))
+	}
+	if st.Submodule != "" {
+		sb.WriteString(fmt.Sprintf("Submodule: %s  \n", st.Submodule))
+	}
+	sb.WriteString("\n## Problem\n\n")
+	if st.Problem != "" {
+		sb.WriteString(st.Problem + "\n\n")
+	} else {
+		sb.WriteString("Implement " + st.Title + ".\n\n")
+	}
+	if len(st.AcceptanceCriteria) > 0 {
+		sb.WriteString("## Acceptance Criteria\n\n")
+		for _, ac := range st.AcceptanceCriteria {
+			sb.WriteString(fmt.Sprintf("- [ ] %s\n", ac))
+		}
+		sb.WriteString("\n")
+	}
+	if len(st.TargetFiles) > 0 {
+		sb.WriteString("## Target Files\n\n")
+		for _, tf := range st.TargetFiles {
+			sb.WriteString(fmt.Sprintf("- `%s`\n", tf))
+		}
+		sb.WriteString("\n")
+	}
+	if len(st.VerificationCommands) > 0 {
+		sb.WriteString("## Verification Commands\n\n```bash\n")
+		for _, vc := range st.VerificationCommands {
+			sb.WriteString(vc + "\n")
+		}
+		sb.WriteString("```\n")
+	}
+	return sb.String()
 }

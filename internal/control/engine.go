@@ -2325,14 +2325,26 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 	// 2. Resolve conversation ID: explicit opt -> repo.DetectedConversationID -> latest from history
 	resumeConvID := opt.ConversationID
 	if resumeConvID == "" {
-		resumeConvID = repo.DetectedConversationID
+		if repo.DirtyStoryID == "" || targetStoryID == "" || targetStoryID == "STORY-RESUME-INPLACE" || repo.DirtyStoryID == targetStoryID {
+			resumeConvID = repo.DetectedConversationID
+		}
 	}
 	if resumeConvID == "" {
 		if rows := e.history[repoKey(host, path)]; len(rows) > 0 {
 			for i := len(rows) - 1; i >= 0; i-- {
 				if len(rows[i].ConversationIDs) > 0 {
-					resumeConvID = rows[i].ConversationIDs[len(rows[i].ConversationIDs)-1]
-					break
+					rowStory := extractStoryIDFromString(rows[i].PromptTitle)
+					matchesStory := targetStoryID != "" && targetStoryID != "STORY-RESUME-INPLACE" && rowStory == targetStoryID
+					matchesPrompt := opt.PromptTitle != "" && rows[i].PromptTitle == opt.PromptTitle
+					if targetStoryID != "STORY-RESUME-INPLACE" {
+						if matchesStory || matchesPrompt {
+							resumeConvID = rows[i].ConversationIDs[len(rows[i].ConversationIDs)-1]
+							break
+						}
+					} else {
+						resumeConvID = rows[i].ConversationIDs[len(rows[i].ConversationIDs)-1]
+						break
+					}
 				}
 			}
 		}
@@ -2427,11 +2439,14 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 	repo.Porcelain = ""
 	repo.DiscardPending = false
 	if isStoryID(targetStoryID) {
+		if repo.DirtyStoryID != "" && repo.DirtyStoryID != targetStoryID {
+			repo.DetectedConversationID = ""
+		}
 		repo.DirtyStoryID = targetStoryID
 	} else {
 		repo.DirtyStoryID = ""
 	}
-	if resumeConvID != "" && repo.DetectedConversationID == "" {
+	if resumeConvID != "" {
 		repo.DetectedConversationID = resumeConvID
 	}
 	e.notifyRepoLocked(repo)

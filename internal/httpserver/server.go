@@ -1384,11 +1384,39 @@ func (s *Server) pollHost(w http.ResponseWriter, r *http.Request) {
 			s.SaveRepo(detail.Repo)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]string{
-		"id": job.ID, "kind": job.Kind,
-		"worktree_path": sch.WorktreePath, "docs_hub_path": docs,
-		"story_id": sch.StoryID,
-	})
+	resumeConvID := sch.ResumeConversationID
+	if resumeConvID == "" && job.ResumeConversationID != "" {
+		resumeConvID = job.ResumeConversationID
+	}
+	engine := sch.Engine
+	var promptText string
+	if p, ok := s.Engine.GetPrompt(sch.PromptID); ok {
+		promptText = p.Body
+		if engine == "" && p.Engine != "" {
+			engine = p.Engine
+		}
+	}
+	if promptText == "" {
+		promptText = sch.PromptTitle
+	}
+	if engine == "" {
+		engine = "agent"
+	}
+	resp := map[string]any{
+		"id":                     job.ID,
+		"kind":                   job.Kind,
+		"worktree_path":          sch.WorktreePath,
+		"docs_hub_path":          docs,
+		"story_id":               sch.StoryID,
+		"schedule_id":            sch.ID,
+		"engine":                 engine,
+		"prompt":                 promptText,
+		"resume_conversation_id": resumeConvID,
+	}
+	if len(job.ConversationIDs) > 0 {
+		resp["conversation_ids"] = job.ConversationIDs
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
