@@ -182,6 +182,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/agent/jobs/{id}/heartbeat", agentJobsHandler.HeartbeatHandler)
 	mux.HandleFunc("GET /v1/notifications", s.getNotifications)
 	mux.HandleFunc("GET /api/v1/notifications", s.getNotifications)
+	mux.HandleFunc("POST /v1/notifications", s.createNotification)
+	mux.HandleFunc("POST /api/v1/notifications", s.createNotification)
 	mux.HandleFunc("POST /v1/fleet/tools/update-all", s.queueAllToolsUpdate)
 	mux.HandleFunc("POST /v1/hosts/all/tools/update", s.queueAllToolsUpdate)
 
@@ -1384,11 +1386,39 @@ func (s *Server) pollHost(w http.ResponseWriter, r *http.Request) {
 			s.SaveRepo(detail.Repo)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]string{
-		"id": job.ID, "kind": job.Kind,
-		"worktree_path": sch.WorktreePath, "docs_hub_path": docs,
-		"story_id": sch.StoryID,
-	})
+	resumeConvID := sch.ResumeConversationID
+	if resumeConvID == "" && job.ResumeConversationID != "" {
+		resumeConvID = job.ResumeConversationID
+	}
+	engine := sch.Engine
+	var promptText string
+	if p, ok := s.Engine.GetPrompt(sch.PromptID); ok {
+		promptText = p.Body
+		if engine == "" && p.Engine != "" {
+			engine = p.Engine
+		}
+	}
+	if promptText == "" {
+		promptText = sch.PromptTitle
+	}
+	if engine == "" {
+		engine = "agent"
+	}
+	resp := map[string]any{
+		"id":                     job.ID,
+		"kind":                   job.Kind,
+		"worktree_path":          sch.WorktreePath,
+		"docs_hub_path":          docs,
+		"story_id":               sch.StoryID,
+		"schedule_id":            sch.ID,
+		"engine":                 engine,
+		"prompt":                 promptText,
+		"resume_conversation_id": resumeConvID,
+	}
+	if len(job.ConversationIDs) > 0 {
+		resp["conversation_ids"] = job.ConversationIDs
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
@@ -1457,6 +1487,19 @@ func (s *Server) getNotifications(w http.ResponseWriter, r *http.Request) {
 		"notifications": notifs,
 		"count":         len(notifs),
 	})
+}
+
+func (s *Server) createNotification(w http.ResponseWriter, r *http.Request) {
+	var rec NotificationRecord
+	if err := json.NewDecoder(r.Body).Decode(&rec); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if rec.Timestamp.IsZero() {
+		rec.Timestamp = time.Now()
+	}
+	s.RecordNotification(rec)
+	writeJSON(w, http.StatusCreated, rec)
 }
 
 func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {

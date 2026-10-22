@@ -42,6 +42,17 @@ func (e *Engine) ListPrompts() []Prompt {
 	return out
 }
 
+// GetPrompt returns a prompt by ID.
+func (e *Engine) GetPrompt(id string) (Prompt, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	p, ok := e.prompts[id]
+	if !ok {
+		return Prompt{}, false
+	}
+	return *p, true
+}
+
 // QueueToolUpdate registers an update command for tools on the given host.
 func (e *Engine) QueueToolUpdate(hostID string, tools []string, force bool) error {
 	e.mu.Lock()

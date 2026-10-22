@@ -1811,6 +1811,56 @@ func TestResumeRepoInPlaceEngineSelection(t *testing.T) {
 	}
 }
 
+func TestResumeRepoInPlace_ConversationIsolationAcrossStories(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-mac", "permanent")
+	repoPath := "/work/app-isolated"
+	if err := e.UpsertRepo(Repo{
+		HostID:                 "host-mac",
+		WorktreePath:           repoPath,
+		CloneURL:               "https://example.test/app-isolated.git",
+		DirtyStoryID:           "STORY-OLD-001",
+		DetectedConversationID: "0ddc4208-8d7a-490b-86bb-1dee2e91ae82",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Also simulate history rows from STORY-OLD-001
+	e.history[repoKey("host-mac", repoPath)] = []HistoryRow{
+		{
+			JobID:           "job-old-1",
+			PromptTitle:     "Execute STORY-OLD-001",
+			ConversationIDs: []string{"0ddc4208-8d7a-490b-86bb-1dee2e91ae82"},
+			Status:          "FAILED",
+		},
+	}
+
+	// 1. Resuming for a completely DIFFERENT story must NOT inherit the old conversation ID
+	schNew, err := e.ResumeRepoInPlace("host-mac", repoPath, ResumeOptions{
+		StoryID: "STORY-NEW-002",
+	})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace failed: %v", err)
+	}
+	if schNew.ResumeConversationID != "" {
+		t.Fatalf("expected empty ResumeConversationID for new story, got %q", schNew.ResumeConversationID)
+	}
+	if schNew.StoryID != "STORY-NEW-002" {
+		t.Fatalf("expected StoryID STORY-NEW-002, got %q", schNew.StoryID)
+	}
+
+	// 2. Resuming for the SAME story SHOULD inherit the conversation ID
+	schSame, err := e.ResumeRepoInPlace("host-mac", repoPath, ResumeOptions{
+		StoryID: "STORY-OLD-001",
+	})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace failed: %v", err)
+	}
+	if schSame.ResumeConversationID != "0ddc4208-8d7a-490b-86bb-1dee2e91ae82" {
+		t.Fatalf("expected ResumeConversationID 0ddc4208..., got %q", schSame.ResumeConversationID)
+	}
+}
+
 func TestDeclineJobCancellationSafetyAndCircuitBreaker(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("host-1", "permanent")
@@ -2561,5 +2611,50 @@ func TestEngine_GetRepo(t *testing.T) {
 	}
 	if _, ok := e.GetRepo("host-1", "/nonexistent"); ok {
 		t.Fatal("expected ok=false for nonexistent repo")
+	}
+}
+
+func TestAbandonJob_RepoBusyRefundsAndKeepsQueueOpen(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("host-1", "linux")
+	r := Repo{
+		HostID:       "host-1",
+		WorktreePath: "/work/repo1",
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	}
+	e.UpsertRepo(r)
+
+	p := &Prompt{ID: "p1", Title: "test prompt", Engine: "agy", Body: "prompt text", Status: "READY"}
+	e.prompts["p1"] = p
+
+	sch, err := e.ExecutePrompt("p1", "host-1", "/work/repo1", 1, nil)
+	if err != nil {
+		t.Fatalf("ExecutePrompt failed: %v", err)
+	}
+
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("expected job to be leased")
+	}
+
+	// Host agent encounters busy lock and abandons with REPO_BUSY
+	if err := e.AbandonJob(job.ID, "REPO_BUSY"); err != nil {
+		t.Fatalf("AbandonJob failed: %v", err)
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	j := e.jobs[job.ID]
+	if j.Status != "FAILED" || j.Reason != "REPO_BUSY" {
+		t.Fatalf("expected job FAILED/REPO_BUSY, got status=%s, reason=%s", j.Status, j.Reason)
+	}
+	s := e.schedules[sch.ID]
+	if s.Status != "QUEUED" || s.IterationsRemaining != 1 {
+		t.Fatalf("expected schedule retained QUEUED with 1 iteration remaining, got status=%s, remaining=%d", s.Status, s.IterationsRemaining)
+	}
+	repo := e.repos[repoKey("host-1", "/work/repo1")]
+	if repo.Queue != QueueOpen {
+		t.Fatalf("expected queue to remain OPEN, got: %s", repo.Queue)
 	}
 }

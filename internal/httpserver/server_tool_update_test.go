@@ -293,4 +293,12 @@ func TestServer_NotificationsAndToolUpdateQueue(t *testing.T) {
 	if recUpAll.Code != http.StatusOK {
 		t.Fatalf("expected 200 on update-all, got %d: %s", recUpAll.Code, recUpAll.Body.String())
 	}
+
+	// 4. Test POST /v1/notifications
+	recPostNotif := httptest.NewRecorder()
+	postPayload := `{"title":"Agent Tool Updated","message":"Updated autopilot on host-1","category":"success","source":"iazio-agent","host_id":"host-1"}`
+	handler.ServeHTTP(recPostNotif, httptest.NewRequest("POST", "/v1/notifications", bytes.NewReader([]byte(postPayload))))
+	if recPostNotif.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on POST /v1/notifications, got %d: %s", recPostNotif.Code, recPostNotif.Body.String())
+	}
 }
