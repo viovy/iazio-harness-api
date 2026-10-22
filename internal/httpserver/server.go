@@ -182,6 +182,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/agent/jobs/{id}/heartbeat", agentJobsHandler.HeartbeatHandler)
 	mux.HandleFunc("GET /v1/notifications", s.getNotifications)
 	mux.HandleFunc("GET /api/v1/notifications", s.getNotifications)
+	mux.HandleFunc("POST /v1/notifications", s.createNotification)
+	mux.HandleFunc("POST /api/v1/notifications", s.createNotification)
 	mux.HandleFunc("POST /v1/fleet/tools/update-all", s.queueAllToolsUpdate)
 	mux.HandleFunc("POST /v1/hosts/all/tools/update", s.queueAllToolsUpdate)
 
@@ -1485,6 +1487,19 @@ func (s *Server) getNotifications(w http.ResponseWriter, r *http.Request) {
 		"notifications": notifs,
 		"count":         len(notifs),
 	})
+}
+
+func (s *Server) createNotification(w http.ResponseWriter, r *http.Request) {
+	var rec NotificationRecord
+	if err := json.NewDecoder(r.Body).Decode(&rec); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if rec.Timestamp.IsZero() {
+		rec.Timestamp = time.Now()
+	}
+	s.RecordNotification(rec)
+	writeJSON(w, http.StatusCreated, rec)
 }
 
 func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
