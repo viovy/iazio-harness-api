@@ -1202,7 +1202,18 @@ func (e *Engine) DeclineJob(jobID, reason string) error {
 		if sch.Status != "CANCELLED" && sch.Status != "FINISHED" {
 			sch.LeaseRetries++
 			if sch.LeaseRetries >= MaxDeclineRetries || strings.HasPrefix(reason, "preflight_rejected:") {
-				sch.Status = "DECLINED"
+				if sch.IsGlobal && sch.LeaseRetries < MaxDeclineRetries*2 {
+					// For global schedules, a preflight rejection on a specific dirty host
+					// must not abort the entire global story across the fleet.
+					// Re-queue the global schedule and unbind host assignment so alternate nodes can execute.
+					sch.Status = "QUEUED"
+					sch.HostID = ""
+					if prompt := e.prompts[sch.PromptID]; prompt != nil && prompt.StoryID != "" {
+						sch.WorktreePath = "."
+					}
+				} else {
+					sch.Status = "DECLINED"
+				}
 			} else {
 				sch.Status = "QUEUED"
 			}
@@ -1724,6 +1735,40 @@ func (e *Engine) reapExpiredLocked() {
 			e.notifyRepoLocked(repo)
 		}
 	}
+
+	// 4. Reconcile orphaned RUNNING history rows where no active running job exists
+	for key, rows := range e.history {
+		parts := strings.Split(key, "\x00")
+		if len(parts) != 2 {
+			continue
+		}
+		hHost, hPath := parts[0], parts[1]
+		repo := e.repos[key]
+		for i := range rows {
+			if rows[i].Status == "RUNNING" {
+				hasLiveJob := false
+				if j, ok := e.jobs[rows[i].JobID]; ok && !j.ExitPosted && (j.Status == "RUNNING" || j.Status == "CANCEL_REQUESTED") {
+					hasLiveJob = true
+				}
+				isStale := false
+				if !hasLiveJob {
+					isStale = true
+				} else if repo != nil && repo.Lock == LockIdle && repo.RunningJobID != rows[i].JobID {
+					isStale = true
+				} else if !rows[i].CreatedAt.IsZero() && now.Sub(rows[i].CreatedAt) > DefaultMaxExec*2 {
+					isStale = true
+				}
+				if isStale {
+					rows[i].Status = "TIMED_OUT"
+					rows[i].Reason = "ORPHANED_RUN_EXPIRED"
+					rows[i].ErrorMessage = "Harness or agent process terminated without exit report."
+					rows[i].DiagnosticCode = "EXECUTION_TIMEOUT"
+					rows[i].Remediation = "Review execution state and re-queue or resume in place."
+					e.notifyHistoryLocked(hHost, hPath, rows[i])
+				}
+			}
+		}
+	}
 }
 
 // PollHost leases the next queued schedule for the host.
@@ -1796,7 +1841,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			// First try to match target submodule if specified
 			if sch.WorktreePath != "" && sch.WorktreePath != "." {
 				for _, r := range e.repos {
-					if r.HostID == host && r.GlobalQueueAllocationEnabled && r.Lock == LockIdle && (r.Queue == QueueOpen || r.Queue == QueueHealing) {
+					if r.HostID == host && r.GlobalQueueAllocationEnabled && r.Lock == LockIdle && (r.Queue == QueueOpen || r.Queue == QueueHealing) && (r.Reason == "" || r.Reason == "REMEDIATED") {
 						if r.WorktreePath == sch.WorktreePath || strings.HasSuffix(r.WorktreePath, "/"+sch.WorktreePath) || filepath.Base(r.WorktreePath) == sch.WorktreePath {
 							repo = r
 							sch.WorktreePath = r.WorktreePath
@@ -1809,7 +1854,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			// If not matched or target was generic, find any idle repo with GlobalQueueAllocationEnabled == true
 			if repo == nil {
 				for _, r := range e.repos {
-					if r.HostID == host && r.GlobalQueueAllocationEnabled && r.Lock == LockIdle && (r.Queue == QueueOpen || r.Queue == QueueHealing) {
+					if r.HostID == host && r.GlobalQueueAllocationEnabled && r.Lock == LockIdle && (r.Queue == QueueOpen || r.Queue == QueueHealing) && (r.Reason == "" || r.Reason == "REMEDIATED") {
 						repo = r
 						sch.WorktreePath = r.WorktreePath
 						sch.HostID = host
@@ -1817,6 +1862,9 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 					}
 				}
 			}
+		}
+		if repo == nil && (sch.IsGlobal || sch.HostID == "global" || sch.HostID == "") {
+			continue
 		}
 		if repo != nil {
 			if (sch.IsGlobal || sch.HostID == "global" || sch.HostID == "") && !repo.GlobalQueueAllocationEnabled {

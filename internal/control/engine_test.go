@@ -2658,3 +2658,113 @@ func TestAbandonJob_RepoBusyRefundsAndKeepsQueueOpen(t *testing.T) {
 		t.Fatalf("expected queue to remain OPEN, got: %s", repo.Queue)
 	}
 }
+
+func TestReapExpiredLocked_OrphanedHistoryReconciled(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{HostID: "mac-mini", WorktreePath: "/work/meta-04"})
+
+	// Inject an orphaned RUNNING history row
+	key := repoKey("mac-mini", "/work/meta-04")
+	e.history[key] = []HistoryRow{
+		{
+			JobID:       "job-1250",
+			ScheduleID:  "sch-1249",
+			PromptTitle: "iazio review",
+			Engine:      "agy",
+			Status:      "RUNNING",
+			CreatedAt:   time.Now().Add(-2 * time.Hour),
+		},
+	}
+
+	// Trigger reap
+	e.mu.Lock()
+	e.reapExpiredLocked()
+	e.mu.Unlock()
+
+	detail, ok := e.GetRepoDetail("mac-mini", "/work/meta-04")
+	if !ok || len(detail.History) == 0 {
+		t.Fatal("expected repo detail and history")
+	}
+
+	row := detail.History[0]
+	if row.Status != "TIMED_OUT" {
+		t.Fatalf("expected history row to transition to TIMED_OUT, got %s", row.Status)
+	}
+	if row.Reason != "ORPHANED_RUN_EXPIRED" {
+		t.Fatalf("expected reason ORPHANED_RUN_EXPIRED, got %s", row.Reason)
+	}
+	if row.DiagnosticCode != "EXECUTION_TIMEOUT" {
+		t.Fatalf("expected DiagnosticCode EXECUTION_TIMEOUT, got %s", row.DiagnosticCode)
+	}
+}
+
+func TestPollHost_GlobalScheduleSkipsDirtyRepo(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("pc1", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:                      "pc1",
+		WorktreePath:                "C:\\work\\meta-repo",
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	// Mark pc1 dirty
+	e.repos[repoKey("pc1", "C:\\work\\meta-repo")].Reason = "HALTED_DIRTY"
+
+	// Enqueue global schedule
+	sch, err := e.EnqueueGlobalStorySchedule("STORY-ROOT-45276", ".", "autopilot", "test prompt")
+	if err != nil {
+		t.Fatalf("EnqueueGlobalStorySchedule failed: %v", err)
+	}
+
+	// Poll pc1: should NOT be leased to the dirty repo
+	job, _, _, ok := e.PollHost("pc1")
+	if ok {
+		t.Fatalf("expected PollHost on dirty repo to return false, leased job: %+v", job)
+	}
+
+	// Schedule must remain QUEUED and global
+	e.mu.Lock()
+	s := e.schedules[sch.ID]
+	e.mu.Unlock()
+	if s.Status != "QUEUED" || !s.IsGlobal {
+		t.Fatalf("expected schedule to remain QUEUED/IsGlobal, got status=%s, isGlobal=%v", s.Status, s.IsGlobal)
+	}
+}
+
+func TestDeclineJob_GlobalScheduleRequeuedOnPreflightDecline(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("pc1", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:                      "pc1",
+		WorktreePath:                "C:\\work\\meta-repo",
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	sch, err := e.EnqueueGlobalStorySchedule("STORY-ROOT-45276", ".", "autopilot", "test prompt")
+	if err != nil {
+		t.Fatalf("EnqueueGlobalStorySchedule failed: %v", err)
+	}
+
+	job, _, _, ok := e.PollHost("pc1")
+	if !ok {
+		t.Fatal("expected PollHost to lease clean repo")
+	}
+
+	// Host declines due to preflight rejection
+	if err := e.DeclineJob(job.ID, "preflight_rejected: HALTED_DIRTY"); err != nil {
+		t.Fatalf("DeclineJob failed: %v", err)
+	}
+
+	e.mu.Lock()
+	s := e.schedules[sch.ID]
+	e.mu.Unlock()
+
+	// Global schedule must be re-queued and unpinned from pc1
+	if s.Status != "QUEUED" {
+		t.Fatalf("expected global schedule to be re-queued, got %s", s.Status)
+	}
+	if s.HostID != "" {
+		t.Fatalf("expected global schedule HostID to be unpinned, got %q", s.HostID)
+	}
+}
