@@ -127,14 +127,17 @@ func toolView(t control.Tool) map[string]any {
 
 func chunkView(c control.LogChunk) map[string]any {
 	return map[string]any{
-		"seq":           c.Seq,
-		"type":          c.Type,
-		"stream":        c.Stream,
-		"text":          c.Text,
-		"head":          c.Head,
-		"tail":          c.Tail,
-		"dropped_bytes": c.DroppedBytes,
-		"silent_for_ms": c.SilentForMs,
+		"seq":             c.Seq,
+		"type":            c.Type,
+		"stream":          c.Stream,
+		"text":            c.Text,
+		"head":            c.Head,
+		"tail":            c.Tail,
+		"dropped_bytes":   c.DroppedBytes,
+		"silent_for_ms":   c.SilentForMs,
+		"harness_pid":     c.HarnessPID,
+		"tool_pid":        c.ToolPID,
+		"elapsed_seconds": c.ElapsedSeconds,
 	}
 }
 
@@ -149,6 +152,17 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 		if !d.RunningStartedAt.IsZero() {
 			startedAt = d.RunningStartedAt.UTC().Format(time.RFC3339)
 		}
+		hostID := d.Running.HostID
+		if hostID == "" {
+			hostID = d.Running.TargetHost
+		}
+		if hostID == "" {
+			hostID = d.Repo.HostID
+		}
+		targetHost := d.Running.TargetHost
+		if targetHost == "" {
+			targetHost = hostID
+		}
 		running = map[string]any{
 			"id":                 d.Running.ID,
 			"status":             d.Running.Status,
@@ -158,6 +172,12 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 			"silent_for_seconds": d.RunningSilentSeconds,
 			"is_stalled":         d.RunningIsStalled,
 			"started_at":         startedAt,
+			"host_id":            hostID,
+			"target_host":        targetHost,
+			"harness_pid":        d.Running.HarnessPID,
+			"tool_pid":           d.Running.ToolPID,
+			"elapsed_seconds":    d.Running.ElapsedSeconds,
+			"resume_count":       d.Running.ResumeCount,
 		}
 	}
 	schedules := make([]map[string]any, 0, len(d.Schedules))
@@ -236,6 +256,14 @@ func jobDetailView(j control.JobDetail) map[string]any {
 	if cids == nil {
 		cids = []string{}
 	}
+	targetHost := j.TargetHost
+	if targetHost == "" {
+		targetHost = j.HostID
+	}
+	hostID := j.HostID
+	if hostID == "" {
+		hostID = j.TargetHost
+	}
 	return map[string]any{
 		"id":                             j.ID,
 		"schedule_id":                    j.ScheduleID,
@@ -256,6 +284,12 @@ func jobDetailView(j control.JobDetail) map[string]any {
 		"is_stalled":                     j.IsStalled,
 		"started_at":                     j.StartedAt,
 		"reason":                         j.Reason,
+		"host_id":                        hostID,
+		"target_host":                    targetHost,
+		"harness_pid":                    j.HarnessPID,
+		"tool_pid":                       j.ToolPID,
+		"elapsed_seconds":                j.ElapsedSeconds,
+		"resume_count":                   j.ResumeCount,
 	}
 }
 
@@ -290,6 +324,8 @@ func historyJobDetailView(r control.HistoryRow, host, path string) map[string]an
 		"diagnostic_code":                r.DiagnosticCode,
 		"model":                          r.Model,
 		"remediation":                    r.Remediation,
+		"host_id":                        host,
+		"target_host":                    host,
 	}
 }
 
@@ -350,6 +386,17 @@ func dispatchScheduleView(j *dispatch.Job) map[string]any {
 	if engine == "" {
 		engine = "auto"
 	}
+	hostID := j.ClaimedHost
+	if hostID == "" {
+		hostID = j.HostID
+	}
+	if hostID == "" {
+		hostID = j.TargetHost
+	}
+	targetHost := j.TargetHost
+	if targetHost == "" || targetHost == "auto" {
+		targetHost = hostID
+	}
 	status := strings.ToUpper(j.Status)
 	if status == "PENDING" {
 		status = "QUEUED"
@@ -361,7 +408,8 @@ func dispatchScheduleView(j *dispatch.Job) map[string]any {
 		"id":                     j.ID,
 		"prompt_id":              "",
 		"prompt_title":           title,
-		"host_id":                j.TargetHost,
+		"host_id":                hostID,
+		"target_host":            targetHost,
 		"repo_path":              j.Repo,
 		"iterations":             1,
 		"iterations_total":       1,
@@ -392,6 +440,17 @@ func dispatchHistoryView(j *dispatch.Job) map[string]any {
 	if engine == "" {
 		engine = "auto"
 	}
+	hostID := j.ClaimedHost
+	if hostID == "" {
+		hostID = j.HostID
+	}
+	if hostID == "" {
+		hostID = j.TargetHost
+	}
+	targetHost := j.TargetHost
+	if targetHost == "" || targetHost == "auto" {
+		targetHost = hostID
+	}
 	status := strings.ToUpper(j.Status)
 	clean := status == "COMPLETED"
 
@@ -401,7 +460,8 @@ func dispatchHistoryView(j *dispatch.Job) map[string]any {
 	}
 
 	return map[string]any{
-		"host_id":          j.TargetHost,
+		"host_id":          hostID,
+		"target_host":      targetHost,
 		"repo_path":        j.Repo,
 		"job_id":           j.ID,
 		"schedule_id":      "",
@@ -435,6 +495,17 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 	if engine == "" {
 		engine = "auto"
 	}
+	hostID := j.ClaimedHost
+	if hostID == "" {
+		hostID = j.HostID
+	}
+	if hostID == "" {
+		hostID = j.TargetHost
+	}
+	targetHost := j.TargetHost
+	if targetHost == "" || targetHost == "auto" {
+		targetHost = hostID
+	}
 	res := map[string]any{
 		"id":                             j.ID,
 		"schedule_id":                    "",
@@ -442,7 +513,8 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 		"status":                         strings.ToUpper(j.Status),
 		"engine":                         engine,
 		"target_agent":                   j.TargetAgent,
-		"target_host":                    j.TargetHost,
+		"target_host":                    targetHost,
+		"host_id":                        hostID,
 		"prompt":                         promptText,
 		"prompt_title":                   title,
 		"story_id":                       storyID,

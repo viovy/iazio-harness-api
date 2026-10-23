@@ -71,6 +71,8 @@ type ResumeOptions struct {
 	HostID         string `json:"host_id,omitempty"`
 	WorktreePath   string `json:"worktree_path,omitempty"`
 	Engine         string `json:"engine,omitempty"`
+	Prompt         string `json:"prompt,omitempty"`
+	CustomPrompt   string `json:"custom_prompt,omitempty"`
 }
 
 // ExitOptions provides additional diagnostic and error context when a job finishes.

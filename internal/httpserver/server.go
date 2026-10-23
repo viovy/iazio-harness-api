@@ -795,6 +795,8 @@ func (s *Server) resumeRepoInPlace(w http.ResponseWriter, r *http.Request) {
 		AllowDirty     bool   `json:"allow_dirty"`
 		PromptID       string `json:"prompt_id"`
 		PromptTitle    string `json:"prompt_title"`
+		Prompt         string `json:"prompt"`
+		CustomPrompt   string `json:"custom_prompt"`
 		Engine         string `json:"engine"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
@@ -809,6 +811,10 @@ func (s *Server) resumeRepoInPlace(w http.ResponseWriter, r *http.Request) {
 		targetPath = r.URL.Query().Get("path")
 	}
 	host := r.PathValue("host")
+	customPrompt := strings.TrimSpace(body.CustomPrompt)
+	if customPrompt == "" {
+		customPrompt = strings.TrimSpace(body.Prompt)
+	}
 	opts := control.ResumeOptions{
 		ConversationID: body.ConversationID,
 		AllowDirty:     body.AllowDirty,
@@ -816,6 +822,8 @@ func (s *Server) resumeRepoInPlace(w http.ResponseWriter, r *http.Request) {
 		JobID:          body.JobID,
 		PromptID:       body.PromptID,
 		PromptTitle:    body.PromptTitle,
+		Prompt:         customPrompt,
+		CustomPrompt:   customPrompt,
 		Engine:         body.Engine,
 		HostID:         host,
 		WorktreePath:   targetPath,
@@ -1989,12 +1997,18 @@ func (s *Server) checkFleetStatus(w http.ResponseWriter, r *http.Request) {
 		probeStatus = "TIMEOUT_CACHED_FALLBACK"
 	}
 
+	isMainBranch := func(b string) bool {
+		return b == "main" || b == "master"
+	}
+	repoMain := isMainBranch(repo.CurrentBranch)
+
 	res := control.RepoFleetStatusResult{
 		RepoPath:             actualPath,
 		Branch:               repo.CurrentBranch,
-		IsClean:              repo.Porcelain == "" && repo.SubmodulesClean && len(repo.DirtySubmodules) == 0,
+		IsClean:              repoMain && repo.Porcelain == "" && repo.SubmodulesClean && len(repo.DirtySubmodules) == 0 && len(repo.NonMainSubmodules) == 0,
 		SubmodulesClean:      repo.SubmodulesClean,
 		DirtySubmodules:      repo.DirtySubmodules,
+		NonMainSubmodules:    repo.NonMainSubmodules,
 		ASEState:             repo.ASEState,
 		ActiveStoryID:        repo.DirtyStoryID,
 		AgentTool:            repo.ActiveTool,
@@ -2010,9 +2024,12 @@ func (s *Server) checkFleetStatus(w http.ResponseWriter, r *http.Request) {
 		if liveStatus.Branch != "" {
 			res.Branch = liveStatus.Branch
 		}
-		res.IsClean = liveStatus.IsClean && liveStatus.SubmodulesClean && len(liveStatus.DirtySubmodules) == 0 && (liveStatus.Porcelain == "")
+		if len(liveStatus.NonMainSubmodules) > 0 {
+			res.NonMainSubmodules = liveStatus.NonMainSubmodules
+		}
 		res.SubmodulesClean = liveStatus.SubmodulesClean
 		res.DirtySubmodules = liveStatus.DirtySubmodules
+		res.IsClean = isMainBranch(res.Branch) && liveStatus.IsClean && liveStatus.SubmodulesClean && len(liveStatus.DirtySubmodules) == 0 && len(res.NonMainSubmodules) == 0 && (liveStatus.Porcelain == "")
 		if liveStatus.ASEState != "" {
 			res.ASEState = liveStatus.ASEState
 		}
@@ -2081,6 +2098,9 @@ func (s *Server) checkFleetStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	res.ModifiedFiles = modifiedFiles
 	res.UntrackedFiles = untrackedFiles
+	if len(modifiedFiles) > 0 || len(untrackedFiles) > 0 {
+		res.IsClean = false
+	}
 
 	if res.IsClean && len(modifiedFiles) == 0 && len(untrackedFiles) == 0 {
 		sb.WriteString(fmt.Sprintf("[probe %s] Working Tree: CLEAN\n", probeID))
@@ -2093,10 +2113,16 @@ func (s *Server) checkFleetStatus(w http.ResponseWriter, r *http.Request) {
 			sb.WriteString(fmt.Sprintf("  ?? %s\n", f))
 		}
 	}
+	if !isMainBranch(res.Branch) {
+		sb.WriteString(fmt.Sprintf("[probe %s] Warning: Primary repo branch is %q (fleet cleanliness requires main/master; git-flow incomplete)\n", probeID, res.Branch))
+	}
 	if res.SubmodulesClean {
 		sb.WriteString(fmt.Sprintf("[probe %s] Submodules: ALL CLEAN\n", probeID))
 	} else {
 		sb.WriteString(fmt.Sprintf("[probe %s] Submodules: DIRTY (%s)\n", probeID, strings.Join(res.DirtySubmodules, ", ")))
+	}
+	if len(res.NonMainSubmodules) > 0 {
+		sb.WriteString(fmt.Sprintf("[probe %s] Submodules on Non-Main branches: %s\n", probeID, strings.Join(res.NonMainSubmodules, ", ")))
 	}
 	sb.WriteString(fmt.Sprintf("[probe %s] ASE State: %s\n", probeID, res.ASEState))
 	if res.AgentTool != "" && res.ToolLiveness != "NONE" {
@@ -2286,20 +2312,26 @@ func (s *Server) retryCorrelation(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) appendChunk(w http.ResponseWriter, r *http.Request) {
 	var raw struct {
-		Type        string `json:"type"`
-		Stream      string `json:"stream"`
-		Text        string `json:"text"`
-		SilentForMs int    `json:"silent_for_ms"`
+		Type           string `json:"type"`
+		Stream         string `json:"stream"`
+		Text           string `json:"text"`
+		SilentForMs    int    `json:"silent_for_ms"`
+		HarnessPID     int    `json:"harness_pid"`
+		ToolPID        int    `json:"tool_pid"`
+		ElapsedSeconds int64  `json:"elapsed_seconds"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
 	s.Engine.AppendLog(r.PathValue("id"), control.LogChunk{
-		Type:        raw.Type,
-		Stream:      raw.Stream,
-		Text:        raw.Text,
-		SilentForMs: raw.SilentForMs,
+		Type:           raw.Type,
+		Stream:         raw.Stream,
+		Text:           raw.Text,
+		SilentForMs:    raw.SilentForMs,
+		HarnessPID:     raw.HarnessPID,
+		ToolPID:        raw.ToolPID,
+		ElapsedSeconds: raw.ElapsedSeconds,
 	})
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "stored"})
 }

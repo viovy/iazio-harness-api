@@ -633,6 +633,15 @@ func (e *Engine) AppendLog(jobID string, chunk LogChunk) {
 		} else if chunk.SilentForMs > 0 {
 			job.LastOutputAt = e.now().Add(-time.Duration(chunk.SilentForMs) * time.Millisecond)
 		}
+		if chunk.HarnessPID > 0 {
+			job.HarnessPID = chunk.HarnessPID
+		}
+		if chunk.ToolPID > 0 {
+			job.ToolPID = chunk.ToolPID
+		}
+		if chunk.ElapsedSeconds > 0 {
+			job.ElapsedSeconds = chunk.ElapsedSeconds
+		}
 	}
 	for _, ch := range e.subs[jobID] {
 		select {
