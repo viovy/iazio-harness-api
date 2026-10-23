@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -382,5 +383,79 @@ func TestStoriesHandler_MaterializeStory(t *testing.T) {
 	st, ok := engine.GetStory("STORY-MAT-1")
 	if !ok || st.SyncState != "MATERIALIZED" {
 		t.Errorf("expected engine story sync_state MATERIALIZED, got %s", st.SyncState)
+	}
+}
+
+func TestIntegration_StoryCreationAndExecutionDispatch(t *testing.T) {
+	store := setupTestStore(t)
+	q := dispatch.NewInMemoryQueue()
+	engine := control.NewEngine(nil)
+	idem := NewIdempotencyStore(10 * time.Minute)
+	handler := NewStoriesHandler(store, q, idem)
+	handler.SetEngine(engine)
+
+	const promptDirective = `/autonomous-story-execution deep review entire vigo* and k8s* submodules, find omissions, gaps, architectural issues and misalignments. Everything should be enterprise grade well architected, enterprise grade product and enterprise grade implemented. ensure all discoveries from review are implemented.`
+
+	payload := map[string]any{
+		"submodule":           ".",
+		"title":               "Deep review and enterprise-grade alignment for vigo* and k8s* submodules",
+		"priority":            "P1",
+		"problem":             "Review entire vigo* and k8s* fleet submodules for enterprise grade completeness",
+		"acceptance_criteria": []string{"Complete deep review", "Implement all findings"},
+		"target_files":        []string{"vigo", "k8s"},
+		"prompt":              promptDirective,
+		"enqueue":             true,
+		"target_agent":        "autopilot",
+	}
+	body, _ := json.Marshal(payload)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/stories", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp CreateStoryResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode CreateStoryResponse: %v", err)
+	}
+
+	if resp.ExecutionJobID == "" {
+		t.Fatalf("expected ExecutionJobID to be populated when enqueue=true")
+	}
+
+	// Verify job was enqueued in dispatch queue with the exact prompt
+	claimed, err := q.Claim(context.Background(), "mac-mini", []string{dispatch.JobTypePromptExecute})
+	if err != nil {
+		t.Fatalf("failed to claim job: %v", err)
+	}
+	if claimed == nil {
+		t.Fatalf("expected claimed job, got nil")
+	}
+	if claimed.ID != resp.ExecutionJobID {
+		t.Errorf("expected claimed job ID %s, got %s", resp.ExecutionJobID, claimed.ID)
+	}
+
+	var claimedPayload struct {
+		PromptID    string `json:"prompt_id"`
+		Repo        string `json:"repo"`
+		StoryID     string `json:"story_id"`
+		Prompt      string `json:"prompt"`
+		TargetAgent string `json:"target_agent"`
+	}
+	if err := json.Unmarshal(claimed.Payload, &claimedPayload); err != nil {
+		t.Fatalf("failed to unmarshal claimed job payload: %v", err)
+	}
+
+	if claimedPayload.Prompt != promptDirective {
+		t.Errorf("expected prompt in job payload to match promptDirective, got: %s", claimedPayload.Prompt)
+	}
+	if claimedPayload.TargetAgent != "autopilot" {
+		t.Errorf("expected target agent 'autopilot', got: %s", claimedPayload.TargetAgent)
+	}
+	if claimedPayload.StoryID != resp.StoryID {
+		t.Errorf("expected story ID %s, got: %s", resp.StoryID, claimedPayload.StoryID)
 	}
 }
