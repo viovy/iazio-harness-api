@@ -35,6 +35,7 @@ type CreateStoryRequest struct {
 	VerificationCommands []string `json:"verification_commands,omitempty"`
 	Body                 string   `json:"body,omitempty"`
 	ContentPath          string   `json:"content_path,omitempty"`
+	Prompt               string   `json:"prompt,omitempty"`
 	Enqueue              bool     `json:"enqueue,omitempty"`
 	TargetAgent          string   `json:"target_agent,omitempty"`
 	TraceID              string   `json:"trace_id,omitempty"`
@@ -300,12 +301,19 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			targetAgent = "autopilot"
 		}
 		promptID := fmt.Sprintf("prompt_%s_%d", storyID, time.Now().Unix())
+		promptText := strings.TrimSpace(req.Prompt)
+		if promptText == "" {
+			promptText = strings.TrimSpace(req.Body)
+		}
+		if promptText == "" {
+			promptText = fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", storyID, storyID, req.Submodule)
+		}
 		execPayload, _ := json.Marshal(map[string]any{
 			"prompt_id":    promptID,
 			"repo":         req.Submodule,
 			"story_id":     storyID,
 			"title":        fmt.Sprintf("Execute story %s: %s", storyID, req.Title),
-			"prompt":       fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", storyID, storyID, req.Submodule),
+			"prompt":       promptText,
 			"target_agent": targetAgent,
 		})
 		if h.queue != nil {
@@ -324,7 +332,7 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if h.scheduler != nil {
-			_, _ = h.scheduler.EnqueueGlobalStorySchedule(storyID, req.Submodule, targetAgent, fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", storyID, storyID, req.Submodule))
+			_, _ = h.scheduler.EnqueueGlobalStorySchedule(storyID, req.Submodule, targetAgent, promptText)
 		}
 	}
 

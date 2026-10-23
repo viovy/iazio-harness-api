@@ -2502,7 +2502,14 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		}
 	}
 
-	// If engine is unset, or if agent is selected with a non-cursor conversation or after quota exhaustion, switch to agy
+	// If engine is unset, contains "harness", or if agent is selected with a non-cursor conversation or after quota exhaustion, switch to agy
+	if strings.Contains(strings.ToLower(engineName), "harness") {
+		if strings.HasPrefix(strings.ToLower(resumeConvID), "cursor-") {
+			engineName = "agent"
+		} else {
+			engineName = "agy"
+		}
+	}
 	if engineName == "" || (engineName == "agent" && resumeConvID != "" && !strings.HasPrefix(strings.ToLower(resumeConvID), "cursor-")) {
 		low := strings.ToLower(resumeConvID)
 		if strings.HasPrefix(low, "cursor-") {
@@ -2697,6 +2704,13 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 	resumeEngine := origSch.Engine
 	if opt.Engine != "" {
 		resumeEngine = opt.Engine
+	}
+	if strings.Contains(strings.ToLower(resumeEngine), "harness") {
+		if strings.HasPrefix(strings.ToLower(resumeConvID), "cursor-") {
+			resumeEngine = "agent"
+		} else {
+			resumeEngine = "agy"
+		}
 	}
 	if resumeEngine == "" || (resumeEngine == "agent" && resumeConvID != "" && !strings.HasPrefix(strings.ToLower(resumeConvID), "cursor-")) {
 		low := strings.ToLower(resumeConvID)

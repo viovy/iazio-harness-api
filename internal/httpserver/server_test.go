@@ -2008,3 +2008,53 @@ func TestGetScheduleEndpointAndJobFallback(t *testing.T) {
 	}
 }
 
+func TestGetProfileReleasesEndpoint_Graceful200OnToolErrors(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	handler := s.Handler()
+
+	// Register profile with a tool whose repository is unreachable / 404
+	_, err := s.Engine.UpsertProfile(control.DistributionProfile{
+		Name: "mac-mini-profile",
+		Tools: []control.ProfileTool{
+			{Name: "autopilot", Repository: "viovy/autopilot", TargetVersion: "0.0.255"},
+			{Name: "iazio-agent", Repository: "viovy/iazio-agent", TargetVersion: "0.0.63"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to put profile: %v", err)
+	}
+
+	// Mock releases service with an offline/404 server
+	offlineServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer offlineServer.Close()
+
+	relSvc := control.NewReleaseService()
+	// inject client pointing to offline server
+	relSvc.SetCachedRelease("viovy/autopilot", "0.0.255", control.ToolRelease{
+		Name:          "autopilot",
+		Repository:    "viovy/autopilot",
+		LatestVersion: "0.0.255",
+		TagName:       "0.0.255",
+	}, 10*time.Minute)
+	s.Engine.Releases = relSvc
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/fleet/profiles/mac-mini-profile/releases", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /v1/fleet/profiles/mac-mini-profile/releases even with tool errors, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var res map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &res); err != nil {
+		t.Fatalf("failed to unmarshal JSON: %v", err)
+	}
+	releases, ok := res["releases"].([]any)
+	if !ok || len(releases) != 2 {
+		t.Fatalf("expected 2 releases in response, got %v", res["releases"])
+	}
+}
+

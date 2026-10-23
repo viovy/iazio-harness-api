@@ -304,14 +304,18 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 
 	token := s.tokenForRepo(repo)
 
-	// Try releases/latest first
-	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
+	candidateURLs := make([]string, 0, 3)
 	if targetVersion != "" && targetVersion != "latest" {
 		tag := targetVersion
-		if !strings.HasPrefix(tag, "v") {
-			tag = "v" + tag
-		}
-		url = fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", repo, tag)
+		bareTag := strings.TrimPrefix(tag, "v")
+		vTag := "v" + bareTag
+		// Check both "v"-prefixed and bare tag names
+		candidateURLs = append(candidateURLs,
+			fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", repo, vTag),
+			fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", repo, bareTag),
+		)
+	} else {
+		candidateURLs = append(candidateURLs, fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo))
 	}
 
 	var cachedEtag string
@@ -320,68 +324,84 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 	}
 
 	var lastErr error
-	rel, newEtag, notModified, err := s.fetchReleaseURL(ctx, url, repo, toolName, targetVersion, token, cachedEtag)
-	if notModified && ok {
-		s.mu.Lock()
-		cached.expiresAt = now.Add(10 * time.Minute)
-		s.cache[cacheKey] = cached
-		s.mu.Unlock()
-		r := cached.release
-		r.Name = toolName
-		return r, nil
+	for _, candURL := range candidateURLs {
+		rel, newEtag, notModified, err := s.fetchReleaseURL(ctx, candURL, repo, toolName, targetVersion, token, cachedEtag)
+		if notModified && ok {
+			s.mu.Lock()
+			cached.expiresAt = now.Add(10 * time.Minute)
+			s.cache[cacheKey] = cached
+			s.mu.Unlock()
+			r := cached.release
+			r.Name = toolName
+			return r, nil
+		}
+		if err == nil && rel.LatestVersion != "" {
+			s.mu.Lock()
+			s.cache[cacheKey] = cachedRelease{
+				release:   rel,
+				etag:      newEtag,
+				expiresAt: now.Add(10 * time.Minute),
+			}
+			s.mu.Unlock()
+			return rel, nil
+		}
+		if err != nil {
+			lastErr = err
+		}
 	}
-	if err == nil && rel.LatestVersion != "" {
+
+	// Fallback 1: check list of all releases (e.g. if latest flag not set or tag lookup returned 404)
+	listURL := fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=5", repo)
+	listRel, listErr := s.fetchReleaseListURL(ctx, listURL, repo, toolName, token)
+	if listErr == nil && listRel.LatestVersion != "" {
 		s.mu.Lock()
 		s.cache[cacheKey] = cachedRelease{
-			release:   rel,
-			etag:      newEtag,
+			release:   listRel,
 			expiresAt: now.Add(10 * time.Minute),
 		}
 		s.mu.Unlock()
-		return rel, nil
+		return listRel, nil
 	}
-	if err != nil {
-		lastErr = err
-	}
-
-	// Fallback 1: check list of all releases (e.g. if latest flag not set)
-	if targetVersion == "" || targetVersion == "latest" {
-		listURL := fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=1", repo)
-		listRel, listErr := s.fetchReleaseListURL(ctx, listURL, repo, toolName, token)
-		if listErr == nil && listRel.LatestVersion != "" {
-			s.mu.Lock()
-			s.cache[cacheKey] = cachedRelease{
-				release:   listRel,
-				expiresAt: now.Add(10 * time.Minute),
-			}
-			s.mu.Unlock()
-			return listRel, nil
-		}
-		if listErr != nil {
-			lastErr = listErr
-		}
-
-		// Fallback 2: check repository tags
-		tagsURL := fmt.Sprintf("https://api.github.com/repos/%s/tags?per_page=1", repo)
-		tagRel, tagErr := s.fetchTagsURL(ctx, tagsURL, repo, toolName, token)
-		if tagErr == nil && tagRel.LatestVersion != "" {
-			s.mu.Lock()
-			s.cache[cacheKey] = cachedRelease{
-				release:   tagRel,
-				expiresAt: now.Add(10 * time.Minute),
-			}
-			s.mu.Unlock()
-			return tagRel, nil
-		}
-		if tagErr != nil {
-			lastErr = tagErr
-		}
+	if listErr != nil {
+		lastErr = listErr
 	}
 
+	// Fallback 2: check repository tags
+	tagsURL := fmt.Sprintf("https://api.github.com/repos/%s/tags?per_page=5", repo)
+	tagRel, tagErr := s.fetchTagsURL(ctx, tagsURL, repo, toolName, token)
+	if tagErr == nil && tagRel.LatestVersion != "" {
+		s.mu.Lock()
+		s.cache[cacheKey] = cachedRelease{
+			release:   tagRel,
+			expiresAt: now.Add(10 * time.Minute),
+		}
+		s.mu.Unlock()
+		return tagRel, nil
+	}
+	if tagErr != nil {
+		lastErr = tagErr
+	}
+
+	// Fallback 3: Return targetVersion as graceful fallback with error message on the struct
+	fallbackVer := targetVersion
+	if fallbackVer == "" || fallbackVer == "latest" {
+		fallbackVer = "0.0.0"
+	}
+	errMsg := "no releases or tags found for repository " + repo
 	if lastErr != nil {
-		return ToolRelease{Name: toolName, Repository: repo, LatestVersion: targetVersion, TagName: targetVersion}, fmt.Errorf("lookup release for %s: %w", repo, lastErr)
+		errMsg = lastErr.Error()
 	}
-	return ToolRelease{Name: toolName, Repository: repo}, fmt.Errorf("no releases or tags found for repository %s", repo)
+	errToReturn := fmt.Errorf("lookup release for %s: %s", repo, errMsg)
+	if lastErr != nil {
+		errToReturn = fmt.Errorf("lookup release for %s: %w", repo, lastErr)
+	}
+	return ToolRelease{
+		Name:          toolName,
+		Repository:    repo,
+		LatestVersion: fallbackVer,
+		TagName:       fallbackVer,
+		Error:         errMsg,
+	}, errToReturn
 }
 
 func (s *ReleaseService) fetchReleaseURL(ctx context.Context, url, repo, toolName, targetVersion, token, ifNoneMatch string) (ToolRelease, string, bool, error) {
@@ -525,6 +545,9 @@ func (s *ReleaseService) GetProfileReleases(ctx context.Context, p DistributionP
 		rel, err := s.GetToolRelease(ctx, repo, t.Name, t.TargetVersion)
 		if err != nil {
 			rel.Error = err.Error()
+			if rel.LatestVersion == "" {
+				rel.LatestVersion = t.TargetVersion
+			}
 			errs = append(errs, fmt.Sprintf("%s (%s): %v", t.Name, repo, err))
 		}
 		out = append(out, rel)
@@ -550,7 +573,10 @@ func (s *ReleaseService) RefreshProfileReleases(ctx context.Context, p Distribut
 		if targetVersion == "" {
 			targetVersion = "latest"
 		}
+		bare := strings.TrimPrefix(targetVersion, "v")
 		delete(s.cache, repo+":"+targetVersion)
+		delete(s.cache, repo+":"+bare)
+		delete(s.cache, repo+":v"+bare)
 		delete(s.cache, repo+":latest")
 	}
 	s.mu.Unlock()

@@ -1663,7 +1663,7 @@ func (s *Server) getProfileReleases(w http.ResponseWriter, r *http.Request) {
 		s.Engine.Releases = control.NewReleaseService()
 	}
 	releases, err := s.Engine.Releases.GetProfileReleases(r.Context(), *profile)
-	if err != nil {
+	if err != nil && len(releases) == 0 {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
