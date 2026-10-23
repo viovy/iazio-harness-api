@@ -157,6 +157,7 @@ type Schedule struct {
 	LeaseRetries         int
 	StoryID              string
 	IsGlobal             bool
+	CustomPrompt         string
 }
 
 // JobDetail carries the execution payload for iazio-harness.
@@ -183,6 +184,12 @@ type JobDetail struct {
 	Model                       string            `json:"model,omitempty"`
 	Agent                       string            `json:"agent,omitempty"`
 	DisableSlashCommands        *bool             `json:"disable_slash_commands,omitempty"`
+	HostID                      string            `json:"host_id,omitempty"`
+	TargetHost                  string            `json:"target_host,omitempty"`
+	HarnessPID                  int               `json:"harness_pid,omitempty"`
+	ToolPID                     int               `json:"tool_pid,omitempty"`
+	ElapsedSeconds              int64             `json:"elapsed_seconds,omitempty"`
+	ResumeCount                 int               `json:"resume_count,omitempty"`
 }
 
 // ActiveJob describes an active job reported on heartbeat.
@@ -198,6 +205,8 @@ type Job struct {
 	ScheduleID           string
 	Kind                 string
 	Status               string
+	HostID               string
+	TargetHost           string
 	LeaseHolder          string
 	LeaseExpiry          time.Time
 	FrozenUntil          time.Time
@@ -210,6 +219,10 @@ type Job struct {
 	ResumeConversationID string
 	ConversationIDs      []string
 	Reason               string
+	HarnessPID           int
+	ToolPID              int
+	ElapsedSeconds       int64
+	ResumeCount          int
 }
 
 // Repo is one registered checkout.
@@ -238,6 +251,7 @@ type Repo struct {
 	RepoAlias                    string
 	SubmodulesClean              bool
 	DirtySubmodules              []string
+	NonMainSubmodules            []string
 	ASEState                     string
 	ActiveTool                   string
 	ToolLiveness                 string
@@ -254,6 +268,7 @@ type RepoRuntimeStatus struct {
 	Porcelain            string    `json:"porcelain,omitempty"`
 	SubmodulesClean      bool      `json:"submodules_clean"`
 	DirtySubmodules      []string  `json:"dirty_submodules,omitempty"`
+	NonMainSubmodules    []string  `json:"non_main_submodules,omitempty"`
 	ASEState             string    `json:"ase_state,omitempty"`
 	ActiveStoryID        string    `json:"active_story_id,omitempty"`
 	ActiveTool           string    `json:"active_tool,omitempty"`
@@ -275,6 +290,7 @@ type RepoFleetStatusResult struct {
 	UntrackedFiles       []string `json:"untracked_files,omitempty"`
 	SubmodulesClean      bool     `json:"submodules_clean"`
 	DirtySubmodules      []string `json:"dirty_submodules,omitempty"`
+	NonMainSubmodules    []string `json:"non_main_submodules,omitempty"`
 	ASEState             string   `json:"ase_state"`
 	ActiveStoryID        string   `json:"active_story_id,omitempty"`
 	CurrentPhase         string   `json:"current_phase,omitempty"`
@@ -352,14 +368,17 @@ type HistoryItem struct {
 
 // LogChunk is one stripped output event.
 type LogChunk struct {
-	Seq          int
-	Type         string
-	Stream       string
-	Text         string
-	Head         string
-	Tail         string
-	DroppedBytes int
-	SilentForMs  int
+	Seq            int
+	Type           string
+	Stream         string
+	Text           string
+	Head           string
+	Tail           string
+	DroppedBytes   int
+	SilentForMs    int
+	HarnessPID     int
+	ToolPID        int
+	ElapsedSeconds int64
 }
 
 // RepoRequest is a checkout the browser asked the agent to register.
@@ -616,6 +635,7 @@ func (e *Engine) newJobLocked(host, path, clone, kind string) *Job {
 	}
 	job := &Job{
 		ID: id, ScheduleID: sid, Kind: kind, Status: "RUNNING",
+		HostID: host, TargetHost: host,
 		LeaseHolder: host, LeaseExpiry: e.now().Add(LeaseInterval),
 		StartedAt: e.now(),
 	}
@@ -791,8 +811,18 @@ func (e *Engine) EnqueueGlobalStorySchedule(storyID, submodule, targetAgent, pro
 	}
 
 	id := e.next("sch-")
+	promptID := e.next("prompt-")
+	e.prompts[promptID] = &Prompt{
+		ID:      promptID,
+		Title:   fmt.Sprintf("Execute story %s", storyID),
+		Body:    promptText,
+		Engine:  targetAgent,
+		StoryID: storyID,
+		Status:  "ACTIVE",
+	}
 	s := &Schedule{
 		ID:                  id,
+		PromptID:            promptID,
 		StoryID:             storyID,
 		WorktreePath:        submodule,
 		PromptTitle:         fmt.Sprintf("Execute story %s", storyID),
@@ -803,6 +833,7 @@ func (e *Engine) EnqueueGlobalStorySchedule(storyID, submodule, targetAgent, pro
 		IterationsRemaining: 1,
 		Priority:            10,
 		IsGlobal:            true,
+		CustomPrompt:        promptText,
 	}
 	e.schedules[id] = s
 	return *s, nil
@@ -1076,28 +1107,45 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 			} else if opt.DiagnosticCode != "" {
 				job.Reason = opt.DiagnosticCode
 			}
+			isDirtyWorktreeAutoHeal := (opt.DiagnosticCode == "INCOMPLETE_DIRTY_WORKTREE" || opt.Reason == "INCOMPLETE_DIRTY_WORKTREE")
 			if sch, ok := e.schedules[job.ScheduleID]; ok {
-				if sch.IterationsRemaining <= 0 {
+				if isDirtyWorktreeAutoHeal {
+					// Incomplete dirty worktree indicates interrupted in-flight ASE turn.
+					// Keep schedule in QUEUED for auto-resumption with KindResume and elevated priority.
+					sch.Status = "QUEUED"
+					sch.Kind = KindResume
+					sch.IterationsRemaining = 1
+					sch.IterationsTotal++
+					sch.Priority += 5
+					if sch.ResumeConversationID == "" && len(job.ConversationIDs) > 0 {
+						sch.ResumeConversationID = job.ConversationIDs[len(job.ConversationIDs)-1]
+					}
+				} else if sch.IterationsRemaining <= 0 {
 					sch.Status = "FAILED"
 				} else {
 					sch.Status = "QUEUED"
 				}
-				if sch.CloneURL != "" {
+				if sch.CloneURL != "" && !isDirtyWorktreeAutoHeal {
 					delete(e.cloneLease, sch.CloneURL)
 				}
 				if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
 					if repo.Lock == LockRunning {
 						repo.Lock = LockIdle
 					}
-					if repo.Queue == QueueOpen {
-						repo.Queue = QueuePaused
-					}
-					if opt.DiagnosticCode != "" {
-						repo.Reason = opt.DiagnosticCode
-					} else if opt.Reason != "" {
-						repo.Reason = opt.Reason
+					if isDirtyWorktreeAutoHeal {
+						repo.Queue = QueueOpen
+						repo.Reason = "INCOMPLETE_DIRTY_WORKTREE"
 					} else {
-						repo.Reason = "NON_ZERO_EXIT"
+						if repo.Queue == QueueOpen {
+							repo.Queue = QueuePaused
+						}
+						if opt.DiagnosticCode != "" {
+							repo.Reason = opt.DiagnosticCode
+						} else if opt.Reason != "" {
+							repo.Reason = opt.Reason
+						} else {
+							repo.Reason = "NON_ZERO_EXIT"
+						}
 					}
 					changedRepo = repo
 				}
@@ -1506,6 +1554,7 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 				}
 				r.SubmodulesClean = st.SubmodulesClean
 				r.DirtySubmodules = st.DirtySubmodules
+				r.NonMainSubmodules = st.NonMainSubmodules
 				r.ASEState = st.ASEState
 				r.ActiveTool = st.ActiveTool
 				r.ToolLiveness = st.ToolLiveness
@@ -1802,8 +1851,13 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 
 		sch.Status = "RUNNING"
 		id := e.next("job-")
+		targetHost := sch.HostID
+		if targetHost == "" || targetHost == "auto" {
+			targetHost = host
+		}
 		job := &Job{
 			ID: id, ScheduleID: sch.ID, Kind: sch.Kind, Status: "RUNNING",
+			HostID: host, TargetHost: targetHost,
 			LeaseHolder: host, LeaseExpiry: e.now().Add(LeaseInterval),
 			StartedAt:            e.now(),
 			LastChunkAt:          e.now(),
@@ -2114,6 +2168,12 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 		ResumeConversationID: job.ResumeConversationID,
 		ConversationIDs:      append([]string(nil), job.ConversationIDs...),
 		Reason:               job.Reason,
+		HostID:               job.LeaseHolder,
+		TargetHost:           job.LeaseHolder,
+		HarnessPID:           job.HarnessPID,
+		ToolPID:              job.ToolPID,
+		ElapsedSeconds:       job.ElapsedSeconds,
+		ResumeCount:          job.ResumeCount,
 	}
 	if !job.StartedAt.IsZero() {
 		detail.StartedAt = job.StartedAt.UTC().Format(time.RFC3339)
@@ -2128,6 +2188,10 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 	}
 	sch := e.schedules[job.ScheduleID]
 	if sch != nil {
+		if detail.HostID == "" {
+			detail.HostID = sch.HostID
+			detail.TargetHost = sch.HostID
+		}
 		if detail.ResumeConversationID == "" {
 			detail.ResumeConversationID = sch.ResumeConversationID
 		}
@@ -2151,11 +2215,18 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 				detail.Engine = p.Engine
 			}
 		}
+		if sch.CustomPrompt != "" {
+			detail.Prompt = sch.CustomPrompt
+		}
 		if detail.StoryID == "" && sch.StoryID != "" {
 			detail.StoryID = sch.StoryID
 		}
 		if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
 			detail.DocsHubPath = repo.DocsHubPath
+			if detail.HostID == "" {
+				detail.HostID = repo.HostID
+				detail.TargetHost = repo.HostID
+			}
 		}
 	}
 	if detail.Engine == "" {
@@ -2464,6 +2535,17 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 	}
 	e.notifyRepoLocked(repo)
 
+	customPrompt := opt.CustomPrompt
+	if customPrompt == "" {
+		customPrompt = opt.Prompt
+	}
+	if customPrompt != "" {
+		promptTitle = customPrompt
+		if len(promptTitle) > 60 {
+			promptTitle = promptTitle[:57] + "..."
+		}
+	}
+
 	// Create and enqueue new resume schedule
 	schID := e.next("sch-")
 	newSch := &Schedule{
@@ -2484,6 +2566,7 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		Priority:             100, // Elevated priority for manual in-place resume
 		ResumeConversationID: resumeConvID,
 		StoryID:              targetStoryID,
+		CustomPrompt:         customPrompt,
 	}
 	e.schedules[schID] = newSch
 	return *newSch, nil
@@ -2639,6 +2722,18 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 		}
 	}
 
+	customPrompt := opt.CustomPrompt
+	if customPrompt == "" {
+		customPrompt = opt.Prompt
+	}
+	promptTitle := origSch.PromptTitle
+	if customPrompt != "" {
+		promptTitle = customPrompt
+		if len(promptTitle) > 60 {
+			promptTitle = promptTitle[:57] + "..."
+		}
+	}
+
 	// Create new schedule to resume execution with KindResume.
 	schID := e.next("sch-")
 	newSch := &Schedule{
@@ -2656,11 +2751,12 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 		EnvKeys:              origSch.EnvKeys,
 		EnvVars:              origSch.EnvVars,
 		Status:               "QUEUED",
-		PromptTitle:          origSch.PromptTitle,
+		PromptTitle:          promptTitle,
 		Engine:               resumeEngine,
 		Priority:             origSch.Priority + 10,
 		ResumeConversationID: resumeConvID,
 		StoryID:              targetStoryID,
+		CustomPrompt:         customPrompt,
 	}
 	e.schedules[schID] = newSch
 	return *newSch, nil

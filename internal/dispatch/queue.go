@@ -71,6 +71,8 @@ type Job struct {
 	Type             string          `json:"type"`
 	Repo             string          `json:"repo"`
 	TargetHost       string          `json:"target_host,omitempty"`
+	ClaimedHost      string          `json:"claimed_host,omitempty"`
+	HostID           string          `json:"host_id,omitempty"`
 	TargetAgent      string          `json:"target_agent,omitempty"`
 	AgentAffinity    *AgentAffinity  `json:"agent_affinity,omitempty"`
 	Payload          json.RawMessage `json:"payload"`
@@ -231,6 +233,8 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 				if j.Attempts < DefaultMaxAttempts {
 					// Safe runner recovery: revert to pending for retry without duplicate execution
 					j.Status = JobStatusPending
+					j.ClaimedHost = ""
+					j.HostID = ""
 					j.ClaimedAt = nil
 					j.HeartbeatAt = nil
 					j.LeaseExpiresAt = nil
@@ -352,6 +356,10 @@ func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []str
 	oldest.FencingToken = q.fencingSeq
 	oldest.Attempts++
 	oldest.Status = JobStatusClaimed
+	if hostID != "" {
+		oldest.ClaimedHost = hostID
+		oldest.HostID = hostID
+	}
 	oldest.ClaimedAt = &now
 	oldest.HeartbeatAt = &now
 	expires := now.Add(DefaultHeartbeatTimeout)
