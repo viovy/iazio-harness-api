@@ -201,6 +201,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	mux.HandleFunc("GET /v1/observability/metrics", s.observabilityMetrics)
+	mux.HandleFunc("GET /v1/observability/stats", s.observabilityMetrics)
+	mux.HandleFunc("GET /api/v1/observability/metrics", s.observabilityMetrics)
 	mux.HandleFunc("GET /swagger", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/swagger/", http.StatusMovedPermanently)
 	})
@@ -1422,6 +1425,7 @@ func (s *Server) pollHost(w http.ResponseWriter, r *http.Request) {
 		"engine":                 engine,
 		"prompt":                 promptText,
 		"resume_conversation_id": resumeConvID,
+		"trace_id":               job.TraceID,
 	}
 	if len(job.ConversationIDs) > 0 {
 		resp["conversation_ids"] = job.ConversationIDs
@@ -2658,6 +2662,83 @@ func (s *Server) healASERepo(w http.ResponseWriter, r *http.Request) {
 		"locks_cleared": locksCleared,
 		"status":        "dispatched",
 		"healed_at":     time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+func (s *Server) observabilityMetrics(w http.ResponseWriter, r *http.Request) {
+	history := s.Engine.ListHistory("", "", "", 0)
+	statusCounts := make(map[string]int)
+	reasonCounts := make(map[string]int)
+	engineCounts := make(map[string]int)
+	traceCounts := 0
+	for _, h := range history {
+		status := h.Status
+		if status == "" {
+			status = "UNKNOWN"
+		}
+		statusCounts[status]++
+		reason := h.Reason
+		if reason == "" {
+			reason = h.DiagnosticCode
+		}
+		if reason != "" {
+			reasonCounts[reason]++
+		}
+		if h.Engine != "" {
+			engineCounts[h.Engine]++
+		}
+		if h.TraceID != "" {
+			traceCounts++
+		}
+	}
+
+	hosts := s.Engine.ListHosts()
+	onlineHosts := 0
+	offlineHosts := 0
+	for _, h := range hosts {
+		if h.Host.Presence == "ONLINE" {
+			onlineHosts++
+		} else {
+			offlineHosts++
+		}
+	}
+
+	idleRepos, runningRepos, pausedRepos := s.Engine.RepoCounts()
+	activeJobs := s.Engine.ActiveJobsCount()
+
+	zipkinEndpoint := os.Getenv("ZIPKIN_ENDPOINT")
+	if zipkinEndpoint == "" {
+		zipkinEndpoint = "https://tian.go.ro/zipkin/api/v2"
+	}
+	esEndpoint := os.Getenv("ELASTICSEARCH_ENDPOINT")
+	if esEndpoint == "" {
+		esEndpoint = "http://192.168.1.19:9200"
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total_executions":  len(history),
+		"status_counts":     statusCounts,
+		"failure_reasons":   reasonCounts,
+		"engine_counts":     engineCounts,
+		"active_jobs_count": activeJobs,
+		"traces_correlated": traceCounts,
+		"hosts": map[string]any{
+			"total":   len(hosts),
+			"online":  onlineHosts,
+			"offline": offlineHosts,
+		},
+		"repositories": map[string]any{
+			"idle":    idleRepos,
+			"running": runningRepos,
+			"paused":  pausedRepos,
+		},
+		"telemetry": map[string]any{
+			"zipkin_endpoint":        zipkinEndpoint,
+			"elasticsearch_endpoint": esEndpoint,
+			"service_name":           "iazio-harness-api",
+			"tracing_enabled":        true,
+		},
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
 	})
 }
 

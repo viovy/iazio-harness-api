@@ -2768,3 +2768,81 @@ func TestDeclineJob_GlobalScheduleRequeuedOnPreflightDecline(t *testing.T) {
 		t.Fatalf("expected global schedule HostID to be unpinned, got %q", s.HostID)
 	}
 }
+
+func TestPostExit_ClearsRunningJobIDOnCompletionAndFailure(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	repoPath := "/Users/romeo/work/meta-repo-04"
+	_ = e.UpsertRepo(Repo{
+		HostID:                      "mac-mini",
+		WorktreePath:                repoPath,
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	_, err := e.EnqueueGlobalStorySchedule("STORY-ROOT-65584", ".", "autopilot", "run story")
+	if err != nil {
+		t.Fatalf("EnqueueGlobalStorySchedule failed: %v", err)
+	}
+
+	job, _, _, ok := e.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("expected PollHost to lease clean repo")
+	}
+
+	// Verify running_job_id is set while running
+	det, ok := e.GetRepoDetail("mac-mini", repoPath)
+	if !ok || det.Repo.RunningJobID != job.ID {
+		t.Fatalf("expected RunningJobID=%s, got %s", job.ID, det.Repo.RunningJobID)
+	}
+
+	// Post exit with code 0 (RUN_FINISHED)
+	if err := e.PostExit(job.ID, 0); err != nil {
+		t.Fatalf("PostExit failed: %v", err)
+	}
+
+	// Verify RunningJobID is cleared immediately
+	hostDet, ok := e.GetHostDetail("mac-mini")
+	if !ok {
+		t.Fatal("expected GetHostDetail to succeed")
+	}
+	for _, r := range hostDet.Repos {
+		if r.WorktreePath == repoPath {
+			if r.RunningJobID != "" {
+				t.Fatalf("expected RunningJobID to be cleared post-exit, got %s", r.RunningJobID)
+			}
+			if r.Lock != LockIdle {
+				t.Fatalf("expected LockIdle post-exit, got %s", r.Lock)
+			}
+		}
+	}
+}
+
+func TestReapExpired_ReconcilesIdleRepoRunningJobID(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	repoPath := "/Users/romeo/work/meta-repo-04"
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+	})
+
+	// Manually inject a leaked running_job_id on an IDLE repo
+	e.mu.Lock()
+	r := e.repos[repoKey("mac-mini", repoPath)]
+	r.Lock = LockIdle
+	r.RunningJobID = "job-stale-999"
+	e.mu.Unlock()
+
+	// GetHostDetail triggers reapExpiredLocked and must reconcile
+	hostDet, ok := e.GetHostDetail("mac-mini")
+	if !ok {
+		t.Fatal("expected GetHostDetail to succeed")
+	}
+	for _, rep := range hostDet.Repos {
+		if rep.WorktreePath == repoPath {
+			if rep.RunningJobID != "" {
+				t.Fatalf("expected leaked RunningJobID to be cleaned by reaper, got %s", rep.RunningJobID)
+			}
+		}
+	}
+}

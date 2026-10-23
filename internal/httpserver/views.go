@@ -95,6 +95,10 @@ func repoSummary(r control.Repo) map[string]any {
 	if !r.LockExpiresAt.IsZero() {
 		expiresAt = r.LockExpiresAt.UTC().Format(time.RFC3339)
 	}
+	runningID := r.RunningJobID
+	if r.Lock == control.LockIdle {
+		runningID = ""
+	}
 	return map[string]any{
 		"path":                            r.WorktreePath,
 		"worktree_path":                   r.WorktreePath,
@@ -109,7 +113,7 @@ func repoSummary(r control.Repo) map[string]any {
 		"docs_hub_path":                   r.DocsHubPath,
 		"clone_url":                       r.CloneURL,
 		"distribution_profile":            r.DistributionProfile,
-		"running_job_id":                  r.RunningJobID,
+		"running_job_id":                  runningID,
 		"dirty_story_id":                  r.DirtyStoryID,
 		"current_branch":                  r.CurrentBranch,
 		"global_queue_allocation_enabled": r.GlobalQueueAllocationEnabled,
@@ -208,6 +212,7 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 			"diagnostic_code":  h.DiagnosticCode,
 			"model":            h.Model,
 			"remediation":      h.Remediation,
+			"trace_id":         h.TraceID,
 			"created_at":       h.CreatedAt.UTC().Format(time.RFC3339),
 		})
 	}
@@ -290,6 +295,7 @@ func jobDetailView(j control.JobDetail) map[string]any {
 		"tool_pid":                       j.ToolPID,
 		"elapsed_seconds":                j.ElapsedSeconds,
 		"resume_count":                   j.ResumeCount,
+		"trace_id":                       j.TraceID,
 	}
 }
 
@@ -324,6 +330,7 @@ func historyJobDetailView(r control.HistoryRow, host, path string) map[string]an
 		"diagnostic_code":                r.DiagnosticCode,
 		"model":                          r.Model,
 		"remediation":                    r.Remediation,
+		"trace_id":                       r.TraceID,
 		"host_id":                        host,
 		"target_host":                    host,
 	}
@@ -350,6 +357,7 @@ func historyItemView(h control.HistoryItem) map[string]any {
 		"diagnostic_code":  h.DiagnosticCode,
 		"model":            h.Model,
 		"remediation":      h.Remediation,
+		"trace_id":         h.TraceID,
 		"created_at":       h.CreatedAt.UTC().Format(time.RFC3339),
 	}
 }

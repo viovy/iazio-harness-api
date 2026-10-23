@@ -104,6 +104,7 @@ ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS error_message text NOT NULL
 ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS diagnostic_code text NOT NULL DEFAULT '';
 ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS model text NOT NULL DEFAULT '';
 ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS remediation text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS trace_id text NOT NULL DEFAULT '';
 
 DELETE FROM harness_history h1
 WHERE h1.status = 'DECLINED'
@@ -582,8 +583,8 @@ func (s *Store) SaveHistory(ctx context.Context, hostID, worktreePath string, ro
 		convBytes = []byte("[]")
 	}
 	_, err = s.db.ExecContext(ctx, `
-INSERT INTO harness_history (job_id, host_id, worktree_path, schedule_id, prompt_title, engine, status, clean, ase_complete, conversation_ids, reason, error_message, diagnostic_code, model, remediation)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+INSERT INTO harness_history (job_id, host_id, worktree_path, schedule_id, prompt_title, engine, status, clean, ase_complete, conversation_ids, reason, error_message, diagnostic_code, model, remediation, trace_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 ON CONFLICT (job_id) DO UPDATE SET
   host_id = EXCLUDED.host_id,
   worktree_path = EXCLUDED.worktree_path,
@@ -598,8 +599,9 @@ ON CONFLICT (job_id) DO UPDATE SET
   error_message = EXCLUDED.error_message,
   diagnostic_code = EXCLUDED.diagnostic_code,
   model = EXCLUDED.model,
-  remediation = EXCLUDED.remediation
-`, row.JobID, hostID, worktreePath, row.ScheduleID, row.PromptTitle, row.Engine, row.Status, row.Clean, row.ASEComplete, string(convBytes), row.Reason, row.ErrorMessage, row.DiagnosticCode, row.Model, row.Remediation)
+  remediation = EXCLUDED.remediation,
+  trace_id = EXCLUDED.trace_id
+`, row.JobID, hostID, worktreePath, row.ScheduleID, row.PromptTitle, row.Engine, row.Status, row.Clean, row.ASEComplete, string(convBytes), row.Reason, row.ErrorMessage, row.DiagnosticCode, row.Model, row.Remediation, row.TraceID)
 	if err != nil {
 		return fmt.Errorf("save history: %w", err)
 	}
@@ -636,7 +638,7 @@ func (s *Store) LoadHistory(ctx context.Context) (map[string][]control.HistoryRo
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT job_id, host_id, worktree_path, schedule_id, prompt_title, engine, status, clean, ase_complete, conversation_ids, reason, error_message, diagnostic_code, model, remediation, created_at
+SELECT job_id, host_id, worktree_path, schedule_id, prompt_title, engine, status, clean, ase_complete, conversation_ids, reason, error_message, diagnostic_code, model, remediation, trace_id, created_at
 FROM harness_history ORDER BY created_at ASC
 `)
 	if err != nil {
@@ -649,7 +651,7 @@ FROM harness_history ORDER BY created_at ASC
 		var r control.HistoryRow
 		var hostID, worktreePath string
 		var convRaw []byte
-		if err := rows.Scan(&r.JobID, &hostID, &worktreePath, &r.ScheduleID, &r.PromptTitle, &r.Engine, &r.Status, &r.Clean, &r.ASEComplete, &convRaw, &r.Reason, &r.ErrorMessage, &r.DiagnosticCode, &r.Model, &r.Remediation, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.JobID, &hostID, &worktreePath, &r.ScheduleID, &r.PromptTitle, &r.Engine, &r.Status, &r.Clean, &r.ASEComplete, &convRaw, &r.Reason, &r.ErrorMessage, &r.DiagnosticCode, &r.Model, &r.Remediation, &r.TraceID, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		if len(convRaw) > 0 {

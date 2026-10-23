@@ -158,6 +158,7 @@ type Schedule struct {
 	StoryID              string
 	IsGlobal             bool
 	CustomPrompt         string
+	TraceID              string
 }
 
 // JobDetail carries the execution payload for iazio-harness.
@@ -190,6 +191,7 @@ type JobDetail struct {
 	ToolPID                     int               `json:"tool_pid,omitempty"`
 	ElapsedSeconds              int64             `json:"elapsed_seconds,omitempty"`
 	ResumeCount                 int               `json:"resume_count,omitempty"`
+	TraceID                     string            `json:"trace_id,omitempty"`
 }
 
 // ActiveJob describes an active job reported on heartbeat.
@@ -223,6 +225,7 @@ type Job struct {
 	ToolPID              int
 	ElapsedSeconds       int64
 	ResumeCount          int
+	TraceID              string
 }
 
 // Repo is one registered checkout.
@@ -343,6 +346,7 @@ type HistoryRow struct {
 	DiagnosticCode  string
 	Model           string
 	Remediation     string
+	TraceID         string
 	CreatedAt       time.Time
 }
 
@@ -363,6 +367,7 @@ type HistoryItem struct {
 	DiagnosticCode  string
 	Model           string
 	Remediation     string
+	TraceID         string
 	CreatedAt       time.Time
 }
 
@@ -954,6 +959,18 @@ func (e *Engine) ReleaseExternal(host, path, holderID string) (Repo, error) {
 				repo.RunningJobID = ""
 			}
 			e.notifyRepoLocked(repo)
+		} else if repo.Lock == LockIdle && repo.RunningJobID != "" {
+			hasActive := false
+			for _, job := range e.jobs {
+				if !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "CANCEL_REQUESTED") && job.ID == repo.RunningJobID {
+					hasActive = true
+					break
+				}
+			}
+			if !hasActive {
+				repo.RunningJobID = ""
+				e.notifyRepoLocked(repo)
+			}
 		}
 	}
 	return *repo, nil
@@ -1096,6 +1113,9 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 				if repo.Lock == LockRunning {
 					repo.Lock = LockIdle
 				}
+				if repo.RunningJobID == jobID || repo.Lock == LockIdle {
+					repo.RunningJobID = ""
+				}
 				changedRepo = repo
 			}
 		}
@@ -1132,6 +1152,9 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 					if repo.Lock == LockRunning {
 						repo.Lock = LockIdle
 					}
+					if repo.RunningJobID == jobID || repo.Lock == LockIdle {
+						repo.RunningJobID = ""
+					}
 					if isDirtyWorktreeAutoHeal {
 						repo.Queue = QueueOpen
 						repo.Reason = "INCOMPLETE_DIRTY_WORKTREE"
@@ -1167,10 +1190,22 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 					if repo.Lock == LockRunning {
 						repo.Lock = LockIdle
 					}
+					if repo.RunningJobID == jobID || repo.Lock == LockIdle {
+						repo.RunningJobID = ""
+					}
 					changedRepo = repo
 				}
 				e.updateHistoryStatusLocked(sch.HostID, sch.WorktreePath, jobID, "RUN_FINISHED", opt)
 			}
+		}
+	}
+	for _, r := range e.repos {
+		if r.RunningJobID == jobID {
+			if r.Lock == LockRunning {
+				r.Lock = LockIdle
+			}
+			r.RunningJobID = ""
+			changedRepo = r
 		}
 	}
 	if changedRepo != nil {
@@ -1733,6 +1768,18 @@ func (e *Engine) reapExpiredLocked() {
 				repo.RunningJobID = ""
 			}
 			e.notifyRepoLocked(repo)
+		} else if repo.Lock == LockIdle && repo.RunningJobID != "" {
+			hasActive := false
+			for _, job := range e.jobs {
+				if !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "CANCEL_REQUESTED") && job.ID == repo.RunningJobID {
+					hasActive = true
+					break
+				}
+			}
+			if !hasActive {
+				repo.RunningJobID = ""
+				e.notifyRepoLocked(repo)
+			}
 		}
 	}
 
@@ -1903,6 +1950,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 		if targetHost == "" || targetHost == "auto" {
 			targetHost = host
 		}
+		traceID := sch.TraceID
 		job := &Job{
 			ID: id, ScheduleID: sch.ID, Kind: sch.Kind, Status: "RUNNING",
 			HostID: host, TargetHost: targetHost,
@@ -1910,6 +1958,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			StartedAt:            e.now(),
 			LastChunkAt:          e.now(),
 			ResumeConversationID: sch.ResumeConversationID,
+			TraceID:              traceID,
 		}
 		if sch.ResumeConversationID != "" {
 			job.ConversationIDs = []string{sch.ResumeConversationID}
@@ -1939,6 +1988,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			Clean:           false,
 			ASEComplete:     false,
 			ConversationIDs: []string{},
+			TraceID:         traceID,
 			CreatedAt:       e.now(),
 		}
 		if sch.ResumeConversationID != "" {
@@ -1984,6 +2034,11 @@ func (e *Engine) updateHistoryStatusLocked(host, path, jobID, status string, opt
 			if rows[i].Reason == "" && (status == "LEASE_EXPIRED" || status == "EXECUTION_TIMEOUT" || status == "HOST_OFFLINE" || status == "FAILED") {
 				rows[i].Reason = status
 			}
+			if rows[i].TraceID == "" {
+				if j, ok := e.jobs[jobID]; ok && j.TraceID != "" {
+					rows[i].TraceID = j.TraceID
+				}
+			}
 			e.notifyHistoryLocked(host, path, rows[i])
 			return
 		}
@@ -2017,17 +2072,21 @@ func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseC
 			return
 		}
 	}
-	title, engine, schID := "", "", ""
+	title, engine, schID, traceID := "", "", "", ""
 	if j, ok := e.jobs[jobID]; ok {
+		traceID = j.TraceID
 		if sch := e.schedules[j.ScheduleID]; sch != nil {
 			title = sch.PromptTitle
 			engine = sch.Engine
 			schID = sch.ID
+			if traceID == "" {
+				traceID = sch.TraceID
+			}
 		}
 	}
 	row := HistoryRow{
 		JobID: jobID, ScheduleID: schID, PromptTitle: title, Engine: engine,
-		Status: status, Clean: clean, ASEComplete: aseComplete, CreatedAt: e.now(),
+		Status: status, Clean: clean, ASEComplete: aseComplete, TraceID: traceID, CreatedAt: e.now(),
 	}
 	e.history[key] = append(e.history[key], row)
 	e.notifyHistoryLocked(host, path, row)

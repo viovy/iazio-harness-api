@@ -2058,3 +2058,62 @@ func TestGetProfileReleasesEndpoint_Graceful200OnToolErrors(t *testing.T) {
 	}
 }
 
+func TestObservabilityMetricsEndpoint(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	s.Engine.RegisterHost("mac-mini", "permanent")
+	_ = s.Engine.UpsertRepo(control.Repo{
+		HostID:       "mac-mini",
+		WorktreePath: "/work/meta-repo",
+	})
+
+	// Add sample history entries
+	s.Engine.SetHistory("mac-mini\x00/work/meta-repo", []control.HistoryRow{
+		{
+			JobID:          "job-101",
+			Status:         "RUN_FINISHED",
+			Engine:         "autopilot",
+			Clean:          true,
+			TraceID:        "4bf92f3577b34da6a3ce929d0e0e4736",
+		},
+		{
+			JobID:          "job-102",
+			Status:         "FAILED",
+			Reason:         "DIRTY_WORKTREE_POST_EXIT",
+			Engine:         "agy",
+			DiagnosticCode: "DIRTY_WORKTREE_POST_EXIT",
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/observability/metrics", nil)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /v1/observability/metrics, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var res map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &res); err != nil {
+		t.Fatalf("failed to decode json: %v", err)
+	}
+
+	if tot, ok := res["total_executions"].(float64); !ok || int(tot) != 2 {
+		t.Errorf("expected total_executions=2, got %v", res["total_executions"])
+	}
+
+	statuses, ok := res["status_counts"].(map[string]any)
+	if !ok || statuses["RUN_FINISHED"] != float64(1) || statuses["FAILED"] != float64(1) {
+		t.Errorf("expected status_counts with RUN_FINISHED=1 and FAILED=1, got %v", res["status_counts"])
+	}
+
+	reasons, ok := res["failure_reasons"].(map[string]any)
+	if !ok || reasons["DIRTY_WORKTREE_POST_EXIT"] != float64(1) {
+		t.Errorf("expected failure_reasons with DIRTY_WORKTREE_POST_EXIT=1, got %v", res["failure_reasons"])
+	}
+
+	telem, ok := res["telemetry"].(map[string]any)
+	if !ok || telem["service_name"] != "iazio-harness-api" {
+		t.Errorf("expected telemetry block with service_name, got %v", res["telemetry"])
+	}
+}
+
