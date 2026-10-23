@@ -2708,11 +2708,11 @@ func (s *Server) observabilityMetrics(w http.ResponseWriter, r *http.Request) {
 
 	zipkinEndpoint := os.Getenv("ZIPKIN_ENDPOINT")
 	if zipkinEndpoint == "" {
-		zipkinEndpoint = "https://tian.go.ro/zipkin/api/v2"
+		zipkinEndpoint = "http://localhost:9411/api/v2"
 	}
 	esEndpoint := os.Getenv("ELASTICSEARCH_ENDPOINT")
 	if esEndpoint == "" {
-		esEndpoint = "http://192.168.1.19:9200"
+		esEndpoint = "http://localhost:9200"
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{

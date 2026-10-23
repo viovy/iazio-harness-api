@@ -2063,11 +2063,11 @@ func TestObservabilityMetricsEndpoint(t *testing.T) {
 	s.Engine.RegisterHost("mac-mini", "permanent")
 	_ = s.Engine.UpsertRepo(control.Repo{
 		HostID:       "mac-mini",
-		WorktreePath: "/work/meta-repo",
+		WorktreePath: "/work/sample-repo",
 	})
 
 	// Add sample history entries
-	s.Engine.SetHistory("mac-mini\x00/work/meta-repo", []control.HistoryRow{
+	s.Engine.SetHistory("mac-mini\x00/work/sample-repo", []control.HistoryRow{
 		{
 			JobID:          "job-101",
 			Status:         "RUN_FINISHED",

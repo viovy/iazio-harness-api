@@ -2704,12 +2704,12 @@ func TestPollHost_GlobalScheduleSkipsDirtyRepo(t *testing.T) {
 	e.RegisterHost("pc1", "permanent")
 	_ = e.UpsertRepo(Repo{
 		HostID:                      "pc1",
-		WorktreePath:                "C:\\work\\meta-repo",
+		WorktreePath:                "C:\\work\\target-repo",
 		GlobalQueueAllocationEnabled: true,
 	})
 
 	// Mark pc1 dirty
-	e.repos[repoKey("pc1", "C:\\work\\meta-repo")].Reason = "HALTED_DIRTY"
+	e.repos[repoKey("pc1", "C:\\work\\target-repo")].Reason = "HALTED_DIRTY"
 
 	// Enqueue global schedule
 	sch, err := e.EnqueueGlobalStorySchedule("STORY-ROOT-45276", ".", "autopilot", "test prompt")
@@ -2737,7 +2737,7 @@ func TestDeclineJob_GlobalScheduleRequeuedOnPreflightDecline(t *testing.T) {
 	e.RegisterHost("pc1", "permanent")
 	_ = e.UpsertRepo(Repo{
 		HostID:                      "pc1",
-		WorktreePath:                "C:\\work\\meta-repo",
+		WorktreePath:                "C:\\work\\target-repo",
 		GlobalQueueAllocationEnabled: true,
 	})
 
@@ -2772,7 +2772,7 @@ func TestDeclineJob_GlobalScheduleRequeuedOnPreflightDecline(t *testing.T) {
 func TestPostExit_ClearsRunningJobIDOnCompletionAndFailure(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("mac-mini", "permanent")
-	repoPath := "/Users/romeo/work/meta-repo-04"
+	repoPath := "/Users/romeo/work/target-repo-04"
 	_ = e.UpsertRepo(Repo{
 		HostID:                      "mac-mini",
 		WorktreePath:                repoPath,
@@ -2820,7 +2820,7 @@ func TestPostExit_ClearsRunningJobIDOnCompletionAndFailure(t *testing.T) {
 func TestReapExpired_ReconcilesIdleRepoRunningJobID(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("mac-mini", "permanent")
-	repoPath := "/Users/romeo/work/meta-repo-04"
+	repoPath := "/Users/romeo/work/target-repo-04"
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",
 		WorktreePath: repoPath,
