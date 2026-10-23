@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS harness_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_harness_history_repo ON harness_history (host_id, worktree_path, created_at ASC);
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS trace_id text NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS harness_git_credentials (
   id text PRIMARY KEY,

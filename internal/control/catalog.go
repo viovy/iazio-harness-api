@@ -218,6 +218,7 @@ type HostDetail struct {
 func (e *Engine) GetHostDetail(id string) (HostDetail, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.reapExpiredLocked()
 	h, ok := e.hosts[id]
 	if !ok {
 		return HostDetail{}, false
@@ -858,6 +859,7 @@ func (e *Engine) ListHistory(hostID, repoPath, status string, limit int) []Histo
 				DiagnosticCode:  row.DiagnosticCode,
 				Model:           row.Model,
 				Remediation:     row.Remediation,
+				TraceID:         row.TraceID,
 				CreatedAt:       row.CreatedAt,
 			})
 		}
@@ -878,4 +880,35 @@ func (e *Engine) ListHistory(hostID, repoPath, status string, limit int) []Histo
 		out = out[:limit]
 	}
 	return out
+}
+
+// RepoCounts returns the number of idle, running, and paused repositories across the fleet.
+func (e *Engine) RepoCounts() (idle, running, paused int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.reapExpiredLocked()
+	for _, r := range e.repos {
+		switch r.Lock {
+		case LockRunning:
+			running++
+		case LockIdle:
+			idle++
+		default:
+			paused++
+		}
+	}
+	return
+}
+
+// ActiveJobsCount returns the number of jobs currently in-flight.
+func (e *Engine) ActiveJobsCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	count := 0
+	for _, j := range e.jobs {
+		if !j.ExitPosted && (j.Status == "RUNNING" || j.Status == "CANCEL_REQUESTED") {
+			count++
+		}
+	}
+	return count
 }
