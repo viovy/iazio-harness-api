@@ -204,6 +204,7 @@ type Schedule struct {
 	ActiveConversationID string
 	ResumeMode           string
 	ResumeFallbackReason string
+	SameConversationConfirmed bool
 	InterruptedASEState  map[string]any
 }
 
@@ -247,6 +248,7 @@ type JobDetail struct {
 	ActiveConversationID        string                 `json:"active_conversation_id,omitempty"`
 	ResumeMode                  string                 `json:"resume_mode,omitempty"`
 	ResumeFallbackReason        string                 `json:"resume_fallback_reason,omitempty"`
+	SameConversationConfirmed   bool                   `json:"same_conversation_confirmed,omitempty"`
 	InterruptedASEState         map[string]any         `json:"interrupted_ase_state,omitempty"`
 	ConversationLineage         []ConversationLineage  `json:"conversation_lineage,omitempty"`
 }
@@ -2521,6 +2523,7 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 		ActiveConversationID:  job.ActiveConversationID,
 		ResumeMode:            job.ResumeMode,
 		ResumeFallbackReason:  job.ResumeFallbackReason,
+		SameConversationConfirmed: job.SameConversationConfirmed,
 		InterruptedASEState:   job.InterruptedASEState,
 		ConversationLineage:   append([]ConversationLineage(nil), job.ConversationLineage...),
 	}
@@ -2724,6 +2727,12 @@ func (e *Engine) AddJobConversationWithOptions(jobID, convID string, opts ...Con
 		if opt.FallbackReason != "" {
 			job.ResumeFallbackReason = opt.FallbackReason
 		}
+		if job.ScheduleID != "" {
+			if sch, ok := e.schedules[job.ScheduleID]; ok && sch != nil {
+				sch.ResumeMode = job.ResumeMode
+				sch.ResumeFallbackReason = job.ResumeFallbackReason
+			}
+		}
 		lineageRec := ConversationLineage{
 			ConversationID: convID,
 			Role:           "fallback_primary",
@@ -2767,9 +2776,15 @@ func (e *Engine) AddJobConversationWithOptions(jobID, convID string, opts ...Con
 			})
 			job.ConversationIDs = append(job.ConversationIDs, convID)
 		} else if job.ActiveConversationID == convID || job.InitialConversationID == convID {
-			if job.InitialConversationID != "" && convID == job.InitialConversationID {
+			if job.InitialConversationID != "" && (convID == job.InitialConversationID || convID == job.ActiveConversationID) {
 				job.ResumeMode = "same_conversation"
 				job.SameConversationConfirmed = true
+				if job.ScheduleID != "" {
+					if sch, ok := e.schedules[job.ScheduleID]; ok && sch != nil {
+						sch.ResumeMode = job.ResumeMode
+						sch.SameConversationConfirmed = job.SameConversationConfirmed
+					}
+				}
 			}
 			found := false
 			for _, c := range job.ConversationIDs {
@@ -2929,8 +2944,117 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		targetStoryID = "STORY-RESUME-INPLACE"
 	}
 
-	// 2. Resolve conversation ID: explicit opt -> repo.DetectedConversationID -> latest from history
+	// 2. Resolve parent job context first (F4)
+	schID := e.next("sch-")
+	parentJobID := opt.ParentJobID
+	if parentJobID == "" && opt.JobID != "" {
+		parentJobID = opt.JobID
+	}
+	rootJobID := opt.RootJobID
+	initConvID := opt.InitialConversationID
 	resumeConvID := opt.ConversationID
+	var parentEngine string
+	var interruptedState map[string]any
+
+	if parentJobID != "" {
+		if pj, ok := e.jobs[parentJobID]; ok {
+			if rootJobID == "" {
+				rootJobID = pj.RootJobID
+				if rootJobID == "" {
+					rootJobID = pj.ParentJobID
+				}
+				if rootJobID == "" {
+					rootJobID = pj.ID
+				}
+			}
+			if pj.ScheduleID != "" {
+				if ps := e.schedules[pj.ScheduleID]; ps != nil && ps.Engine != "" {
+					parentEngine = ps.Engine
+				}
+			}
+			if opt.ConversationID == "" {
+				if pj.ActiveConversationID != "" {
+					resumeConvID = pj.ActiveConversationID
+				} else if pj.ResumeConversationID != "" {
+					resumeConvID = pj.ResumeConversationID
+				} else if pj.InitialConversationID != "" {
+					resumeConvID = pj.InitialConversationID
+				} else if len(pj.ConversationIDs) > 0 {
+					resumeConvID = pj.ConversationIDs[len(pj.ConversationIDs)-1]
+				}
+			}
+			if initConvID == "" {
+				if pj.InitialConversationID != "" {
+					initConvID = pj.InitialConversationID
+				} else {
+					initConvID = resumeConvID
+				}
+			}
+			if targetStoryID == "STORY-RESUME-INPLACE" && pj.ScheduleID != "" {
+				if ps := e.schedules[pj.ScheduleID]; ps != nil && ps.StoryID != "" {
+					targetStoryID = ps.StoryID
+				}
+			}
+			interruptedState = map[string]any{
+				"story_id":      targetStoryID,
+				"parent_job_id": parentJobID,
+				"parent_status": pj.Status,
+				"parent_engine": parentEngine,
+			}
+			if pj.InterruptedASEState != nil {
+				for k, v := range pj.InterruptedASEState {
+					interruptedState[k] = v
+				}
+			}
+		} else {
+			for _, rows := range e.history {
+				for _, r := range rows {
+					if r.JobID == parentJobID {
+						if rootJobID == "" {
+							rootJobID = r.RootJobID
+							if rootJobID == "" {
+								rootJobID = r.ParentJobID
+							}
+							if rootJobID == "" {
+								rootJobID = r.JobID
+							}
+						}
+						parentEngine = r.Engine
+						if opt.ConversationID == "" {
+							if r.ActiveConversationID != "" {
+								resumeConvID = r.ActiveConversationID
+							} else if r.InitialConversationID != "" {
+								resumeConvID = r.InitialConversationID
+							} else if len(r.ConversationIDs) > 0 {
+								resumeConvID = r.ConversationIDs[len(r.ConversationIDs)-1]
+							}
+						}
+						if initConvID == "" {
+							if r.InitialConversationID != "" {
+								initConvID = r.InitialConversationID
+							} else {
+								initConvID = resumeConvID
+							}
+						}
+						interruptedState = map[string]any{
+							"story_id":      targetStoryID,
+							"parent_job_id": parentJobID,
+							"parent_status": r.Status,
+							"parent_engine": r.Engine,
+						}
+						if r.InterruptedASEState != nil {
+							for k, v := range r.InterruptedASEState {
+								interruptedState[k] = v
+							}
+						}
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Ambient conversation fallback if no parent job conversation found
 	if resumeConvID == "" {
 		if repo.DirtyStoryID == "" || targetStoryID == "" || targetStoryID == "STORY-RESUME-INPLACE" || repo.DirtyStoryID == targetStoryID {
 			resumeConvID = repo.DetectedConversationID
@@ -2939,16 +3063,14 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 	if resumeConvID == "" {
 		if rows := e.history[repoKey(host, path)]; len(rows) > 0 {
 			for i := len(rows) - 1; i >= 0; i-- {
-				if len(rows[i].ConversationIDs) > 0 {
-					rowStory := extractStoryIDFromString(rows[i].PromptTitle)
-					matchesStory := targetStoryID != "" && targetStoryID != "STORY-RESUME-INPLACE" && rowStory == targetStoryID
-					matchesPrompt := opt.PromptTitle != "" && rows[i].PromptTitle == opt.PromptTitle
-					if targetStoryID != "STORY-RESUME-INPLACE" {
-						if matchesStory || matchesPrompt {
-							resumeConvID = rows[i].ConversationIDs[len(rows[i].ConversationIDs)-1]
-							break
-						}
-					} else {
+				rowStory := extractStoryIDFromString(rows[i].PromptTitle)
+				matchesStory := targetStoryID != "" && targetStoryID != "STORY-RESUME-INPLACE" && rowStory == targetStoryID
+				matchesPrompt := opt.PromptTitle != "" && rows[i].PromptTitle == opt.PromptTitle
+				if targetStoryID == "STORY-RESUME-INPLACE" || matchesStory || matchesPrompt {
+					if rows[i].ActiveConversationID != "" {
+						resumeConvID = rows[i].ActiveConversationID
+						break
+					} else if len(rows[i].ConversationIDs) > 0 {
 						resumeConvID = rows[i].ConversationIDs[len(rows[i].ConversationIDs)-1]
 						break
 					}
@@ -2963,14 +3085,31 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 	promptID := opt.PromptID
 	engineName := opt.Engine
 
-	// 3a. Explicit prompt ID
+	// 3a. Check engine mismatch against parent (F4)
+	resumeMode := "pending"
+	var resumeFallbackReason string
+	if engineName != "" && parentEngine != "" && !strings.EqualFold(engineName, parentEngine) {
+		resumeMode = "fallback_new_conversation"
+		resumeFallbackReason = fmt.Sprintf("cross-engine resume not supported: parent used %s, requested %s", parentEngine, engineName)
+		resumeConvID = "" // clear cross-engine session to start clean
+	} else if engineName == "" && parentEngine != "" {
+		engineName = parentEngine
+	}
+	if opt.ResumeMode != "" {
+		resumeMode = opt.ResumeMode
+	}
+	if opt.ResumeFallbackReason != "" {
+		resumeFallbackReason = opt.ResumeFallbackReason
+	}
+
+	// 3b. Explicit prompt ID
 	if promptID != "" {
 		if p, ok := e.prompts[promptID]; ok {
 			targetPrompt = p
 		}
 	}
 
-	// 3b. Try to find prompt from history
+	// 3c. Try to find prompt from history
 	if targetPrompt == nil {
 		if rows := e.history[repoKey(host, path)]; len(rows) > 0 {
 			lastRow := rows[len(rows)-1]
@@ -2995,7 +3134,7 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		}
 	}
 
-	// 3c. Fallback to first READY prompt
+	// 3d. Fallback to first READY prompt
 	if targetPrompt == nil {
 		for _, p := range e.prompts {
 			if p.Status == "READY" {
@@ -3077,118 +3216,6 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 	}
 
 	// Create and enqueue new resume schedule
-	schID := e.next("sch-")
-	parentJobID := opt.ParentJobID
-	if parentJobID == "" && opt.JobID != "" {
-		parentJobID = opt.JobID
-	}
-	rootJobID := opt.RootJobID
-	initConvID := opt.InitialConversationID
-	var interruptedState map[string]any
-
-	if parentJobID != "" {
-		if pj, ok := e.jobs[parentJobID]; ok {
-			if rootJobID == "" {
-				rootJobID = pj.RootJobID
-				if rootJobID == "" {
-					rootJobID = pj.ParentJobID
-				}
-				if rootJobID == "" {
-					rootJobID = pj.ID
-				}
-			}
-			if opt.ConversationID == "" {
-				if pj.ActiveConversationID != "" {
-					resumeConvID = pj.ActiveConversationID
-				} else if pj.ResumeConversationID != "" {
-					resumeConvID = pj.ResumeConversationID
-				} else if pj.InitialConversationID != "" {
-					resumeConvID = pj.InitialConversationID
-				} else if len(pj.ConversationIDs) > 0 {
-					resumeConvID = pj.ConversationIDs[len(pj.ConversationIDs)-1]
-				}
-			}
-			if initConvID == "" {
-				if pj.InitialConversationID != "" {
-					initConvID = pj.InitialConversationID
-				} else {
-					initConvID = resumeConvID
-				}
-			}
-			var ps *Schedule
-			if pj.ScheduleID != "" {
-				ps = e.schedules[pj.ScheduleID]
-			}
-			parentEngine := ""
-			if ps != nil && ps.Engine != "" {
-				parentEngine = ps.Engine
-			}
-			if targetStoryID == "STORY-RESUME-INPLACE" && ps != nil && ps.StoryID != "" {
-				targetStoryID = ps.StoryID
-			}
-			if engineName == "" && parentEngine != "" {
-				engineName = parentEngine
-			}
-			interruptedState = map[string]any{
-				"story_id":      targetStoryID,
-				"parent_job_id": parentJobID,
-				"parent_status": pj.Status,
-				"parent_engine": parentEngine,
-			}
-			if pj.InterruptedASEState != nil {
-				for k, v := range pj.InterruptedASEState {
-					interruptedState[k] = v
-				}
-			}
-		} else {
-			for _, rows := range e.history {
-				for _, r := range rows {
-					if r.JobID == parentJobID {
-						if rootJobID == "" {
-							rootJobID = r.RootJobID
-							if rootJobID == "" {
-								rootJobID = r.ParentJobID
-							}
-							if rootJobID == "" {
-								rootJobID = r.JobID
-							}
-						}
-						if opt.ConversationID == "" {
-							if r.ActiveConversationID != "" {
-								resumeConvID = r.ActiveConversationID
-							} else if r.InitialConversationID != "" {
-								resumeConvID = r.InitialConversationID
-							} else if len(r.ConversationIDs) > 0 {
-								resumeConvID = r.ConversationIDs[len(r.ConversationIDs)-1]
-							}
-						}
-						if initConvID == "" {
-							if r.InitialConversationID != "" {
-								initConvID = r.InitialConversationID
-							} else {
-								initConvID = resumeConvID
-							}
-						}
-						if engineName == "" && r.Engine != "" {
-							engineName = r.Engine
-						}
-						interruptedState = map[string]any{
-							"story_id":      targetStoryID,
-							"parent_job_id": parentJobID,
-							"parent_status": r.Status,
-							"parent_engine": r.Engine,
-						}
-						if r.InterruptedASEState != nil {
-							for k, v := range r.InterruptedASEState {
-								interruptedState[k] = v
-							}
-						}
-						break
-					}
-				}
-			}
-		}
-	}
 	if rootJobID == "" && parentJobID != "" {
 		rootJobID = parentJobID
 	}
@@ -3296,7 +3323,8 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		ExecutionChain:        execChain,
 		InitialConversationID: initConvID,
 		ActiveConversationID:  resumeConvID,
-		ResumeMode:            "same_conversation",
+		ResumeMode:            resumeMode,
+		ResumeFallbackReason:  resumeFallbackReason,
 		InterruptedASEState:   interruptedState,
 	}
 	e.schedules[schID] = newSch
@@ -3431,9 +3459,22 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 		e.notifyRepoLocked(repo)
 	}
 
-	resumeEngine := origSch.Engine
-	if opt.Engine != "" {
-		resumeEngine = opt.Engine
+	parentEngine := origSch.Engine
+	resumeEngine := opt.Engine
+	resumeMode := "pending"
+	var resumeFallbackReason string
+	if resumeEngine != "" && parentEngine != "" && !strings.EqualFold(resumeEngine, parentEngine) {
+		resumeMode = "fallback_new_conversation"
+		resumeFallbackReason = fmt.Sprintf("cross-engine resume not supported: parent used %s, requested %s", parentEngine, resumeEngine)
+		resumeConvID = "" // clear cross-engine session to start clean
+	} else if resumeEngine == "" {
+		resumeEngine = parentEngine
+	}
+	if opt.ResumeMode != "" {
+		resumeMode = opt.ResumeMode
+	}
+	if opt.ResumeFallbackReason != "" {
+		resumeFallbackReason = opt.ResumeFallbackReason
 	}
 	if strings.Contains(strings.ToLower(resumeEngine), "harness") {
 		if strings.HasPrefix(strings.ToLower(resumeConvID), "cursor-") {
@@ -3576,7 +3617,8 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 		ExecutionChain:        execChain,
 		InitialConversationID: initConvID,
 		ActiveConversationID:  resumeConvID,
-		ResumeMode:            "same_conversation",
+		ResumeMode:            resumeMode,
+		ResumeFallbackReason:  resumeFallbackReason,
 		InterruptedASEState:   interruptedState,
 	}
 	e.schedules[schID] = newSch

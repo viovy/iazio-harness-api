@@ -283,20 +283,33 @@ func TestLiveStoreIfConfigured(t *testing.T) {
 
 	// 6. History round-trip
 	testHistory := control.HistoryRow{
-		JobID:           "job-pg-1",
-		ScheduleID:      "sched-1",
-		PromptTitle:     "Prompt 1",
-		Engine:          "agent",
-		Status:          "SUCCESS",
-		Clean:           true,
-		ASEComplete:     true,
-		ConversationIDs: []string{"conv-1"},
-		Reason:          "ok",
-		ErrorMessage:    "",
-		DiagnosticCode:  "",
-		Model:           "gemini",
-		Remediation:     "",
-		CreatedAt:       now,
+		JobID:                 "job-pg-1",
+		ScheduleID:            "sched-1",
+		PromptTitle:           "Prompt 1",
+		Engine:                "agent",
+		Status:                "SUCCESS",
+		Clean:                 true,
+		ASEComplete:           true,
+		ConversationIDs:       []string{"conv-1"},
+		Reason:                "ok",
+		ErrorMessage:          "",
+		DiagnosticCode:        "",
+		Model:                 "gemini",
+		Remediation:           "",
+		CreatedAt:             now,
+		ParentJobID:           "job-pg-0",
+		RootJobID:             "job-pg-root",
+		InitialConversationID: "conv-init-123",
+		ActiveConversationID:  "conv-active-456",
+		ResumeMode:            "fallback_new_conversation",
+		ResumeFallbackReason:  "initial session corrupted",
+		ExecutionAttempt:      2,
+		ExecutionChain:        []string{"job-pg-0"},
+		ConversationLineage: []control.ConversationLineage{
+			{ConversationID: "conv-init-123", Role: "initial_active"},
+			{ConversationID: "conv-active-456", Role: "fallback_primary", Reason: "initial session corrupted"},
+		},
+		InterruptedASEState: map[string]any{"phase": "IMPLEMENTATION", "step": float64(2)},
 	}
 	if err := store.SaveHistory(ctx, "host-pg-test", "/test/repo", testHistory); err != nil {
 		t.Fatalf("SaveHistory: %v", err)
@@ -307,6 +320,26 @@ func TestLiveStoreIfConfigured(t *testing.T) {
 	}
 	if len(histMap) == 0 {
 		t.Fatal("expected history rows")
+	}
+	rows := histMap["host-pg-test\x00/test/repo"]
+	if len(rows) == 0 {
+		t.Fatal("expected history row for host-pg-test")
+	}
+	savedRow := rows[len(rows)-1]
+	if savedRow.InitialConversationID != "conv-init-123" {
+		t.Fatalf("expected InitialConversationID conv-init-123, got %s", savedRow.InitialConversationID)
+	}
+	if savedRow.ActiveConversationID != "conv-active-456" {
+		t.Fatalf("expected ActiveConversationID conv-active-456, got %s", savedRow.ActiveConversationID)
+	}
+	if savedRow.ResumeMode != "fallback_new_conversation" {
+		t.Fatalf("expected ResumeMode fallback_new_conversation, got %s", savedRow.ResumeMode)
+	}
+	if savedRow.ExecutionAttempt != 2 {
+		t.Fatalf("expected ExecutionAttempt 2, got %d", savedRow.ExecutionAttempt)
+	}
+	if len(savedRow.ConversationLineage) != 2 {
+		t.Fatalf("expected ConversationLineage length 2, got %d", len(savedRow.ConversationLineage))
 	}
 	if err := store.DeleteHistory(ctx, "job-pg-1"); err != nil {
 		t.Fatalf("DeleteHistory: %v", err)

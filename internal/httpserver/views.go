@@ -65,6 +65,7 @@ func scheduleView(s control.Schedule) map[string]any {
 		"active_conversation_id":  s.ActiveConversationID,
 		"resume_mode":             s.ResumeMode,
 		"resume_fallback_reason":  s.ResumeFallbackReason,
+		"same_conversation_confirmed": s.SameConversationConfirmed || s.ResumeMode == "same_conversation",
 		"interrupted_ase_state":   s.InterruptedASEState,
 	}
 }
@@ -202,6 +203,7 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 			"active_conversation_id":  d.Running.ActiveConversationID,
 			"resume_mode":             d.Running.ResumeMode,
 			"resume_fallback_reason":  d.Running.ResumeFallbackReason,
+			"same_conversation_confirmed": d.Running.SameConversationConfirmed || d.Running.ResumeMode == "same_conversation",
 			"conversation_lineage":    d.Running.ConversationLineage,
 		}
 	}
@@ -243,6 +245,7 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 			"active_conversation_id":  h.ActiveConversationID,
 			"resume_mode":             h.ResumeMode,
 			"resume_fallback_reason":  h.ResumeFallbackReason,
+			"same_conversation_confirmed": h.SameConversationConfirmed || h.ResumeMode == "same_conversation",
 			"interrupted_ase_state":   h.InterruptedASEState,
 			"conversation_lineage":    h.ConversationLineage,
 		})
@@ -335,6 +338,7 @@ func jobDetailView(j control.JobDetail) map[string]any {
 		"active_conversation_id":         j.ActiveConversationID,
 		"resume_mode":                    j.ResumeMode,
 		"resume_fallback_reason":         j.ResumeFallbackReason,
+		"same_conversation_confirmed":    j.SameConversationConfirmed || j.ResumeMode == "same_conversation",
 		"interrupted_ase_state":          j.InterruptedASEState,
 		"conversation_lineage":           j.ConversationLineage,
 	}
@@ -382,6 +386,7 @@ func historyJobDetailView(r control.HistoryRow, host, path string) map[string]an
 		"active_conversation_id":         r.ActiveConversationID,
 		"resume_mode":                    r.ResumeMode,
 		"resume_fallback_reason":         r.ResumeFallbackReason,
+		"same_conversation_confirmed":    r.SameConversationConfirmed || r.ResumeMode == "same_conversation",
 		"interrupted_ase_state":          r.InterruptedASEState,
 		"conversation_lineage":           r.ConversationLineage,
 	}
@@ -418,6 +423,7 @@ func historyItemView(h control.HistoryItem) map[string]any {
 		"active_conversation_id":  h.ActiveConversationID,
 		"resume_mode":             h.ResumeMode,
 		"resume_fallback_reason":  h.ResumeFallbackReason,
+		"same_conversation_confirmed": h.SameConversationConfirmed || h.ResumeMode == "same_conversation",
 		"interrupted_ase_state":   h.InterruptedASEState,
 		"conversation_lineage":    h.ConversationLineage,
 	}

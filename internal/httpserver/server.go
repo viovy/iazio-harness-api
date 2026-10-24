@@ -2782,6 +2782,9 @@ func (s *Server) observabilityMetrics(w http.ResponseWriter, r *http.Request) {
 	reasonCounts := make(map[string]int)
 	engineCounts := make(map[string]int)
 	traceCounts := 0
+	sameConvSuccessCount := 0
+	fallbackConvCount := 0
+	fallbackReasonCounts := make(map[string]int)
 	for _, h := range history {
 		status := h.Status
 		if status == "" {
@@ -2800,6 +2803,16 @@ func (s *Server) observabilityMetrics(w http.ResponseWriter, r *http.Request) {
 		}
 		if h.TraceID != "" {
 			traceCounts++
+		}
+		if h.ResumeMode == "same_conversation" || h.SameConversationConfirmed {
+			sameConvSuccessCount++
+		} else if h.ResumeMode == "fallback_new_conversation" {
+			fallbackConvCount++
+			fbReason := h.ResumeFallbackReason
+			if fbReason == "" {
+				fbReason = "UNKNOWN"
+			}
+			fallbackReasonCounts[fbReason]++
 		}
 	}
 
@@ -2842,6 +2855,11 @@ func (s *Server) observabilityMetrics(w http.ResponseWriter, r *http.Request) {
 			"idle":    idleRepos,
 			"running": runningRepos,
 			"paused":  pausedRepos,
+		},
+		"resume_metrics": map[string]any{
+			"same_conversation_success_total": sameConvSuccessCount,
+			"fallback_new_conversation_total": fallbackConvCount,
+			"fallback_reasons":                fallbackReasonCounts,
 		},
 		"telemetry": map[string]any{
 			"zipkin_endpoint":        zipkinEndpoint,

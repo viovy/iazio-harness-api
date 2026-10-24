@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -715,10 +716,14 @@ FROM harness_history ORDER BY created_at ASC
 			r.ConversationIDs = []string{}
 		}
 		if len(interruptedRaw) > 0 {
-			_ = json.Unmarshal(interruptedRaw, &r.InterruptedASEState)
+			if errU := json.Unmarshal(interruptedRaw, &r.InterruptedASEState); errU != nil {
+				log.Printf("[pgstore] warning: corrupt interrupted_ase_state JSON for job %s: %v", r.JobID, errU)
+			}
 		}
 		if len(lineageRaw) > 0 {
-			_ = json.Unmarshal(lineageRaw, &r.ConversationLineage)
+			if errU := json.Unmarshal(lineageRaw, &r.ConversationLineage); errU != nil {
+				log.Printf("[pgstore] warning: corrupt conversation_lineage JSON for job %s: %v", r.JobID, errU)
+			}
 		}
 		if r.ConversationLineage == nil {
 			r.ConversationLineage = []control.ConversationLineage{}
