@@ -29,7 +29,7 @@ type DistributionProfile struct {
 	Endpoints    map[string]string   `json:"endpoints,omitempty" yaml:"endpoints,omitempty"`
 	Tools        []ProfileTool       `json:"tools" yaml:"tools"`
 	Version      string              `json:"version,omitempty" yaml:"version,omitempty"`
-	VersionSeq   uint64              `json:"version_seq,omitempty" yaml:"version_seq,omitempty"`
+	VersionSeq   uint64              `json:"-" yaml:"-"`
 	SourceRepo   string              `json:"source_repo,omitempty" yaml:"source_repo,omitempty"`
 	SourceHost   string              `json:"source_host,omitempty" yaml:"source_host,omitempty"`
 	CreatedAt    time.Time           `json:"created_at" yaml:"created_at"`
@@ -308,6 +308,27 @@ func (e *Engine) UpsertProfile(p DistributionProfile) (*DistributionProfile, err
 	cp := candidate
 	e.mu.Unlock()
 	return &cp, nil
+}
+
+// LoadProfile loads a profile from persistent storage into memory during engine startup
+// without triggering OnSaveProfile or modifying timestamps (E2).
+func (e *Engine) LoadProfile(p DistributionProfile) {
+	name := strings.TrimSpace(p.Name)
+	if name == "" {
+		name = "generic"
+	}
+	pMu := e.getProfileLock(name)
+	pMu.Lock()
+	defer pMu.Unlock()
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cp := p
+	if len(p.Tools) > 0 {
+		cp.Tools = make([]ProfileTool, len(p.Tools))
+		copy(cp.Tools, p.Tools)
+	}
+	e.profiles[name] = &cp
 }
 
 // DeleteProfile removes a distribution profile. Generic is protected.

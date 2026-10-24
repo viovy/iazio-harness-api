@@ -1930,7 +1930,11 @@ func (s *Server) refreshProfileReleases(w http.ResponseWriter, r *http.Request) 
 	if errStr != "" {
 		resp["error"] = errStr
 	}
-	writeJSON(w, http.StatusOK, resp)
+	httpCode := http.StatusOK
+	if status == "error" {
+		httpCode = http.StatusBadGateway
+	}
+	writeJSON(w, httpCode, resp)
 }
 
 func (s *Server) syncAllProfiles(w http.ResponseWriter, r *http.Request) {
@@ -2651,11 +2655,12 @@ func (s *Server) createProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	created, err := s.Engine.UpsertProfile(p)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		if strings.Contains(err.Error(), "persist profile") {
+			writeErr(w, http.StatusInternalServerError, err)
+		} else {
+			writeErr(w, http.StatusBadRequest, err)
+		}
 		return
-	}
-	if s.SaveProfile != nil {
-		s.SaveProfile(*created)
 	}
 	writeJSON(w, http.StatusCreated, created)
 }
@@ -2687,11 +2692,12 @@ func (s *Server) updateProfile(w http.ResponseWriter, r *http.Request) {
 	p.Name = name
 	updated, err := s.Engine.UpsertProfile(p)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		if strings.Contains(err.Error(), "persist profile") {
+			writeErr(w, http.StatusInternalServerError, err)
+		} else {
+			writeErr(w, http.StatusBadRequest, err)
+		}
 		return
-	}
-	if s.SaveProfile != nil {
-		s.SaveProfile(*updated)
 	}
 	writeJSON(w, http.StatusOK, updated)
 }
@@ -2724,11 +2730,12 @@ func (s *Server) syncGenericProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	profile, err := s.Engine.SyncGenericProfile(raw)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		if strings.Contains(err.Error(), "persist profile") {
+			writeErr(w, http.StatusInternalServerError, err)
+		} else {
+			writeErr(w, http.StatusBadRequest, err)
+		}
 		return
-	}
-	if s.SaveProfile != nil {
-		s.SaveProfile(*profile)
 	}
 	writeJSON(w, http.StatusOK, profile)
 }
@@ -2749,11 +2756,12 @@ func (s *Server) scanRepoProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	profile, err := s.Engine.ScanRepoProfile(body.HostID, body.RepoPath, body.ProfileName)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		if strings.Contains(err.Error(), "persist profile") {
+			writeErr(w, http.StatusInternalServerError, err)
+		} else {
+			writeErr(w, http.StatusBadRequest, err)
+		}
 		return
-	}
-	if s.SaveProfile != nil {
-		s.SaveProfile(*profile)
 	}
 	if s.SaveRepo != nil {
 		if repo, ok := s.Engine.GetRepo(body.HostID, body.RepoPath); ok {

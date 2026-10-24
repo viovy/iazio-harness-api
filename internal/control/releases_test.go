@@ -1535,3 +1535,103 @@ func TestEngine_UpdateProfileTools_ConcurrentUpsertConsistency(t *testing.T) {
 		t.Fatalf("expected in-memory VersionSeq (%d) to equal persisted VersionSeq (%d) (G3)", p.VersionSeq, lastSaved)
 	}
 }
+
+func TestEngine_LoadProfile_PreservesTimestampsAndNoSave(t *testing.T) {
+	e := NewEngine(time.Now)
+	saved := false
+	e.OnSaveProfile = func(p DistributionProfile) error {
+		saved = true
+		return nil
+	}
+
+	origCreated := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	origUpdated := time.Date(2025, 2, 1, 12, 0, 0, 0, time.UTC)
+	e.LoadProfile(DistributionProfile{
+		Name:        "loaded-profile",
+		Description: "Loaded from DB",
+		CreatedAt:   origCreated,
+		UpdatedAt:   origUpdated,
+		Tools: []ProfileTool{
+			{Name: "tool1", Repository: "viovy/tool1"},
+		},
+	})
+
+	if saved {
+		t.Fatalf("expected LoadProfile not to invoke OnSaveProfile at startup (E2)")
+	}
+
+	p, err := e.GetProfile("loaded-profile")
+	if err != nil {
+		t.Fatalf("failed to get loaded profile: %v", err)
+	}
+	if !p.CreatedAt.Equal(origCreated) || !p.UpdatedAt.Equal(origUpdated) {
+		t.Fatalf("expected CreatedAt and UpdatedAt to be preserved: got CreatedAt=%v, UpdatedAt=%v", p.CreatedAt, p.UpdatedAt)
+	}
+}
+
+func TestReleaseService_ForbiddenShortCircuitsFallbacks(t *testing.T) {
+	calls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusForbidden) // 403 without rate limit headers
+	}))
+	defer ts.Close()
+
+	svc := NewReleaseService()
+	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
+
+	rel, err := svc.GetToolRelease(context.Background(), "viovy/forbidden-repo", "forbidden-tool", "latest")
+	if err == nil {
+		t.Fatal("expected error on forbidden repo")
+	}
+	if rel.LastSyncStatus != "forbidden" {
+		t.Fatalf("expected LastSyncStatus='forbidden', got %q", rel.LastSyncStatus)
+	}
+	// Crucial: should NOT fall back to /releases and /tags (should be exactly 1 call)
+	if calls != 1 {
+		t.Fatalf("expected forbidden error to short-circuit fallbacks (1 call), but made %d calls (E7)", calls)
+	}
+}
+
+func TestReleaseService_BackoffNeverShortened(t *testing.T) {
+	svc := NewReleaseService()
+	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	h1 := make(http.Header)
+	h1.Set("Retry-After", "300") // 5 minutes = 12:05
+	d1 := parseRateLimitBackoff(h1, now)
+	if d1 != 300*time.Second {
+		t.Fatalf("expected 300s, got %v", d1)
+	}
+
+	svc.mu.Lock()
+	svc.rateLimits["repo-a"] = now.Add(d1)
+	svc.globalRateLimitUntil = now.Add(d1)
+	svc.mu.Unlock()
+
+	// Shorter Retry-After arrives
+	h2 := make(http.Header)
+	h2.Set("Retry-After", "60") // 1 minute = 12:01
+	d2 := parseRateLimitBackoff(h2, now)
+	expiry2 := now.Add(d2)
+
+	svc.mu.Lock()
+	if expiry2.After(svc.rateLimits["repo-a"]) {
+		svc.rateLimits["repo-a"] = expiry2
+	}
+	if expiry2.After(svc.globalRateLimitUntil) {
+		svc.globalRateLimitUntil = expiry2
+	}
+	activeRepo := svc.rateLimits["repo-a"]
+	activeGlobal := svc.globalRateLimitUntil
+	svc.mu.Unlock()
+
+	if !activeRepo.Equal(now.Add(300 * time.Second)) {
+		t.Fatalf("expected rate limit for repo-a not to be shortened by smaller Retry-After (E7)")
+	}
+	if !activeGlobal.Equal(now.Add(300 * time.Second)) {
+		t.Fatalf("expected global rate limit not to be shortened by smaller Retry-After (E7)")
+	}
+}

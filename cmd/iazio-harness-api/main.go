@@ -153,9 +153,6 @@ func run(ctx context.Context, args []string) error {
 		srv.SaveHost = func(h control.Host) {
 			_ = store.SaveHost(context.Background(), h)
 		}
-		srv.SaveProfile = func(p control.DistributionProfile) {
-			_ = store.SaveProfile(context.Background(), p)
-		}
 		srv.Engine.OnSaveProfile = func(p control.DistributionProfile) error {
 			return store.SaveProfile(context.Background(), p)
 		}
@@ -164,9 +161,11 @@ func run(ctx context.Context, args []string) error {
 		}
 		if profiles, err := store.LoadProfiles(ctx); err == nil {
 			for _, p := range profiles {
-				_, _ = srv.Engine.UpsertProfile(p)
+				srv.Engine.LoadProfile(p)
 			}
 			log.Printf("loaded %d distribution profiles from database", len(profiles))
+		} else {
+			log.Printf("failed to load distribution profiles from database: %v", err)
 		}
 		if srv.Engine.Releases != nil {
 			if err := srv.Engine.Releases.SetStore(store); err != nil {

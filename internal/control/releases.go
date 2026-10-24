@@ -558,11 +558,15 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 		}
 		if err != nil {
 			lastErr = err
-			if strings.Contains(err.Error(), "rate limited") {
-				// Stop immediately on rate limit without spending quota on list or tags (G6)
+			if strings.Contains(err.Error(), "rate limited") || strings.Contains(err.Error(), "forbidden") {
+				// Stop immediately on rate limit or forbidden without spending quota on list or tags (G6, E7)
 				fallbackVer := targetVersion
 				if fallbackVer == "" || fallbackVer == "latest" {
 					fallbackVer = "0.0.0"
+				}
+				status := "rate_limited"
+				if strings.Contains(err.Error(), "forbidden") {
+					status = "forbidden"
 				}
 				return ToolRelease{
 					Name:           toolName,
@@ -571,7 +575,7 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 					TargetVersion:  targetVersion,
 					TagName:        fallbackVer,
 					LastCheckedAt:  now,
-					LastSyncStatus: "rate_limited",
+					LastSyncStatus: status,
 					Error:          err.Error(),
 				}, err
 			}
@@ -761,8 +765,12 @@ func (s *ReleaseService) fetchReleaseURL(ctx context.Context, url, repo, toolNam
 		backoffDur := parseRateLimitBackoff(resp.Header, s.now())
 		s.mu.Lock()
 		expiry := s.now().Add(backoffDur)
-		s.rateLimits[repo] = expiry
-		s.globalRateLimitUntil = expiry
+		if expiry.After(s.rateLimits[repo]) {
+			s.rateLimits[repo] = expiry
+		}
+		if expiry.After(s.globalRateLimitUntil) {
+			s.globalRateLimitUntil = expiry
+		}
 		s.mu.Unlock()
 		return ToolRelease{Name: toolName, Repository: repo, LatestVersion: targetVersion, TagName: targetVersion, LastSyncStatus: "rate_limited"}, "", false, fmt.Errorf("rate limited (status %d)", resp.StatusCode)
 	}
@@ -845,8 +853,12 @@ func (s *ReleaseService) fetchReleaseListURL(ctx context.Context, url, repo, too
 		backoffDur := parseRateLimitBackoff(resp.Header, s.now())
 		s.mu.Lock()
 		expiry := s.now().Add(backoffDur)
-		s.rateLimits[repo] = expiry
-		s.globalRateLimitUntil = expiry
+		if expiry.After(s.rateLimits[repo]) {
+			s.rateLimits[repo] = expiry
+		}
+		if expiry.After(s.globalRateLimitUntil) {
+			s.globalRateLimitUntil = expiry
+		}
 		s.mu.Unlock()
 		return ToolRelease{Name: toolName, Repository: repo, LastSyncStatus: "rate_limited"}, "", false, fmt.Errorf("rate limited (status %d)", resp.StatusCode)
 	}
@@ -935,8 +947,12 @@ func (s *ReleaseService) fetchTagsURL(ctx context.Context, url, repo, toolName, 
 		backoffDur := parseRateLimitBackoff(resp.Header, s.now())
 		s.mu.Lock()
 		expiry := s.now().Add(backoffDur)
-		s.rateLimits[repo] = expiry
-		s.globalRateLimitUntil = expiry
+		if expiry.After(s.rateLimits[repo]) {
+			s.rateLimits[repo] = expiry
+		}
+		if expiry.After(s.globalRateLimitUntil) {
+			s.globalRateLimitUntil = expiry
+		}
 		s.mu.Unlock()
 		return ToolRelease{Name: toolName, Repository: repo, LastSyncStatus: "rate_limited"}, "", false, fmt.Errorf("rate limited (status %d)", resp.StatusCode)
 	}

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2395,4 +2396,113 @@ func TestServer_RefreshProfileReleases_MixedToolOutcomesPartialStatus(t *testing
 	if prof.Tools[1].TargetVersion != "1.0.0" {
 		t.Fatalf("expected tool-bad target to remain 1.0.0, got %s", prof.Tools[1].TargetVersion)
 	}
+}
+
+func TestRefreshProfileReleases_TotalFailureReturns502(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	mockRelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer mockRelServer.Close()
+
+	relSvc := control.NewReleaseService()
+	relSvc.SetBaseURL(mockRelServer.URL)
+	relSvc.SetHTTPClient(mockRelServer.Client())
+	s.Engine.Releases = relSvc
+
+	_, err := s.Engine.UpsertProfile(control.DistributionProfile{
+		Name: "fail-profile",
+		Tools: []control.ProfileTool{
+			{
+				Name:          "tool-fail",
+				Repository:    "viovy/repo-fail",
+				TargetVersion: "1.0.0",
+				TrackLatest:   control.BoolPtr(true),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create profile failed: %v", err)
+	}
+
+	handler := s.Handler()
+	req := httptest.NewRequest(http.MethodPost, "/v1/fleet/profiles/fail-profile/refresh", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	// E8: Total failure must return 502 Bad Gateway
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 Bad Gateway for total failure, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp["status"] != "error" {
+		t.Fatalf("expected status 'error', got %v", resp["status"])
+	}
+}
+
+func TestProfileHandlers_SinglePersistencePathNoRedundantWrite(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	var savedState control.DistributionProfile
+	var saveCount int
+	var mu sync.Mutex
+
+	s.Engine.OnSaveProfile = func(p control.DistributionProfile) error {
+		mu.Lock()
+		savedState = p
+		saveCount++
+		mu.Unlock()
+		return nil
+	}
+
+	handler := s.Handler()
+
+	// 1. Create profile via POST /v1/fleet/profiles
+	createPayload := `{"name":"test-single-persist","description":"initial","tools":[{"name":"tool1","repository":"viovy/tool1","target_version":"1.0.0"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/fleet/profiles", strings.NewReader(createPayload))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	mu.Lock()
+	if saveCount != 1 {
+		t.Fatalf("expected exactly 1 save on create, got %d (E1)", saveCount)
+	}
+	if savedState.Description != "initial" {
+		t.Fatalf("expected saved description 'initial', got %q", savedState.Description)
+	}
+	mu.Unlock()
+
+	// 2. Update profile via PUT /v1/fleet/profiles/test-single-persist
+	updatePayload := `{"description":"updated-desc","tools":[{"name":"tool1","repository":"viovy/tool1","target_version":"2.0.0"}]}`
+	req = httptest.NewRequest(http.MethodPut, "/v1/fleet/profiles/test-single-persist", strings.NewReader(updatePayload))
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on update, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	mu.Lock()
+	if saveCount != 2 {
+		t.Fatalf("expected exactly 2 total saves after update, got %d (E1 redundant write detected)", saveCount)
+	}
+	if savedState.Description != "updated-desc" {
+		t.Fatalf("expected saved description 'updated-desc', got %q", savedState.Description)
+	}
+	mu.Unlock()
+
+	inMem, err := s.Engine.GetProfile("test-single-persist")
+	if err != nil {
+		t.Fatalf("failed to get profile from engine: %v", err)
+	}
+	mu.Lock()
+	if inMem.Description != savedState.Description || len(inMem.Tools) != len(savedState.Tools) || inMem.Tools[0].TargetVersion != savedState.Tools[0].TargetVersion {
+		t.Fatalf("in-memory state does not match persisted state: inMem=%+v, saved=%+v", inMem, savedState)
+	}
+	mu.Unlock()
 }
