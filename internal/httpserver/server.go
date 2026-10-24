@@ -1694,27 +1694,11 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else if toolParam != "" || body.TargetVersion != "" {
+		// When no profile is configured or profile has no tools, explicit tool targets cannot be validated (F6, S4)
 		for _, toolName := range body.Tools {
-			var foundTool *control.ProfileTool
-			if p != nil {
-				for _, pt := range p.Tools {
-					if strings.EqualFold(pt.Name, toolName) || strings.EqualFold(pt.BinaryName, toolName) {
-						toolCopy := pt
-						foundTool = &toolCopy
-						break
-					}
-				}
-			}
-			if foundTool == nil {
-				writeErr(w, http.StatusNotFound, fmt.Errorf("unknown tool: %s", toolName))
-				return
-			}
+			writeErr(w, http.StatusNotFound, fmt.Errorf("unknown tool: %s", toolName))
+			return
 		}
-	}
-
-	if len(body.Tools) > 1 && body.TargetVersion != "" {
-		writeErr(w, http.StatusUnprocessableEntity, fmt.Errorf("target_version can only be specified when exactly one tool is targeted"))
-		return
 	}
 
 	if len(body.Tools) == 1 {
