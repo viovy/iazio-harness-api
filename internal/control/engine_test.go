@@ -3848,3 +3848,133 @@ func TestEngine_PostExit_PendingWithoutMarker_MapsToUnverified(t *testing.T) {
 		t.Fatalf("expected AttachConfirmation to be unverified, got %q", jobResume.AttachConfirmation)
 	}
 }
+
+func TestEngine_AssociatedJobsAndHistoricalScheduleLineage(t *testing.T) {
+	e := NewEngine(func() time.Time { return time.Now() })
+
+	t1 := time.Date(2026, 10, 24, 10, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 10, 24, 11, 0, 0, 0, time.UTC)
+	t3 := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+
+	// Historical rows on mac-mini /work/fleet-repo-03
+	keyMain := "mac-mini\x00/work/fleet-repo-03"
+	e.history[keyMain] = []HistoryRow{
+		{
+			JobID:       "job-1310",
+			ScheduleID:  "sch-1310",
+			PromptTitle: "autonomous feature delivery",
+			Status:      "failed",
+			CreatedAt:   t1,
+		},
+		{
+			JobID:       "job-1311",
+			ScheduleID:  "sch-1311",
+			PromptTitle: "autonomous feature delivery",
+			Status:      "execution_timeout",
+			CreatedAt:   t2,
+		},
+		{
+			JobID:       "job-1313",
+			ScheduleID:  "sch-1312",
+			PromptTitle: "autonomous feature delivery",
+			Status:      "running",
+			CreatedAt:   t3,
+		},
+		{
+			JobID:       "job-unrelated",
+			ScheduleID:  "sch-9999",
+			PromptTitle: "different prompt task",
+			Status:      "success",
+			CreatedAt:   t2,
+		},
+	}
+
+	// Negative cases: same prompt on different host or repo
+	e.history["other-host\x00/work/fleet-repo-03"] = []HistoryRow{
+		{
+			JobID:       "job-other-host",
+			ScheduleID:  "sch-other-host",
+			PromptTitle: "autonomous feature delivery",
+			Status:      "failed",
+			CreatedAt:   t1,
+		},
+	}
+	e.history["mac-mini\x00/work/different-repo"] = []HistoryRow{
+		{
+			JobID:       "job-other-repo",
+			ScheduleID:  "sch-other-repo",
+			PromptTitle: "autonomous feature delivery",
+			Status:      "failed",
+			CreatedAt:   t1,
+		},
+	}
+
+	// 1. GetAssociatedJobsForScheduleLocked for legacy schedule sch-1312 without explicit pointers
+	jobs := e.GetAssociatedJobsForSchedule("sch-1312")
+	expected := []string{"job-1313", "job-1310", "job-1311"}
+	if len(jobs) != len(expected) {
+		t.Fatalf("expected %d jobs, got %d: %v", len(expected), len(jobs), jobs)
+	}
+	jobMap := make(map[string]bool)
+	for _, j := range jobs {
+		jobMap[j] = true
+	}
+	for _, exp := range expected {
+		if !jobMap[exp] {
+			t.Errorf("expected job %q to be included in associated jobs", exp)
+		}
+	}
+	if jobMap["job-other-host"] || jobMap["job-other-repo"] || jobMap["job-unrelated"] {
+		t.Errorf("negative correlation failed: included unrelated job in %v", jobs)
+	}
+
+	// 2. Schedule with explicit lineage MUST NOT have legacy rows polluted
+	e.schedules["sch-explicit"] = &Schedule{
+		ID:          "sch-explicit",
+		HostID:      "mac-mini",
+		WorktreePath: "/work/fleet-repo-03",
+		PromptTitle: "autonomous feature delivery",
+		ParentJobID: "job-parent-explicit",
+	}
+	explicitJobs := e.GetAssociatedJobsForSchedule("sch-explicit")
+	for _, j := range explicitJobs {
+		if j == "job-1310" || j == "job-1311" {
+			t.Fatalf("explicit lineage schedule must not be polluted by legacy correlation, got: %v", explicitJobs)
+		}
+	}
+
+	// 3. ReconstructScheduleFromHistoryLocked deterministically selects latest row
+	sch1312, ok := e.GetSchedule("sch-1312")
+	if !ok {
+		t.Fatalf("failed to retrieve historical schedule sch-1312")
+	}
+	if sch1312.Status != "running" {
+		t.Errorf("expected latest row status 'running', got %q", sch1312.Status)
+	}
+
+	// 4. ListSchedules F2 check: active schedule in memory is NOT duplicated when status filter excludes it
+	e.schedules["sch-active"] = &Schedule{
+		ID:          "sch-active",
+		HostID:      "mac-mini",
+		WorktreePath: "/work/fleet-repo-03",
+		PromptTitle: "active prompt",
+		Status:      "running",
+	}
+	e.history[keyMain] = append(e.history[keyMain], HistoryRow{
+		JobID:       "job-active-old",
+		ScheduleID:  "sch-active",
+		PromptTitle: "active prompt",
+		Status:      "failed",
+		CreatedAt:   t1,
+	})
+
+	// Filter for status="failed". In-memory sch-active is "running" so it is excluded from out.
+	// Its historical row "failed" must NOT be emitted as a phantom duplicate.
+	listFailed := e.ListSchedules("mac-mini", "/work/fleet-repo-03", "failed")
+	for _, s := range listFailed {
+		if s.ID == "sch-active" {
+			t.Fatalf("F2 violation: active schedule sch-active was resurrected as a phantom duplicate from history")
+		}
+	}
+}
+
