@@ -800,6 +800,47 @@ func (e *Engine) ListSchedules(hostID, repoPath, status string) []Schedule {
 		sCopy.AssociatedJobs = e.GetAssociatedJobsForScheduleLocked(sch.ID)
 		out = append(out, sCopy)
 	}
+
+	existingScheds := make(map[string]bool)
+	for _, s := range out {
+		existingScheds[s.ID] = true
+	}
+	for key, rows := range e.history {
+		parts := strings.SplitN(key, "\x00", 2)
+		hID := ""
+		rPath := ""
+		if len(parts) == 2 {
+			hID = parts[0]
+			rPath = parts[1]
+		}
+		if hostID != "" && hID != hostID {
+			continue
+		}
+		if cleanPath != "" && filepath.Clean(rPath) != cleanPath {
+			continue
+		}
+		for _, r := range rows {
+			if r.ScheduleID == "" || existingScheds[r.ScheduleID] {
+				continue
+			}
+			if status != "" && !strings.EqualFold(r.Status, status) {
+				continue
+			}
+			existingScheds[r.ScheduleID] = true
+			sCopy := Schedule{
+				ID:           r.ScheduleID,
+				HostID:       hID,
+				WorktreePath: rPath,
+				PromptTitle:  r.PromptTitle,
+				Engine:       r.Engine,
+				Status:       r.Status,
+				ParentJobID:  r.ParentJobID,
+				RootJobID:    r.RootJobID,
+			}
+			sCopy.AssociatedJobs = e.GetAssociatedJobsForScheduleLocked(r.ScheduleID)
+			out = append(out, sCopy)
+		}
+	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Priority != out[j].Priority {
 			return out[i].Priority > out[j].Priority
