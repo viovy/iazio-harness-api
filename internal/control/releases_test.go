@@ -451,7 +451,7 @@ func TestReleaseService_SyncAllProfiles_AutoAdvanceTargetVersion(t *testing.T) {
 	_, err := e.UpsertProfile(DistributionProfile{
 		Name: "generic",
 		Tools: []ProfileTool{
-			{Name: "autopilot-fleet", Repository: "viovy/autopilot-plugins-internal", TargetVersion: "0.0.482", TrackLatest: true},
+			{Name: "autopilot-fleet", Repository: "viovy/autopilot-plugins-internal", TargetVersion: "0.0.482", TrackLatest: BoolPtr(true)},
 		},
 	})
 	if err != nil {
@@ -558,7 +558,7 @@ func TestReleaseService_PinnedVersionDoesNotAutoAdvance(t *testing.T) {
 	_, _ = e.UpsertProfile(DistributionProfile{
 		Name: "pinned-profile",
 		Tools: []ProfileTool{
-			{Name: "autopilot-fleet", Repository: "viovy/autopilot-plugins-internal", TargetVersion: "0.0.482", TrackLatest: false},
+			{Name: "autopilot-fleet", Repository: "viovy/autopilot-plugins-internal", TargetVersion: "0.0.482", TrackLatest: BoolPtr(false)},
 		},
 	})
 
@@ -707,7 +707,7 @@ func TestReleaseService_ConsecutiveReleasesAutoAdvanceTracking(t *testing.T) {
 	if p1.Tools[0].TargetVersion != "0.0.492" {
 		t.Fatalf("expected target 0.0.492 after first sync, got %s", p1.Tools[0].TargetVersion)
 	}
-	if !p1.Tools[0].TrackLatest {
+	if p1.Tools[0].TrackLatest == nil || !*p1.Tools[0].TrackLatest {
 		t.Fatalf("expected TrackLatest true to be preserved after first advance")
 	}
 
@@ -725,7 +725,7 @@ func TestReleaseService_ConsecutiveReleasesAutoAdvanceTracking(t *testing.T) {
 	if p2.Tools[0].TargetVersion != "0.0.493" {
 		t.Fatalf("expected target 0.0.493 after second sync, got %s", p2.Tools[0].TargetVersion)
 	}
-	if !p2.Tools[0].TrackLatest {
+	if p2.Tools[0].TrackLatest == nil || !*p2.Tools[0].TrackLatest {
 		t.Fatalf("expected TrackLatest still true after second advance")
 	}
 }
@@ -889,7 +889,7 @@ func TestReleaseService_GenericBaselinePinnedVersionPreserved(t *testing.T) {
 				Repository:    "viovy/autopilot-plugins-internal",
 				Tier:          "baseline",
 				TargetVersion: "0.0.480",
-				TrackLatest:   false,
+				TrackLatest:   BoolPtr(false),
 			},
 		},
 	})
@@ -906,7 +906,7 @@ func TestReleaseService_GenericBaselinePinnedVersionPreserved(t *testing.T) {
 	if p.Tools[0].TargetVersion != "0.0.480" {
 		t.Fatalf("expected operator pin 0.0.480 to be preserved, got %s", p.Tools[0].TargetVersion)
 	}
-	if p.Tools[0].TrackLatest {
+	if p.Tools[0].TrackLatest != nil && *p.Tools[0].TrackLatest {
 		t.Fatalf("expected TrackLatest to remain false for operator pin")
 	}
 	if p.Tools[0].LatestAvailableVersion != "0.0.492" {
@@ -1071,5 +1071,171 @@ func TestEngine_RepoRuntimeStatusTelemetryAndFleetCleanAggregation(t *testing.T)
 	hClean := e.hosts[hostID]
 	if !hClean.FleetGitClean {
 		t.Fatalf("expected FleetGitClean to be true when all repos are clean")
+	}
+}
+
+func TestReleaseService_LegacyProfileMissingTrackLatestAutoAdvances(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tag_name":     "0.0.492",
+			"html_url":     "https://github.com/viovy/autopilot-plugins-internal/releases/tag/0.0.492",
+			"published_at": time.Now().UTC().Format(time.RFC3339),
+		})
+	}))
+	defer ts.Close()
+
+	svc := NewReleaseService()
+	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
+
+	e := NewEngine(time.Now)
+	e.Releases = svc
+
+	// Simulate legacy JSON row from DB with NO track_latest field and stale target 0.0.482
+	legacyJSON := []byte(`{
+		"name": "generic",
+		"is_default": true,
+		"tools": [
+			{
+				"name": "autopilot-plugins-internal",
+				"repository": "viovy/autopilot-plugins-internal",
+				"tier": "baseline",
+				"target_version": "0.0.482"
+			},
+			{
+				"name": "pinned-tool",
+				"repository": "viovy/autopilot-plugins-internal",
+				"tier": "baseline",
+				"target_version": "0.0.480",
+				"track_latest": false
+			}
+		]
+	}`)
+	var legacyProfile DistributionProfile
+	if err := json.Unmarshal(legacyJSON, &legacyProfile); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	// Verify legacy row tool has TrackLatest == nil
+	if legacyProfile.Tools[0].TrackLatest != nil {
+		t.Fatalf("expected legacy tool 0 to decode with nil TrackLatest, got %v", *legacyProfile.Tools[0].TrackLatest)
+	}
+	// Verify explicit pin tool has TrackLatest != nil and false
+	if legacyProfile.Tools[1].TrackLatest == nil || *legacyProfile.Tools[1].TrackLatest != false {
+		t.Fatalf("expected explicit pin tool 1 to decode with TrackLatest=false")
+	}
+
+	_, _ = e.UpsertProfile(legacyProfile)
+
+	adv := svc.SyncAllProfiles(context.Background(), e, nil)
+	if adv != 1 {
+		t.Fatalf("expected 1 legacy tool to auto-advance, got %d", adv)
+	}
+
+	p, err := e.GetProfile("generic")
+	if err != nil {
+		t.Fatalf("failed to get profile: %v", err)
+	}
+	// Legacy baseline tool: target must advance to 0.0.492 (R2)
+	if p.Tools[0].TargetVersion != "0.0.492" {
+		t.Fatalf("expected legacy tool to advance to 0.0.492, got %s", p.Tools[0].TargetVersion)
+	}
+	if p.Tools[0].TrackLatest == nil || !*p.Tools[0].TrackLatest {
+		t.Fatalf("expected legacy tool to migrate TrackLatest to true")
+	}
+
+	// Explicit pinned tool: target must remain 0.0.480
+	if p.Tools[1].TargetVersion != "0.0.480" {
+		t.Fatalf("expected pinned tool to stay at 0.0.480, got %s", p.Tools[1].TargetVersion)
+	}
+	if p.Tools[1].TrackLatest == nil || *p.Tools[1].TrackLatest != false {
+		t.Fatalf("expected pinned tool to remain TrackLatest=false")
+	}
+}
+
+func TestEngine_RepoRuntimeStatus_MultiRepoBatchAggregation(t *testing.T) {
+	e := NewEngine(time.Now)
+	hostID := "host-gamma"
+	e.RegisterHost(hostID, "linux", "generic")
+
+	// Post 1: repo-1 is dirty
+	e.UpdateRepoRuntimeStatus(hostID, []RepoRuntimeStatus{
+		{
+			RepoPath: "/workspace/repo-1",
+			IsClean:  false,
+		},
+	})
+	if e.hosts[hostID].FleetGitClean {
+		t.Fatalf("expected FleetGitClean=false after repo-1 is dirty")
+	}
+
+	// Post 2: single-repo batch for repo-2 which is clean.
+	// Must NOT flip host to clean because repo-1 remains dirty in inventory (R5)!
+	e.UpdateRepoRuntimeStatus(hostID, []RepoRuntimeStatus{
+		{
+			RepoPath: "/workspace/repo-2",
+			IsClean:  true,
+		},
+	})
+	if e.hosts[hostID].FleetGitClean {
+		t.Fatalf("expected FleetGitClean to REMAIN false when repo-1 is dirty and single clean repo-2 is reported (R5)")
+	}
+
+	// Post 3: repo-1 reports clean -> host flips to clean
+	e.UpdateRepoRuntimeStatus(hostID, []RepoRuntimeStatus{
+		{
+			RepoPath: "/workspace/repo-1",
+			IsClean:  true,
+		},
+	})
+	if !e.hosts[hostID].FleetGitClean {
+		t.Fatalf("expected FleetGitClean=true after all repos become clean")
+	}
+}
+
+func TestEngine_HostHarnessActiveReconciliation(t *testing.T) {
+	e := NewEngine(time.Now)
+	hostID := "host-delta"
+	e.RegisterHost(hostID, "linux", "generic")
+
+	// Heartbeat with active jobs
+	_ = e.HeartbeatDetailed(hostID, "ONLINE", nil, false, ActiveJob{JobID: "job-123"})
+	if !e.hosts[hostID].HarnessActive {
+		t.Fatalf("expected HarnessActive=true when active jobs are present")
+	}
+
+	// Heartbeat with no active jobs
+	_ = e.HeartbeatDetailed(hostID, "ONLINE", nil, false)
+	if e.hosts[hostID].HarnessActive {
+		t.Fatalf("expected HarnessActive=false when active jobs are cleared")
+	}
+}
+
+func TestReleaseService_SyncAllProfiles_ErrorPropagation(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	svc := NewReleaseService()
+	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
+
+	e := NewEngine(time.Now)
+	e.Releases = svc
+
+	_, _ = e.UpsertProfile(DistributionProfile{
+		Name: "err-profile",
+		Tools: []ProfileTool{
+			{Name: "err-tool", Repository: "viovy/err-tool", TargetVersion: "latest"},
+		},
+	})
+
+	res := svc.SyncAllProfilesDetailed(context.Background(), e, nil)
+	if len(res.Errors) == 0 {
+		t.Fatalf("expected error recorded for err-profile in SyncAllProfilesDetailed (R7)")
+	}
+	if res.TotalAdvanced != 0 {
+		t.Fatalf("expected 0 tools advanced on error, got %d", res.TotalAdvanced)
 	}
 }

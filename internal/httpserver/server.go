@@ -1934,7 +1934,7 @@ func (s *Server) syncAllProfiles(w http.ResponseWriter, r *http.Request) {
 		s.Engine.SetReleaseService(relSvc)
 	}
 
-	totalUpdated := relSvc.SyncAllProfiles(r.Context(), s.Engine, func(profile string, tool control.ProfileTool, fromVersion, toVersion string) {
+	syncRes := relSvc.SyncAllProfilesDetailed(r.Context(), s.Engine, func(profile string, tool control.ProfileTool, fromVersion, toVersion string) {
 		s.RecordNotification(NotificationRecord{
 			Title:    "Release Detected",
 			Message:  fmt.Sprintf("New release detected for %s: %s (was %s). Profile '%s' updated.", tool.Name, toVersion, fromVersion, profile),
@@ -1951,11 +1951,24 @@ func (s *Server) syncAllProfiles(w http.ResponseWriter, r *http.Request) {
 		})
 	})
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":        "ok",
-		"tools_updated": totalUpdated,
+	status := "ok"
+	if len(syncRes.Errors) > 0 {
+		if syncRes.TotalAdvanced > 0 || len(syncRes.Errors) < len(s.Engine.ListProfiles()) {
+			status = "partial"
+		} else {
+			status = "error"
+		}
+	}
+
+	resp := map[string]any{
+		"status":        status,
+		"tools_updated": syncRes.TotalAdvanced,
 		"synced_at":     time.Now().UTC().Format(time.RFC3339),
-	})
+	}
+	if len(syncRes.Errors) > 0 {
+		resp["errors"] = syncRes.Errors
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) pingAck(w http.ResponseWriter, r *http.Request) {

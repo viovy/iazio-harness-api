@@ -89,8 +89,10 @@ func hostView(h control.Host, paused int) map[string]any {
 		prof = "generic"
 	}
 	var fleetChecked any
+	var fleetGitClean any
 	if h.FleetCheckedAt != nil && !h.FleetCheckedAt.IsZero() {
 		fleetChecked = h.FleetCheckedAt.UTC().Format(time.RFC3339)
+		fleetGitClean = h.FleetGitClean
 	}
 	return map[string]any{
 		"id":                   h.ID,
@@ -102,7 +104,7 @@ func hostView(h control.Host, paused int) map[string]any {
 		"last_heartbeat":       beat,
 		"repos_paused":         paused,
 		"fetch_failed":         h.FetchFailed,
-		"fleet_git_clean":      h.FleetGitClean,
+		"fleet_git_clean":      fleetGitClean,
 		"harness_active":       h.HarnessActive,
 		"fleet_checked_at":     fleetChecked,
 		"tools":                tools,

@@ -2212,7 +2212,7 @@ func TestSyncAllProfilesEndpoint_AndCacheControl(t *testing.T) {
 	_, err := s.Engine.UpsertProfile(control.DistributionProfile{
 		Name: "generic",
 		Tools: []control.ProfileTool{
-			{Name: "autopilot-fleet", Repository: "viovy/autopilot-plugins-internal", TargetVersion: "0.0.482", TrackLatest: true},
+			{Name: "autopilot-fleet", Repository: "viovy/autopilot-plugins-internal", TargetVersion: "0.0.482", TrackLatest: control.BoolPtr(true)},
 		},
 	})
 	if err != nil {
@@ -2295,7 +2295,7 @@ func TestServer_RefreshPinnedProfileCannotDowngrade(t *testing.T) {
 				Name:          "autopilot-plugins-internal",
 				Repository:    "viovy/autopilot-plugins-internal",
 				TargetVersion: "0.0.492",
-				TrackLatest:   false,
+				TrackLatest:   control.BoolPtr(false),
 			},
 		},
 	})

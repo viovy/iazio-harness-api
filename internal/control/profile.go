@@ -52,7 +52,7 @@ type ProfileTool struct {
 	Description            string       `json:"description" yaml:"description"`
 	Tier                   string       `json:"tier" yaml:"tier"` // baseline | optional
 	TargetVersion          string       `json:"target_version,omitempty" yaml:"target_version,omitempty"`
-	TrackLatest            bool         `json:"track_latest,omitempty" yaml:"track_latest,omitempty"`
+	TrackLatest            *bool        `json:"track_latest,omitempty" yaml:"track_latest,omitempty"`
 	LatestAvailableVersion string       `json:"latest_available_version,omitempty" yaml:"latest_available_version,omitempty"`
 	LatestReleaseURL       string       `json:"latest_release_url,omitempty" yaml:"latest_release_url,omitempty"`
 	LatestPublishedAt      *time.Time   `json:"latest_published_at,omitempty" yaml:"latest_published_at,omitempty"`
@@ -60,6 +60,27 @@ type ProfileTool struct {
 	LastSyncStatus         string       `json:"last_sync_status,omitempty" yaml:"last_sync_status,omitempty"`
 	LastSyncError          string       `json:"last_sync_error,omitempty" yaml:"last_sync_error,omitempty"`
 	Service                *ToolService `json:"service,omitempty" yaml:"service,omitempty"`
+}
+
+// BoolPtr returns a pointer to a bool value.
+func BoolPtr(b bool) *bool {
+	return &b
+}
+
+// IsTrackingLatest determines if the tool should auto-advance to latest upstream releases.
+// If track_latest was omitted in storage (nil, legacy rows), it migrates baseline tools
+// in default/generic profiles or unpinned targets to true (R2). Explicit false is strictly preserved.
+func (t ProfileTool) IsTrackingLatest(isDefaultProfile bool) bool {
+	if t.TrackLatest != nil {
+		return *t.TrackLatest
+	}
+	if t.TargetVersion == "" || t.TargetVersion == "latest" {
+		return true
+	}
+	if isDefaultProfile && (t.Tier == "baseline" || t.Tier == "") {
+		return true
+	}
+	return false
 }
 
 type ToolService struct {
@@ -297,7 +318,7 @@ func parseFleetDistribution(raw []byte) (*DistributionProfile, error) {
 			Description:   t.Description,
 			Tier:          t.Tier,
 			TargetVersion: t.TargetVersion,
-			TrackLatest:   trackLatest,
+			TrackLatest:   BoolPtr(trackLatest),
 			Service:       t.Service,
 		})
 	}

@@ -976,13 +976,14 @@ func (s *ReleaseService) syncProfileWithCachePolicy(
 	}
 
 	var releases []ToolRelease
+	var fetchErr error
 	if invalidate {
-		releases, err = s.RefreshProfileReleases(ctx, *p)
+		releases, fetchErr = s.RefreshProfileReleases(ctx, *p)
 	} else {
-		releases, err = s.GetProfileReleases(ctx, *p)
+		releases, fetchErr = s.GetProfileReleases(ctx, *p)
 	}
-	if err != nil && len(releases) == 0 {
-		return 0, err
+	if fetchErr != nil && len(releases) == 0 {
+		return 0, fetchErr
 	}
 
 	totalAdvanced := 0
@@ -1026,16 +1027,14 @@ func (s *ReleaseService) syncProfileWithCachePolicy(
 						updatedTools[i].LastSyncError = ""
 
 						oldTarget := updatedTools[i].TargetVersion
-						// Determine if tool is tracking latest:
-						// 1. Explicit TrackLatest == true
-						// 2. TargetVersion is empty or "latest"
-						// Operator pins (TrackLatest == false with explicit version) are strictly preserved (E2)
-						isTrackingLatest := updatedTools[i].TrackLatest || oldTarget == "" || oldTarget == "latest"
+						// Determine if tool is tracking latest (R2):
+						// Respect explicit TrackLatest pointer (*bool), migrating legacy rows where TrackLatest is nil.
+						isTrackingLatest := updatedTools[i].IsTrackingLatest(p.IsDefault || profileName == "generic")
 
 						if isTrackingLatest {
-							// Maintain tracking intent across auto-advances (N1)
-							if !updatedTools[i].TrackLatest {
-								updatedTools[i].TrackLatest = true
+							// Maintain tracking intent across auto-advances
+							if updatedTools[i].TrackLatest == nil || !*updatedTools[i].TrackLatest {
+								updatedTools[i].TrackLatest = BoolPtr(true)
 								configChanged = true
 							}
 
@@ -1069,18 +1068,35 @@ func (s *ReleaseService) syncProfileWithCachePolicy(
 		}
 	}
 
+	if fetchErr != nil {
+		return totalAdvanced, fetchErr
+	}
 	return totalAdvanced, nil
 }
 
+// SyncAllProfilesResult details the outcome of syncing all profiles.
+type SyncAllProfilesResult struct {
+	TotalAdvanced int               `json:"tools_updated"`
+	Errors        map[string]string `json:"errors,omitempty"`
+}
+
 // SyncAllProfiles iterates all registered distribution profiles and updates tool release information.
-// It invalidates unique repositories once at the start of the tick and deduplicates requests across profiles (E4).
 // Returns the number of tools whose target version was advanced.
 func (s *ReleaseService) SyncAllProfiles(ctx context.Context, e *Engine, onReleaseDetected ReleaseNotificationCallback) int {
+	res := s.SyncAllProfilesDetailed(ctx, e, onReleaseDetected)
+	return res.TotalAdvanced
+}
+
+// SyncAllProfilesDetailed iterates all registered distribution profiles, updates tool releases,
+// deduplicates requests across profiles (E4), and records per-profile error messages (R7).
+func (s *ReleaseService) SyncAllProfilesDetailed(ctx context.Context, e *Engine, onReleaseDetected ReleaseNotificationCallback) SyncAllProfilesResult {
+	res := SyncAllProfilesResult{
+		Errors: make(map[string]string),
+	}
 	if e == nil {
-		return 0
+		return res
 	}
 	profiles := e.ListProfiles()
-	totalAdvanced := 0
 
 	// Deduplicate unique repositories across all profiles and invalidate once per tick (E4)
 	for _, p := range profiles {
@@ -1091,9 +1107,10 @@ func (s *ReleaseService) SyncAllProfiles(ctx context.Context, e *Engine, onRelea
 		adv, err := s.syncProfileWithCachePolicy(ctx, e, p.Name, onReleaseDetected, false)
 		if err != nil {
 			log.Printf("[ReleaseService] ERROR syncing profile %s: %v", p.Name, err)
+			res.Errors[p.Name] = err.Error()
 		} else {
-			totalAdvanced += adv
+			res.TotalAdvanced += adv
 		}
 	}
-	return totalAdvanced
+	return res
 }

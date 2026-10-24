@@ -1714,16 +1714,19 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 		if h.RepoStatuses == nil {
 			h.RepoStatuses = make(map[string]RepoRuntimeStatus)
 		}
-		allClean := true
-		now := time.Now().UTC()
 		for _, st := range statuses {
 			cleanPath := filepath.Clean(st.RepoPath)
 			h.RepoStatuses[cleanPath] = st
+		}
+		allClean := true
+		for _, st := range h.RepoStatuses {
 			if !st.IsClean {
 				allClean = false
+				break
 			}
 		}
 		h.FleetGitClean = allClean
+		now := time.Now().UTC()
 		h.FleetCheckedAt = &now
 	}
 
