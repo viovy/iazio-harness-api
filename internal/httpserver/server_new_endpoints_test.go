@@ -54,6 +54,19 @@ func TestServer_GitCredentialsTestEndpoints(t *testing.T) {
 
 func TestServer_ProfileRefreshAndHostPing(t *testing.T) {
 	e := control.NewEngine(time.Now)
+	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tag_name": "1.0.0",
+			"html_url": "https://github.com/viovy/iazio-agent/releases/tag/1.0.0",
+		})
+	}))
+	defer mockGH.Close()
+	relSvc := control.NewReleaseService()
+	relSvc.SetBaseURL(mockGH.URL)
+	relSvc.SetHTTPClient(mockGH.Client())
+	e.Releases = relSvc
+
 	srv := &Server{Engine: e}
 	handler := srv.Handler()
 
@@ -440,7 +453,17 @@ func TestServer_ProfileRefreshUpdatesTargetVersion(t *testing.T) {
 	}
 
 	// Mock release service
+	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tag_name": "1.0.0",
+			"html_url": "https://github.com/viovy/iazio-agent/releases/tag/1.0.0",
+		})
+	}))
+	defer mockGH.Close()
 	mockRelService := control.NewReleaseService()
+	mockRelService.SetBaseURL(mockGH.URL)
+	mockRelService.SetHTTPClient(mockGH.Client())
 	e.Releases = mockRelService
 
 	// Call refresh endpoint
