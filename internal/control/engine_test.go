@@ -4051,5 +4051,28 @@ func TestEngine_AssociatedJobsAndHistoricalScheduleLineage(t *testing.T) {
 	if !foundParent {
 		t.Fatalf("expected in-memory schedule with ParentJobID to include parent job-1311, got: %v", preRestartJobs)
 	}
+
+	// 8. F2 check: In-memory schedule with AssociatedJobs seed but no parent pointer gives identical lineage before and after restart
+	e.schedules["sch-1312-in-mem"] = &Schedule{
+		ID:             "sch-1312-in-mem",
+		HostID:         "mac-mini",
+		WorktreePath:   "/work/fleet-repo-03",
+		PromptTitle:    "autonomous feature delivery",
+		Status:         "failed",
+		AssociatedJobs: []string{"job-1313"},
+	}
+	inMemLineage := e.GetAssociatedJobsForSchedule("sch-1312-in-mem")
+	if len(inMemLineage) != 2 || inMemLineage[0] != "job-1311" || inMemLineage[1] != "job-1313" {
+		t.Fatalf("F2 violation: in-memory schedule failed to correlate legacy parent: got %v, expected [job-1311, job-1313]", inMemLineage)
+	}
+
+	// 9. F1 check: GetJob returns historical job from e.history when not present in e.jobs
+	histJobDetail, ok := e.GetJob("job-1311")
+	if !ok {
+		t.Fatalf("F1 violation: GetJob('job-1311') failed to find historical job in e.history")
+	}
+	if histJobDetail.ID != "job-1311" || histJobDetail.ScheduleID != "sch-1310" || histJobDetail.HostID != "mac-mini" {
+		t.Fatalf("F1 violation: unexpected job detail from history: %+v", histJobDetail)
+	}
 }
 

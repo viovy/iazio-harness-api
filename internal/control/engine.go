@@ -2635,10 +2635,11 @@ func (e *Engine) GetAssociatedJobsForScheduleLocked(schID string) []string {
 	}
 
 	// 2. Legacy fallback: correlate historical runs sharing the same prompt title, host, and repo
-	// Story Req 2 & Review F1:
+	// Story Req 2 & Review F1/F2:
 	// Only apply when explicit parent/root lineage is absent on BOTH schedule and history rows,
 	// and when there is at least one executed job in jobSet (fresh unexecuted schedules never scoop history).
-	hasExplicitLineage := (sch != nil && (sch.ParentJobID != "" || sch.RootJobID != "" || len(sch.AssociatedJobs) > 0)) ||
+	// Note: len(sch.AssociatedJobs) must NOT be treated as explicit lineage because dispatch seeds the job itself into AssociatedJobs.
+	hasExplicitLineage := (sch != nil && (sch.ParentJobID != "" || sch.RootJobID != "")) ||
 		(latestRow != nil && (latestRow.ParentJobID != "" || latestRow.RootJobID != ""))
 
 	targetPrompt := ""
@@ -2698,7 +2699,7 @@ func (e *Engine) GetAssociatedJobsForScheduleLocked(schID string) []string {
 				} else {
 					prev := curCluster[len(curCluster)-1]
 					prevStatus := strings.ToUpper(prev.Status)
-					isTerminalSuccess := (prevStatus == "SUCCESS" || prevStatus == "COMPLETED")
+					isTerminalSuccess := (prevStatus == "SUCCESS" || prevStatus == "COMPLETED" || prev.Clean)
 					gap := cand.CreatedAt.Sub(prev.CreatedAt)
 
 					totalSpan := cand.CreatedAt.Sub(curCluster[0].CreatedAt)
@@ -2908,6 +2909,54 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 	e.reapExpiredLocked()
 	job, ok := e.jobs[id]
 	if !ok {
+		// History fallback for finished/historical jobs across process restarts
+		for key, rows := range e.history {
+			for _, r := range rows {
+				if r.JobID == id {
+					host, path := "", ""
+					if idx := strings.Index(key, "\x00"); idx >= 0 {
+						host, path = key[:idx], key[idx+1:]
+					}
+					cids := r.ConversationIDs
+					if cids == nil {
+						cids = []string{}
+					}
+					detail := JobDetail{
+						ID:                        r.JobID,
+						ScheduleID:                r.ScheduleID,
+						Kind:                      r.Engine,
+						Status:                    r.Status,
+						Engine:                    r.Engine,
+						Prompt:                    r.PromptTitle,
+						StoryID:                   r.PromptTitle,
+						WorktreePath:              path,
+						HostID:                    host,
+						TargetHost:                host,
+						ConversationIDs:           append([]string(nil), cids...),
+						Reason:                    r.Reason,
+						ParentJobID:               r.ParentJobID,
+						RootJobID:                 r.RootJobID,
+						ExecutionAttempt:          r.ExecutionAttempt,
+						ExecutionChain:            append([]string(nil), r.ExecutionChain...),
+						InitialConversationID:     r.InitialConversationID,
+						ActiveConversationID:      r.ActiveConversationID,
+						ResumeMode:                r.ResumeMode,
+						ResumeFallbackReason:      r.ResumeFallbackReason,
+						SameConversationConfirmed: r.SameConversationConfirmed || r.ResumeMode == "same_conversation",
+						AttachConfirmation:        r.AttachConfirmation,
+						InterruptedASEState:       r.InterruptedASEState,
+						ConversationLineage:       append([]ConversationLineage(nil), r.ConversationLineage...),
+					}
+					if !r.CreatedAt.IsZero() {
+						detail.StartedAt = r.CreatedAt.UTC().Format(time.RFC3339)
+					}
+					if r.ScheduleID != "" {
+						detail.AssociatedJobs = e.GetAssociatedJobsForScheduleLocked(r.ScheduleID)
+					}
+					return detail, true
+				}
+			}
+		}
 		return JobDetail{}, false
 	}
 	detail := JobDetail{
