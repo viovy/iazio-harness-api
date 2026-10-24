@@ -302,3 +302,66 @@ func TestServer_NotificationsAndToolUpdateQueue(t *testing.T) {
 		t.Fatalf("expected 201 on POST /v1/notifications, got %d: %s", recPostNotif.Code, recPostNotif.Body.String())
 	}
 }
+
+func TestServer_ForceUpdateToolEndpoint(t *testing.T) {
+	e := control.NewEngine(time.Now)
+	srv := &Server{Engine: e}
+	handler := srv.Handler()
+
+	// Register host and seed generic profile with a tool
+	e.RegisterHost("mac-mini", "desktop", "generic")
+	_, _ = e.UpsertProfile(control.DistributionProfile{
+		Name:      "generic",
+		IsDefault: true,
+		Tools: []control.ProfileTool{
+			{
+				Name:                   "autopilot-plugins-internal",
+				Repository:             "viovy/autopilot-plugins-internal",
+				BinaryName:             "autopilot",
+				TargetVersion:          "0.0.492",
+				LatestAvailableVersion: "0.0.492",
+				Tier:                   "baseline",
+			},
+		},
+	})
+
+	// 1. POST /api/agents/mac-mini/tools/autopilot-plugins-internal/force-update with explicit target_version
+	rec1 := httptest.NewRecorder()
+	body1 := `{"target_version":"0.0.492"}`
+	req1 := httptest.NewRequest("POST", "/api/agents/mac-mini/tools/autopilot-plugins-internal/force-update", bytes.NewReader([]byte(body1)))
+	handler.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("expected 200 from force-update, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+	var res1 map[string]any
+	if err := json.Unmarshal(rec1.Body.Bytes(), &res1); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if res1["status"] != "queued" || res1["target_version"] != "0.0.492" {
+		t.Fatalf("unexpected force update response: %v", res1)
+	}
+
+	// Verify pending tool update on host
+	pending := e.ConsumePendingToolUpdate("mac-mini")
+	if pending == nil {
+		t.Fatal("expected pending tool update on host")
+	}
+	if !pending.Force || len(pending.Tools) != 1 || pending.Tools[0] != "autopilot-plugins-internal" || pending.TargetVersion != "0.0.492" {
+		t.Fatalf("unexpected pending tool update: %+v", pending)
+	}
+
+	// 2. POST /api/v1/agents/mac-mini/tools/autopilot-plugins-internal/force-update without body, resolving from profile
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest("POST", "/api/v1/agents/mac-mini/tools/autopilot-plugins-internal/force-update", nil)
+	handler.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected 200 from profile-resolved force-update, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	var res2 map[string]any
+	if err := json.Unmarshal(rec2.Body.Bytes(), &res2); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if res2["target_version"] != "0.0.492" {
+		t.Fatalf("expected profile-resolved target_version 0.0.492, got %v", res2["target_version"])
+	}
+}

@@ -261,6 +261,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/hosts/{id}", s.hostDetail)
 	mux.HandleFunc("POST /v1/hosts/{id}/heartbeat", s.heartbeat)
 	mux.HandleFunc("POST /v1/hosts/{id}/tools/update", s.queueToolUpdate)
+	mux.HandleFunc("POST /v1/hosts/{id}/tools/{tool}/update", s.queueToolUpdate)
+	mux.HandleFunc("POST /v1/fleet/agents/{id}/tools/{tool}/force-update", s.queueToolUpdate)
+	mux.HandleFunc("POST /api/v1/agents/{id}/tools/{tool}/force-update", s.queueToolUpdate)
+	mux.HandleFunc("POST /api/agents/{id}/tools/{tool}/force-update", s.queueToolUpdate)
 	mux.HandleFunc("POST /v1/hosts/{id}/poll", s.pollHost)
 	mux.HandleFunc("GET /v1/hosts/{host}/repos", s.repoDetail)
 	mux.HandleFunc("DELETE /v1/hosts/{host}/repos", s.unregisterRepo)
@@ -1625,24 +1629,54 @@ func (s *Server) createNotification(w http.ResponseWriter, r *http.Request) {
 func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 	hostID := r.PathValue("id")
 	var body struct {
-		Tools []string `json:"tools"`
-		Force bool     `json:"force"`
+		Tools         []string `json:"tools"`
+		Force         bool     `json:"force"`
+		TargetVersion string   `json:"target_version,omitempty"`
+		Version       string   `json:"version,omitempty"`
 	}
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 	}
-	if err := s.Engine.QueueToolUpdate(hostID, body.Tools, body.Force); err != nil {
+	if toolParam := strings.TrimSpace(r.PathValue("tool")); toolParam != "" {
+		body.Tools = []string{toolParam}
+		body.Force = true
+	}
+	if body.TargetVersion == "" && body.Version != "" {
+		body.TargetVersion = body.Version
+	}
+	// If a specific tool is requested and TargetVersion is empty, resolve latest version from profile
+	if len(body.Tools) == 1 && body.TargetVersion == "" {
+		toolName := body.Tools[0]
+		if p, err := s.Engine.GetProfile("generic"); err == nil && p != nil {
+			for _, pt := range p.Tools {
+				if strings.EqualFold(pt.Name, toolName) || strings.EqualFold(pt.BinaryName, toolName) {
+					if pt.TargetVersion != "" && pt.TargetVersion != "latest" {
+						body.TargetVersion = pt.TargetVersion
+					} else if pt.LatestAvailableVersion != "" {
+						body.TargetVersion = pt.LatestAvailableVersion
+					}
+					break
+				}
+			}
+		}
+	}
+
+	if err := s.Engine.QueueToolUpdate(hostID, body.Tools, body.Force, body.TargetVersion); err != nil {
 		writeErr(w, http.StatusNotFound, err)
 		return
 	}
 
 	var jobID string
 	if s.Queue != nil {
-		payload, _ := json.Marshal(map[string]any{
+		payloadMap := map[string]any{
 			"host_id": hostID,
 			"tools":   body.Tools,
 			"force":   body.Force,
-		})
+		}
+		if body.TargetVersion != "" {
+			payloadMap["target_version"] = body.TargetVersion
+		}
+		payload, _ := json.Marshal(payloadMap)
 		job := &dispatch.Job{
 			Type:       "agent.tools.update",
 			Repo:       "fleet",
@@ -1659,6 +1693,14 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	meta := map[string]any{
+		"tools": body.Tools,
+		"force": body.Force,
+	}
+	if body.TargetVersion != "" {
+		meta["target_version"] = body.TargetVersion
+	}
+
 	s.RecordNotification(NotificationRecord{
 		Title:    "Tool Update Queued",
 		Message:  fmt.Sprintf("Tool update queued for host %s (job: %s)", hostID, jobID),
@@ -1666,19 +1708,20 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 		Source:   "harness-api",
 		JobID:    jobID,
 		HostID:   hostID,
-		Metadata: map[string]any{
-			"tools": body.Tools,
-			"force": body.Force,
-		},
+		Metadata: meta,
 	})
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"status":  "queued",
 		"host_id": hostID,
 		"job_id":  jobID,
 		"tools":   body.Tools,
 		"force":   body.Force,
-	})
+	}
+	if body.TargetVersion != "" {
+		resp["target_version"] = body.TargetVersion
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) queueAllToolsUpdate(w http.ResponseWriter, r *http.Request) {

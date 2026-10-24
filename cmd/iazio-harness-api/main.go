@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,15 +27,18 @@ import (
 )
 
 var (
-	versionStamp = "0.1.0-dev"
-	commitStamp  = "unknown"
-	branchStamp  = "unknown"
+	versionStamp   = "0.1.0-dev"
+	commitStamp    = "unknown"
+	branchStamp    = "unknown"
+	setVersionOnce sync.Once
 )
 
 func run(ctx context.Context, args []string) error {
-	version.Version = versionStamp
-	version.Commit = commitStamp
-	version.Branch = branchStamp
+	setVersionOnce.Do(func() {
+		version.Version = versionStamp
+		version.Commit = commitStamp
+		version.Branch = branchStamp
+	})
 	if len(args) > 1 && args[1] == "version" {
 		fmt.Println("iazio-harness-api " + version.Informational())
 		return nil

@@ -69,8 +69,8 @@ func BoolPtr(b bool) *bool {
 }
 
 // IsTrackingLatest determines if the tool should auto-advance to latest upstream releases.
-// If track_latest was omitted in storage (nil, legacy rows), it migrates baseline tools
-// in default/generic profiles or unpinned targets to true (R2). Explicit false is strictly preserved.
+// If track_latest was omitted in storage (nil, legacy rows), it defaults to tracking latest for
+// all tools in default/generic profiles or unpinned targets regardless of tool tier. Explicit false is strictly preserved.
 func (t ProfileTool) IsTrackingLatest(isDefaultProfile bool) bool {
 	if t.TrackLatest != nil {
 		return *t.TrackLatest
@@ -78,7 +78,7 @@ func (t ProfileTool) IsTrackingLatest(isDefaultProfile bool) bool {
 	if t.TargetVersion == "" || t.TargetVersion == "latest" {
 		return true
 	}
-	if isDefaultProfile && (t.Tier == "baseline" || t.Tier == "") {
+	if isDefaultProfile {
 		return true
 	}
 	return false

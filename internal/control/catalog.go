@@ -54,16 +54,21 @@ func (e *Engine) GetPrompt(id string) (Prompt, bool) {
 }
 
 // QueueToolUpdate registers an update command for tools on the given host.
-func (e *Engine) QueueToolUpdate(hostID string, tools []string, force bool) error {
+func (e *Engine) QueueToolUpdate(hostID string, tools []string, force bool, targetVersion ...string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	h, ok := e.hosts[hostID]
 	if !ok {
 		return ErrNotFound
 	}
+	var tv string
+	if len(targetVersion) > 0 {
+		tv = targetVersion[0]
+	}
 	h.PendingToolUpdate = &PendingToolUpdate{
-		Tools: tools,
-		Force: force,
+		Tools:         tools,
+		Force:         force,
+		TargetVersion: tv,
 	}
 	return nil
 }
