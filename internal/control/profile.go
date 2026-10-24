@@ -158,17 +158,24 @@ func (e *Engine) UpdateProfileTools(name string, updater func(tools []ProfileToo
 		return nil, false, ErrProfileNotFound
 	}
 
-	newTools, configChanged := updater(p.Tools)
-	p.Tools = newTools
+	clonedTools := make([]ProfileTool, len(p.Tools))
+	copy(clonedTools, p.Tools)
+
+	newTools, configChanged := updater(clonedTools)
 
 	if configChanged {
-		p.UpdatedAt = e.now()
+		candidate := *p
+		candidate.Tools = newTools
+		candidate.UpdatedAt = e.now()
 		if e.OnSaveProfile != nil {
-			if err := e.OnSaveProfile(*p); err != nil {
+			if err := e.OnSaveProfile(candidate); err != nil {
 				return nil, false, fmt.Errorf("persist profile %s: %w", name, err)
 			}
 		}
+		p.UpdatedAt = candidate.UpdatedAt
 	}
+
+	p.Tools = newTools
 
 	cp := *p
 	if len(p.Tools) > 0 {

@@ -341,6 +341,12 @@ type RepoRuntimeStatus struct {
 	Alias                string    `json:"alias,omitempty"`
 	IsClean              bool      `json:"is_clean"`
 	Branch               string    `json:"branch,omitempty"`
+	HeadSHA              string    `json:"head_sha,omitempty"`
+	DirtyFilesCount      int       `json:"dirty_files_count"`
+	UntrackedFilesCount  int       `json:"untracked_files_count"`
+	Ahead                int       `json:"ahead"`
+	Behind               int       `json:"behind"`
+	HasActiveGitLock     bool      `json:"has_active_git_lock"`
 	Porcelain            string    `json:"porcelain,omitempty"`
 	SubmodulesClean      bool      `json:"submodules_clean"`
 	DirtySubmodules      []string  `json:"dirty_submodules,omitempty"`
@@ -521,6 +527,10 @@ type Host struct {
 	Tools               []Tool
 	PendingToolUpdate   *PendingToolUpdate
 	PendingCommands     []CommandEnvelope
+	FleetGitClean       bool
+	HarnessActive       bool
+	FleetCheckedAt      *time.Time
+	RepoStatuses        map[string]RepoRuntimeStatus
 }
 
 // PingAck is a live acknowledgment from an agent responding to a PING command.
@@ -1698,6 +1708,25 @@ func (e *Engine) DeregisterRepoStatusWaiter(key string) {
 func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeStatus) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	h, hasHost := e.hosts[hostID]
+	if hasHost && h != nil {
+		if h.RepoStatuses == nil {
+			h.RepoStatuses = make(map[string]RepoRuntimeStatus)
+		}
+		allClean := true
+		now := time.Now().UTC()
+		for _, st := range statuses {
+			cleanPath := filepath.Clean(st.RepoPath)
+			h.RepoStatuses[cleanPath] = st
+			if !st.IsClean {
+				allClean = false
+			}
+		}
+		h.FleetGitClean = allClean
+		h.FleetCheckedAt = &now
+	}
+
 	for _, st := range statuses {
 		key := hostID + ":" + filepath.Clean(st.RepoPath)
 		if ch, ok := e.repoWaiters[key]; ok {

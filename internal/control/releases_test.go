@@ -860,3 +860,216 @@ func TestReleaseService_MultiToolAC1Fixtures(t *testing.T) {
 		}
 	}
 }
+
+func TestReleaseService_GenericBaselinePinnedVersionPreserved(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tag_name":     "0.0.492",
+			"html_url":     "https://github.com/viovy/autopilot-plugins-internal/releases/tag/0.0.492",
+			"published_at": time.Now().UTC().Format(time.RFC3339),
+		})
+	}))
+	defer ts.Close()
+
+	svc := NewReleaseService()
+	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
+
+	e := NewEngine(time.Now)
+	e.Releases = svc
+
+	// Generic default profile with an operator pin on a baseline tool (TrackLatest == false)
+	_, _ = e.UpsertProfile(DistributionProfile{
+		Name:      "generic",
+		IsDefault: true,
+		Tools: []ProfileTool{
+			{
+				Name:          "autopilot-plugins-internal",
+				Repository:    "viovy/autopilot-plugins-internal",
+				Tier:          "baseline",
+				TargetVersion: "0.0.480",
+				TrackLatest:   false,
+			},
+		},
+	})
+
+	adv := svc.SyncAllProfiles(context.Background(), e, nil)
+	if adv != 0 {
+		t.Fatalf("expected 0 tools advanced when pinned with TrackLatest=false, got %d", adv)
+	}
+
+	p, err := e.GetProfile("generic")
+	if err != nil {
+		t.Fatalf("failed to get profile: %v", err)
+	}
+	if p.Tools[0].TargetVersion != "0.0.480" {
+		t.Fatalf("expected operator pin 0.0.480 to be preserved, got %s", p.Tools[0].TargetVersion)
+	}
+	if p.Tools[0].TrackLatest {
+		t.Fatalf("expected TrackLatest to remain false for operator pin")
+	}
+	if p.Tools[0].LatestAvailableVersion != "0.0.492" {
+		t.Fatalf("expected LatestAvailableVersion to be updated to 0.0.492, got %s", p.Tools[0].LatestAvailableVersion)
+	}
+}
+
+func TestReleaseService_PerTickRepoDeduplication(t *testing.T) {
+	var requestCount int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "shared-tool") {
+			requestCount++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tag_name":     "1.0.0",
+				"html_url":     "https://github.com/viovy/shared-tool/releases/tag/1.0.0",
+				"published_at": time.Now().UTC().Format(time.RFC3339),
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	svc := NewReleaseService()
+	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
+
+	e := NewEngine(time.Now)
+	e.Releases = svc
+
+	// Two distinct profiles sharing the same upstream repository
+	_, _ = e.UpsertProfile(DistributionProfile{
+		Name: "profile-a",
+		Tools: []ProfileTool{
+			{Name: "shared-tool", Repository: "viovy/shared-tool", TargetVersion: "latest"},
+		},
+	})
+	_, _ = e.UpsertProfile(DistributionProfile{
+		Name: "profile-b",
+		Tools: []ProfileTool{
+			{Name: "shared-tool", Repository: "viovy/shared-tool", TargetVersion: "latest"},
+		},
+	})
+
+	svc.SyncAllProfiles(context.Background(), e, nil)
+	if requestCount != 1 {
+		t.Fatalf("expected exactly 1 upstream request across multiple profiles for shared repo, got %d", requestCount)
+	}
+}
+
+func TestReleaseService_NegativeCaching404(t *testing.T) {
+	var requestCount int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	svc := NewReleaseService()
+	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
+
+	// First request: hits upstream 404
+	_, _ = svc.GetToolRelease(context.Background(), "viovy/missing-repo", "missing-repo", "latest")
+	if requestCount != 3 { // latest, releases list, tags list fallbacks
+		t.Logf("first lookup hit upstream %d times across fallbacks", requestCount)
+	}
+	initialHits := requestCount
+
+	// Second request: served from negative cache, upstream hit count must NOT increase
+	_, _ = svc.GetToolRelease(context.Background(), "viovy/missing-repo", "missing-repo", "latest")
+	if requestCount != initialHits {
+		t.Fatalf("expected negative cache hit with 0 additional upstream requests, got %d", requestCount-initialHits)
+	}
+}
+
+func TestEngine_UpdateProfileTools_PersistFailureDoesNotMutateMemory(t *testing.T) {
+	e := NewEngine(time.Now)
+	_, _ = e.UpsertProfile(DistributionProfile{
+		Name: "persist-fail-profile",
+		Tools: []ProfileTool{
+			{Name: "tool1", Repository: "viovy/tool1", TargetVersion: "1.0.0"},
+		},
+	})
+
+	// Configure OnSaveProfile to simulate a storage/database failure
+	e.OnSaveProfile = func(p DistributionProfile) error {
+		return errors.New("simulated disk storage full")
+	}
+
+	_, _, err := e.UpdateProfileTools("persist-fail-profile", func(tools []ProfileTool) ([]ProfileTool, bool) {
+		tools[0].TargetVersion = "2.0.0"
+		return tools, true
+	})
+	if err == nil {
+		t.Fatalf("expected error from UpdateProfileTools when OnSaveProfile fails")
+	}
+
+	// In-memory profile must NOT have been updated to 2.0.0 (E3)
+	p, _ := e.GetProfile("persist-fail-profile")
+	if p.Tools[0].TargetVersion != "1.0.0" {
+		t.Fatalf("expected in-memory TargetVersion to remain 1.0.0 on save error, got %s", p.Tools[0].TargetVersion)
+	}
+}
+
+func TestEngine_RepoRuntimeStatusTelemetryAndFleetCleanAggregation(t *testing.T) {
+	e := NewEngine(time.Now)
+	hostID := "host-alpha"
+	e.RegisterHost(hostID, "linux", "generic")
+
+	// Update with one dirty repo
+	e.UpdateRepoRuntimeStatus(hostID, []RepoRuntimeStatus{
+		{
+			RepoPath:            "/workspace/repo-1",
+			IsClean:             true,
+			Branch:              "main",
+			HeadSHA:             "abcdef1234",
+			DirtyFilesCount:     0,
+			UntrackedFilesCount: 0,
+		},
+		{
+			RepoPath:            "/workspace/repo-2",
+			IsClean:             false,
+			Branch:              "feature",
+			HeadSHA:             "9876543210",
+			DirtyFilesCount:     3,
+			UntrackedFilesCount: 1,
+			Ahead:               2,
+			Behind:              0,
+			HasActiveGitLock:    false,
+		},
+	})
+
+	h, ok := e.hosts[hostID]
+	if !ok {
+		t.Fatalf("host not found")
+	}
+	if h.FleetGitClean {
+		t.Fatalf("expected FleetGitClean to be false when repo-2 is dirty")
+	}
+	if h.FleetCheckedAt == nil {
+		t.Fatalf("expected FleetCheckedAt to be set")
+	}
+	st2 := h.RepoStatuses["/workspace/repo-2"]
+	if st2.DirtyFilesCount != 3 || st2.UntrackedFilesCount != 1 || st2.Ahead != 2 {
+		t.Fatalf("expected repo-2 telemetry to be ingested, got %+v", st2)
+	}
+
+	// Update repo-2 to clean
+	e.UpdateRepoRuntimeStatus(hostID, []RepoRuntimeStatus{
+		{
+			RepoPath:            "/workspace/repo-2",
+			IsClean:             true,
+			Branch:              "feature",
+			HeadSHA:             "9876543210",
+			DirtyFilesCount:     0,
+			UntrackedFilesCount: 0,
+		},
+	})
+
+	hClean := e.hosts[hostID]
+	if !hClean.FleetGitClean {
+		t.Fatalf("expected FleetGitClean to be true when all repos are clean")
+	}
+}

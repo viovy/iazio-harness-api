@@ -349,6 +349,20 @@ func (s *ReleaseService) TestCredential(ctx context.Context, token string) (GitC
 	}, nil
 }
 
+var (
+	warnedReposMu sync.Mutex
+	warnedRepos   = make(map[string]bool)
+)
+
+func warnUnauthenticatedOnce(repo string) {
+	warnedReposMu.Lock()
+	defer warnedReposMu.Unlock()
+	if !warnedRepos[repo] {
+		warnedRepos[repo] = true
+		log.Printf("[ReleaseService] WARN: unauthenticated GitHub release requests for %s (rate limit: 60 req/hr). Set GITHUB_TOKEN or configure git credentials.", repo)
+	}
+}
+
 func (s *ReleaseService) tokenForRepo(repo string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -370,7 +384,7 @@ func (s *ReleaseService) tokenForRepo(repo string) string {
 	if tok := os.Getenv("GH_TOKEN"); tok != "" {
 		return tok
 	}
-	log.Printf("[ReleaseService] WARN: unauthenticated GitHub release requests for %s (rate limit: 60 req/hr). Set GITHUB_TOKEN or configure git credentials.", repo)
+	warnUnauthenticatedOnce(repo)
 	return ""
 }
 
@@ -579,6 +593,26 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 	if lastErr != nil {
 		errToReturn = fmt.Errorf("lookup release for %s: %w", repo, lastErr)
 	}
+
+	// Negatively cache 404/not found errors for 5 minutes (E4)
+	if lastErr != nil && strings.Contains(lastErr.Error(), "404") {
+		s.mu.Lock()
+		s.cache[cacheKey] = cachedRelease{
+			release: ToolRelease{
+				Name:           toolName,
+				Repository:     repo,
+				LatestVersion:  fallbackVer,
+				TargetVersion:  targetVersion,
+				TagName:        fallbackVer,
+				LastCheckedAt:  now,
+				LastSyncStatus: "error",
+				Error:          errMsg,
+			},
+			expiresAt: now.Add(5 * time.Minute),
+		}
+		s.mu.Unlock()
+	}
+
 	return ToolRelease{
 		Name:           toolName,
 		Repository:     repo,
@@ -923,6 +957,16 @@ func (s *ReleaseService) SyncProfile(
 	profileName string,
 	onReleaseDetected ReleaseNotificationCallback,
 ) (int, error) {
+	return s.syncProfileWithCachePolicy(ctx, e, profileName, onReleaseDetected, true)
+}
+
+func (s *ReleaseService) syncProfileWithCachePolicy(
+	ctx context.Context,
+	e *Engine,
+	profileName string,
+	onReleaseDetected ReleaseNotificationCallback,
+	invalidate bool,
+) (int, error) {
 	if e == nil {
 		return 0, fmt.Errorf("engine required")
 	}
@@ -931,7 +975,12 @@ func (s *ReleaseService) SyncProfile(
 		return 0, err
 	}
 
-	releases, err := s.RefreshProfileReleases(ctx, *p)
+	var releases []ToolRelease
+	if invalidate {
+		releases, err = s.RefreshProfileReleases(ctx, *p)
+	} else {
+		releases, err = s.GetProfileReleases(ctx, *p)
+	}
 	if err != nil && len(releases) == 0 {
 		return 0, err
 	}
@@ -980,11 +1029,8 @@ func (s *ReleaseService) SyncProfile(
 						// Determine if tool is tracking latest:
 						// 1. Explicit TrackLatest == true
 						// 2. TargetVersion is empty or "latest"
-						// 3. Generic/default baseline tool without explicit override
+						// Operator pins (TrackLatest == false with explicit version) are strictly preserved (E2)
 						isTrackingLatest := updatedTools[i].TrackLatest || oldTarget == "" || oldTarget == "latest"
-						if !isTrackingLatest && (p.IsDefault || profileName == "generic") && updatedTools[i].Tier == "baseline" {
-							isTrackingLatest = true
-						}
 
 						if isTrackingLatest {
 							// Maintain tracking intent across auto-advances (N1)
@@ -1027,6 +1073,7 @@ func (s *ReleaseService) SyncProfile(
 }
 
 // SyncAllProfiles iterates all registered distribution profiles and updates tool release information.
+// It invalidates unique repositories once at the start of the tick and deduplicates requests across profiles (E4).
 // Returns the number of tools whose target version was advanced.
 func (s *ReleaseService) SyncAllProfiles(ctx context.Context, e *Engine, onReleaseDetected ReleaseNotificationCallback) int {
 	if e == nil {
@@ -1035,9 +1082,16 @@ func (s *ReleaseService) SyncAllProfiles(ctx context.Context, e *Engine, onRelea
 	profiles := e.ListProfiles()
 	totalAdvanced := 0
 
+	// Deduplicate unique repositories across all profiles and invalidate once per tick (E4)
 	for _, p := range profiles {
-		adv, err := s.SyncProfile(ctx, e, p.Name, onReleaseDetected)
-		if err == nil {
+		s.InvalidateProfileCache(p)
+	}
+
+	for _, p := range profiles {
+		adv, err := s.syncProfileWithCachePolicy(ctx, e, p.Name, onReleaseDetected, false)
+		if err != nil {
+			log.Printf("[ReleaseService] ERROR syncing profile %s: %v", p.Name, err)
+		} else {
 			totalAdvanced += adv
 		}
 	}
