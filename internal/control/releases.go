@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,13 +16,94 @@ import (
 
 // ToolRelease represents the latest release information for a tool.
 type ToolRelease struct {
-	Name          string    `json:"name"`
-	Repository    string    `json:"repository"`
-	LatestVersion string    `json:"latest_version"`
-	TagName       string    `json:"tag_name"`
-	PublishedAt   time.Time `json:"published_at,omitempty"`
-	HTMLURL       string    `json:"html_url,omitempty"`
-	Error         string    `json:"error,omitempty"`
+	Name           string    `json:"name"`
+	Repository     string    `json:"repository"`
+	LatestVersion  string    `json:"latest_version"`
+	TargetVersion  string    `json:"target_version,omitempty"`
+	TagName        string    `json:"tag_name"`
+	PublishedAt    time.Time `json:"published_at,omitempty"`
+	HTMLURL        string    `json:"html_url,omitempty"`
+	LastCheckedAt  time.Time `json:"last_checked_at,omitempty"`
+	LastSyncStatus string    `json:"last_sync_status,omitempty"`
+	Error          string    `json:"error,omitempty"`
+}
+
+type semverTuple struct {
+	Major      int
+	Minor      int
+	Patch      int
+	PreRelease string
+	Raw        string
+}
+
+func parseSemVer(tag string) (semverTuple, bool) {
+	clean := strings.TrimSpace(tag)
+	clean = strings.TrimPrefix(clean, "v")
+	clean = strings.TrimPrefix(clean, "V")
+	if clean == "" {
+		return semverTuple{}, false
+	}
+	parts := strings.SplitN(clean, "-", 2)
+	nums := strings.Split(parts[0], ".")
+	if len(nums) < 2 {
+		return semverTuple{}, false
+	}
+	major, err1 := strconv.Atoi(nums[0])
+	minor, err2 := strconv.Atoi(nums[1])
+	patch := 0
+	var err3 error
+	if len(nums) >= 3 {
+		patch, err3 = strconv.Atoi(nums[2])
+	}
+	if err1 != nil || err2 != nil || err3 != nil {
+		return semverTuple{}, false
+	}
+	pre := ""
+	if len(parts) > 1 {
+		pre = parts[1]
+	}
+	return semverTuple{
+		Major:      major,
+		Minor:      minor,
+		Patch:      patch,
+		PreRelease: pre,
+		Raw:        clean,
+	}, true
+}
+
+func compareSemVer(v1, v2 string) int {
+	s1, ok1 := parseSemVer(v1)
+	s2, ok2 := parseSemVer(v2)
+	if !ok1 && !ok2 {
+		return strings.Compare(v1, v2)
+	}
+	if !ok1 {
+		return -1
+	}
+	if !ok2 {
+		return 1
+	}
+	if s1.Major != s2.Major {
+		return s1.Major - s2.Major
+	}
+	if s1.Minor != s2.Minor {
+		return s1.Minor - s2.Minor
+	}
+	if s1.Patch != s2.Patch {
+		return s1.Patch - s2.Patch
+	}
+	if s1.PreRelease == "" && s2.PreRelease != "" {
+		return 1
+	}
+	if s1.PreRelease != "" && s2.PreRelease == "" {
+		return -1
+	}
+	return strings.Compare(s1.PreRelease, s2.PreRelease)
+}
+
+// CompareSemVer compares two SemVer strings, returning >0 if v1 > v2, <0 if v1 < v2, and 0 if equal.
+func CompareSemVer(v1, v2 string) int {
+	return compareSemVer(v1, v2)
 }
 
 type cachedRelease struct {
@@ -56,6 +138,7 @@ type ReleaseService struct {
 	now         func() time.Time
 	token       string
 	store       GitCredentialStore
+	baseURL     string
 }
 
 // NewReleaseService creates a ReleaseService with in-memory caching.
@@ -75,7 +158,15 @@ func NewReleaseService() *ReleaseService {
 		client:      &http.Client{Timeout: 10 * time.Second},
 		now:         time.Now,
 		token:       token,
+		baseURL:     "https://api.github.com",
 	}
+}
+
+// SetBaseURL overrides the GitHub API base URL (useful for testing against mock servers).
+func (s *ReleaseService) SetBaseURL(u string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.baseURL = strings.TrimSuffix(u, "/")
 }
 
 // SetStore attaches a persistence store and loads existing credentials into memory.
@@ -286,11 +377,14 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 	if !strings.Contains(repo, "/") {
 		repo = "viovy/" + repo
 	}
-	if targetVersion == "" {
-		targetVersion = "latest"
-	}
+
+	isLatestLookup := targetVersion == "" || targetVersion == "latest"
 
 	cacheKey := repo + ":" + targetVersion
+	if isLatestLookup {
+		cacheKey = repo + ":latest"
+	}
+
 	s.mu.RLock()
 	cached, ok := s.cache[cacheKey]
 	s.mu.RUnlock()
@@ -299,23 +393,30 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 	if ok && now.Before(cached.expiresAt) {
 		r := cached.release
 		r.Name = toolName
+		if !isLatestLookup {
+			r.TargetVersion = targetVersion
+		}
 		return r, nil
 	}
 
 	token := s.tokenForRepo(repo)
+	base := s.baseURL
+	if base == "" {
+		base = "https://api.github.com"
+	}
 
 	candidateURLs := make([]string, 0, 3)
-	if targetVersion != "" && targetVersion != "latest" {
+	if !isLatestLookup {
 		tag := targetVersion
 		bareTag := strings.TrimPrefix(tag, "v")
 		vTag := "v" + bareTag
 		// Check both "v"-prefixed and bare tag names
 		candidateURLs = append(candidateURLs,
-			fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", repo, vTag),
-			fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", repo, bareTag),
+			fmt.Sprintf("%s/repos/%s/releases/tags/%s", base, repo, vTag),
+			fmt.Sprintf("%s/repos/%s/releases/tags/%s", base, repo, bareTag),
 		)
 	} else {
-		candidateURLs = append(candidateURLs, fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo))
+		candidateURLs = append(candidateURLs, fmt.Sprintf("%s/repos/%s/releases/latest", base, repo))
 	}
 
 	var cachedEtag string
@@ -333,14 +434,27 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 			s.mu.Unlock()
 			r := cached.release
 			r.Name = toolName
+			r.LastCheckedAt = now
+			r.LastSyncStatus = "not_modified"
+			if !isLatestLookup {
+				r.TargetVersion = targetVersion
+			}
 			return r, nil
 		}
 		if err == nil && rel.LatestVersion != "" {
+			rel.LastCheckedAt = now
+			rel.LastSyncStatus = "ok"
+			if !isLatestLookup {
+				rel.TargetVersion = targetVersion
+			}
 			s.mu.Lock()
 			s.cache[cacheKey] = cachedRelease{
 				release:   rel,
 				etag:      newEtag,
 				expiresAt: now.Add(10 * time.Minute),
+			}
+			if isLatestLookup {
+				s.cache[repo+":latest"] = s.cache[cacheKey]
 			}
 			s.mu.Unlock()
 			return rel, nil
@@ -350,14 +464,22 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 		}
 	}
 
-	// Fallback 1: check list of all releases (e.g. if latest flag not set or tag lookup returned 404)
-	listURL := fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=5", repo)
+	// Fallback 1: check list of all releases with SemVer sorting
+	listURL := fmt.Sprintf("%s/repos/%s/releases?per_page=15", base, repo)
 	listRel, listErr := s.fetchReleaseListURL(ctx, listURL, repo, toolName, token)
 	if listErr == nil && listRel.LatestVersion != "" {
+		listRel.LastCheckedAt = now
+		listRel.LastSyncStatus = "ok"
+		if !isLatestLookup {
+			listRel.TargetVersion = targetVersion
+		}
 		s.mu.Lock()
 		s.cache[cacheKey] = cachedRelease{
 			release:   listRel,
 			expiresAt: now.Add(10 * time.Minute),
+		}
+		if isLatestLookup {
+			s.cache[repo+":latest"] = s.cache[cacheKey]
 		}
 		s.mu.Unlock()
 		return listRel, nil
@@ -366,14 +488,22 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 		lastErr = listErr
 	}
 
-	// Fallback 2: check repository tags
-	tagsURL := fmt.Sprintf("https://api.github.com/repos/%s/tags?per_page=5", repo)
+	// Fallback 2: check repository tags with SemVer sorting
+	tagsURL := fmt.Sprintf("%s/repos/%s/tags?per_page=15", base, repo)
 	tagRel, tagErr := s.fetchTagsURL(ctx, tagsURL, repo, toolName, token)
 	if tagErr == nil && tagRel.LatestVersion != "" {
+		tagRel.LastCheckedAt = now
+		tagRel.LastSyncStatus = "ok"
+		if !isLatestLookup {
+			tagRel.TargetVersion = targetVersion
+		}
 		s.mu.Lock()
 		s.cache[cacheKey] = cachedRelease{
 			release:   tagRel,
 			expiresAt: now.Add(10 * time.Minute),
+		}
+		if isLatestLookup {
+			s.cache[repo+":latest"] = s.cache[cacheKey]
 		}
 		s.mu.Unlock()
 		return tagRel, nil
@@ -396,11 +526,14 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 		errToReturn = fmt.Errorf("lookup release for %s: %w", repo, lastErr)
 	}
 	return ToolRelease{
-		Name:          toolName,
-		Repository:    repo,
-		LatestVersion: fallbackVer,
-		TagName:       fallbackVer,
-		Error:         errMsg,
+		Name:           toolName,
+		Repository:     repo,
+		LatestVersion:  fallbackVer,
+		TargetVersion:  targetVersion,
+		TagName:        fallbackVer,
+		LastCheckedAt:  now,
+		LastSyncStatus: "error",
+		Error:          errMsg,
 	}, errToReturn
 }
 
@@ -475,23 +608,42 @@ func (s *ReleaseService) fetchReleaseListURL(ctx context.Context, url, repo, too
 		return ToolRelease{Name: toolName, Repository: repo}, fmt.Errorf("status %d", resp.StatusCode)
 	}
 
-	var list []struct {
+	type ghReleaseItem struct {
 		TagName     string    `json:"tag_name"`
 		HTMLURL     string    `json:"html_url"`
 		PublishedAt time.Time `json:"published_at"`
+		Draft       bool      `json:"draft"`
+		Prerelease  bool      `json:"prerelease"`
 	}
+	var list []ghReleaseItem
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil || len(list) == 0 {
 		return ToolRelease{Name: toolName, Repository: repo}, fmt.Errorf("no releases")
 	}
 
-	ver := strings.TrimPrefix(list[0].TagName, "v")
+	var candidates []ghReleaseItem
+	for _, item := range list {
+		if !item.Draft {
+			candidates = append(candidates, item)
+		}
+	}
+	if len(candidates) == 0 {
+		candidates = list
+	}
+
+	// Sort descending by SemVer
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return compareSemVer(candidates[i].TagName, candidates[j].TagName) > 0
+	})
+
+	best := candidates[0]
+	ver := strings.TrimPrefix(best.TagName, "v")
 	return ToolRelease{
 		Name:          toolName,
 		Repository:    repo,
 		LatestVersion: ver,
-		TagName:       list[0].TagName,
-		PublishedAt:   list[0].PublishedAt,
-		HTMLURL:       list[0].HTMLURL,
+		TagName:       best.TagName,
+		PublishedAt:   best.PublishedAt,
+		HTMLURL:       best.HTMLURL,
 	}, nil
 }
 
@@ -523,13 +675,18 @@ func (s *ReleaseService) fetchTagsURL(ctx context.Context, url, repo, toolName, 
 		return ToolRelease{Name: toolName, Repository: repo}, fmt.Errorf("no tags")
 	}
 
-	ver := strings.TrimPrefix(tags[0].Name, "v")
+	sort.SliceStable(tags, func(i, j int) bool {
+		return compareSemVer(tags[i].Name, tags[j].Name) > 0
+	})
+
+	best := tags[0]
+	ver := strings.TrimPrefix(best.Name, "v")
 	return ToolRelease{
 		Name:          toolName,
 		Repository:    repo,
 		LatestVersion: ver,
-		TagName:       tags[0].Name,
-		HTMLURL:       fmt.Sprintf("https://github.com/%s/releases/tag/%s", repo, tags[0].Name),
+		TagName:       best.Name,
+		HTMLURL:       fmt.Sprintf("https://github.com/%s/releases/tag/%s", repo, best.Name),
 	}, nil
 }
 
@@ -542,10 +699,12 @@ func (s *ReleaseService) GetProfileReleases(ctx context.Context, p DistributionP
 		if repo == "" {
 			repo = "viovy/" + t.Name
 		}
-		rel, err := s.GetToolRelease(ctx, repo, t.Name, t.TargetVersion)
+		// Query the latest upstream release for the tool
+		rel, err := s.GetToolRelease(ctx, repo, t.Name, "latest")
+		rel.TargetVersion = t.TargetVersion
 		if err != nil {
 			rel.Error = err.Error()
-			if rel.LatestVersion == "" {
+			if rel.LatestVersion == "" || rel.LatestVersion == "0.0.0" {
 				rel.LatestVersion = t.TargetVersion
 			}
 			errs = append(errs, fmt.Sprintf("%s (%s): %v", t.Name, repo, err))
@@ -596,5 +755,87 @@ func (s *ReleaseService) SetCachedRelease(repo, version string, release ToolRele
 	s.cache[repo+":"+version] = cachedRelease{
 		release:   release,
 		expiresAt: s.now().Add(ttl),
+	}
+	if version != "latest" {
+		s.cache[repo+":latest"] = cachedRelease{
+			release:   release,
+			expiresAt: s.now().Add(ttl),
+		}
+	}
+}
+
+// ReleaseNotificationCallback is invoked when a new release is detected and profile updated.
+type ReleaseNotificationCallback func(profileName string, tool ProfileTool, oldVersion, newVersion string)
+
+// StartBackgroundSync runs a background worker polling GitHub releases and auto-advancing tracking profiles.
+func (s *ReleaseService) StartBackgroundSync(ctx context.Context, e *Engine, interval time.Duration, onReleaseDetected ReleaseNotificationCallback) {
+	if interval <= 0 {
+		interval = 60 * time.Second
+	}
+	go func() {
+		// Initial sync after 2 seconds
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+			s.SyncAllProfiles(ctx, e, onReleaseDetected)
+		}
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.SyncAllProfiles(ctx, e, onReleaseDetected)
+			}
+		}
+	}()
+}
+
+// SyncAllProfiles iterates all registered distribution profiles and updates tool release information.
+func (s *ReleaseService) SyncAllProfiles(ctx context.Context, e *Engine, onReleaseDetected ReleaseNotificationCallback) {
+	if e == nil {
+		return
+	}
+	profiles := e.ListProfiles()
+	for _, p := range profiles {
+		releases, err := s.RefreshProfileReleases(ctx, p)
+		if err != nil && len(releases) == 0 {
+			continue
+		}
+		updated := false
+		for i := range p.Tools {
+			toolName := strings.ToLower(p.Tools[i].Name)
+			repoName := strings.ToLower(p.Tools[i].Repository)
+			for _, rel := range releases {
+				relTool := strings.ToLower(rel.Name)
+				relRepo := strings.ToLower(rel.Repository)
+				if (relTool == toolName || relRepo == repoName || strings.HasSuffix(relRepo, "/"+toolName)) &&
+					rel.LatestVersion != "" && rel.Error == "" {
+					oldTarget := p.Tools[i].TargetVersion
+					p.Tools[i].LatestAvailableVersion = rel.LatestVersion
+					p.Tools[i].LatestReleaseURL = rel.HTMLURL
+					p.Tools[i].LatestPublishedAt = rel.PublishedAt
+					p.Tools[i].LastCheckedAt = s.now()
+					p.Tools[i].LastSyncStatus = "ok"
+					p.Tools[i].LastSyncError = ""
+
+					// Auto-advance target_version if target is empty, "latest", or older than latest release
+					if oldTarget == "" || oldTarget == "latest" || compareSemVer(rel.LatestVersion, oldTarget) > 0 {
+						p.Tools[i].TargetVersion = rel.LatestVersion
+						updated = true
+						if onReleaseDetected != nil {
+							onReleaseDetected(p.Name, p.Tools[i], oldTarget, rel.LatestVersion)
+						}
+					}
+					break
+				}
+			}
+		}
+		if updated {
+			_, _ = e.UpsertProfile(p)
+		}
 	}
 }

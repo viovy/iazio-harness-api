@@ -46,13 +46,19 @@ type ProfileInstallRootPaths struct {
 }
 
 type ProfileTool struct {
-	Name          string       `json:"name" yaml:"name"`
-	Repository    string       `json:"repository" yaml:"repository"`
-	BinaryName    string       `json:"binary_name" yaml:"binary_name"`
-	Description   string       `json:"description" yaml:"description"`
-	Tier          string       `json:"tier" yaml:"tier"` // baseline | optional
-	TargetVersion string       `json:"target_version,omitempty" yaml:"target_version,omitempty"`
-	Service       *ToolService `json:"service,omitempty" yaml:"service,omitempty"`
+	Name                   string       `json:"name" yaml:"name"`
+	Repository             string       `json:"repository" yaml:"repository"`
+	BinaryName             string       `json:"binary_name" yaml:"binary_name"`
+	Description            string       `json:"description" yaml:"description"`
+	Tier                   string       `json:"tier" yaml:"tier"` // baseline | optional
+	TargetVersion          string       `json:"target_version,omitempty" yaml:"target_version,omitempty"`
+	LatestAvailableVersion string       `json:"latest_available_version,omitempty" yaml:"latest_available_version,omitempty"`
+	LatestReleaseURL       string       `json:"latest_release_url,omitempty" yaml:"latest_release_url,omitempty"`
+	LatestPublishedAt      time.Time    `json:"latest_published_at,omitempty" yaml:"latest_published_at,omitempty"`
+	LastCheckedAt          time.Time    `json:"last_checked_at,omitempty" yaml:"last_checked_at,omitempty"`
+	LastSyncStatus         string       `json:"last_sync_status,omitempty" yaml:"last_sync_status,omitempty"`
+	LastSyncError          string       `json:"last_sync_error,omitempty" yaml:"last_sync_error,omitempty"`
+	Service                *ToolService `json:"service,omitempty" yaml:"service,omitempty"`
 }
 
 type ToolService struct {

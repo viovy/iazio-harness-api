@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -340,4 +341,144 @@ func TestControl_FleetStatusAndCommandsCoverage(t *testing.T) {
 	e.Releases.SetCachedRelease("viovy/iazio-agent", "latest", ToolRelease{Name: "iazio-agent", TagName: "v1.0.0"}, time.Hour)
 	rels, _ := e.Releases.RefreshProfileReleases(context.Background(), p)
 	_ = rels
+}
+
+func TestSemVerComparisonAndSorting(t *testing.T) {
+	if compareSemVer("0.0.492", "0.0.482") <= 0 {
+		t.Errorf("expected 0.0.492 > 0.0.482")
+	}
+	if compareSemVer("0.0.482", "0.0.492") >= 0 {
+		t.Errorf("expected 0.0.482 < 0.0.492")
+	}
+	if compareSemVer("v0.0.492", "0.0.492") != 0 {
+		t.Errorf("expected v0.0.492 == 0.0.492")
+	}
+	if compareSemVer("1.0.0", "0.9.99") <= 0 {
+		t.Errorf("expected 1.0.0 > 0.9.99")
+	}
+	if compareSemVer("1.0.0", "1.0.0-rc1") <= 0 {
+		t.Errorf("expected 1.0.0 > 1.0.0-rc1")
+	}
+	if CompareSemVer("0.0.492", "0.0.482") <= 0 {
+		t.Errorf("expected exported CompareSemVer 0.0.492 > 0.0.482")
+	}
+}
+
+func TestReleaseService_SemVerSortedReleasesAndTagsFallback(t *testing.T) {
+	// Mock server returning releases where 0.0.492 is returned along with 0.0.482 out of order
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/releases/latest"):
+			w.WriteHeader(http.StatusNotFound) // Simulate latest release object missing
+		case strings.HasSuffix(r.URL.Path, "/releases"):
+			// Return releases list where 0.0.482 is listed before 0.0.492 to verify SemVer sorting
+			json.NewEncoder(w).Encode([]map[string]any{
+				{"tag_name": "0.0.482", "html_url": "https://github.com/viovy/autopilot-plugins-internal/releases/tag/0.0.482", "draft": false},
+				{"tag_name": "0.0.492", "html_url": "https://github.com/viovy/autopilot-plugins-internal/releases/tag/0.0.492", "draft": false},
+				{"tag_name": "0.0.493-draft", "html_url": "draft-url", "draft": true},
+			})
+		case strings.HasSuffix(r.URL.Path, "/tags"):
+			json.NewEncoder(w).Encode([]map[string]any{
+				{"name": "0.0.482"},
+				{"name": "0.0.492"},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	svc := NewReleaseService()
+	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
+
+	// Calling GetToolRelease with "latest" should sort SemVer and pick 0.0.492
+	rel, err := svc.GetToolRelease(context.Background(), "viovy/autopilot-plugins-internal", "autopilot-fleet", "latest")
+	if err != nil {
+		t.Fatalf("unexpected error fetching release: %v", err)
+	}
+	if rel.LatestVersion != "0.0.492" {
+		t.Fatalf("expected latest version 0.0.492, got %s", rel.LatestVersion)
+	}
+
+	// Profile with old target_version 0.0.482 must resolve LatestVersion as 0.0.492
+	p := DistributionProfile{
+		Name: "generic",
+		Tools: []ProfileTool{
+			{Name: "autopilot-fleet", Repository: "viovy/autopilot-plugins-internal", TargetVersion: "0.0.482"},
+		},
+	}
+	releases, err := svc.GetProfileReleases(context.Background(), p)
+	if err != nil {
+		t.Fatalf("GetProfileReleases failed: %v", err)
+	}
+	if len(releases) != 1 {
+		t.Fatalf("expected 1 release, got %d", len(releases))
+	}
+	if releases[0].LatestVersion != "0.0.492" {
+		t.Fatalf("expected LatestVersion 0.0.492, got %s", releases[0].LatestVersion)
+	}
+	if releases[0].TargetVersion != "0.0.482" {
+		t.Fatalf("expected TargetVersion 0.0.482, got %s", releases[0].TargetVersion)
+	}
+}
+
+func TestReleaseService_SyncAllProfiles_AutoAdvanceTargetVersion(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/releases/latest") {
+			json.NewEncoder(w).Encode(map[string]any{
+				"tag_name":     "0.0.492",
+				"html_url":     "https://github.com/viovy/autopilot-plugins-internal/releases/tag/0.0.492",
+				"published_at": time.Now().UTC().Format(time.RFC3339),
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	svc := NewReleaseService()
+	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
+
+	e := NewEngine(time.Now)
+	e.Releases = svc
+
+	_, err := e.UpsertProfile(DistributionProfile{
+		Name: "generic",
+		Tools: []ProfileTool{
+			{Name: "autopilot-fleet", Repository: "viovy/autopilot-plugins-internal", TargetVersion: "0.0.482"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("UpsertProfile failed: %v", err)
+	}
+
+	var detectedProfile, detectedTool, detectedOld, detectedNew string
+	svc.SyncAllProfiles(context.Background(), e, func(profileName string, tool ProfileTool, oldVer, newVer string) {
+		detectedProfile = profileName
+		detectedTool = tool.Name
+		detectedOld = oldVer
+		detectedNew = newVer
+	})
+
+	if detectedProfile != "generic" || detectedTool != "autopilot-fleet" {
+		t.Fatalf("expected notification for generic autopilot-fleet, got %s/%s", detectedProfile, detectedTool)
+	}
+	if detectedOld != "0.0.482" || detectedNew != "0.0.492" {
+		t.Fatalf("expected version advance 0.0.482 -> 0.0.492, got %s -> %s", detectedOld, detectedNew)
+	}
+
+	updatedProfile, _ := e.GetProfile("generic")
+	if updatedProfile.Tools[0].TargetVersion != "0.0.492" {
+		t.Fatalf("expected TargetVersion updated to 0.0.492, got %s", updatedProfile.Tools[0].TargetVersion)
+	}
+	if updatedProfile.Tools[0].LatestAvailableVersion != "0.0.492" {
+		t.Fatalf("expected LatestAvailableVersion 0.0.492, got %s", updatedProfile.Tools[0].LatestAvailableVersion)
+	}
+	if updatedProfile.Tools[0].LastSyncStatus != "ok" {
+		t.Fatalf("expected LastSyncStatus ok, got %s", updatedProfile.Tools[0].LastSyncStatus)
+	}
 }

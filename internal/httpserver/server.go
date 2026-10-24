@@ -300,6 +300,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/git-credentials/test", s.testGitCredentialPayload)
 	mux.HandleFunc("POST /v1/fleet/profiles/{name}/refresh", s.refreshProfileReleases)
 	mux.HandleFunc("POST /api/v1/binaries-profiles/{name}/refresh", s.refreshProfileReleases)
+	mux.HandleFunc("POST /v1/fleet/profiles/sync", s.syncAllProfiles)
+	mux.HandleFunc("POST /api/v1/binaries-profiles/sync", s.syncAllProfiles)
 	mux.HandleFunc("POST /v1/hosts/{host}/ping", s.pingHost)
 	mux.HandleFunc("POST /api/v1/agents/{host}/ping", s.pingHost)
 	mux.HandleFunc("POST /v1/hosts/{host}/ping-ack", s.pingAck)
@@ -1777,6 +1779,9 @@ func (s *Server) getProfileReleases(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"profile":  name,
 		"releases": releases,
@@ -1901,8 +1906,16 @@ func (s *Server) refreshProfileReleases(w http.ResponseWriter, r *http.Request) 
 			relRepo := strings.ToLower(rel.Repository)
 			if (relTool == toolName || relRepo == repoName || strings.HasSuffix(relRepo, "/"+toolName)) &&
 				rel.LatestVersion != "" && rel.Error == "" {
-				p.Tools[i].TargetVersion = rel.LatestVersion
-				updated = true
+				if p.Tools[i].TargetVersion != rel.LatestVersion {
+					p.Tools[i].TargetVersion = rel.LatestVersion
+					updated = true
+				}
+				p.Tools[i].LatestAvailableVersion = rel.LatestVersion
+				p.Tools[i].LatestReleaseURL = rel.HTMLURL
+				p.Tools[i].LatestPublishedAt = rel.PublishedAt
+				p.Tools[i].LastCheckedAt = time.Now()
+				p.Tools[i].LastSyncStatus = "ok"
+				p.Tools[i].LastSyncError = ""
 				break
 			}
 		}
@@ -1917,7 +1930,7 @@ func (s *Server) refreshProfileReleases(w http.ResponseWriter, r *http.Request) 
 	s.RecordNotification(NotificationRecord{
 		Title:    "Profile Releases Refreshed",
 		Message:  fmt.Sprintf("Refreshed release versions for profile '%s'. Updated target versions: %v", name, updated),
-		Category: "info",
+		Category: "release",
 		Source:   "harness-api",
 		Metadata: map[string]any{
 			"profile": name,
@@ -1926,9 +1939,102 @@ func (s *Server) refreshProfileReleases(w http.ResponseWriter, r *http.Request) 
 		},
 	})
 
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"profile":  name,
 		"releases": releases,
+	})
+}
+
+func (s *Server) syncAllProfiles(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+
+	if s.Engine.Releases == nil {
+		s.Engine.Releases = control.NewReleaseService()
+	}
+
+	profiles := s.Engine.ListProfiles()
+	if len(profiles) == 0 {
+		p, err := s.Engine.GetProfile("generic")
+		if err == nil && p != nil {
+			profiles = append(profiles, *p)
+		}
+	}
+
+	totalUpdated := 0
+	type syncResult struct {
+		Profile  string                `json:"profile"`
+		Releases []control.ToolRelease `json:"releases"`
+		Updated  bool                  `json:"updated"`
+	}
+	results := make([]syncResult, 0, len(profiles))
+
+	for _, p := range profiles {
+		releases, err := s.Engine.Releases.RefreshProfileReleases(r.Context(), p)
+		if err != nil && len(releases) == 0 {
+			continue
+		}
+		updated := false
+		for i := range p.Tools {
+			toolName := strings.ToLower(p.Tools[i].Name)
+			repoName := strings.ToLower(p.Tools[i].Repository)
+			for _, rel := range releases {
+				relTool := strings.ToLower(rel.Name)
+				relRepo := strings.ToLower(rel.Repository)
+				if (relTool == toolName || relRepo == repoName || strings.HasSuffix(relRepo, "/"+toolName)) &&
+					rel.LatestVersion != "" && rel.Error == "" {
+					oldTarget := p.Tools[i].TargetVersion
+					p.Tools[i].LatestAvailableVersion = rel.LatestVersion
+					p.Tools[i].LatestReleaseURL = rel.HTMLURL
+					p.Tools[i].LatestPublishedAt = rel.PublishedAt
+					p.Tools[i].LastCheckedAt = time.Now()
+					p.Tools[i].LastSyncStatus = "ok"
+					p.Tools[i].LastSyncError = ""
+
+					if oldTarget == "" || oldTarget == "latest" || control.CompareSemVer(rel.LatestVersion, oldTarget) > 0 {
+						p.Tools[i].TargetVersion = rel.LatestVersion
+						updated = true
+						totalUpdated++
+						s.RecordNotification(NotificationRecord{
+							Title:    "Release Detected",
+							Message:  fmt.Sprintf("New release detected for %s: %s (was %s). Profile '%s' updated.", p.Tools[i].Name, rel.LatestVersion, oldTarget, p.Name),
+							Category: "release",
+							Source:   "release-sync",
+							Metadata: map[string]any{
+								"event":        "release.detected",
+								"profile":      p.Name,
+								"tool":         p.Tools[i].Name,
+								"from_version": oldTarget,
+								"to_version":   rel.LatestVersion,
+								"url":          rel.HTMLURL,
+							},
+						})
+					}
+					break
+				}
+			}
+		}
+		if updated {
+			saved, uErr := s.Engine.UpsertProfile(p)
+			if uErr == nil && s.SaveProfile != nil && saved != nil {
+				s.SaveProfile(*saved)
+			}
+		}
+		results = append(results, syncResult{
+			Profile:  p.Name,
+			Releases: releases,
+			Updated:  updated,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":        "ok",
+		"total_updated": totalUpdated,
+		"profiles":      results,
 	})
 }
 
@@ -2584,6 +2690,9 @@ func writeErr(w http.ResponseWriter, code int, err error) {
 }
 
 func (s *Server) listProfiles(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
 	writeJSON(w, http.StatusOK, s.Engine.ListProfiles())
 }
 
@@ -2605,6 +2714,9 @@ func (s *Server) createProfile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getProfile(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
 	name := r.PathValue("name")
 	p, err := s.Engine.GetProfile(name)
 	if err != nil {

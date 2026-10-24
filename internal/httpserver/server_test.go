@@ -2193,3 +2193,74 @@ func TestHostHeartbeat_ToolServiceMetadata(t *testing.T) {
 		t.Errorf("expected 3 capabilities, got %v", toolMap["capabilities"])
 	}
 }
+
+func TestSyncAllProfilesEndpoint_AndCacheControl(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	handler := s.Handler()
+
+	_, err := s.Engine.UpsertProfile(control.DistributionProfile{
+		Name: "generic",
+		Tools: []control.ProfileTool{
+			{Name: "autopilot-fleet", Repository: "viovy/autopilot-plugins-internal", TargetVersion: "0.0.482"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to upsert profile: %v", err)
+	}
+
+	relSvc := control.NewReleaseService()
+	relSvc.SetCachedRelease("viovy/autopilot-plugins-internal", "latest", control.ToolRelease{
+		Name:          "autopilot-fleet",
+		Repository:    "viovy/autopilot-plugins-internal",
+		LatestVersion: "0.0.492",
+		TagName:       "0.0.492",
+	}, 10*time.Minute)
+	s.Engine.Releases = relSvc
+
+	// 1. Check GET /v1/fleet/profiles has Cache-Control: no-store
+	reqGet := httptest.NewRequest(http.MethodGet, "/v1/fleet/profiles", nil)
+	rrGet := httptest.NewRecorder()
+	handler.ServeHTTP(rrGet, reqGet)
+	if rrGet.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rrGet.Code)
+	}
+	if !strings.Contains(rrGet.Header().Get("Cache-Control"), "no-store") {
+		t.Errorf("expected Cache-Control no-store, got %s", rrGet.Header().Get("Cache-Control"))
+	}
+
+	// 2. Call POST /v1/fleet/profiles/sync
+	reqSync := httptest.NewRequest(http.MethodPost, "/v1/fleet/profiles/sync", nil)
+	rrSync := httptest.NewRecorder()
+	handler.ServeHTTP(rrSync, reqSync)
+	if rrSync.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rrSync.Code, rrSync.Body.String())
+	}
+	if !strings.Contains(rrSync.Header().Get("Cache-Control"), "no-store") {
+		t.Errorf("expected Cache-Control no-store on sync, got %s", rrSync.Header().Get("Cache-Control"))
+	}
+
+	var syncResp map[string]any
+	if err := json.Unmarshal(rrSync.Body.Bytes(), &syncResp); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if syncResp["status"] != "ok" {
+		t.Errorf("expected status ok, got %v", syncResp["status"])
+	}
+
+	// 3. Verify target version auto-advanced to 0.0.492
+	prof, _ := s.Engine.GetProfile("generic")
+	if prof.Tools[0].TargetVersion != "0.0.492" {
+		t.Errorf("expected TargetVersion 0.0.492, got %s", prof.Tools[0].TargetVersion)
+	}
+	if prof.Tools[0].LatestAvailableVersion != "0.0.492" {
+		t.Errorf("expected LatestAvailableVersion 0.0.492, got %s", prof.Tools[0].LatestAvailableVersion)
+	}
+
+	// 4. Verify notification was recorded
+	notifs := s.GetNotifications(10)
+	if len(notifs) == 0 {
+		t.Errorf("expected release notification recorded")
+	} else if notifs[0].Category != "release" {
+		t.Errorf("expected category release, got %s", notifs[0].Category)
+	}
+}
