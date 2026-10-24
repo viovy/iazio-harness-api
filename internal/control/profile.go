@@ -29,6 +29,7 @@ type DistributionProfile struct {
 	Endpoints    map[string]string   `json:"endpoints,omitempty" yaml:"endpoints,omitempty"`
 	Tools        []ProfileTool       `json:"tools" yaml:"tools"`
 	Version      string              `json:"version,omitempty" yaml:"version,omitempty"`
+	VersionSeq   uint64              `json:"-" yaml:"-"`
 	SourceRepo   string              `json:"source_repo,omitempty" yaml:"source_repo,omitempty"`
 	SourceHost   string              `json:"source_host,omitempty" yaml:"source_host,omitempty"`
 	CreatedAt    time.Time           `json:"created_at" yaml:"created_at"`
@@ -46,13 +47,41 @@ type ProfileInstallRootPaths struct {
 }
 
 type ProfileTool struct {
-	Name          string       `json:"name" yaml:"name"`
-	Repository    string       `json:"repository" yaml:"repository"`
-	BinaryName    string       `json:"binary_name" yaml:"binary_name"`
-	Description   string       `json:"description" yaml:"description"`
-	Tier          string       `json:"tier" yaml:"tier"` // baseline | optional
-	TargetVersion string       `json:"target_version,omitempty" yaml:"target_version,omitempty"`
-	Service       *ToolService `json:"service,omitempty" yaml:"service,omitempty"`
+	Name                   string       `json:"name" yaml:"name"`
+	Repository             string       `json:"repository" yaml:"repository"`
+	BinaryName             string       `json:"binary_name" yaml:"binary_name"`
+	Description            string       `json:"description" yaml:"description"`
+	Tier                   string       `json:"tier" yaml:"tier"` // baseline | optional
+	TargetVersion          string       `json:"target_version,omitempty" yaml:"target_version,omitempty"`
+	TrackLatest            *bool        `json:"track_latest,omitempty" yaml:"track_latest,omitempty"`
+	LatestAvailableVersion string       `json:"latest_available_version,omitempty" yaml:"latest_available_version,omitempty"`
+	LatestReleaseURL       string       `json:"latest_release_url,omitempty" yaml:"latest_release_url,omitempty"`
+	LatestPublishedAt      *time.Time   `json:"latest_published_at,omitempty" yaml:"latest_published_at,omitempty"`
+	LastCheckedAt          *time.Time   `json:"last_checked_at,omitempty" yaml:"last_checked_at,omitempty"`
+	LastSyncStatus         string       `json:"last_sync_status,omitempty" yaml:"last_sync_status,omitempty"`
+	LastSyncError          string       `json:"last_sync_error,omitempty" yaml:"last_sync_error,omitempty"`
+	Service                *ToolService `json:"service,omitempty" yaml:"service,omitempty"`
+}
+
+// BoolPtr returns a pointer to a bool value.
+func BoolPtr(b bool) *bool {
+	return &b
+}
+
+// IsTrackingLatest determines if the tool should auto-advance to latest upstream releases.
+// If track_latest was omitted in storage (nil, legacy rows), it migrates baseline tools
+// in default/generic profiles or unpinned targets to true (R2). Explicit false is strictly preserved.
+func (t ProfileTool) IsTrackingLatest(isDefaultProfile bool) bool {
+	if t.TrackLatest != nil {
+		return *t.TrackLatest
+	}
+	if t.TargetVersion == "" || t.TargetVersion == "latest" {
+		return true
+	}
+	if isDefaultProfile && (t.Tier == "baseline" || t.Tier == "") {
+		return true
+	}
+	return false
 }
 
 type ToolService struct {
@@ -82,13 +111,18 @@ type ManifestToolItem struct {
 	Service       *ToolService `json:"service,omitempty"`
 }
 
-// ListProfiles returns all distribution profiles sorted by name.
+// ListProfiles returns all distribution profiles sorted by name with deep-copied Tools.
 func (e *Engine) ListProfiles() []DistributionProfile {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	out := make([]DistributionProfile, 0, len(e.profiles))
 	for _, p := range e.profiles {
-		out = append(out, *p)
+		cp := *p
+		if len(p.Tools) > 0 {
+			cp.Tools = make([]ProfileTool, len(p.Tools))
+			copy(cp.Tools, p.Tools)
+		}
+		out = append(out, cp)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].IsDefault != out[j].IsDefault {
@@ -99,7 +133,21 @@ func (e *Engine) ListProfiles() []DistributionProfile {
 	return out
 }
 
-// GetProfile returns a distribution profile by name.
+// GetReleaseService returns the registered ReleaseService in a thread-safe manner.
+func (e *Engine) GetReleaseService() *ReleaseService {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.Releases
+}
+
+// SetReleaseService registers the ReleaseService in a thread-safe manner.
+func (e *Engine) SetReleaseService(r *ReleaseService) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.Releases = r
+}
+
+// GetProfile returns a distribution profile by name with deep-copied Tools and Endpoints.
 func (e *Engine) GetProfile(name string) (*DistributionProfile, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -108,32 +156,179 @@ func (e *Engine) GetProfile(name string) (*DistributionProfile, error) {
 		return nil, ErrProfileNotFound
 	}
 	cp := *p
+	if len(p.Tools) > 0 {
+		cp.Tools = make([]ProfileTool, len(p.Tools))
+		copy(cp.Tools, p.Tools)
+	}
+	if len(p.Endpoints) > 0 {
+		cp.Endpoints = make(map[string]string, len(p.Endpoints))
+		for k, v := range p.Endpoints {
+			cp.Endpoints[k] = v
+		}
+	}
 	return &cp, nil
 }
 
+// UpdateProfileTools atomically updates the tools slice of an existing profile.
+// It holds a per-profile lock to ensure consistency between persistence and in-memory state (G3).
+// If configChanged is true, UpdatedAt and VersionSeq are updated, and OnSaveProfile is invoked outside e.mu.
+func (e *Engine) UpdateProfileTools(name string, updater func(tools []ProfileTool) ([]ProfileTool, bool)) (*DistributionProfile, bool, error) {
+	trimmedName := strings.TrimSpace(name)
+	pMu := e.getProfileLock(trimmedName)
+	pMu.Lock()
+	defer pMu.Unlock()
+
+	e.mu.Lock()
+	p, ok := e.profiles[trimmedName]
+	if !ok {
+		e.mu.Unlock()
+		return nil, false, ErrProfileNotFound
+	}
+
+	clonedTools := make([]ProfileTool, len(p.Tools))
+	copy(clonedTools, p.Tools)
+
+	newTools, configChanged := updater(clonedTools)
+	if !configChanged {
+		p.Tools = newTools
+		cp := *p
+		if len(p.Tools) > 0 {
+			cp.Tools = make([]ProfileTool, len(p.Tools))
+			copy(cp.Tools, p.Tools)
+		}
+		e.mu.Unlock()
+		return &cp, false, nil
+	}
+
+	candidate := *p
+	candidate.Tools = newTools
+	candidate.UpdatedAt = e.now()
+	candidate.VersionSeq = p.VersionSeq + 1
+	saveFn := e.OnSaveProfile
+	e.mu.Unlock()
+
+	// Persist outside e.mu while holding per-profile lock (G3)
+	if saveFn != nil {
+		if err := saveFn(candidate); err != nil {
+			return nil, false, fmt.Errorf("persist profile %s: %w", name, err)
+		}
+	}
+
+	// Commit updated candidate to in-memory profile
+	e.mu.Lock()
+	p, ok = e.profiles[trimmedName]
+	if !ok {
+		e.mu.Unlock()
+		return nil, false, ErrProfileNotFound
+	}
+	p.Tools = candidate.Tools
+	p.UpdatedAt = candidate.UpdatedAt
+	p.VersionSeq = candidate.VersionSeq
+
+	cp := *p
+	if len(p.Tools) > 0 {
+		cp.Tools = make([]ProfileTool, len(p.Tools))
+		copy(cp.Tools, p.Tools)
+	}
+	e.mu.Unlock()
+	return &cp, true, nil
+}
+
 // UpsertProfile inserts or updates a distribution profile.
+// It holds a per-profile lock to ensure consistency between persistence and in-memory state (G3).
 func (e *Engine) UpsertProfile(p DistributionProfile) (*DistributionProfile, error) {
 	name := strings.TrimSpace(p.Name)
 	if name == "" {
 		return nil, fmt.Errorf("profile name is required")
 	}
+
+	pMu := e.getProfileLock(name)
+	pMu.Lock()
+	defer pMu.Unlock()
+
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	now := e.now()
 	existing, ok := e.profiles[name]
 	if ok {
 		p.CreatedAt = existing.CreatedAt
 		p.UpdatedAt = now
+		p.VersionSeq = existing.VersionSeq + 1
 		if name == "generic" {
 			p.IsDefault = true
+		}
+		// F1: Preserve existing tool TrackLatest and telemetry fields if incoming value is nil or empty
+		existingToolsByName := make(map[string]ProfileTool, len(existing.Tools))
+		for _, t := range existing.Tools {
+			existingToolsByName[t.Name] = t
+		}
+		for i := range p.Tools {
+			if exTool, found := existingToolsByName[p.Tools[i].Name]; found {
+				if p.Tools[i].TrackLatest == nil {
+					p.Tools[i].TrackLatest = exTool.TrackLatest
+				}
+				if p.Tools[i].LatestAvailableVersion == "" {
+					p.Tools[i].LatestAvailableVersion = exTool.LatestAvailableVersion
+				}
+				if p.Tools[i].LatestReleaseURL == "" {
+					p.Tools[i].LatestReleaseURL = exTool.LatestReleaseURL
+				}
+				if p.Tools[i].LatestPublishedAt == nil {
+					p.Tools[i].LatestPublishedAt = exTool.LatestPublishedAt
+				}
+				if p.Tools[i].LastCheckedAt == nil {
+					p.Tools[i].LastCheckedAt = exTool.LastCheckedAt
+				}
+				if p.Tools[i].LastSyncStatus == "" {
+					p.Tools[i].LastSyncStatus = exTool.LastSyncStatus
+				}
+				if p.Tools[i].LastSyncError == "" {
+					p.Tools[i].LastSyncError = exTool.LastSyncError
+				}
+			}
 		}
 	} else {
 		p.CreatedAt = now
 		p.UpdatedAt = now
+		p.VersionSeq = 1
 	}
-	e.profiles[name] = &p
-	cp := p
+
+	candidate := p
+	saveFn := e.OnSaveProfile
+	e.mu.Unlock()
+
+	// Persist outside e.mu while holding per-profile lock (G3)
+	if saveFn != nil {
+		if err := saveFn(candidate); err != nil {
+			return nil, fmt.Errorf("persist profile %s: %w", name, err)
+		}
+	}
+
+	e.mu.Lock()
+	e.profiles[name] = &candidate
+	cp := candidate
+	e.mu.Unlock()
 	return &cp, nil
+}
+
+// LoadProfile loads a profile from persistent storage into memory during engine startup
+// without triggering OnSaveProfile or modifying timestamps (E2).
+func (e *Engine) LoadProfile(p DistributionProfile) {
+	name := strings.TrimSpace(p.Name)
+	if name == "" {
+		name = "generic"
+	}
+	pMu := e.getProfileLock(name)
+	pMu.Lock()
+	defer pMu.Unlock()
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cp := p
+	if len(p.Tools) > 0 {
+		cp.Tools = make([]ProfileTool, len(p.Tools))
+		copy(cp.Tools, p.Tools)
+	}
+	e.profiles[name] = &cp
 }
 
 // DeleteProfile removes a distribution profile. Generic is protected.
@@ -172,12 +367,13 @@ func parseFleetDistribution(raw []byte) (*DistributionProfile, error) {
 				IsPrivate bool   `yaml:"is_private" json:"is_private"`
 			} `yaml:"repositories" json:"repositories"`
 			Tools []struct {
-				Name        string       `yaml:"name" json:"name"`
-				Repository  string       `yaml:"repository" json:"repository"`
-				BinaryName  string       `yaml:"binary_name" json:"binary_name"`
-				Description string       `yaml:"description" json:"description"`
-				Tier        string       `yaml:"tier" json:"tier"`
-				Service     *ToolService `yaml:"service" json:"service"`
+				Name          string       `yaml:"name" json:"name"`
+				Repository    string       `yaml:"repository" json:"repository"`
+				BinaryName    string       `yaml:"binary_name" json:"binary_name"`
+				Description   string       `yaml:"description" json:"description"`
+				Tier          string       `yaml:"tier" json:"tier"`
+				TargetVersion string       `yaml:"target_version" json:"target_version"`
+				Service       *ToolService `yaml:"service" json:"service"`
 			} `yaml:"tools" json:"tools"`
 		} `yaml:"fleet_distribution" json:"fleet_distribution"`
 	}
@@ -214,13 +410,16 @@ func parseFleetDistribution(raw []byte) (*DistributionProfile, error) {
 		if repoDef, ok := fd.Repositories[t.Repository]; ok && repoDef.Repo != "" {
 			repo = repoDef.Repo
 		}
+		trackLatest := t.TargetVersion == "" || t.TargetVersion == "latest"
 		profile.Tools = append(profile.Tools, ProfileTool{
-			Name:        t.Name,
-			Repository:  repo,
-			BinaryName:  t.BinaryName,
-			Description: t.Description,
-			Tier:        t.Tier,
-			Service:     t.Service,
+			Name:          t.Name,
+			Repository:    repo,
+			BinaryName:    t.BinaryName,
+			Description:   t.Description,
+			Tier:          t.Tier,
+			TargetVersion: t.TargetVersion,
+			TrackLatest:   BoolPtr(trackLatest),
+			Service:       t.Service,
 		})
 	}
 	return &profile, nil

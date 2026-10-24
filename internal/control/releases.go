@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,13 +17,94 @@ import (
 
 // ToolRelease represents the latest release information for a tool.
 type ToolRelease struct {
-	Name          string    `json:"name"`
-	Repository    string    `json:"repository"`
-	LatestVersion string    `json:"latest_version"`
-	TagName       string    `json:"tag_name"`
-	PublishedAt   time.Time `json:"published_at,omitempty"`
-	HTMLURL       string    `json:"html_url,omitempty"`
-	Error         string    `json:"error,omitempty"`
+	Name           string    `json:"name"`
+	Repository     string    `json:"repository"`
+	LatestVersion  string    `json:"latest_version"`
+	TargetVersion  string    `json:"target_version,omitempty"`
+	TagName        string    `json:"tag_name"`
+	PublishedAt    time.Time `json:"published_at,omitempty"`
+	HTMLURL        string    `json:"html_url,omitempty"`
+	LastCheckedAt  time.Time `json:"last_checked_at,omitempty"`
+	LastSyncStatus string    `json:"last_sync_status,omitempty"`
+	Error          string    `json:"error,omitempty"`
+}
+
+type semverTuple struct {
+	Major      int
+	Minor      int
+	Patch      int
+	PreRelease string
+	Raw        string
+}
+
+func parseSemVer(tag string) (semverTuple, bool) {
+	clean := strings.TrimSpace(tag)
+	clean = strings.TrimPrefix(clean, "v")
+	clean = strings.TrimPrefix(clean, "V")
+	if clean == "" {
+		return semverTuple{}, false
+	}
+	parts := strings.SplitN(clean, "-", 2)
+	nums := strings.Split(parts[0], ".")
+	if len(nums) < 2 {
+		return semverTuple{}, false
+	}
+	major, err1 := strconv.Atoi(nums[0])
+	minor, err2 := strconv.Atoi(nums[1])
+	patch := 0
+	var err3 error
+	if len(nums) >= 3 {
+		patch, err3 = strconv.Atoi(nums[2])
+	}
+	if err1 != nil || err2 != nil || err3 != nil {
+		return semverTuple{}, false
+	}
+	pre := ""
+	if len(parts) > 1 {
+		pre = parts[1]
+	}
+	return semverTuple{
+		Major:      major,
+		Minor:      minor,
+		Patch:      patch,
+		PreRelease: pre,
+		Raw:        clean,
+	}, true
+}
+
+func compareSemVer(v1, v2 string) int {
+	s1, ok1 := parseSemVer(v1)
+	s2, ok2 := parseSemVer(v2)
+	if !ok1 && !ok2 {
+		return strings.Compare(v1, v2)
+	}
+	if !ok1 {
+		return -1
+	}
+	if !ok2 {
+		return 1
+	}
+	if s1.Major != s2.Major {
+		return s1.Major - s2.Major
+	}
+	if s1.Minor != s2.Minor {
+		return s1.Minor - s2.Minor
+	}
+	if s1.Patch != s2.Patch {
+		return s1.Patch - s2.Patch
+	}
+	if s1.PreRelease == "" && s2.PreRelease != "" {
+		return 1
+	}
+	if s1.PreRelease != "" && s2.PreRelease == "" {
+		return -1
+	}
+	return strings.Compare(s1.PreRelease, s2.PreRelease)
+}
+
+// CompareSemVer compares two SemVer strings, returning >0 if v1 > v2, <0 if v1 < v2, and 0 if equal.
+func CompareSemVer(v1, v2 string) int {
+	return compareSemVer(v1, v2)
 }
 
 type cachedRelease struct {
@@ -49,13 +132,18 @@ type GitCredentialStore interface {
 
 // ReleaseService queries and caches latest Git release versions for profile tools.
 type ReleaseService struct {
-	mu          sync.RWMutex
-	cache       map[string]cachedRelease
-	credentials map[string]GitCredential
-	client      *http.Client
-	now         func() time.Time
-	token       string
-	store       GitCredentialStore
+	mu                   sync.RWMutex
+	cache                map[string]cachedRelease
+	endpointETags        map[string]string    // URL -> ETag mapping (prevents cross-endpoint ETag contamination, F5)
+	rateLimits           map[string]time.Time // repo -> backoff expiry time (F5)
+	globalRateLimitUntil time.Time            // shared backoff expiry time across repos (G6)
+	noFormalReleases     map[string]time.Time // repo -> expiry time of 404 cache for /releases/latest (G6)
+	credentials          map[string]GitCredential
+	client               *http.Client
+	now                  func() time.Time
+	token                string
+	store                GitCredentialStore
+	baseURL              string
 }
 
 // NewReleaseService creates a ReleaseService with in-memory caching.
@@ -70,12 +158,30 @@ func NewReleaseService() *ReleaseService {
 		}
 	}
 	return &ReleaseService{
-		cache:       make(map[string]cachedRelease),
-		credentials: make(map[string]GitCredential),
-		client:      &http.Client{Timeout: 10 * time.Second},
-		now:         time.Now,
-		token:       token,
+		cache:            make(map[string]cachedRelease),
+		endpointETags:    make(map[string]string),
+		rateLimits:       make(map[string]time.Time),
+		noFormalReleases: make(map[string]time.Time),
+		credentials:      make(map[string]GitCredential),
+		client:           &http.Client{Timeout: 10 * time.Second},
+		now:              time.Now,
+		token:            token,
+		baseURL:          "https://api.github.com",
 	}
+}
+
+// SetBaseURL overrides the GitHub API base URL (useful for testing against mock servers).
+func (s *ReleaseService) SetBaseURL(u string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.baseURL = strings.TrimSuffix(u, "/")
+}
+
+// SetHTTPClient overrides the HTTP client (useful for testing with mock servers).
+func (s *ReleaseService) SetHTTPClient(c *http.Client) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.client = c
 }
 
 // SetStore attaches a persistence store and loads existing credentials into memory.
@@ -257,6 +363,20 @@ func (s *ReleaseService) TestCredential(ctx context.Context, token string) (GitC
 	}, nil
 }
 
+var (
+	warnedReposMu sync.Mutex
+	warnedRepos   = make(map[string]bool)
+)
+
+func warnUnauthenticatedOnce(repo string) {
+	warnedReposMu.Lock()
+	defer warnedReposMu.Unlock()
+	if !warnedRepos[repo] {
+		warnedRepos[repo] = true
+		log.Printf("[ReleaseService] WARN: unauthenticated GitHub release requests for %s (rate limit: 60 req/hr). Set GITHUB_TOKEN or configure git credentials.", repo)
+	}
+}
+
 func (s *ReleaseService) tokenForRepo(repo string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -278,7 +398,25 @@ func (s *ReleaseService) tokenForRepo(repo string) string {
 	if tok := os.Getenv("GH_TOKEN"); tok != "" {
 		return tok
 	}
+	warnUnauthenticatedOnce(repo)
 	return ""
+}
+
+func parseRateLimitBackoff(header http.Header, now time.Time) time.Duration {
+	if retryAfter := header.Get("Retry-After"); retryAfter != "" {
+		if secs, err := strconv.Atoi(retryAfter); err == nil && secs > 0 {
+			return time.Duration(secs) * time.Second
+		}
+	}
+	if reset := header.Get("X-RateLimit-Reset"); reset != "" {
+		if unixSec, err := strconv.ParseInt(reset, 10, 64); err == nil {
+			t := time.Unix(unixSec, 0)
+			if t.After(now) {
+				return t.Sub(now)
+			}
+		}
+	}
+	return 5 * time.Minute // default backoff
 }
 
 // GetToolRelease returns the latest release for a repository.
@@ -286,46 +424,94 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 	if !strings.Contains(repo, "/") {
 		repo = "viovy/" + repo
 	}
-	if targetVersion == "" {
-		targetVersion = "latest"
-	}
+
+	isLatestLookup := targetVersion == "" || targetVersion == "latest"
 
 	cacheKey := repo + ":" + targetVersion
+	if isLatestLookup {
+		cacheKey = repo + ":latest"
+	}
+
+	now := s.now()
+
+	// Check per-repo and global rate limit backoff (F5, G6)
+	s.mu.RLock()
+	backoffUntil, isRateLimited := s.rateLimits[repo]
+	if !isRateLimited || backoffUntil.Before(s.globalRateLimitUntil) {
+		backoffUntil = s.globalRateLimitUntil
+		if now.Before(backoffUntil) {
+			isRateLimited = true
+		}
+	}
+	s.mu.RUnlock()
+	if isRateLimited && now.Before(backoffUntil) {
+		err := fmt.Errorf("rate limit backoff active for %s until %s", repo, backoffUntil.Format(time.RFC3339))
+		fallbackVer := targetVersion
+		if fallbackVer == "" || fallbackVer == "latest" {
+			fallbackVer = "0.0.0"
+		}
+		return ToolRelease{
+			Name:           toolName,
+			Repository:     repo,
+			LatestVersion:  fallbackVer,
+			TargetVersion:  targetVersion,
+			TagName:        fallbackVer,
+			LastCheckedAt:  now,
+			LastSyncStatus: "rate_limited",
+			Error:          err.Error(),
+		}, err
+	}
+
 	s.mu.RLock()
 	cached, ok := s.cache[cacheKey]
 	s.mu.RUnlock()
 
-	now := s.now()
 	if ok && now.Before(cached.expiresAt) {
 		r := cached.release
 		r.Name = toolName
+		if !isLatestLookup {
+			r.TargetVersion = targetVersion
+		}
+		// Treat cached negative results as errors (F4)
+		if r.Error != "" {
+			return r, fmt.Errorf("lookup release for %s: %s", repo, r.Error)
+		}
 		return r, nil
 	}
 
 	token := s.tokenForRepo(repo)
+	base := s.baseURL
+	if base == "" {
+		base = "https://api.github.com"
+	}
 
 	candidateURLs := make([]string, 0, 3)
-	if targetVersion != "" && targetVersion != "latest" {
+	if !isLatestLookup {
 		tag := targetVersion
 		bareTag := strings.TrimPrefix(tag, "v")
 		vTag := "v" + bareTag
 		// Check both "v"-prefixed and bare tag names
 		candidateURLs = append(candidateURLs,
-			fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", repo, vTag),
-			fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", repo, bareTag),
+			fmt.Sprintf("%s/repos/%s/releases/tags/%s", base, repo, vTag),
+			fmt.Sprintf("%s/repos/%s/releases/tags/%s", base, repo, bareTag),
 		)
 	} else {
-		candidateURLs = append(candidateURLs, fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo))
-	}
-
-	var cachedEtag string
-	if ok {
-		cachedEtag = cached.etag
+		s.mu.RLock()
+		skipUntil := s.noFormalReleases[repo]
+		skipLatest := !skipUntil.IsZero() && now.Before(skipUntil)
+		s.mu.RUnlock()
+		if !skipLatest {
+			candidateURLs = append(candidateURLs, fmt.Sprintf("%s/repos/%s/releases/latest", base, repo))
+		}
 	}
 
 	var lastErr error
 	for _, candURL := range candidateURLs {
-		rel, newEtag, notModified, err := s.fetchReleaseURL(ctx, candURL, repo, toolName, targetVersion, token, cachedEtag)
+		s.mu.RLock()
+		urlEtag := s.endpointETags[candURL]
+		s.mu.RUnlock()
+
+		rel, newEtag, notModified, err := s.fetchReleaseURL(ctx, candURL, repo, toolName, targetVersion, token, urlEtag)
 		if notModified && ok {
 			s.mu.Lock()
 			cached.expiresAt = now.Add(10 * time.Minute)
@@ -333,47 +519,211 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 			s.mu.Unlock()
 			r := cached.release
 			r.Name = toolName
+			r.LastCheckedAt = now
+			r.LastSyncStatus = "not_modified"
+			if !isLatestLookup {
+				r.TargetVersion = targetVersion
+			}
 			return r, nil
 		}
+		if newEtag != "" {
+			s.mu.Lock()
+			s.endpointETags[candURL] = newEtag
+			s.mu.Unlock()
+		}
 		if err == nil && rel.LatestVersion != "" {
+			// SemVer ordering guard: never downgrade LatestAvailableVersion if an existing cached release has higher SemVer (G7)
+			// Expire the guard if the cached release is past its TTL so retracted releases are not permanently pinned (F-8)
+			if ok && cached.release.LatestVersion != "" && !cached.expiresAt.Before(now) && compareSemVer(rel.LatestVersion, cached.release.LatestVersion) < 0 {
+				rel.LatestVersion = cached.release.LatestVersion
+				rel.TagName = cached.release.TagName
+				rel.HTMLURL = cached.release.HTMLURL
+				rel.PublishedAt = cached.release.PublishedAt
+			}
+			rel.LastCheckedAt = now
+			rel.LastSyncStatus = "ok"
+			if !isLatestLookup {
+				rel.TargetVersion = targetVersion
+			}
 			s.mu.Lock()
 			s.cache[cacheKey] = cachedRelease{
 				release:   rel,
 				etag:      newEtag,
 				expiresAt: now.Add(10 * time.Minute),
 			}
+			if isLatestLookup {
+				s.cache[repo+":latest"] = s.cache[cacheKey]
+			}
 			s.mu.Unlock()
 			return rel, nil
 		}
 		if err != nil {
 			lastErr = err
+			if strings.Contains(err.Error(), "rate limited") || strings.Contains(err.Error(), "forbidden") {
+				// Stop immediately on rate limit or forbidden without spending quota on list or tags (G6, E7)
+				fallbackVer := targetVersion
+				if fallbackVer == "" || fallbackVer == "latest" {
+					fallbackVer = "0.0.0"
+				}
+				status := "rate_limited"
+				if strings.Contains(err.Error(), "forbidden") {
+					status = "forbidden"
+				}
+				return ToolRelease{
+					Name:           toolName,
+					Repository:     repo,
+					LatestVersion:  fallbackVer,
+					TargetVersion:  targetVersion,
+					TagName:        fallbackVer,
+					LastCheckedAt:  now,
+					LastSyncStatus: status,
+					Error:          err.Error(),
+				}, err
+			}
 		}
 	}
 
-	// Fallback 1: check list of all releases (e.g. if latest flag not set or tag lookup returned 404)
-	listURL := fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=5", repo)
-	listRel, listErr := s.fetchReleaseListURL(ctx, listURL, repo, toolName, token)
-	if listErr == nil && listRel.LatestVersion != "" {
+	// Fallback 1: check list of all releases with SemVer sorting
+	listKey := repo + ":releases_list"
+	s.mu.RLock()
+	cachedList, okList := s.cache[listKey]
+	s.mu.RUnlock()
+
+	listURL := fmt.Sprintf("%s/repos/%s/releases?per_page=15", base, repo)
+	s.mu.RLock()
+	listEtag := s.endpointETags[listURL]
+	s.mu.RUnlock()
+
+	listRel, listNewEtag, listNotMod, listErr := s.fetchReleaseListURL(ctx, listURL, repo, toolName, token, listEtag)
+	if listNewEtag != "" {
 		s.mu.Lock()
-		s.cache[cacheKey] = cachedRelease{
+		s.endpointETags[listURL] = listNewEtag
+		s.mu.Unlock()
+	}
+	if listNotMod {
+		if okList {
+			s.mu.Lock()
+			cachedList.expiresAt = now.Add(10 * time.Minute)
+			s.cache[listKey] = cachedList
+			s.cache[cacheKey] = cachedList
+			s.mu.Unlock()
+			r := cachedList.release
+			r.Name = toolName
+			r.LastCheckedAt = now
+			r.LastSyncStatus = "not_modified"
+			if !isLatestLookup {
+				r.TargetVersion = targetVersion
+			}
+			return r, nil
+		}
+		s.mu.RLock()
+		candRel, okCand := s.cache[repo+":latest"]
+		if !okCand {
+			candRel, okCand = s.cache[cacheKey]
+		}
+		s.mu.RUnlock()
+		if okCand {
+			r := candRel.release
+			r.Name = toolName
+			r.LastCheckedAt = now
+			r.LastSyncStatus = "not_modified"
+			if !isLatestLookup {
+				r.TargetVersion = targetVersion
+			}
+			return r, nil
+		}
+	}
+	if listErr == nil && listRel.LatestVersion != "" {
+		listRel.LastCheckedAt = now
+		listRel.LastSyncStatus = "ok"
+		if !isLatestLookup {
+			listRel.TargetVersion = targetVersion
+		}
+		s.mu.Lock()
+		s.cache[listKey] = cachedRelease{
 			release:   listRel,
+			etag:      listNewEtag,
 			expiresAt: now.Add(10 * time.Minute),
+		}
+		s.cache[cacheKey] = s.cache[listKey]
+		if isLatestLookup {
+			s.cache[repo+":latest"] = s.cache[listKey]
 		}
 		s.mu.Unlock()
 		return listRel, nil
 	}
 	if listErr != nil {
 		lastErr = listErr
+		if strings.Contains(listErr.Error(), "rate limited") || strings.Contains(listErr.Error(), "forbidden") {
+			// Stop immediately on rate limit or forbidden without spending quota on tags fallback (F-2)
+			fallbackVer := targetVersion
+			if fallbackVer == "" || fallbackVer == "latest" {
+				fallbackVer = "0.0.0"
+			}
+			status := "rate_limited"
+			if strings.Contains(listErr.Error(), "forbidden") {
+				status = "forbidden"
+			}
+			return ToolRelease{
+				Name:           toolName,
+				Repository:     repo,
+				LatestVersion:  fallbackVer,
+				TargetVersion:  targetVersion,
+				TagName:        fallbackVer,
+				LastCheckedAt:  now,
+				LastSyncStatus: status,
+				Error:          listErr.Error(),
+			}, listErr
+		}
 	}
 
-	// Fallback 2: check repository tags
-	tagsURL := fmt.Sprintf("https://api.github.com/repos/%s/tags?per_page=5", repo)
-	tagRel, tagErr := s.fetchTagsURL(ctx, tagsURL, repo, toolName, token)
-	if tagErr == nil && tagRel.LatestVersion != "" {
+	// Fallback 2: check repository tags with SemVer sorting
+	tagsKey := repo + ":tags_list"
+	s.mu.RLock()
+	cachedTags, okTags := s.cache[tagsKey]
+	s.mu.RUnlock()
+
+	tagsURL := fmt.Sprintf("%s/repos/%s/tags?per_page=15", base, repo)
+	s.mu.RLock()
+	tagsEtag := s.endpointETags[tagsURL]
+	s.mu.RUnlock()
+
+	tagRel, tagsNewEtag, tagsNotMod, tagErr := s.fetchTagsURL(ctx, tagsURL, repo, toolName, token, tagsEtag)
+	if tagsNewEtag != "" {
 		s.mu.Lock()
-		s.cache[cacheKey] = cachedRelease{
+		s.endpointETags[tagsURL] = tagsNewEtag
+		s.mu.Unlock()
+	}
+	if tagsNotMod && okTags {
+		s.mu.Lock()
+		cachedTags.expiresAt = now.Add(10 * time.Minute)
+		s.cache[tagsKey] = cachedTags
+		s.cache[cacheKey] = cachedTags
+		s.mu.Unlock()
+		r := cachedTags.release
+		r.Name = toolName
+		r.LastCheckedAt = now
+		r.LastSyncStatus = "not_modified"
+		if !isLatestLookup {
+			r.TargetVersion = targetVersion
+		}
+		return r, nil
+	}
+	if tagErr == nil && tagRel.LatestVersion != "" {
+		tagRel.LastCheckedAt = now
+		tagRel.LastSyncStatus = "ok"
+		if !isLatestLookup {
+			tagRel.TargetVersion = targetVersion
+		}
+		s.mu.Lock()
+		s.cache[tagsKey] = cachedRelease{
 			release:   tagRel,
+			etag:      tagsNewEtag,
 			expiresAt: now.Add(10 * time.Minute),
+		}
+		s.cache[cacheKey] = s.cache[tagsKey]
+		if isLatestLookup {
+			s.cache[repo+":latest"] = s.cache[tagsKey]
 		}
 		s.mu.Unlock()
 		return tagRel, nil
@@ -395,12 +745,35 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 	if lastErr != nil {
 		errToReturn = fmt.Errorf("lookup release for %s: %w", repo, lastErr)
 	}
+
+	// Negatively cache 404/not found errors for 5 minutes (E4)
+	if lastErr != nil && strings.Contains(lastErr.Error(), "404") {
+		s.mu.Lock()
+		s.cache[cacheKey] = cachedRelease{
+			release: ToolRelease{
+				Name:           toolName,
+				Repository:     repo,
+				LatestVersion:  fallbackVer,
+				TargetVersion:  targetVersion,
+				TagName:        fallbackVer,
+				LastCheckedAt:  now,
+				LastSyncStatus: "error",
+				Error:          errMsg,
+			},
+			expiresAt: now.Add(5 * time.Minute),
+		}
+		s.mu.Unlock()
+	}
+
 	return ToolRelease{
-		Name:          toolName,
-		Repository:    repo,
-		LatestVersion: fallbackVer,
-		TagName:       fallbackVer,
-		Error:         errMsg,
+		Name:           toolName,
+		Repository:     repo,
+		LatestVersion:  fallbackVer,
+		TargetVersion:  targetVersion,
+		TagName:        fallbackVer,
+		LastCheckedAt:  now,
+		LastSyncStatus: "error",
+		Error:          errMsg,
 	}, errToReturn
 }
 
@@ -426,6 +799,30 @@ func (s *ReleaseService) fetchReleaseURL(ctx context.Context, url, repo, toolNam
 
 	if resp.StatusCode == http.StatusNotModified {
 		return ToolRelease{Name: toolName, Repository: repo}, ifNoneMatch, true, nil
+	}
+
+	if resp.StatusCode == http.StatusTooManyRequests || (resp.StatusCode == http.StatusForbidden && (resp.Header.Get("X-RateLimit-Remaining") == "0" || resp.Header.Get("Retry-After") != "")) {
+		backoffDur := parseRateLimitBackoff(resp.Header, s.now())
+		s.mu.Lock()
+		expiry := s.now().Add(backoffDur)
+		if expiry.After(s.rateLimits[repo]) {
+			s.rateLimits[repo] = expiry
+		}
+		if expiry.After(s.globalRateLimitUntil) {
+			s.globalRateLimitUntil = expiry
+		}
+		s.mu.Unlock()
+		return ToolRelease{Name: toolName, Repository: repo, LatestVersion: targetVersion, TagName: targetVersion, LastSyncStatus: "rate_limited"}, "", false, fmt.Errorf("rate limited (status %d)", resp.StatusCode)
+	}
+
+	if resp.StatusCode == http.StatusForbidden {
+		return ToolRelease{Name: toolName, Repository: repo, LatestVersion: targetVersion, TagName: targetVersion}, "", false, fmt.Errorf("forbidden (HTTP 403, check token scopes / SSO)")
+	}
+
+	if resp.StatusCode == http.StatusNotFound && strings.HasSuffix(url, "/releases/latest") {
+		s.mu.Lock()
+		s.noFormalReleases[repo] = s.now().Add(1 * time.Hour)
+		s.mu.Unlock()
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -454,83 +851,190 @@ func (s *ReleaseService) fetchReleaseURL(ctx context.Context, url, repo, toolNam
 	}, etag, false, nil
 }
 
-func (s *ReleaseService) fetchReleaseListURL(ctx context.Context, url, repo, toolName, token string) (ToolRelease, error) {
+func isPrereleaseTag(tag string) bool {
+	lower := strings.ToLower(tag)
+	return strings.Contains(lower, "-rc") ||
+		strings.Contains(lower, "-beta") ||
+		strings.Contains(lower, "-alpha") ||
+		strings.Contains(lower, "-dev") ||
+		strings.Contains(lower, "-preview") ||
+		strings.Contains(lower, "-prerelease")
+}
+
+func (s *ReleaseService) fetchReleaseListURL(ctx context.Context, url, repo, toolName, token, cachedEtag string) (ToolRelease, string, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return ToolRelease{Name: toolName, Repository: repo}, err
+		return ToolRelease{Name: toolName, Repository: repo}, "", false, err
 	}
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 	req.Header.Set("User-Agent", "iazio-harness-api/1.0")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	if cachedEtag != "" {
+		req.Header.Set("If-None-Match", cachedEtag)
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return ToolRelease{Name: toolName, Repository: repo}, err
+		return ToolRelease{Name: toolName, Repository: repo}, "", false, err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return ToolRelease{Name: toolName, Repository: repo}, fmt.Errorf("status %d", resp.StatusCode)
+	if resp.StatusCode == http.StatusNotModified {
+		return ToolRelease{Name: toolName, Repository: repo}, cachedEtag, true, nil
 	}
 
-	var list []struct {
+	if resp.StatusCode == http.StatusTooManyRequests || (resp.StatusCode == http.StatusForbidden && (resp.Header.Get("X-RateLimit-Remaining") == "0" || resp.Header.Get("Retry-After") != "")) {
+		backoffDur := parseRateLimitBackoff(resp.Header, s.now())
+		s.mu.Lock()
+		expiry := s.now().Add(backoffDur)
+		if expiry.After(s.rateLimits[repo]) {
+			s.rateLimits[repo] = expiry
+		}
+		if expiry.After(s.globalRateLimitUntil) {
+			s.globalRateLimitUntil = expiry
+		}
+		s.mu.Unlock()
+		return ToolRelease{Name: toolName, Repository: repo, LastSyncStatus: "rate_limited"}, "", false, fmt.Errorf("rate limited (status %d)", resp.StatusCode)
+	}
+
+	if resp.StatusCode == http.StatusForbidden {
+		return ToolRelease{Name: toolName, Repository: repo}, "", false, fmt.Errorf("forbidden (HTTP 403, check token scopes / SSO)")
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return ToolRelease{Name: toolName, Repository: repo}, "", false, fmt.Errorf("status %d", resp.StatusCode)
+	}
+
+	newEtag := resp.Header.Get("ETag")
+
+	type ghReleaseItem struct {
 		TagName     string    `json:"tag_name"`
 		HTMLURL     string    `json:"html_url"`
 		PublishedAt time.Time `json:"published_at"`
+		Draft       bool      `json:"draft"`
+		Prerelease  bool      `json:"prerelease"`
 	}
+	var list []ghReleaseItem
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil || len(list) == 0 {
-		return ToolRelease{Name: toolName, Repository: repo}, fmt.Errorf("no releases")
+		return ToolRelease{Name: toolName, Repository: repo}, "", false, fmt.Errorf("no releases")
 	}
 
-	ver := strings.TrimPrefix(list[0].TagName, "v")
+	var candidates []ghReleaseItem
+	for _, item := range list {
+		if !item.Draft && !item.Prerelease && !isPrereleaseTag(item.TagName) {
+			candidates = append(candidates, item)
+		}
+	}
+	if len(candidates) == 0 {
+		for _, item := range list {
+			if !item.Draft {
+				candidates = append(candidates, item)
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		candidates = list
+	}
+
+	// Sort descending by SemVer
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return compareSemVer(candidates[i].TagName, candidates[j].TagName) > 0
+	})
+
+	best := candidates[0]
+	ver := strings.TrimPrefix(best.TagName, "v")
 	return ToolRelease{
 		Name:          toolName,
 		Repository:    repo,
 		LatestVersion: ver,
-		TagName:       list[0].TagName,
-		PublishedAt:   list[0].PublishedAt,
-		HTMLURL:       list[0].HTMLURL,
-	}, nil
+		TagName:       best.TagName,
+		PublishedAt:   best.PublishedAt,
+		HTMLURL:       best.HTMLURL,
+	}, newEtag, false, nil
 }
 
-func (s *ReleaseService) fetchTagsURL(ctx context.Context, url, repo, toolName, token string) (ToolRelease, error) {
+func (s *ReleaseService) fetchTagsURL(ctx context.Context, url, repo, toolName, token, cachedEtag string) (ToolRelease, string, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return ToolRelease{Name: toolName, Repository: repo}, err
+		return ToolRelease{Name: toolName, Repository: repo}, "", false, err
 	}
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 	req.Header.Set("User-Agent", "iazio-harness-api/1.0")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	if cachedEtag != "" {
+		req.Header.Set("If-None-Match", cachedEtag)
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return ToolRelease{Name: toolName, Repository: repo}, err
+		return ToolRelease{Name: toolName, Repository: repo}, "", false, err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return ToolRelease{Name: toolName, Repository: repo}, fmt.Errorf("status %d", resp.StatusCode)
+	if resp.StatusCode == http.StatusNotModified {
+		return ToolRelease{Name: toolName, Repository: repo}, cachedEtag, true, nil
 	}
+
+	if resp.StatusCode == http.StatusTooManyRequests || (resp.StatusCode == http.StatusForbidden && (resp.Header.Get("X-RateLimit-Remaining") == "0" || resp.Header.Get("Retry-After") != "")) {
+		backoffDur := parseRateLimitBackoff(resp.Header, s.now())
+		s.mu.Lock()
+		expiry := s.now().Add(backoffDur)
+		if expiry.After(s.rateLimits[repo]) {
+			s.rateLimits[repo] = expiry
+		}
+		if expiry.After(s.globalRateLimitUntil) {
+			s.globalRateLimitUntil = expiry
+		}
+		s.mu.Unlock()
+		return ToolRelease{Name: toolName, Repository: repo, LastSyncStatus: "rate_limited"}, "", false, fmt.Errorf("rate limited (status %d)", resp.StatusCode)
+	}
+
+	if resp.StatusCode == http.StatusForbidden {
+		return ToolRelease{Name: toolName, Repository: repo}, "", false, fmt.Errorf("forbidden (HTTP 403, check token scopes / SSO)")
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return ToolRelease{Name: toolName, Repository: repo}, "", false, fmt.Errorf("status %d", resp.StatusCode)
+	}
+
+	newEtag := resp.Header.Get("ETag")
 
 	var tags []struct {
 		Name string `json:"name"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&tags); err != nil || len(tags) == 0 {
-		return ToolRelease{Name: toolName, Repository: repo}, fmt.Errorf("no tags")
+		return ToolRelease{Name: toolName, Repository: repo}, "", false, fmt.Errorf("no tags")
 	}
 
-	ver := strings.TrimPrefix(tags[0].Name, "v")
+	var candidateTags []struct {
+		Name string `json:"name"`
+	}
+	for _, item := range tags {
+		if !isPrereleaseTag(item.Name) {
+			candidateTags = append(candidateTags, item)
+		}
+	}
+	if len(candidateTags) == 0 {
+		candidateTags = tags
+	}
+
+	sort.SliceStable(candidateTags, func(i, j int) bool {
+		return compareSemVer(candidateTags[i].Name, candidateTags[j].Name) > 0
+	})
+
+	best := candidateTags[0]
+	ver := strings.TrimPrefix(best.Name, "v")
 	return ToolRelease{
 		Name:          toolName,
 		Repository:    repo,
 		LatestVersion: ver,
-		TagName:       tags[0].Name,
-		HTMLURL:       fmt.Sprintf("https://github.com/%s/releases/tag/%s", repo, tags[0].Name),
-	}, nil
+		TagName:       best.Name,
+		HTMLURL:       fmt.Sprintf("https://github.com/%s/releases/tag/%s", repo, best.Name),
+	}, newEtag, false, nil
 }
 
 // GetProfileReleases queries latest releases for all tools in a profile.
@@ -542,13 +1046,17 @@ func (s *ReleaseService) GetProfileReleases(ctx context.Context, p DistributionP
 		if repo == "" {
 			repo = "viovy/" + t.Name
 		}
-		rel, err := s.GetToolRelease(ctx, repo, t.Name, t.TargetVersion)
-		if err != nil {
-			rel.Error = err.Error()
-			if rel.LatestVersion == "" {
+		// Query the latest upstream release for the tool
+		rel, err := s.GetToolRelease(ctx, repo, t.Name, "latest")
+		rel.TargetVersion = t.TargetVersion
+		if err != nil || rel.Error != "" {
+			if rel.Error == "" && err != nil {
+				rel.Error = err.Error()
+			}
+			if rel.LatestVersion == "" || rel.LatestVersion == "0.0.0" {
 				rel.LatestVersion = t.TargetVersion
 			}
-			errs = append(errs, fmt.Sprintf("%s (%s): %v", t.Name, repo, err))
+			errs = append(errs, fmt.Sprintf("%s (%s): %s", t.Name, repo, rel.Error))
 		}
 		out = append(out, rel)
 	}
@@ -558,9 +1066,12 @@ func (s *ReleaseService) GetProfileReleases(ctx context.Context, p DistributionP
 	return out, nil
 }
 
-// RefreshProfileReleases purges cached releases for all tools in a profile and fetches fresh releases.
-func (s *ReleaseService) RefreshProfileReleases(ctx context.Context, p DistributionProfile) ([]ToolRelease, error) {
+// InvalidateProfileCache expires the TTL of cached entries for tools in a profile,
+// while intentionally preserving their cached ETags so subsequent requests use conditional HTTP (If-None-Match).
+func (s *ReleaseService) InvalidateProfileCache(p DistributionProfile) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	expired := s.now().Add(-1 * time.Hour)
 	for _, t := range p.Tools {
 		repo := t.Repository
 		if repo == "" {
@@ -574,12 +1085,25 @@ func (s *ReleaseService) RefreshProfileReleases(ctx context.Context, p Distribut
 			targetVersion = "latest"
 		}
 		bare := strings.TrimPrefix(targetVersion, "v")
-		delete(s.cache, repo+":"+targetVersion)
-		delete(s.cache, repo+":"+bare)
-		delete(s.cache, repo+":v"+bare)
-		delete(s.cache, repo+":latest")
+		for _, key := range []string{
+			repo + ":" + targetVersion,
+			repo + ":" + bare,
+			repo + ":v" + bare,
+			repo + ":latest",
+			repo + ":releases_list",
+			repo + ":tags_list",
+		} {
+			if entry, exists := s.cache[key]; exists {
+				entry.expiresAt = expired
+				s.cache[key] = entry
+			}
+		}
 	}
-	s.mu.Unlock()
+}
+
+// RefreshProfileReleases expires cached release TTLs (preserving ETags) and queries fresh releases.
+func (s *ReleaseService) RefreshProfileReleases(ctx context.Context, p DistributionProfile) ([]ToolRelease, error) {
+	s.InvalidateProfileCache(p)
 	return s.GetProfileReleases(ctx, p)
 }
 
@@ -593,8 +1117,227 @@ func (s *ReleaseService) SetCachedRelease(repo, version string, release ToolRele
 	if version == "" {
 		version = "latest"
 	}
+	etag := ""
+	if release.TagName != "" {
+		etag = `W/"` + release.TagName + `"`
+	}
 	s.cache[repo+":"+version] = cachedRelease{
 		release:   release,
+		etag:      etag,
 		expiresAt: s.now().Add(ttl),
 	}
+}
+
+// ReleaseNotificationCallback is invoked when a new release is detected and profile updated.
+type ReleaseNotificationCallback func(profileName string, tool ProfileTool, oldVersion, newVersion string)
+
+func (s *ReleaseService) hasConfiguredToken() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.token != "" || len(s.credentials) > 0 {
+		return true
+	}
+	return os.Getenv("GITHUB_TOKEN") != "" || os.Getenv("GH_TOKEN") != ""
+}
+
+// StartBackgroundSync runs a background worker polling GitHub releases and auto-advancing tracking profiles.
+func (s *ReleaseService) StartBackgroundSync(ctx context.Context, e *Engine, interval time.Duration, onReleaseDetected ReleaseNotificationCallback) {
+	if interval <= 0 {
+		interval = 60 * time.Second
+	}
+	// Stretch unauthenticated interval to at least 5 minutes to stay within the 60 req/h limit (F-7)
+	if !s.hasConfiguredToken() && interval < 5*time.Minute {
+		interval = 5 * time.Minute
+	}
+	go func() {
+		// Initial sync after 2 seconds
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+			s.SyncAllProfiles(ctx, e, onReleaseDetected)
+		}
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.SyncAllProfiles(ctx, e, onReleaseDetected)
+			}
+		}
+	}()
+}
+
+// SyncProfile synchronizes release versions for a single profile.
+// Updates tools atomically under Engine lock, respects TrackLatest, prevents downgrade,
+// and invokes onReleaseDetected only after successful persistence.
+func (s *ReleaseService) SyncProfile(
+	ctx context.Context,
+	e *Engine,
+	profileName string,
+	onReleaseDetected ReleaseNotificationCallback,
+) (int, error) {
+	return s.syncProfileWithCachePolicy(ctx, e, profileName, onReleaseDetected, true)
+}
+
+func (s *ReleaseService) syncProfileWithCachePolicy(
+	ctx context.Context,
+	e *Engine,
+	profileName string,
+	onReleaseDetected ReleaseNotificationCallback,
+	invalidate bool,
+) (int, error) {
+	if e == nil {
+		return 0, fmt.Errorf("engine required")
+	}
+	p, err := e.GetProfile(profileName)
+	if err != nil {
+		return 0, err
+	}
+
+	var releases []ToolRelease
+	var fetchErr error
+	if invalidate {
+		releases, fetchErr = s.RefreshProfileReleases(ctx, *p)
+	} else {
+		releases, fetchErr = s.GetProfileReleases(ctx, *p)
+	}
+	if fetchErr != nil && len(releases) == 0 {
+		return 0, fetchErr
+	}
+
+	totalAdvanced := 0
+	type notif struct {
+		tool        ProfileTool
+		fromVersion string
+		toVersion   string
+	}
+	var pendingNotifications []notif
+
+	_, _, updateErr := e.UpdateProfileTools(profileName, func(tools []ProfileTool) ([]ProfileTool, bool) {
+		updatedTools := make([]ProfileTool, len(tools))
+		copy(updatedTools, tools)
+		configChanged := false
+		now := s.now()
+
+		for i := range updatedTools {
+			toolName := strings.ToLower(updatedTools[i].Name)
+			repoName := strings.ToLower(updatedTools[i].Repository)
+
+			for _, rel := range releases {
+				relTool := strings.ToLower(rel.Name)
+				relRepo := strings.ToLower(rel.Repository)
+				if relTool == toolName || relRepo == repoName || strings.HasSuffix(relRepo, "/"+toolName) {
+					updatedTools[i].LastCheckedAt = &now
+
+					if rel.Error != "" {
+						if rel.LastSyncStatus == "rate_limited" {
+							updatedTools[i].LastSyncStatus = "rate_limited"
+						} else {
+							updatedTools[i].LastSyncStatus = "error"
+						}
+						updatedTools[i].LastSyncError = rel.Error
+						break
+					}
+
+					if rel.LatestVersion != "" {
+						updatedTools[i].LatestAvailableVersion = rel.LatestVersion
+						updatedTools[i].LatestReleaseURL = rel.HTMLURL
+						if !rel.PublishedAt.IsZero() {
+							pub := rel.PublishedAt
+							updatedTools[i].LatestPublishedAt = &pub
+						}
+						updatedTools[i].LastSyncStatus = "ok"
+						updatedTools[i].LastSyncError = ""
+
+						oldTarget := updatedTools[i].TargetVersion
+						// Determine if tool is tracking latest (R2):
+						// Respect explicit TrackLatest pointer (*bool), migrating legacy rows where TrackLatest is nil.
+						isTrackingLatest := updatedTools[i].IsTrackingLatest(p.IsDefault || profileName == "generic")
+
+						if isTrackingLatest {
+							// Maintain tracking intent across auto-advances
+							if updatedTools[i].TrackLatest == nil || !*updatedTools[i].TrackLatest {
+								updatedTools[i].TrackLatest = BoolPtr(true)
+								configChanged = true
+							}
+
+							// Advance target_version if target is empty, "latest", or upstream is strictly newer SemVer (N2)
+							if oldTarget == "" || oldTarget == "latest" || compareSemVer(rel.LatestVersion, oldTarget) > 0 {
+								updatedTools[i].TargetVersion = rel.LatestVersion
+								configChanged = true
+								totalAdvanced++
+								pendingNotifications = append(pendingNotifications, notif{
+									tool:        updatedTools[i],
+									fromVersion: oldTarget,
+									toVersion:   rel.LatestVersion,
+								})
+							}
+						}
+					}
+					break
+				}
+			}
+		}
+		return updatedTools, configChanged
+	})
+
+	if updateErr != nil {
+		return 0, updateErr
+	}
+
+	if onReleaseDetected != nil {
+		for _, n := range pendingNotifications {
+			onReleaseDetected(profileName, n.tool, n.fromVersion, n.toVersion)
+		}
+	}
+
+	if fetchErr != nil {
+		return totalAdvanced, fetchErr
+	}
+	return totalAdvanced, nil
+}
+
+// SyncAllProfilesResult details the outcome of syncing all profiles.
+type SyncAllProfilesResult struct {
+	TotalAdvanced int               `json:"tools_updated"`
+	Errors        map[string]string `json:"errors,omitempty"`
+}
+
+// SyncAllProfiles iterates all registered distribution profiles and updates tool release information.
+// Returns the number of tools whose target version was advanced.
+func (s *ReleaseService) SyncAllProfiles(ctx context.Context, e *Engine, onReleaseDetected ReleaseNotificationCallback) int {
+	res := s.SyncAllProfilesDetailed(ctx, e, onReleaseDetected)
+	return res.TotalAdvanced
+}
+
+// SyncAllProfilesDetailed iterates all registered distribution profiles, updates tool releases,
+// deduplicates requests across profiles (E4), and records per-profile error messages (R7).
+func (s *ReleaseService) SyncAllProfilesDetailed(ctx context.Context, e *Engine, onReleaseDetected ReleaseNotificationCallback) SyncAllProfilesResult {
+	res := SyncAllProfilesResult{
+		Errors: make(map[string]string),
+	}
+	if e == nil {
+		return res
+	}
+	profiles := e.ListProfiles()
+
+	// Deduplicate unique repositories across all profiles and invalidate once per tick (E4)
+	for _, p := range profiles {
+		s.InvalidateProfileCache(p)
+	}
+
+	for _, p := range profiles {
+		adv, err := s.syncProfileWithCachePolicy(ctx, e, p.Name, onReleaseDetected, false)
+		if err != nil {
+			log.Printf("[ReleaseService] ERROR syncing profile %s: %v", p.Name, err)
+			res.Errors[p.Name] = err.Error()
+		} else {
+			res.TotalAdvanced += adv
+		}
+	}
+	return res
 }

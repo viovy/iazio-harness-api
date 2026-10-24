@@ -153,17 +153,19 @@ func run(ctx context.Context, args []string) error {
 		srv.SaveHost = func(h control.Host) {
 			_ = store.SaveHost(context.Background(), h)
 		}
-		srv.SaveProfile = func(p control.DistributionProfile) {
-			_ = store.SaveProfile(context.Background(), p)
+		srv.Engine.OnSaveProfile = func(p control.DistributionProfile) error {
+			return store.SaveProfile(context.Background(), p)
 		}
 		srv.DeleteProfile = func(name string) {
 			_ = store.DeleteProfile(context.Background(), name)
 		}
 		if profiles, err := store.LoadProfiles(ctx); err == nil {
 			for _, p := range profiles {
-				_, _ = srv.Engine.UpsertProfile(p)
+				srv.Engine.LoadProfile(p)
 			}
 			log.Printf("loaded %d distribution profiles from database", len(profiles))
+		} else {
+			log.Printf("failed to load distribution profiles from database: %v", err)
 		}
 		if srv.Engine.Releases != nil {
 			if err := srv.Engine.Releases.SetStore(store); err != nil {
@@ -174,6 +176,33 @@ func run(ctx context.Context, args []string) error {
 	} else {
 		seedDefaults(context.Background(), srv.Engine, nil, srv.CodebaseStore)
 	}
+
+	if srv.Engine.Releases != nil {
+		syncInterval := 60 * time.Second
+		if raw := os.Getenv("IAZIO_RELEASE_SYNC_INTERVAL"); raw != "" {
+			if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+				syncInterval = d
+			}
+		}
+		srv.Engine.Releases.StartBackgroundSync(ctx, srv.Engine, syncInterval, func(profileName string, tool control.ProfileTool, oldVersion, newVersion string) {
+			srv.RecordNotification(httpserver.NotificationRecord{
+				Title:    "Release Detected",
+				Message:  fmt.Sprintf("New release detected for %s: %s (was %s). Profile '%s' updated.", tool.Name, newVersion, oldVersion, profileName),
+				Category: "release",
+				Source:   "release-watcher",
+				Metadata: map[string]any{
+					"event":        "release.detected",
+					"profile":      profileName,
+					"tool":         tool.Name,
+					"from_version": oldVersion,
+					"to_version":   newVersion,
+					"url":          tool.LatestReleaseURL,
+				},
+			})
+		})
+		log.Printf("started background release sync watcher (interval=%v)", syncInterval)
+	}
+
 	httpServer := &http.Server{
 		Addr:              addr,
 		Handler:           srv.Handler(),

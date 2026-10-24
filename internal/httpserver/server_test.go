@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2284,5 +2285,363 @@ func TestHostHeartbeat_ToolServiceMetadata(t *testing.T) {
 	caps, ok := toolMap["capabilities"].([]any)
 	if !ok || len(caps) != 3 {
 		t.Errorf("expected 3 capabilities, got %v", toolMap["capabilities"])
+	}
+}
+
+func TestSyncAllProfilesEndpoint_AndCacheControl(t *testing.T) {
+	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"mock-etag-492"`)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tag_name":     "0.0.492",
+			"html_url":     "https://github.com/viovy/autopilot-plugins-internal/releases/tag/0.0.492",
+			"published_at": time.Now().UTC().Format(time.RFC3339),
+		})
+	}))
+	defer mockGH.Close()
+
+	s := &Server{Engine: control.NewEngine(nil)}
+	handler := s.Handler()
+
+	_, err := s.Engine.UpsertProfile(control.DistributionProfile{
+		Name: "generic",
+		Tools: []control.ProfileTool{
+			{Name: "autopilot-fleet", Repository: "viovy/autopilot-plugins-internal", TargetVersion: "0.0.482", TrackLatest: control.BoolPtr(true)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to upsert profile: %v", err)
+	}
+
+	relSvc := control.NewReleaseService()
+	relSvc.SetBaseURL(mockGH.URL)
+	s.Engine.SetReleaseService(relSvc)
+
+	// 1. Check GET /v1/fleet/profiles has Cache-Control: no-store
+	reqGet := httptest.NewRequest(http.MethodGet, "/v1/fleet/profiles", nil)
+	rrGet := httptest.NewRecorder()
+	handler.ServeHTTP(rrGet, reqGet)
+	if rrGet.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rrGet.Code)
+	}
+	if !strings.Contains(rrGet.Header().Get("Cache-Control"), "no-store") {
+		t.Errorf("expected Cache-Control no-store, got %s", rrGet.Header().Get("Cache-Control"))
+	}
+
+	// 2. Call POST /v1/fleet/profiles/sync
+	reqSync := httptest.NewRequest(http.MethodPost, "/v1/fleet/profiles/sync", nil)
+	rrSync := httptest.NewRecorder()
+	handler.ServeHTTP(rrSync, reqSync)
+	if rrSync.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rrSync.Code, rrSync.Body.String())
+	}
+	if !strings.Contains(rrSync.Header().Get("Cache-Control"), "no-store") {
+		t.Errorf("expected Cache-Control no-store on sync, got %s", rrSync.Header().Get("Cache-Control"))
+	}
+
+	var syncResp map[string]any
+	if err := json.Unmarshal(rrSync.Body.Bytes(), &syncResp); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if syncResp["status"] != "ok" {
+		t.Errorf("expected status ok, got %v", syncResp["status"])
+	}
+
+	// 3. Verify target version auto-advanced to 0.0.492
+	prof, _ := s.Engine.GetProfile("generic")
+	if prof.Tools[0].TargetVersion != "0.0.492" {
+		t.Errorf("expected TargetVersion 0.0.492, got %s", prof.Tools[0].TargetVersion)
+	}
+	if prof.Tools[0].LatestAvailableVersion != "0.0.492" {
+		t.Errorf("expected LatestAvailableVersion 0.0.492, got %s", prof.Tools[0].LatestAvailableVersion)
+	}
+
+	// 4. Verify notification was recorded
+	notifs := s.GetNotifications(10)
+	if len(notifs) == 0 {
+		t.Errorf("expected release notification recorded")
+	} else if notifs[0].Category != "release" {
+		t.Errorf("expected category release, got %s", notifs[0].Category)
+	}
+}
+
+func TestServer_RefreshPinnedProfileCannotDowngrade(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tag_name":     "0.0.490",
+			"html_url":     "https://github.com/viovy/autopilot-plugins-internal/releases/tag/0.0.490",
+			"published_at": time.Now().UTC().Format(time.RFC3339),
+		})
+	}))
+	defer ts.Close()
+
+	s := &Server{Engine: control.NewEngine(nil)}
+	relSvc := control.NewReleaseService()
+	relSvc.SetBaseURL(ts.URL)
+	s.Engine.SetReleaseService(relSvc)
+
+	// Seed profile with explicit pinned TargetVersion 0.0.492 (ahead of upstream 0.0.490) and TrackLatest false
+	_, _ = s.Engine.UpsertProfile(control.DistributionProfile{
+		Name: "pinned-profile",
+		Tools: []control.ProfileTool{
+			{
+				Name:          "autopilot-plugins-internal",
+				Repository:    "viovy/autopilot-plugins-internal",
+				TargetVersion: "0.0.492",
+				TrackLatest:   control.BoolPtr(false),
+			},
+		},
+	})
+
+	handler := s.Handler()
+	req := httptest.NewRequest(http.MethodPost, "/v1/fleet/profiles/pinned-profile/refresh", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	prof, _ := s.Engine.GetProfile("pinned-profile")
+	// TargetVersion must NOT be downgraded to 0.0.490
+	if prof.Tools[0].TargetVersion != "0.0.492" {
+		t.Fatalf("expected pinned target 0.0.492 preserved, but got %s", prof.Tools[0].TargetVersion)
+	}
+	// LatestAvailableVersion reflects upstream
+	if prof.Tools[0].LatestAvailableVersion != "0.0.490" {
+		t.Fatalf("expected latest available version 0.0.490, got %s", prof.Tools[0].LatestAvailableVersion)
+	}
+}
+
+func TestServer_RefreshProfileReleases_MixedToolOutcomesPartialStatus(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "repo-good/releases/latest"):
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"tag_name": "v2.0.0", "html_url": "https://github.com/viovy/repo-good/releases/tag/v2.0.0"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	s := &Server{Engine: control.NewEngine(nil)}
+	s.Engine.Releases.SetBaseURL(ts.URL)
+	s.Engine.Releases.SetHTTPClient(ts.Client())
+
+	_, err := s.Engine.UpsertProfile(control.DistributionProfile{
+		Name: "mixed-profile",
+		Tools: []control.ProfileTool{
+			{
+				Name:          "tool-good",
+				Repository:    "viovy/repo-good",
+				TargetVersion: "1.0.0",
+				TrackLatest:   control.BoolPtr(true),
+			},
+			{
+				Name:          "tool-bad",
+				Repository:    "viovy/repo-bad",
+				TargetVersion: "1.0.0",
+				TrackLatest:   control.BoolPtr(true),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create profile failed: %v", err)
+	}
+
+	handler := s.Handler()
+	req := httptest.NewRequest(http.MethodPost, "/v1/fleet/profiles/mixed-profile/refresh", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	// F2: Must return 200 OK (NOT 502) on partial failure
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for partial refresh, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		Status       string                      `json:"status"`
+		ToolsUpdated int                         `json:"tools_updated"`
+		Error        string                      `json:"error"`
+		Profile      control.DistributionProfile `json:"profile"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if resp.Status != "partial" {
+		t.Fatalf("expected status 'partial', got '%s'", resp.Status)
+	}
+	if resp.ToolsUpdated != 1 {
+		t.Fatalf("expected tools_updated=1, got %d", resp.ToolsUpdated)
+	}
+	if resp.Error == "" {
+		t.Fatalf("expected non-empty error field describing failed tool")
+	}
+
+	// Verify good tool was advanced and bad tool remained at target
+	prof, _ := s.Engine.GetProfile("mixed-profile")
+	if prof.Tools[0].TargetVersion != "2.0.0" {
+		t.Fatalf("expected tool-good target to advance to 2.0.0, got %s", prof.Tools[0].TargetVersion)
+	}
+	if prof.Tools[1].TargetVersion != "1.0.0" {
+		t.Fatalf("expected tool-bad target to remain 1.0.0, got %s", prof.Tools[1].TargetVersion)
+	}
+}
+
+func TestRefreshProfileReleases_TotalFailureReturns502(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	mockRelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer mockRelServer.Close()
+
+	relSvc := control.NewReleaseService()
+	relSvc.SetBaseURL(mockRelServer.URL)
+	relSvc.SetHTTPClient(mockRelServer.Client())
+	s.Engine.Releases = relSvc
+
+	_, err := s.Engine.UpsertProfile(control.DistributionProfile{
+		Name: "fail-profile",
+		Tools: []control.ProfileTool{
+			{
+				Name:          "tool-fail",
+				Repository:    "viovy/repo-fail",
+				TargetVersion: "1.0.0",
+				TrackLatest:   control.BoolPtr(true),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create profile failed: %v", err)
+	}
+
+	handler := s.Handler()
+	req := httptest.NewRequest(http.MethodPost, "/v1/fleet/profiles/fail-profile/refresh", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	// E8: Total failure must return 502 Bad Gateway
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 Bad Gateway for total failure, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp["status"] != "error" {
+		t.Fatalf("expected status 'error', got %v", resp["status"])
+	}
+}
+
+func TestProfileHandlers_SinglePersistencePathNoRedundantWrite(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	var savedState control.DistributionProfile
+	var saveCount int
+	var mu sync.Mutex
+
+	s.Engine.OnSaveProfile = func(p control.DistributionProfile) error {
+		mu.Lock()
+		savedState = p
+		saveCount++
+		mu.Unlock()
+		return nil
+	}
+
+	handler := s.Handler()
+
+	// 1. Create profile via POST /v1/fleet/profiles
+	createPayload := `{"name":"test-single-persist","description":"initial","tools":[{"name":"tool1","repository":"viovy/tool1","target_version":"1.0.0"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/fleet/profiles", strings.NewReader(createPayload))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	mu.Lock()
+	if saveCount != 1 {
+		t.Fatalf("expected exactly 1 save on create, got %d (E1)", saveCount)
+	}
+	if savedState.Description != "initial" {
+		t.Fatalf("expected saved description 'initial', got %q", savedState.Description)
+	}
+	mu.Unlock()
+
+	// 2. Update profile via PUT /v1/fleet/profiles/test-single-persist
+	updatePayload := `{"description":"updated-desc","tools":[{"name":"tool1","repository":"viovy/tool1","target_version":"2.0.0"}]}`
+	req = httptest.NewRequest(http.MethodPut, "/v1/fleet/profiles/test-single-persist", strings.NewReader(updatePayload))
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on update, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	mu.Lock()
+	if saveCount != 2 {
+		t.Fatalf("expected exactly 2 total saves after update, got %d (E1 redundant write detected)", saveCount)
+	}
+	if savedState.Description != "updated-desc" {
+		t.Fatalf("expected saved description 'updated-desc', got %q", savedState.Description)
+	}
+	mu.Unlock()
+
+	inMem, err := s.Engine.GetProfile("test-single-persist")
+	if err != nil {
+		t.Fatalf("failed to get profile from engine: %v", err)
+	}
+	mu.Lock()
+	if inMem.Description != savedState.Description || len(inMem.Tools) != len(savedState.Tools) || inMem.Tools[0].TargetVersion != savedState.Tools[0].TargetVersion {
+		t.Fatalf("in-memory state does not match persisted state: inMem=%+v, saved=%+v", inMem, savedState)
+	}
+	mu.Unlock()
+}
+
+func TestSyncAllProfiles_TotalFailureReturns502(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	mockRelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer mockRelServer.Close()
+
+	relSvc := control.NewReleaseService()
+	relSvc.SetBaseURL(mockRelServer.URL)
+	relSvc.SetHTTPClient(mockRelServer.Client())
+	s.Engine.Releases = relSvc
+
+	_, err := s.Engine.UpsertProfile(control.DistributionProfile{
+		Name: "fail-all-profile",
+		Tools: []control.ProfileTool{
+			{
+				Name:          "tool-fail",
+				Repository:    "viovy/repo-fail",
+				TargetVersion: "1.0.0",
+				TrackLatest:   control.BoolPtr(true),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create profile failed: %v", err)
+	}
+
+	handler := s.Handler()
+	req := httptest.NewRequest(http.MethodPost, "/v1/fleet/profiles/sync", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	// L1, N3: Total failure across profiles must return 502 Bad Gateway
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 Bad Gateway for total sync-all failure, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp["status"] != "error" {
+		t.Fatalf("expected status 'error', got %v", resp["status"])
 	}
 }

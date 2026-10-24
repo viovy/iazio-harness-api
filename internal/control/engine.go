@@ -341,6 +341,12 @@ type RepoRuntimeStatus struct {
 	Alias                string    `json:"alias,omitempty"`
 	IsClean              bool      `json:"is_clean"`
 	Branch               string    `json:"branch,omitempty"`
+	HeadSHA              string    `json:"head_sha,omitempty"`
+	DirtyFilesCount      int       `json:"dirty_files_count"`
+	UntrackedFilesCount  int       `json:"untracked_files_count"`
+	Ahead                int       `json:"ahead"`
+	Behind               int       `json:"behind"`
+	HasActiveGitLock     bool      `json:"has_active_git_lock"`
 	Porcelain            string    `json:"porcelain,omitempty"`
 	SubmodulesClean      bool      `json:"submodules_clean"`
 	DirtySubmodules      []string  `json:"dirty_submodules,omitempty"`
@@ -521,6 +527,10 @@ type Host struct {
 	Tools               []Tool
 	PendingToolUpdate   *PendingToolUpdate
 	PendingCommands     []CommandEnvelope
+	FleetGitClean       bool
+	HarnessActive       bool
+	FleetCheckedAt      *time.Time
+	RepoStatuses        map[string]RepoRuntimeStatus
 }
 
 // PingAck is a live acknowledgment from an agent responding to a PING command.
@@ -565,6 +575,9 @@ type Engine struct {
 	pingWaiters     map[string]chan PingAck
 	repoWaiters     map[string]chan RepoRuntimeStatus
 	profiles        map[string]*DistributionProfile
+	profileLocksMu  sync.Mutex
+	profileLocks    map[string]*sync.Mutex
+	OnSaveProfile   func(p DistributionProfile) error
 	cloneLease      map[string]string
 	hubLease        string
 	runningRev      map[string]bool
@@ -638,6 +651,7 @@ func NewEngine(now func() time.Time) *Engine {
 		pingWaiters:  map[string]chan PingAck{},
 		repoWaiters:  map[string]chan RepoRuntimeStatus{},
 		profiles:     map[string]*DistributionProfile{},
+		profileLocks: make(map[string]*sync.Mutex),
 		cloneLease:   map[string]string{},
 		runningRev:   map[string]bool{},
 		history:      map[string][]HistoryRow{},
@@ -646,6 +660,20 @@ func NewEngine(now func() time.Time) *Engine {
 		Releases:     NewReleaseService(),
 		toolPriority: []string{"agy", "agent", "copilot", "opencode"},
 	}
+}
+
+func (e *Engine) getProfileLock(name string) *sync.Mutex {
+	e.profileLocksMu.Lock()
+	defer e.profileLocksMu.Unlock()
+	if e.profileLocks == nil {
+		e.profileLocks = make(map[string]*sync.Mutex)
+	}
+	m, ok := e.profileLocks[name]
+	if !ok {
+		m = &sync.Mutex{}
+		e.profileLocks[name] = m
+	}
+	return m
 }
 
 func (e *Engine) next(prefix string) string {
@@ -1693,10 +1721,55 @@ func (e *Engine) DeregisterRepoStatusWaiter(key string) {
 	delete(e.repoWaiters, key)
 }
 
+// StaleRepoThreshold defines the age after which a repository telemetry entry is considered stale
+// and pruned from the host's RepoStatuses map during fleet aggregation.
+const StaleRepoThreshold = 10 * time.Minute
+
 // UpdateRepoRuntimeStatus updates repository fields based on continuous agent telemetry.
 func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeStatus) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	now := e.now().UTC()
+
+	h, hasHost := e.hosts[hostID]
+	if hasHost && h != nil {
+		if h.RepoStatuses == nil {
+			h.RepoStatuses = make(map[string]RepoRuntimeStatus)
+		}
+		for _, st := range statuses {
+			cleanPath := filepath.Clean(st.RepoPath)
+			st.LastCheckedAt = now // Always stamp server receive time to prevent client clock skew issues (G1)
+			h.RepoStatuses[cleanPath] = st
+		}
+
+		// Prune stale repos that have not reported within StaleRepoThreshold based on server receive time (G1)
+		// Skip pruning while HarnessActive is true on the host so status is not dropped during long harness runs (F-4)
+		if !h.HarnessActive {
+			for path, st := range h.RepoStatuses {
+				if now.Sub(st.LastCheckedAt) > StaleRepoThreshold {
+					delete(h.RepoStatuses, path)
+				}
+			}
+		}
+
+		if len(h.RepoStatuses) == 0 {
+			// Empty inventory must NOT report clean; mark unknown (G1)
+			h.FleetGitClean = false
+			h.FleetCheckedAt = nil
+		} else {
+			allClean := true
+			for _, st := range h.RepoStatuses {
+				if !st.IsClean {
+					allClean = false
+					break
+				}
+			}
+			h.FleetGitClean = allClean
+			h.FleetCheckedAt = &now
+		}
+	}
+
 	for _, st := range statuses {
 		key := hostID + ":" + filepath.Clean(st.RepoPath)
 		if ch, ok := e.repoWaiters[key]; ok {

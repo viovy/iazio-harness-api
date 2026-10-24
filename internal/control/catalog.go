@@ -153,6 +153,7 @@ func (e *Engine) HeartbeatDetailed(id, presence string, tools []Tool, fetchFaile
 	h.LastSeen = e.now()
 	h.FetchFailed = fetchFailed
 	h.Tools = append([]Tool(nil), tools...)
+	h.HarnessActive = len(activeJobs) > 0
 
 	activeMap := make(map[string]bool)
 	for _, aj := range activeJobs {

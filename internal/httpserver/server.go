@@ -300,6 +300,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/git-credentials/test", s.testGitCredentialPayload)
 	mux.HandleFunc("POST /v1/fleet/profiles/{name}/refresh", s.refreshProfileReleases)
 	mux.HandleFunc("POST /api/v1/binaries-profiles/{name}/refresh", s.refreshProfileReleases)
+	mux.HandleFunc("POST /v1/fleet/profiles/sync", s.syncAllProfiles)
+	mux.HandleFunc("POST /api/v1/binaries-profiles/sync", s.syncAllProfiles)
 	mux.HandleFunc("POST /v1/hosts/{host}/ping", s.pingHost)
 	mux.HandleFunc("POST /api/v1/agents/{host}/ping", s.pingHost)
 	mux.HandleFunc("POST /v1/hosts/{host}/ping-ack", s.pingAck)
@@ -1777,6 +1779,9 @@ func (s *Server) getProfileReleases(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"profile":  name,
 		"releases": releases,
@@ -1878,58 +1883,114 @@ func (s *Server) testGitCredentialPayload(w http.ResponseWriter, r *http.Request
 
 func (s *Server) refreshProfileReleases(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	p, err := s.Engine.GetProfile(name)
-	if err != nil {
+	if _, err := s.Engine.GetProfile(name); err != nil {
 		writeErr(w, http.StatusNotFound, control.ErrNotFound)
 		return
 	}
-	if s.Engine.Releases == nil {
-		s.Engine.Releases = control.NewReleaseService()
-	}
-	releases, err := s.Engine.Releases.RefreshProfileReleases(r.Context(), *p)
-	if err != nil && len(releases) == 0 {
-		writeErr(w, http.StatusBadGateway, err)
-		return
+	relSvc := s.Engine.GetReleaseService()
+	if relSvc == nil {
+		relSvc = control.NewReleaseService()
+		s.Engine.SetReleaseService(relSvc)
 	}
 
-	updated := false
-	for i := range p.Tools {
-		toolName := strings.ToLower(p.Tools[i].Name)
-		repoName := strings.ToLower(p.Tools[i].Repository)
-		for _, rel := range releases {
-			relTool := strings.ToLower(rel.Name)
-			relRepo := strings.ToLower(rel.Repository)
-			if (relTool == toolName || relRepo == repoName || strings.HasSuffix(relRepo, "/"+toolName)) &&
-				rel.LatestVersion != "" && rel.Error == "" {
-				p.Tools[i].TargetVersion = rel.LatestVersion
-				updated = true
-				break
-			}
-		}
-	}
-	if updated {
-		saved, uErr := s.Engine.UpsertProfile(*p)
-		if uErr == nil && s.SaveProfile != nil && saved != nil {
-			s.SaveProfile(*saved)
+	advanced, err := relSvc.SyncProfile(r.Context(), s.Engine, name, func(prof string, tool control.ProfileTool, fromVer, toVer string) {
+		s.RecordNotification(NotificationRecord{
+			Title:    "Release Detected",
+			Message:  fmt.Sprintf("New release detected for %s: %s (was %s). Profile '%s' updated.", tool.Name, toVer, fromVer, prof),
+			Category: "release",
+			Source:   "release-watcher",
+		})
+	})
+	status := "ok"
+	var errStr string
+	if err != nil {
+		errStr = err.Error()
+		if advanced > 0 {
+			status = "partial"
+		} else {
+			status = "error"
 		}
 	}
 
+	updatedProfile, _ := s.Engine.GetProfile(name)
 	s.RecordNotification(NotificationRecord{
 		Title:    "Profile Releases Refreshed",
-		Message:  fmt.Sprintf("Refreshed release versions for profile '%s'. Updated target versions: %v", name, updated),
-		Category: "info",
+		Message:  fmt.Sprintf("Refreshed release versions for profile '%s'. Status: %s, advanced tools: %d", name, status, advanced),
+		Category: "release",
 		Source:   "harness-api",
-		Metadata: map[string]any{
-			"profile": name,
-			"updated": updated,
-			"tools":   len(releases),
-		},
+	})
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+	resp := map[string]any{
+		"status":        status,
+		"tools_updated": advanced,
+		"profile":       updatedProfile,
+	}
+	if errStr != "" {
+		resp["error"] = errStr
+	}
+	httpCode := http.StatusOK
+	if status == "error" {
+		httpCode = http.StatusBadGateway
+	}
+	writeJSON(w, httpCode, resp)
+}
+
+func (s *Server) syncAllProfiles(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+
+	if s.Engine == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "engine not initialized"})
+		return
+	}
+	relSvc := s.Engine.GetReleaseService()
+	if relSvc == nil {
+		relSvc = control.NewReleaseService()
+		s.Engine.SetReleaseService(relSvc)
+	}
+
+	syncRes := relSvc.SyncAllProfilesDetailed(r.Context(), s.Engine, func(profile string, tool control.ProfileTool, fromVersion, toVersion string) {
+		s.RecordNotification(NotificationRecord{
+			Title:    "Release Detected",
+			Message:  fmt.Sprintf("New release detected for %s: %s (was %s). Profile '%s' updated.", tool.Name, toVersion, fromVersion, profile),
+			Category: "release",
+			Source:   "release-sync",
+			Metadata: map[string]any{
+				"event":        "release.detected",
+				"profile":      profile,
+				"tool":         tool.Name,
+				"from_version": fromVersion,
+				"to_version":   toVersion,
+				"url":          tool.LatestReleaseURL,
+			},
+		})
 	})
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"profile":  name,
-		"releases": releases,
-	})
+	status := "ok"
+	if len(syncRes.Errors) > 0 {
+		if syncRes.TotalAdvanced > 0 || len(syncRes.Errors) < len(s.Engine.ListProfiles()) {
+			status = "partial"
+		} else {
+			status = "error"
+		}
+	}
+
+	resp := map[string]any{
+		"status":        status,
+		"tools_updated": syncRes.TotalAdvanced,
+		"synced_at":     time.Now().UTC().Format(time.RFC3339),
+	}
+	if len(syncRes.Errors) > 0 {
+		resp["errors"] = syncRes.Errors
+	}
+	httpCode := http.StatusOK
+	if status == "error" {
+		httpCode = http.StatusBadGateway
+	}
+	writeJSON(w, httpCode, resp)
 }
 
 func (s *Server) pingAck(w http.ResponseWriter, r *http.Request) {
@@ -2584,6 +2645,9 @@ func writeErr(w http.ResponseWriter, code int, err error) {
 }
 
 func (s *Server) listProfiles(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
 	writeJSON(w, http.StatusOK, s.Engine.ListProfiles())
 }
 
@@ -2595,16 +2659,20 @@ func (s *Server) createProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	created, err := s.Engine.UpsertProfile(p)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		if strings.Contains(err.Error(), "persist profile") {
+			writeErr(w, http.StatusInternalServerError, err)
+		} else {
+			writeErr(w, http.StatusBadRequest, err)
+		}
 		return
-	}
-	if s.SaveProfile != nil {
-		s.SaveProfile(*created)
 	}
 	writeJSON(w, http.StatusCreated, created)
 }
 
 func (s *Server) getProfile(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
 	name := r.PathValue("name")
 	p, err := s.Engine.GetProfile(name)
 	if err != nil {
@@ -2628,11 +2696,12 @@ func (s *Server) updateProfile(w http.ResponseWriter, r *http.Request) {
 	p.Name = name
 	updated, err := s.Engine.UpsertProfile(p)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		if strings.Contains(err.Error(), "persist profile") {
+			writeErr(w, http.StatusInternalServerError, err)
+		} else {
+			writeErr(w, http.StatusBadRequest, err)
+		}
 		return
-	}
-	if s.SaveProfile != nil {
-		s.SaveProfile(*updated)
 	}
 	writeJSON(w, http.StatusOK, updated)
 }
@@ -2665,11 +2734,12 @@ func (s *Server) syncGenericProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	profile, err := s.Engine.SyncGenericProfile(raw)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		if strings.Contains(err.Error(), "persist profile") {
+			writeErr(w, http.StatusInternalServerError, err)
+		} else {
+			writeErr(w, http.StatusBadRequest, err)
+		}
 		return
-	}
-	if s.SaveProfile != nil {
-		s.SaveProfile(*profile)
 	}
 	writeJSON(w, http.StatusOK, profile)
 }
@@ -2690,11 +2760,12 @@ func (s *Server) scanRepoProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	profile, err := s.Engine.ScanRepoProfile(body.HostID, body.RepoPath, body.ProfileName)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		if strings.Contains(err.Error(), "persist profile") {
+			writeErr(w, http.StatusInternalServerError, err)
+		} else {
+			writeErr(w, http.StatusBadRequest, err)
+		}
 		return
-	}
-	if s.SaveProfile != nil {
-		s.SaveProfile(*profile)
 	}
 	if s.SaveRepo != nil {
 		if repo, ok := s.Engine.GetRepo(body.HostID, body.RepoPath); ok {
