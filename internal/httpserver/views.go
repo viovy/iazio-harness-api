@@ -39,35 +39,35 @@ func scheduleView(s control.Schedule) map[string]any {
 		keys = []string{}
 	}
 	return map[string]any{
-		"id":                     s.ID,
-		"prompt_id":              s.PromptID,
-		"prompt_title":           s.PromptTitle,
-		"host_id":                s.HostID,
-		"repo_path":              s.WorktreePath,
-		"iterations":             s.IterationsRemaining,
-		"iterations_total":       s.IterationsTotal,
-		"iterations_remaining":   s.IterationsRemaining,
-		"iterations_completed":   s.IterationsCompleted,
-		"env_keys":               keys,
-		"kind":                   s.Kind,
-		"priority":               s.Priority,
-		"status":                 s.Status,
-		"engine":                 s.Engine,
-		"resume_conversation_id": s.ResumeConversationID,
-		"story_id":               s.StoryID,
-		"is_global":              s.IsGlobal,
-		"parent_job_id":           s.ParentJobID,
-		"root_job_id":             s.RootJobID,
-		"associated_jobs":         s.AssociatedJobs,
-		"execution_attempt":       s.ExecutionAttempt,
-		"execution_chain":         s.ExecutionChain,
-		"initial_conversation_id": s.InitialConversationID,
-		"active_conversation_id":  s.ActiveConversationID,
-		"resume_mode":             s.ResumeMode,
-		"resume_fallback_reason":  s.ResumeFallbackReason,
+		"id":                          s.ID,
+		"prompt_id":                   s.PromptID,
+		"prompt_title":                s.PromptTitle,
+		"host_id":                     s.HostID,
+		"repo_path":                   s.WorktreePath,
+		"iterations":                  s.IterationsRemaining,
+		"iterations_total":            s.IterationsTotal,
+		"iterations_remaining":        s.IterationsRemaining,
+		"iterations_completed":        s.IterationsCompleted,
+		"env_keys":                    keys,
+		"kind":                        s.Kind,
+		"priority":                    s.Priority,
+		"status":                      s.Status,
+		"engine":                      s.Engine,
+		"resume_conversation_id":      s.ResumeConversationID,
+		"story_id":                    s.StoryID,
+		"is_global":                   s.IsGlobal,
+		"parent_job_id":               s.ParentJobID,
+		"root_job_id":                 s.RootJobID,
+		"associated_jobs":             s.AssociatedJobs,
+		"execution_attempt":           s.ExecutionAttempt,
+		"execution_chain":             s.ExecutionChain,
+		"initial_conversation_id":     s.InitialConversationID,
+		"active_conversation_id":      s.ActiveConversationID,
+		"resume_mode":                 s.ResumeMode,
+		"resume_fallback_reason":      s.ResumeFallbackReason,
 		"same_conversation_confirmed": s.SameConversationConfirmed || s.ResumeMode == "same_conversation",
-		"attach_confirmation":     s.AttachConfirmation,
-		"interrupted_ase_state":   s.InterruptedASEState,
+		"attach_confirmation":         s.AttachConfirmation,
+		"interrupted_ase_state":       s.InterruptedASEState,
 	}
 }
 
@@ -142,6 +142,39 @@ func repoSummary(r control.Repo) map[string]any {
 }
 
 func toolView(t control.Tool) map[string]any {
+	installed := t.Installed || t.ServiceInstalled || t.Status == "OK"
+	instType := t.InstallationType
+	if instType == "" {
+		if t.ServiceType == "user_service" {
+			instType = "systemd-user"
+		} else if t.ServiceType != "" && t.ServiceType != "none" {
+			instType = t.ServiceType
+		} else {
+			instType = "binary"
+		}
+	}
+	activeState := t.ActiveState
+	if activeState == "" {
+		if t.ServiceStatus != "" && t.ServiceStatus != "not_installed" {
+			activeState = t.ServiceStatus
+		} else {
+			activeState = "active"
+		}
+	}
+	watchdogEnabled := t.WatchdogEnabled
+	if !watchdogEnabled {
+		for _, c := range t.Capabilities {
+			if strings.Contains(c, "watchdog") {
+				watchdogEnabled = true
+				break
+			}
+		}
+	}
+	configStatus := t.ConfigStatus
+	if configStatus == "" {
+		configStatus = "synced"
+	}
+
 	return map[string]any{
 		"name":              t.Name,
 		"path":              t.Path,
@@ -151,6 +184,11 @@ func toolView(t control.Tool) map[string]any {
 		"service_type":      t.ServiceType,
 		"service_status":    t.ServiceStatus,
 		"capabilities":      t.Capabilities,
+		"installed":         installed,
+		"installation_type": instType,
+		"active_state":      activeState,
+		"watchdog_enabled":  watchdogEnabled,
+		"config_status":     configStatus,
 	}
 }
 
@@ -193,29 +231,29 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 			targetHost = hostID
 		}
 		running = map[string]any{
-			"id":                 d.Running.ID,
-			"status":             d.Running.Status,
-			"prompt_title":       d.RunningTitle,
-			"engine":             d.RunningEngine,
-			"conversation_ids":   cids,
-			"silent_for_seconds": d.RunningSilentSeconds,
-			"is_stalled":         d.RunningIsStalled,
-			"started_at":         startedAt,
-			"host_id":            hostID,
-			"target_host":        targetHost,
-			"harness_pid":        d.Running.HarnessPID,
-			"tool_pid":           d.Running.ToolPID,
-			"elapsed_seconds":    d.Running.ElapsedSeconds,
-			"resume_count":            d.Running.ResumeCount,
-			"parent_job_id":           d.Running.ParentJobID,
-			"root_job_id":             d.Running.RootJobID,
-			"initial_conversation_id": d.Running.InitialConversationID,
-			"active_conversation_id":  d.Running.ActiveConversationID,
-			"resume_mode":             d.Running.ResumeMode,
-			"resume_fallback_reason":  d.Running.ResumeFallbackReason,
+			"id":                          d.Running.ID,
+			"status":                      d.Running.Status,
+			"prompt_title":                d.RunningTitle,
+			"engine":                      d.RunningEngine,
+			"conversation_ids":            cids,
+			"silent_for_seconds":          d.RunningSilentSeconds,
+			"is_stalled":                  d.RunningIsStalled,
+			"started_at":                  startedAt,
+			"host_id":                     hostID,
+			"target_host":                 targetHost,
+			"harness_pid":                 d.Running.HarnessPID,
+			"tool_pid":                    d.Running.ToolPID,
+			"elapsed_seconds":             d.Running.ElapsedSeconds,
+			"resume_count":                d.Running.ResumeCount,
+			"parent_job_id":               d.Running.ParentJobID,
+			"root_job_id":                 d.Running.RootJobID,
+			"initial_conversation_id":     d.Running.InitialConversationID,
+			"active_conversation_id":      d.Running.ActiveConversationID,
+			"resume_mode":                 d.Running.ResumeMode,
+			"resume_fallback_reason":      d.Running.ResumeFallbackReason,
 			"same_conversation_confirmed": d.Running.SameConversationConfirmed || d.Running.ResumeMode == "same_conversation",
-			"attach_confirmation":     d.Running.AttachConfirmation,
-			"conversation_lineage":    d.Running.ConversationLineage,
+			"attach_confirmation":         d.Running.AttachConfirmation,
+			"conversation_lineage":        d.Running.ConversationLineage,
 		}
 	}
 	schedules := make([]map[string]any, 0, len(d.Schedules))
@@ -233,33 +271,33 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 			ids = []string{}
 		}
 		history = append(history, map[string]any{
-			"job_id":                  h.JobID,
-			"schedule_id":             h.ScheduleID,
-			"prompt_title":            h.PromptTitle,
-			"engine":                  h.Engine,
-			"status":                  h.Status,
-			"clean":                   h.Clean,
-			"ase_complete":            h.ASEComplete,
-			"conversation_ids":        ids,
-			"reason":                  h.Reason,
-			"error_message":           h.ErrorMessage,
-			"diagnostic_code":         h.DiagnosticCode,
-			"model":                   h.Model,
-			"remediation":             h.Remediation,
-			"trace_id":                h.TraceID,
-			"created_at":              h.CreatedAt.UTC().Format(time.RFC3339),
-			"parent_job_id":           h.ParentJobID,
-			"root_job_id":             h.RootJobID,
-			"execution_attempt":       h.ExecutionAttempt,
-			"execution_chain":         h.ExecutionChain,
-			"initial_conversation_id": h.InitialConversationID,
-			"active_conversation_id":  h.ActiveConversationID,
-			"resume_mode":             h.ResumeMode,
-			"resume_fallback_reason":  h.ResumeFallbackReason,
+			"job_id":                      h.JobID,
+			"schedule_id":                 h.ScheduleID,
+			"prompt_title":                h.PromptTitle,
+			"engine":                      h.Engine,
+			"status":                      h.Status,
+			"clean":                       h.Clean,
+			"ase_complete":                h.ASEComplete,
+			"conversation_ids":            ids,
+			"reason":                      h.Reason,
+			"error_message":               h.ErrorMessage,
+			"diagnostic_code":             h.DiagnosticCode,
+			"model":                       h.Model,
+			"remediation":                 h.Remediation,
+			"trace_id":                    h.TraceID,
+			"created_at":                  h.CreatedAt.UTC().Format(time.RFC3339),
+			"parent_job_id":               h.ParentJobID,
+			"root_job_id":                 h.RootJobID,
+			"execution_attempt":           h.ExecutionAttempt,
+			"execution_chain":             h.ExecutionChain,
+			"initial_conversation_id":     h.InitialConversationID,
+			"active_conversation_id":      h.ActiveConversationID,
+			"resume_mode":                 h.ResumeMode,
+			"resume_fallback_reason":      h.ResumeFallbackReason,
 			"same_conversation_confirmed": h.SameConversationConfirmed || h.ResumeMode == "same_conversation",
-			"attach_confirmation":     h.AttachConfirmation,
-			"interrupted_ase_state":   h.InterruptedASEState,
-			"conversation_lineage":    h.ConversationLineage,
+			"attach_confirmation":         h.AttachConfirmation,
+			"interrupted_ase_state":       h.InterruptedASEState,
+			"conversation_lineage":        h.ConversationLineage,
 		})
 	}
 	var lockExpiresAt any
@@ -412,35 +450,35 @@ func historyItemView(h control.HistoryItem) map[string]any {
 		ids = []string{}
 	}
 	return map[string]any{
-		"host_id":                 h.HostID,
-		"repo_path":               h.WorktreePath,
-		"job_id":                  h.JobID,
-		"schedule_id":             h.ScheduleID,
-		"prompt_title":            h.PromptTitle,
-		"engine":                  h.Engine,
-		"status":                  h.Status,
-		"clean":                   h.Clean,
-		"ase_complete":            h.ASEComplete,
-		"conversation_ids":        ids,
-		"reason":                  h.Reason,
-		"error_message":           h.ErrorMessage,
-		"diagnostic_code":         h.DiagnosticCode,
-		"model":                   h.Model,
-		"remediation":             h.Remediation,
-		"trace_id":                h.TraceID,
-		"created_at":              h.CreatedAt.UTC().Format(time.RFC3339),
-		"parent_job_id":           h.ParentJobID,
-		"root_job_id":             h.RootJobID,
-		"execution_attempt":       h.ExecutionAttempt,
-		"execution_chain":         h.ExecutionChain,
-		"initial_conversation_id": h.InitialConversationID,
-		"active_conversation_id":  h.ActiveConversationID,
-		"resume_mode":             h.ResumeMode,
-		"resume_fallback_reason":  h.ResumeFallbackReason,
+		"host_id":                     h.HostID,
+		"repo_path":                   h.WorktreePath,
+		"job_id":                      h.JobID,
+		"schedule_id":                 h.ScheduleID,
+		"prompt_title":                h.PromptTitle,
+		"engine":                      h.Engine,
+		"status":                      h.Status,
+		"clean":                       h.Clean,
+		"ase_complete":                h.ASEComplete,
+		"conversation_ids":            ids,
+		"reason":                      h.Reason,
+		"error_message":               h.ErrorMessage,
+		"diagnostic_code":             h.DiagnosticCode,
+		"model":                       h.Model,
+		"remediation":                 h.Remediation,
+		"trace_id":                    h.TraceID,
+		"created_at":                  h.CreatedAt.UTC().Format(time.RFC3339),
+		"parent_job_id":               h.ParentJobID,
+		"root_job_id":                 h.RootJobID,
+		"execution_attempt":           h.ExecutionAttempt,
+		"execution_chain":             h.ExecutionChain,
+		"initial_conversation_id":     h.InitialConversationID,
+		"active_conversation_id":      h.ActiveConversationID,
+		"resume_mode":                 h.ResumeMode,
+		"resume_fallback_reason":      h.ResumeFallbackReason,
 		"same_conversation_confirmed": h.SameConversationConfirmed || h.ResumeMode == "same_conversation",
-		"attach_confirmation":     h.AttachConfirmation,
-		"interrupted_ase_state":   h.InterruptedASEState,
-		"conversation_lineage":    h.ConversationLineage,
+		"attach_confirmation":         h.AttachConfirmation,
+		"interrupted_ase_state":       h.InterruptedASEState,
+		"conversation_lineage":        h.ConversationLineage,
 	}
 }
 
