@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-harness-api/internal/control"
+	"github.com/viovy/iazio-harness-api/internal/dispatch"
 )
 
 func TestServer_ToolUpdateAndReleases(t *testing.T) {
@@ -363,5 +364,69 @@ func TestServer_ForceUpdateToolEndpoint(t *testing.T) {
 	}
 	if res2["target_version"] != "0.0.492" {
 		t.Fatalf("expected profile-resolved target_version 0.0.492, got %v", res2["target_version"])
+	}
+
+	// 3. POST /v1/fleet/agents/mac-mini/tools/autopilot-plugins-internal/force-update with s.Queue populated (F7)
+	q := dispatch.NewInMemoryQueue()
+	srv.Queue = q
+	rec3 := httptest.NewRecorder()
+	req3 := httptest.NewRequest("POST", "/v1/fleet/agents/mac-mini/tools/autopilot-plugins-internal/force-update", bytes.NewReader([]byte(`{"target_version":"0.0.493"}`)))
+	handler.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("expected 200 from fleet force-update route, got %d: %s", rec3.Code, rec3.Body.String())
+	}
+	var res3 map[string]any
+	if err := json.Unmarshal(rec3.Body.Bytes(), &res3); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	jobID, ok := res3["job_id"].(string)
+	if !ok || jobID == "" {
+		t.Fatalf("expected job_id returned in response when Queue is present, got %v", res3)
+	}
+	job, ok := q.Get(jobID)
+	if !ok || job == nil {
+		t.Fatalf("expected enqueued job %s in queue, found=%v", jobID, ok)
+	}
+	if job.Type != "agent.tools.update" || job.TargetHost != "mac-mini" {
+		t.Fatalf("unexpected job properties: %+v", job)
+	}
+	var payloadMap map[string]any
+	if err := json.Unmarshal(job.Payload, &payloadMap); err != nil {
+		t.Fatalf("failed to unmarshal job payload: %v", err)
+	}
+	if payloadMap["target_version"] != "0.0.493" {
+		t.Fatalf("expected target_version 0.0.493 in job payload, got %v", payloadMap["target_version"])
+	}
+
+	// 4. Unknown host must return 404 (F6, F7)
+	rec4 := httptest.NewRecorder()
+	req4 := httptest.NewRequest("POST", "/api/agents/unknown-host/tools/autopilot-plugins-internal/force-update", nil)
+	handler.ServeHTTP(rec4, req4)
+	if rec4.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown host, got %d: %s", rec4.Code, rec4.Body.String())
+	}
+
+	// 5. Unknown tool must return 404 (F6, F7)
+	rec5 := httptest.NewRecorder()
+	req5 := httptest.NewRequest("POST", "/api/agents/mac-mini/tools/unknown-tool/force-update", nil)
+	handler.ServeHTTP(rec5, req5)
+	if rec5.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown tool, got %d: %s", rec5.Code, rec5.Body.String())
+	}
+
+	// 6. Multiple tools with target_version must return 400 (F2, F7)
+	rec6 := httptest.NewRecorder()
+	req6 := httptest.NewRequest("POST", "/v1/hosts/mac-mini/tools/update", bytes.NewReader([]byte(`{"tools":["toolA","toolB"],"target_version":"1.0.0"}`)))
+	handler.ServeHTTP(rec6, req6)
+	if rec6.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when target_version is provided with multiple tools, got %d: %s", rec6.Code, rec6.Body.String())
+	}
+
+	// 7. Malformed JSON body must return 400 (F6, F7)
+	rec7 := httptest.NewRecorder()
+	req7 := httptest.NewRequest("POST", "/api/agents/mac-mini/tools/autopilot-plugins-internal/force-update", bytes.NewReader([]byte(`{not valid json`)))
+	handler.ServeHTTP(rec7, req7)
+	if rec7.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for malformed json body, got %d: %s", rec7.Code, rec7.Body.String())
 	}
 }

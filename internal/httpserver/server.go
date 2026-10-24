@@ -1628,6 +1628,12 @@ func (s *Server) createNotification(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 	hostID := r.PathValue("id")
+	hostDet, ok := s.Engine.GetHostDetail(hostID)
+	if !ok {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("host not found: %s", hostID))
+		return
+	}
+
 	var body struct {
 		Tools         []string `json:"tools"`
 		Force         bool     `json:"force"`
@@ -1635,28 +1641,60 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 		Version       string   `json:"version,omitempty"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		dec := json.NewDecoder(r.Body)
+		if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid json body: %w", err))
+			return
+		}
 	}
-	if toolParam := strings.TrimSpace(r.PathValue("tool")); toolParam != "" {
+	toolParam := strings.TrimSpace(r.PathValue("tool"))
+	if toolParam != "" {
 		body.Tools = []string{toolParam}
 		body.Force = true
 	}
 	if body.TargetVersion == "" && body.Version != "" {
 		body.TargetVersion = body.Version
 	}
-	// If a specific tool is requested and TargetVersion is empty, resolve latest version from profile
-	if len(body.Tools) == 1 && body.TargetVersion == "" {
+
+	// Single-tool guard (F2): reject target_version unless exactly one tool is specified
+	if body.TargetVersion != "" && len(body.Tools) != 1 {
+		writeErr(w, http.StatusBadRequest, errors.New("target_version can only be specified when exactly one tool is targeted"))
+		return
+	}
+
+	// Resolve target profile for the host, falling back to generic default profile (F6)
+	profileName := hostDet.Host.DistributionProfile
+	if profileName == "" {
+		profileName = "generic"
+	}
+	p, err := s.Engine.GetProfile(profileName)
+	if err != nil || p == nil {
+		p, _ = s.Engine.GetProfile("generic")
+	}
+
+	if len(body.Tools) == 1 {
 		toolName := body.Tools[0]
-		if p, err := s.Engine.GetProfile("generic"); err == nil && p != nil {
+		var foundTool *control.ProfileTool
+		if p != nil {
 			for _, pt := range p.Tools {
 				if strings.EqualFold(pt.Name, toolName) || strings.EqualFold(pt.BinaryName, toolName) {
-					if pt.TargetVersion != "" && pt.TargetVersion != "latest" {
-						body.TargetVersion = pt.TargetVersion
-					} else if pt.LatestAvailableVersion != "" {
-						body.TargetVersion = pt.LatestAvailableVersion
-					}
+					toolCopy := pt
+					foundTool = &toolCopy
 					break
 				}
+			}
+		}
+		// If tool name was in URL path (/tools/{tool}/update or force-update), validate existence (F6)
+		if toolParam != "" && foundTool == nil {
+			writeErr(w, http.StatusNotFound, fmt.Errorf("unknown tool: %s", toolParam))
+			return
+		}
+		// Prefer LatestAvailableVersion for force update when target_version is not explicitly supplied (F6)
+		if body.TargetVersion == "" && foundTool != nil {
+			if foundTool.LatestAvailableVersion != "" {
+				body.TargetVersion = foundTool.LatestAvailableVersion
+			} else if foundTool.TargetVersion != "" && foundTool.TargetVersion != "latest" {
+				body.TargetVersion = foundTool.TargetVersion
 			}
 		}
 	}
