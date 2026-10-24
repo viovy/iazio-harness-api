@@ -325,10 +325,14 @@ func (r Repo) EffectiveAlias() string {
 
 // Tool is one binary from the latest heartbeat.
 type Tool struct {
-	Name    string
-	Path    string
-	Version string
-	Status  string
+	Name             string   `json:"name"`
+	Path             string   `json:"path"`
+	Version          string   `json:"version"`
+	Status           string   `json:"status"`
+	ServiceInstalled bool     `json:"service_installed,omitempty"`
+	ServiceType      string   `json:"service_type,omitempty"`
+	ServiceStatus    string   `json:"service_status,omitempty"`
+	Capabilities     []string `json:"capabilities,omitempty"`
 }
 
 // HistoryRow is one finished execution on a repo page.
@@ -526,21 +530,21 @@ func NewEngine(now func() time.Time) *Engine {
 		now = time.Now
 	}
 	return &Engine{
-		now:        now,
-		ideas:      map[string]*Idea{},
-		prompts:    map[string]*Prompt{},
-		schedules:  map[string]*Schedule{},
-		jobs:       map[string]*Job{},
-		repos:      map[string]*Repo{},
-		hosts:       map[string]*Host{},
-		stories:     map[string]*Story{},
-		pingWaiters: map[string]chan PingAck{},
-		repoWaiters: map[string]chan RepoRuntimeStatus{},
-		profiles:    map[string]*DistributionProfile{},
-		cloneLease: map[string]string{},
-		runningRev: map[string]bool{},
-		history:    map[string][]HistoryRow{},
-		logs:       map[string][]LogChunk{},
+		now:          now,
+		ideas:        map[string]*Idea{},
+		prompts:      map[string]*Prompt{},
+		schedules:    map[string]*Schedule{},
+		jobs:         map[string]*Job{},
+		repos:        map[string]*Repo{},
+		hosts:        map[string]*Host{},
+		stories:      map[string]*Story{},
+		pingWaiters:  map[string]chan PingAck{},
+		repoWaiters:  map[string]chan RepoRuntimeStatus{},
+		profiles:     map[string]*DistributionProfile{},
+		cloneLease:   map[string]string{},
+		runningRev:   map[string]bool{},
+		history:      map[string][]HistoryRow{},
+		logs:         map[string][]LogChunk{},
 		subs:         map[string][]chan LogChunk{},
 		Releases:     NewReleaseService(),
 		toolPriority: []string{"agy", "agent", "copilot", "opencode"},

@@ -341,4 +341,3 @@ func TestControl_FleetStatusAndCommandsCoverage(t *testing.T) {
 	rels, _ := e.Releases.RefreshProfileReleases(context.Background(), p)
 	_ = rels
 }
-

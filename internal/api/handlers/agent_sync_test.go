@@ -337,4 +337,3 @@ type mockErrIngestor struct {
 func (m *mockErrIngestor) Ingest(ctx context.Context, req codebase.IngestRequest) (*codebase.IngestResult, error) {
 	return nil, m.err
 }
-

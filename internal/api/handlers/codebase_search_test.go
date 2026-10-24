@@ -201,4 +201,3 @@ type errSearchStore struct {
 func (m *errSearchStore) SearchChunks(ctx context.Context, req codebase.SearchRequest) (*codebase.SearchResult, error) {
 	return nil, m.err
 }
-

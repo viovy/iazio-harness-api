@@ -372,4 +372,3 @@ func TestCatalogAdditionalCoverage(t *testing.T) {
 		t.Errorf("expected success for idle repo discard hub, got %v", err)
 	}
 }
-

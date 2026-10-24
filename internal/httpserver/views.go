@@ -122,10 +122,14 @@ func repoSummary(r control.Repo) map[string]any {
 
 func toolView(t control.Tool) map[string]any {
 	return map[string]any{
-		"name":    t.Name,
-		"path":    t.Path,
-		"version": t.Version,
-		"status":  t.Status,
+		"name":              t.Name,
+		"path":              t.Path,
+		"version":           t.Version,
+		"status":            t.Status,
+		"service_installed": t.ServiceInstalled,
+		"service_type":      t.ServiceType,
+		"service_status":    t.ServiceStatus,
+		"capabilities":      t.Capabilities,
 	}
 }
 
