@@ -303,6 +303,8 @@ func TestLiveStoreIfConfigured(t *testing.T) {
 		ActiveConversationID:  "conv-active-456",
 		ResumeMode:            "fallback_new_conversation",
 		ResumeFallbackReason:  "initial session corrupted",
+		SameConversationConfirmed: true,
+		AttachConfirmation:    "implicit",
 		ExecutionAttempt:      2,
 		ExecutionChain:        []string{"job-pg-0"},
 		ConversationLineage: []control.ConversationLineage{
@@ -334,6 +336,12 @@ func TestLiveStoreIfConfigured(t *testing.T) {
 	}
 	if savedRow.ResumeMode != "fallback_new_conversation" {
 		t.Fatalf("expected ResumeMode fallback_new_conversation, got %s", savedRow.ResumeMode)
+	}
+	if !savedRow.SameConversationConfirmed {
+		t.Fatalf("expected SameConversationConfirmed true")
+	}
+	if savedRow.AttachConfirmation != "implicit" {
+		t.Fatalf("expected AttachConfirmation implicit, got %s", savedRow.AttachConfirmation)
 	}
 	if savedRow.ExecutionAttempt != 2 {
 		t.Fatalf("expected ExecutionAttempt 2, got %d", savedRow.ExecutionAttempt)

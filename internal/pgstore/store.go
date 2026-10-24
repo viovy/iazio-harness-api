@@ -116,6 +116,8 @@ ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS interrupted_ase_state jsonb
 ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS conversation_lineage jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS execution_attempt integer NOT NULL DEFAULT 1;
 ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS execution_chain jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS same_conversation_confirmed boolean NOT NULL DEFAULT false;
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS attach_confirmation text NOT NULL DEFAULT '';
 
 DELETE FROM harness_history h1
 WHERE h1.status = 'DECLINED'
@@ -615,9 +617,9 @@ INSERT INTO harness_history (
   ase_complete, conversation_ids, reason, error_message, diagnostic_code, model,
   remediation, trace_id, parent_job_id, root_job_id, initial_conversation_id,
   active_conversation_id, resume_mode, resume_fallback_reason, interrupted_ase_state,
-  conversation_lineage, execution_attempt, execution_chain
+  conversation_lineage, execution_attempt, execution_chain, same_conversation_confirmed, attach_confirmation
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
 ON CONFLICT (job_id) DO UPDATE SET
   host_id = EXCLUDED.host_id,
   worktree_path = EXCLUDED.worktree_path,
@@ -643,8 +645,10 @@ ON CONFLICT (job_id) DO UPDATE SET
   interrupted_ase_state = EXCLUDED.interrupted_ase_state,
   conversation_lineage = EXCLUDED.conversation_lineage,
   execution_attempt = EXCLUDED.execution_attempt,
-  execution_chain = EXCLUDED.execution_chain
-`, row.JobID, hostID, worktreePath, row.ScheduleID, row.PromptTitle, row.Engine, row.Status, row.Clean, row.ASEComplete, string(convBytes), row.Reason, row.ErrorMessage, row.DiagnosticCode, row.Model, row.Remediation, row.TraceID, row.ParentJobID, row.RootJobID, row.InitialConversationID, row.ActiveConversationID, row.ResumeMode, row.ResumeFallbackReason, string(interruptedBytes), string(lineageBytes), attempt, string(chainBytes))
+  execution_chain = EXCLUDED.execution_chain,
+  same_conversation_confirmed = EXCLUDED.same_conversation_confirmed,
+  attach_confirmation = EXCLUDED.attach_confirmation
+`, row.JobID, hostID, worktreePath, row.ScheduleID, row.PromptTitle, row.Engine, row.Status, row.Clean, row.ASEComplete, string(convBytes), row.Reason, row.ErrorMessage, row.DiagnosticCode, row.Model, row.Remediation, row.TraceID, row.ParentJobID, row.RootJobID, row.InitialConversationID, row.ActiveConversationID, row.ResumeMode, row.ResumeFallbackReason, string(interruptedBytes), string(lineageBytes), attempt, string(chainBytes), row.SameConversationConfirmed, row.AttachConfirmation)
 	if err != nil {
 		return fmt.Errorf("save history: %w", err)
 	}
@@ -686,7 +690,7 @@ SELECT
   ase_complete, conversation_ids, reason, error_message, diagnostic_code, model,
   remediation, trace_id, created_at, parent_job_id, root_job_id, initial_conversation_id,
   active_conversation_id, resume_mode, resume_fallback_reason, interrupted_ase_state,
-  conversation_lineage, execution_attempt, execution_chain
+  conversation_lineage, execution_attempt, execution_chain, same_conversation_confirmed, attach_confirmation
 FROM harness_history ORDER BY created_at ASC
 `)
 	if err != nil {
@@ -705,7 +709,7 @@ FROM harness_history ORDER BY created_at ASC
 			&r.DiagnosticCode, &r.Model, &r.Remediation, &r.TraceID, &r.CreatedAt,
 			&r.ParentJobID, &r.RootJobID, &r.InitialConversationID, &r.ActiveConversationID,
 			&r.ResumeMode, &r.ResumeFallbackReason, &interruptedRaw, &lineageRaw,
-			&r.ExecutionAttempt, &chainRaw,
+			&r.ExecutionAttempt, &chainRaw, &r.SameConversationConfirmed, &r.AttachConfirmation,
 		); err != nil {
 			return nil, err
 		}

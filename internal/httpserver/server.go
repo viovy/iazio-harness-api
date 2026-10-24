@@ -545,6 +545,9 @@ func (s *Server) resumeJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errors.New("invalid initial_conversation_id: contains illegal characters or path traversal"))
 		return
 	}
+	if opts.ResumeMode != "fallback_new_conversation" {
+		opts.ResumeMode = ""
+	}
 	sch, err := s.Engine.ResumeJob(jobID, opts)
 	if err != nil {
 		code := http.StatusConflict
@@ -849,13 +852,17 @@ func (s *Server) resumeRepoInPlace(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errors.New("invalid active_conversation_id: contains illegal characters or path traversal"))
 		return
 	}
+	resumeMode := ""
+	if body.ResumeMode == "fallback_new_conversation" {
+		resumeMode = "fallback_new_conversation"
+	}
 	opts := control.ResumeOptions{
 		ConversationID:        body.ConversationID,
 		InitialConversationID: initConvID,
 		ActiveConversationID:  body.ActiveConversationID,
 		ParentJobID:           parentJobID,
 		RootJobID:             body.RootJobID,
-		ResumeMode:            body.ResumeMode,
+		ResumeMode:            resumeMode,
 		ResumeFallbackReason:  body.ResumeFallbackReason,
 		InterruptedASEState:   body.InterruptedASEState,
 		AllowDirty:            body.AllowDirty,

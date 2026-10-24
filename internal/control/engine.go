@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -205,6 +206,7 @@ type Schedule struct {
 	ResumeMode           string
 	ResumeFallbackReason string
 	SameConversationConfirmed bool
+	AttachConfirmation   string
 	InterruptedASEState  map[string]any
 }
 
@@ -249,6 +251,7 @@ type JobDetail struct {
 	ResumeMode                  string                 `json:"resume_mode,omitempty"`
 	ResumeFallbackReason        string                 `json:"resume_fallback_reason,omitempty"`
 	SameConversationConfirmed   bool                   `json:"same_conversation_confirmed,omitempty"`
+	AttachConfirmation         string                 `json:"attach_confirmation,omitempty"`
 	InterruptedASEState         map[string]any         `json:"interrupted_ase_state,omitempty"`
 	ConversationLineage         []ConversationLineage  `json:"conversation_lineage,omitempty"`
 }
@@ -294,6 +297,7 @@ type Job struct {
 	ResumeMode            string
 	ResumeFallbackReason  string
 	SameConversationConfirmed bool
+	AttachConfirmation   string
 	InterruptedASEState   map[string]any
 	ConversationLineage   []ConversationLineage
 }
@@ -431,6 +435,7 @@ type HistoryRow struct {
 	ResumeMode            string
 	ResumeFallbackReason  string
 	SameConversationConfirmed bool
+	AttachConfirmation   string
 	InterruptedASEState   map[string]any
 	ConversationLineage   []ConversationLineage
 }
@@ -463,6 +468,7 @@ type HistoryItem struct {
 	ResumeMode            string
 	ResumeFallbackReason  string
 	SameConversationConfirmed bool
+	AttachConfirmation   string
 	InterruptedASEState   map[string]any
 	ConversationLineage   []ConversationLineage
 }
@@ -1216,6 +1222,24 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 			}
 		}
 	} else if job.Status == "RUNNING" {
+		// Resolve pending resume mode at exit (Finding A1):
+		// If job resumed on an initial session and no fallback occurred, treat attach as implicitly confirmed.
+		if job.ParentJobID != "" && job.ResumeMode == "pending" && job.ResumeFallbackReason == "" {
+			job.ResumeMode = "same_conversation"
+			job.SameConversationConfirmed = true
+			job.AttachConfirmation = "implicit"
+			if job.ActiveConversationID == "" && job.InitialConversationID != "" {
+				job.ActiveConversationID = job.InitialConversationID
+			}
+			if sch, ok := e.schedules[job.ScheduleID]; ok {
+				sch.ResumeMode = job.ResumeMode
+				sch.SameConversationConfirmed = job.SameConversationConfirmed
+				sch.AttachConfirmation = job.AttachConfirmation
+				if sch.ActiveConversationID == "" && sch.InitialConversationID != "" {
+					sch.ActiveConversationID = sch.InitialConversationID
+				}
+			}
+		}
 		if code != 0 {
 			job.Status = "FAILED"
 			if opt.Reason != "" {
@@ -2054,11 +2078,21 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 		}
 		actConvID := sch.ActiveConversationID
 		if actConvID == "" {
+			actConvID = sch.ResumeConversationID
+		}
+		if actConvID == "" {
 			actConvID = initConvID
 		}
 		resMode := sch.ResumeMode
 		if resMode == "" && (initConvID != "" || sch.Kind == KindResume) {
-			resMode = "same_conversation"
+			resMode = "pending"
+		}
+		resumeTargetConv := actConvID
+		if resumeTargetConv == "" {
+			resumeTargetConv = sch.ResumeConversationID
+		}
+		if resumeTargetConv == "" {
+			resumeTargetConv = initConvID
 		}
 
 		execAttempt := sch.ExecutionAttempt
@@ -2094,7 +2128,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			LeaseExpiry:           e.now().Add(LeaseInterval),
 			StartedAt:             e.now(),
 			LastChunkAt:           e.now(),
-			ResumeConversationID:  actConvID,
+			ResumeConversationID:  resumeTargetConv,
 			TraceID:               traceID,
 			ParentJobID:           sch.ParentJobID,
 			RootJobID:             sch.RootJobID,
@@ -2104,10 +2138,15 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			ActiveConversationID:  actConvID,
 			ResumeMode:            resMode,
 			ResumeFallbackReason:  sch.ResumeFallbackReason,
+			SameConversationConfirmed: sch.SameConversationConfirmed,
+			AttachConfirmation:    sch.AttachConfirmation,
 			InterruptedASEState:   sch.InterruptedASEState,
 		}
 		if actConvID != "" {
 			job.ConversationIDs = []string{actConvID}
+			if initConvID != "" && initConvID != actConvID {
+				job.ConversationIDs = append([]string{initConvID}, actConvID)
+			}
 			cliArgs := fmt.Sprintf("--conversation=%s", actConvID)
 			role := "initial_resumed"
 			if sch.Kind != KindResume && sch.ParentJobID == "" {
@@ -2119,6 +2158,17 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 					Role:           role,
 					AttachedAt:     e.now(),
 					CLIArgs:        cliArgs,
+					ASEPhase:       "START",
+				},
+			}
+		} else if initConvID != "" {
+			job.ConversationIDs = []string{initConvID}
+			job.ConversationLineage = []ConversationLineage{
+				{
+					ConversationID: initConvID,
+					Role:           "initial_target",
+					AttachedAt:     e.now(),
+					CLIArgs:        fmt.Sprintf("--conversation=%s", initConvID),
 					ASEPhase:       "START",
 				},
 			}
@@ -2202,8 +2252,13 @@ func (e *Engine) updateHistoryStatusLocked(host, path, jobID, status string, opt
 			if rows[i].Reason == "" && (status == "LEASE_EXPIRED" || status == "EXECUTION_TIMEOUT" || status == "HOST_OFFLINE" || status == "FAILED") {
 				rows[i].Reason = status
 			}
-			if rows[i].TraceID == "" {
-				if j, ok := e.jobs[jobID]; ok && j.TraceID != "" {
+			if j, ok := e.jobs[jobID]; ok {
+				rows[i].ResumeMode = j.ResumeMode
+				rows[i].SameConversationConfirmed = j.SameConversationConfirmed
+				rows[i].AttachConfirmation = j.AttachConfirmation
+				rows[i].ActiveConversationID = j.ActiveConversationID
+				rows[i].ConversationLineage = j.ConversationLineage
+				if rows[i].TraceID == "" {
 					rows[i].TraceID = j.TraceID
 				}
 			}
@@ -2236,12 +2291,20 @@ func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseC
 			if status != "" {
 				rows[i].Status = status
 			}
+			if j, ok := e.jobs[jobID]; ok {
+				rows[i].ResumeMode = j.ResumeMode
+				rows[i].SameConversationConfirmed = j.SameConversationConfirmed
+				rows[i].AttachConfirmation = j.AttachConfirmation
+				rows[i].ActiveConversationID = j.ActiveConversationID
+				rows[i].ConversationLineage = j.ConversationLineage
+			}
 			e.notifyHistoryLocked(host, path, rows[i])
 			return
 		}
 	}
 	title, engine, schID, traceID := "", "", "", ""
-	var pj, rj, initConv, actConv, resMode, resReason string
+	var pj, rj, initConv, actConv, resMode, resReason, attachConf string
+	var sameConvConf bool
 	var attempt int
 	var chain []string
 	var intState map[string]any
@@ -2256,6 +2319,8 @@ func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseC
 		actConv = j.ActiveConversationID
 		resMode = j.ResumeMode
 		resReason = j.ResumeFallbackReason
+		sameConvConf = j.SameConversationConfirmed
+		attachConf = j.AttachConfirmation
 		intState = j.InterruptedASEState
 		lineage = j.ConversationLineage
 		if sch := e.schedules[j.ScheduleID]; sch != nil {
@@ -2273,6 +2338,7 @@ func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseC
 		ParentJobID: pj, RootJobID: rj, ExecutionAttempt: attempt, ExecutionChain: chain,
 		InitialConversationID: initConv, ActiveConversationID: actConv, ResumeMode: resMode,
 		ResumeFallbackReason: resReason, InterruptedASEState: intState, ConversationLineage: lineage,
+		SameConversationConfirmed: sameConvConf, AttachConfirmation: attachConf,
 	}
 	e.history[key] = append(e.history[key], row)
 	e.notifyHistoryLocked(host, path, row)
@@ -2524,6 +2590,7 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 		ResumeMode:            job.ResumeMode,
 		ResumeFallbackReason:  job.ResumeFallbackReason,
 		SameConversationConfirmed: job.SameConversationConfirmed,
+		AttachConfirmation:        job.AttachConfirmation,
 		InterruptedASEState:   job.InterruptedASEState,
 		ConversationLineage:   append([]ConversationLineage(nil), job.ConversationLineage...),
 	}
@@ -2760,6 +2827,18 @@ func (e *Engine) AddJobConversationWithOptions(jobID, convID string, opts ...Con
 			if job.InitialConversationID == "" {
 				job.InitialConversationID = convID
 			}
+			if job.ParentJobID != "" && job.ResumeMode == "pending" && (convID == job.InitialConversationID || convID == job.ActiveConversationID) {
+				job.ResumeMode = "same_conversation"
+				job.SameConversationConfirmed = true
+				job.AttachConfirmation = "marker"
+				if job.ScheduleID != "" {
+					if sch, ok := e.schedules[job.ScheduleID]; ok && sch != nil {
+						sch.ResumeMode = job.ResumeMode
+						sch.SameConversationConfirmed = job.SameConversationConfirmed
+						sch.AttachConfirmation = job.AttachConfirmation
+					}
+				}
+			}
 			if job.ScheduleID != "" {
 				if sch, ok := e.schedules[job.ScheduleID]; ok && sch != nil {
 					if repo, ok := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; ok && repo != nil {
@@ -2776,13 +2855,17 @@ func (e *Engine) AddJobConversationWithOptions(jobID, convID string, opts ...Con
 			})
 			job.ConversationIDs = append(job.ConversationIDs, convID)
 		} else if job.ActiveConversationID == convID || job.InitialConversationID == convID {
-			if job.InitialConversationID != "" && (convID == job.InitialConversationID || convID == job.ActiveConversationID) {
+			// Terminal fallback check: if job is already in fallback_new_conversation, do NOT mutate to same_conversation!
+			// Only transition to same_conversation if in pending mode and this is actually a resume run (ParentJobID != "").
+			if job.ParentJobID != "" && job.ResumeMode == "pending" && (convID == job.InitialConversationID || convID == job.ActiveConversationID) {
 				job.ResumeMode = "same_conversation"
 				job.SameConversationConfirmed = true
+				job.AttachConfirmation = "marker"
 				if job.ScheduleID != "" {
 					if sch, ok := e.schedules[job.ScheduleID]; ok && sch != nil {
 						sch.ResumeMode = job.ResumeMode
 						sch.SameConversationConfirmed = job.SameConversationConfirmed
+						sch.AttachConfirmation = job.AttachConfirmation
 					}
 				}
 			}
@@ -2903,6 +2986,24 @@ func (e *Engine) ResumeRepoInPlace(host, path string, opts ...ResumeOptions) (Sc
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.resumeRepoInPlaceLocked(host, path, opts...)
+}
+
+func extractInterruptedASEFromWorktree(worktree string) (phase string, step int, gate string) {
+	if worktree == "" {
+		return "", 0, ""
+	}
+	cpPath := filepath.Join(worktree, ".autopilot", "state", "checkpoint.json")
+	if data, err := os.ReadFile(cpPath); err == nil {
+		var cp struct {
+			Phase     string `json:"phase"`
+			StepIndex int    `json:"step_index"`
+			Gate      string `json:"last_completed_gate"`
+		}
+		if err := json.Unmarshal(data, &cp); err == nil {
+			return cp.Phase, cp.StepIndex, cp.Gate
+		}
+	}
+	return "", 0, ""
 }
 
 func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOptions) (Schedule, error) {
@@ -3085,21 +3186,17 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 	promptID := opt.PromptID
 	engineName := opt.Engine
 
-	// 3a. Check engine mismatch against parent (F4)
+	// 3a. Initialize resume mode
 	resumeMode := "pending"
 	var resumeFallbackReason string
-	if engineName != "" && parentEngine != "" && !strings.EqualFold(engineName, parentEngine) {
+	if opt.ResumeMode == "fallback_new_conversation" {
 		resumeMode = "fallback_new_conversation"
-		resumeFallbackReason = fmt.Sprintf("cross-engine resume not supported: parent used %s, requested %s", parentEngine, engineName)
-		resumeConvID = "" // clear cross-engine session to start clean
-	} else if engineName == "" && parentEngine != "" {
+		if opt.ResumeFallbackReason != "" {
+			resumeFallbackReason = opt.ResumeFallbackReason
+		}
+	}
+	if engineName == "" && parentEngine != "" {
 		engineName = parentEngine
-	}
-	if opt.ResumeMode != "" {
-		resumeMode = opt.ResumeMode
-	}
-	if opt.ResumeFallbackReason != "" {
-		resumeFallbackReason = opt.ResumeFallbackReason
 	}
 
 	// 3b. Explicit prompt ID
@@ -3184,6 +3281,13 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		engineName = "agy"
 	}
 
+	// 3e. Final canonical 4-tuple engine validation against parent (Finding A3)
+	if parentEngine != "" && !strings.EqualFold(engineName, parentEngine) {
+		resumeMode = "fallback_new_conversation"
+		resumeFallbackReason = fmt.Sprintf("cross-engine resume not supported: parent used %s, final engine is %s", parentEngine, engineName)
+		resumeConvID = "" // clear session to start clean on new engine
+	}
+
 	// Reset repo lock and clear halt state, retaining in-flight story and conversation bindings (F3)
 	repo.Lock = LockIdle
 	repo.RunningJobID = ""
@@ -3231,7 +3335,11 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		interruptedState["story_id"] = targetStoryID
 	}
 	if interruptedState["phase"] == nil || interruptedState["phase"] == "" {
-		if repo.ASEState != "" {
+		if cpPhase, cpStep, cpGate := extractInterruptedASEFromWorktree(repo.WorktreePath); cpPhase != "" {
+			interruptedState["phase"] = cpPhase
+			interruptedState["step"] = cpStep
+			interruptedState["last_completed_gate"] = cpGate
+		} else if repo.ASEState != "" {
 			interruptedState["phase"] = repo.ASEState
 		} else if repo.Reason == "HALTED_DIRTY" {
 			interruptedState["phase"] = "IMPLEMENTATION"
