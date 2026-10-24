@@ -2811,7 +2811,7 @@ func (s *Server) observabilityMetrics(w http.ResponseWriter, r *http.Request) {
 		if h.TraceID != "" {
 			traceCounts++
 		}
-		if h.ResumeMode == "same_conversation" || h.SameConversationConfirmed {
+		if (h.ResumeMode == "same_conversation" || h.SameConversationConfirmed) && (h.AttachConfirmation == "marker" || (h.AttachConfirmation == "implicit" && h.Status == "FINISHED")) {
 			sameConvSuccessCount++
 		} else if h.ResumeMode == "fallback_new_conversation" {
 			fallbackConvCount++

@@ -2,7 +2,6 @@ package control
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1222,20 +1221,27 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 			}
 		}
 	} else if job.Status == "RUNNING" {
-		// Resolve pending resume mode at exit (Finding A1):
-		// If job resumed on an initial session and no fallback occurred, treat attach as implicitly confirmed.
+		// Resolve pending resume mode at exit (Finding A1, hardened in Finding B1):
+		// If job resumed on an initial session and no fallback occurred:
+		// Only confirm implicit attachment on exit code 0; on non-zero, mark unverified.
 		if job.ParentJobID != "" && job.ResumeMode == "pending" && job.ResumeFallbackReason == "" {
-			job.ResumeMode = "same_conversation"
-			job.SameConversationConfirmed = true
-			job.AttachConfirmation = "implicit"
-			if job.ActiveConversationID == "" && job.InitialConversationID != "" {
-				job.ActiveConversationID = job.InitialConversationID
+			if code == 0 {
+				job.ResumeMode = "same_conversation"
+				job.SameConversationConfirmed = true
+				job.AttachConfirmation = "implicit"
+				if job.ActiveConversationID == "" && job.InitialConversationID != "" {
+					job.ActiveConversationID = job.InitialConversationID
+				}
+			} else {
+				job.ResumeMode = "same_conversation_unverified"
+				job.SameConversationConfirmed = false
+				job.AttachConfirmation = "unknown"
 			}
 			if sch, ok := e.schedules[job.ScheduleID]; ok {
 				sch.ResumeMode = job.ResumeMode
 				sch.SameConversationConfirmed = job.SameConversationConfirmed
 				sch.AttachConfirmation = job.AttachConfirmation
-				if sch.ActiveConversationID == "" && sch.InitialConversationID != "" {
+				if code == 0 && sch.ActiveConversationID == "" && sch.InitialConversationID != "" {
 					sch.ActiveConversationID = sch.InitialConversationID
 				}
 			}
@@ -1806,6 +1812,16 @@ func (e *Engine) reapExpiredLocked() {
 				} else if leaseExpired && !timedOut {
 					reason = "LEASE_EXPIRED"
 				}
+				if job.ResumeMode == "pending" {
+					job.ResumeMode = "same_conversation_unverified"
+					job.SameConversationConfirmed = false
+					job.AttachConfirmation = "unknown"
+					if sch != nil {
+						sch.ResumeMode = job.ResumeMode
+						sch.SameConversationConfirmed = job.SameConversationConfirmed
+						sch.AttachConfirmation = job.AttachConfirmation
+					}
+				}
 				if sch != nil {
 					if leaseExpired && !timedOut && sch.LeaseRetries < 2 {
 						sch.LeaseRetries++
@@ -2253,6 +2269,16 @@ func (e *Engine) updateHistoryStatusLocked(host, path, jobID, status string, opt
 				rows[i].Reason = status
 			}
 			if j, ok := e.jobs[jobID]; ok {
+				if j.ResumeMode == "pending" && (status == "LEASE_EXPIRED" || status == "EXECUTION_TIMEOUT" || status == "HOST_OFFLINE" || status == "FAILED" || status == "CANCELLED" || status == "CANCEL_REQUESTED") {
+					j.ResumeMode = "same_conversation_unverified"
+					j.SameConversationConfirmed = false
+					j.AttachConfirmation = "unknown"
+					if sch, ok := e.schedules[j.ScheduleID]; ok && sch != nil {
+						sch.ResumeMode = j.ResumeMode
+						sch.SameConversationConfirmed = j.SameConversationConfirmed
+						sch.AttachConfirmation = j.AttachConfirmation
+					}
+				}
 				rows[i].ResumeMode = j.ResumeMode
 				rows[i].SameConversationConfirmed = j.SameConversationConfirmed
 				rows[i].AttachConfirmation = j.AttachConfirmation
@@ -2988,22 +3014,78 @@ func (e *Engine) ResumeRepoInPlace(host, path string, opts ...ResumeOptions) (Sc
 	return e.resumeRepoInPlaceLocked(host, path, opts...)
 }
 
-func extractInterruptedASEFromWorktree(worktree string) (phase string, step int, gate string) {
-	if worktree == "" {
-		return "", 0, ""
-	}
-	cpPath := filepath.Join(worktree, ".autopilot", "state", "checkpoint.json")
-	if data, err := os.ReadFile(cpPath); err == nil {
-		var cp struct {
-			Phase     string `json:"phase"`
-			StepIndex int    `json:"step_index"`
-			Gate      string `json:"last_completed_gate"`
+func canonicalizeEngine(engine, convID string) string {
+	raw := strings.ToLower(strings.TrimSpace(engine))
+	if strings.Contains(raw, "harness") {
+		if strings.HasPrefix(strings.ToLower(convID), "cursor-") {
+			return "agent"
 		}
-		if err := json.Unmarshal(data, &cp); err == nil {
-			return cp.Phase, cp.StepIndex, cp.Gate
+		return "agy"
+	}
+	switch raw {
+	case "agy":
+		return "agy"
+	case "agent", "cursor":
+		return "agent"
+	default:
+		return raw
+	}
+}
+
+func resolveResumeIdentity(parentEngine, requestedEngine, convID string, isQuotaExhausted bool, requestedResumeMode, requestedFallbackReason string) (finalEngine, resumeMode, resumeFallbackReason, resumeConvID string) {
+	resumeMode = "pending"
+	resumeConvID = convID
+	if requestedResumeMode == "fallback_new_conversation" {
+		resumeMode = "fallback_new_conversation"
+		resumeFallbackReason = requestedFallbackReason
+	}
+
+	engineName := requestedEngine
+	if engineName == "" && parentEngine != "" {
+		engineName = parentEngine
+	}
+
+	// Canonicalize parent engine
+	canonicalParent := canonicalizeEngine(parentEngine, convID)
+
+	// Remap alias/harness
+	if strings.Contains(strings.ToLower(engineName), "harness") {
+		if strings.HasPrefix(strings.ToLower(convID), "cursor-") {
+			engineName = "agent"
+		} else {
+			engineName = "agy"
 		}
 	}
-	return "", 0, ""
+
+	// Non-cursor sessions on agent switch to agy
+	if engineName == "" || (engineName == "agent" && convID != "" && !strings.HasPrefix(strings.ToLower(convID), "cursor-")) {
+		if strings.HasPrefix(strings.ToLower(convID), "cursor-") {
+			engineName = "agent"
+		} else {
+			engineName = "agy"
+		}
+	}
+
+	// Quota exhaustion switches agent to agy
+	if engineName == "agent" && isQuotaExhausted {
+		engineName = "agy"
+	}
+
+	if engineName == "" {
+		engineName = "agy"
+	}
+
+	finalEngine = engineName
+	canonicalFinal := canonicalizeEngine(finalEngine, convID)
+
+	// Final canonical 4-tuple engine validation against parent
+	if canonicalParent != "" && canonicalFinal != "" && canonicalParent != canonicalFinal {
+		resumeMode = "fallback_new_conversation"
+		resumeFallbackReason = fmt.Sprintf("cross-engine resume not supported: parent used %s, final engine is %s", parentEngine, finalEngine)
+		resumeConvID = "" // clear session to start clean on new engine
+	}
+
+	return finalEngine, resumeMode, resumeFallbackReason, resumeConvID
 }
 
 func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOptions) (Schedule, error) {
@@ -3184,20 +3266,7 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 	var targetPrompt *Prompt
 	promptTitle := opt.PromptTitle
 	promptID := opt.PromptID
-	engineName := opt.Engine
-
-	// 3a. Initialize resume mode
-	resumeMode := "pending"
-	var resumeFallbackReason string
-	if opt.ResumeMode == "fallback_new_conversation" {
-		resumeMode = "fallback_new_conversation"
-		if opt.ResumeFallbackReason != "" {
-			resumeFallbackReason = opt.ResumeFallbackReason
-		}
-	}
-	if engineName == "" && parentEngine != "" {
-		engineName = parentEngine
-	}
+	requestedEngine := opt.Engine
 
 	// 3b. Explicit prompt ID
 	if promptID != "" {
@@ -3213,11 +3282,11 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 			if promptTitle == "" {
 				promptTitle = lastRow.PromptTitle
 			}
-			if engineName == "" {
+			if requestedEngine == "" {
 				if (lastRow.DiagnosticCode == "QUOTA_EXHAUSTED" || lastRow.Reason == "QUOTA_EXHAUSTED" || repo.Reason == "QUOTA_EXHAUSTED" || lastRow.Remediation == "switch_to_agy") && (lastRow.Engine == "agent" || lastRow.Engine == "") {
-					engineName = "agy"
+					requestedEngine = "agy"
 				} else if lastRow.Engine != "" {
-					engineName = lastRow.Engine
+					requestedEngine = lastRow.Engine
 				}
 			}
 		}
@@ -3246,8 +3315,8 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		promptID = targetPrompt.ID
 		promptTitle = targetPrompt.Title
 		promptRev = targetPrompt.Revision
-		if engineName == "" && targetPrompt.Engine != "" {
-			engineName = targetPrompt.Engine
+		if requestedEngine == "" && targetPrompt.Engine != "" {
+			requestedEngine = targetPrompt.Engine
 		}
 	}
 	if promptID == "" {
@@ -3261,32 +3330,17 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		}
 	}
 
-	// If engine is unset, contains "harness", or if agent is selected with a non-cursor conversation or after quota exhaustion, switch to agy
-	if strings.Contains(strings.ToLower(engineName), "harness") {
-		if strings.HasPrefix(strings.ToLower(resumeConvID), "cursor-") {
-			engineName = "agent"
-		} else {
-			engineName = "agy"
+	isQuotaExhausted := (repo.Reason == "QUOTA_EXHAUSTED")
+	if !isQuotaExhausted && len(e.history[repoKey(host, path)]) > 0 {
+		lastRow := e.history[repoKey(host, path)][len(e.history[repoKey(host, path)])-1]
+		if lastRow.DiagnosticCode == "QUOTA_EXHAUSTED" || strings.Contains(lastRow.ErrorMessage, "ActionRequiredError") || strings.Contains(lastRow.Reason, "ActionRequiredError") || lastRow.Remediation == "switch_to_agy" {
+			isQuotaExhausted = true
 		}
-	}
-	if engineName == "" || (engineName == "agent" && resumeConvID != "" && !strings.HasPrefix(strings.ToLower(resumeConvID), "cursor-")) {
-		low := strings.ToLower(resumeConvID)
-		if strings.HasPrefix(low, "cursor-") {
-			engineName = "agent"
-		} else {
-			engineName = "agy"
-		}
-	}
-	if engineName == "agent" && (repo.Reason == "QUOTA_EXHAUSTED" || (len(e.history[repoKey(host, path)]) > 0 && (e.history[repoKey(host, path)][len(e.history[repoKey(host, path)])-1].DiagnosticCode == "QUOTA_EXHAUSTED" || strings.Contains(e.history[repoKey(host, path)][len(e.history[repoKey(host, path)])-1].ErrorMessage, "ActionRequiredError") || strings.Contains(e.history[repoKey(host, path)][len(e.history[repoKey(host, path)])-1].Reason, "ActionRequiredError")))) {
-		engineName = "agy"
 	}
 
-	// 3e. Final canonical 4-tuple engine validation against parent (Finding A3)
-	if parentEngine != "" && !strings.EqualFold(engineName, parentEngine) {
-		resumeMode = "fallback_new_conversation"
-		resumeFallbackReason = fmt.Sprintf("cross-engine resume not supported: parent used %s, final engine is %s", parentEngine, engineName)
-		resumeConvID = "" // clear session to start clean on new engine
-	}
+	engineName, resumeMode, resumeFallbackReason, resumeConvID := resolveResumeIdentity(
+		parentEngine, requestedEngine, resumeConvID, isQuotaExhausted, opt.ResumeMode, opt.ResumeFallbackReason,
+	)
 
 	// Reset repo lock and clear halt state, retaining in-flight story and conversation bindings (F3)
 	repo.Lock = LockIdle
@@ -3335,11 +3389,7 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		interruptedState["story_id"] = targetStoryID
 	}
 	if interruptedState["phase"] == nil || interruptedState["phase"] == "" {
-		if cpPhase, cpStep, cpGate := extractInterruptedASEFromWorktree(repo.WorktreePath); cpPhase != "" {
-			interruptedState["phase"] = cpPhase
-			interruptedState["step"] = cpStep
-			interruptedState["last_completed_gate"] = cpGate
-		} else if repo.ASEState != "" {
+		if repo.ASEState != "" {
 			interruptedState["phase"] = repo.ASEState
 		} else if repo.Reason == "HALTED_DIRTY" {
 			interruptedState["phase"] = "IMPLEMENTATION"
@@ -3568,52 +3618,23 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 	}
 
 	parentEngine := origSch.Engine
-	resumeEngine := opt.Engine
-	resumeMode := "pending"
-	var resumeFallbackReason string
-	if resumeEngine != "" && parentEngine != "" && !strings.EqualFold(resumeEngine, parentEngine) {
-		resumeMode = "fallback_new_conversation"
-		resumeFallbackReason = fmt.Sprintf("cross-engine resume not supported: parent used %s, requested %s", parentEngine, resumeEngine)
-		resumeConvID = "" // clear cross-engine session to start clean
-	} else if resumeEngine == "" {
-		resumeEngine = parentEngine
-	}
-	if opt.ResumeMode != "" {
-		resumeMode = opt.ResumeMode
-	}
-	if opt.ResumeFallbackReason != "" {
-		resumeFallbackReason = opt.ResumeFallbackReason
-	}
-	if strings.Contains(strings.ToLower(resumeEngine), "harness") {
-		if strings.HasPrefix(strings.ToLower(resumeConvID), "cursor-") {
-			resumeEngine = "agent"
-		} else {
-			resumeEngine = "agy"
-		}
-	}
-	if resumeEngine == "" || (resumeEngine == "agent" && resumeConvID != "" && !strings.HasPrefix(strings.ToLower(resumeConvID), "cursor-")) {
-		low := strings.ToLower(resumeConvID)
-		if strings.HasPrefix(low, "cursor-") {
-			resumeEngine = "agent"
-		} else {
-			resumeEngine = "agy"
-		}
-	}
-	// If prior job failed with quota exhaustion or ActionRequiredError, auto-switch to agy
-	if resumeEngine == "agent" {
-		if prevReason == "QUOTA_EXHAUSTED" || strings.Contains(prevReason, "ActionRequiredError") || strings.Contains(prevReason, "out of usage") {
-			resumeEngine = "agy"
-		} else {
-			for _, rows := range e.history {
-				for _, r := range rows {
-					if r.JobID == job.ID && (r.DiagnosticCode == "QUOTA_EXHAUSTED" || strings.Contains(r.ErrorMessage, "ActionRequiredError") || strings.Contains(r.Reason, "ActionRequiredError")) {
-						resumeEngine = "agy"
-						break
-					}
+	requestedEngine := opt.Engine
+
+	isQuotaExhausted := (prevReason == "QUOTA_EXHAUSTED" || strings.Contains(prevReason, "ActionRequiredError") || strings.Contains(prevReason, "out of usage"))
+	if !isQuotaExhausted {
+		for _, rows := range e.history {
+			for _, r := range rows {
+				if r.JobID == job.ID && (r.DiagnosticCode == "QUOTA_EXHAUSTED" || strings.Contains(r.ErrorMessage, "ActionRequiredError") || strings.Contains(r.Reason, "ActionRequiredError")) {
+					isQuotaExhausted = true
+					break
 				}
 			}
 		}
 	}
+
+	resumeEngine, resumeMode, resumeFallbackReason, resumeConvID := resolveResumeIdentity(
+		parentEngine, requestedEngine, resumeConvID, isQuotaExhausted, opt.ResumeMode, opt.ResumeFallbackReason,
+	)
 
 	customPrompt := opt.CustomPrompt
 	if customPrompt == "" {
@@ -3643,7 +3664,7 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 			initConvID = resumeConvID
 		}
 	}
-	if resumeConvID == "" {
+	if resumeMode != "fallback_new_conversation" && resumeConvID == "" {
 		resumeConvID = initConvID
 	}
 

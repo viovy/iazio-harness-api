@@ -3468,3 +3468,177 @@ func TestEngine_FallbackTerminal_RePostActiveID_StaysFallback(t *testing.T) {
 		t.Fatalf("expected SameConversationConfirmed to remain false on fallback job")
 	}
 }
+
+func TestEngine_PendingToExitNonZero_NotConfirmedSameConversation(t *testing.T) {
+	e := NewEngine(nil)
+	repoPath := "/home/romeo/work/meta-repo"
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+	p := e.PutPrompt(Prompt{ID: "prompt-1", Title: "Ready ASE prompt", Engine: "agy", Status: "READY"})
+
+	_, err := e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, "aad902c8-bda6-44c7-8a68-c468a1562399")
+	if err != nil {
+		t.Fatalf("ExecutePromptWithResume failed: %v", err)
+	}
+	job1, _, _, _ := e.PollHost("mac-mini")
+	_ = e.PostExit(job1.ID, 1, ExitOptions{Reason: "FAILED"})
+
+	resumeSch, err := e.ResumeRepoInPlace("mac-mini", repoPath, ResumeOptions{
+		JobID:       job1.ID,
+		ParentJobID: job1.ID,
+		AllowDirty:  true,
+	})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace failed: %v", err)
+	}
+	if resumeSch.ResumeMode != "pending" {
+		t.Fatalf("expected initial ResumeMode 'pending', got %q", resumeSch.ResumeMode)
+	}
+
+	job2, _, _, ok := e.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("poll job2 failed")
+	}
+
+	// Exit 1 without marker: must NOT confirm same_conversation (Finding B1)
+	_ = e.PostExit(job2.ID, 1, ExitOptions{Reason: "FAILED"})
+
+	det, _ := e.GetJob(job2.ID)
+	if det.ResumeMode != "same_conversation_unverified" {
+		t.Fatalf("expected non-zero exit ResumeMode 'same_conversation_unverified', got %q", det.ResumeMode)
+	}
+	if det.SameConversationConfirmed {
+		t.Fatalf("expected SameConversationConfirmed false on non-zero exit")
+	}
+	if det.AttachConfirmation != "unknown" {
+		t.Fatalf("expected AttachConfirmation 'unknown', got %q", det.AttachConfirmation)
+	}
+
+	// Verify history record also unverified
+	lastRow, _, _, found := e.FindHistoryRow(job2.ID)
+	if !found {
+		t.Fatal("expected history row for job2")
+	}
+	if lastRow.ResumeMode != "same_conversation_unverified" {
+		t.Fatalf("expected history ResumeMode 'same_conversation_unverified', got %q", lastRow.ResumeMode)
+	}
+	if lastRow.SameConversationConfirmed {
+		t.Fatalf("expected history SameConversationConfirmed false on non-zero exit")
+	}
+	if lastRow.AttachConfirmation != "unknown" {
+		t.Fatalf("expected history AttachConfirmation 'unknown', got %q", lastRow.AttachConfirmation)
+	}
+}
+
+func TestEngine_ResumeJob_SharedResolver_ParentHarnessAlias(t *testing.T) {
+	e := NewEngine(nil)
+	repoPath := "/home/romeo/work/meta-repo"
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+	p := e.PutPrompt(Prompt{ID: "prompt-harness-alias", Title: "Parent Harness Alias", Engine: "harness", Status: "READY"})
+
+	convID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	_, err := e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, convID)
+	if err != nil {
+		t.Fatalf("ExecutePromptWithResume failed: %v", err)
+	}
+	job1, _, _, _ := e.PollHost("mac-mini")
+	_ = e.PostExit(job1.ID, 1, ExitOptions{Reason: "FAILED"})
+
+	// ResumeJob from parent with Engine="harness" (Finding B4)
+	resumeSch, err := e.ResumeJob(job1.ID)
+	if err != nil {
+		t.Fatalf("ResumeJob failed: %v", err)
+	}
+	if resumeSch.Engine != "agy" {
+		t.Fatalf("expected canonical engine 'agy', got %q", resumeSch.Engine)
+	}
+	if resumeSch.ResumeMode != "pending" {
+		t.Fatalf("expected ResumeMode 'pending' (no false cross-engine fallback!), got %q", resumeSch.ResumeMode)
+	}
+	if resumeSch.ResumeConversationID != convID {
+		t.Fatalf("expected ResumeConversationID %q to be preserved, got %q", convID, resumeSch.ResumeConversationID)
+	}
+	if resumeSch.ResumeFallbackReason != "" {
+		t.Fatalf("expected empty ResumeFallbackReason, got %q", resumeSch.ResumeFallbackReason)
+	}
+}
+
+func TestEngine_ResumeJob_QuotaExhausted_SharedResolverFallback(t *testing.T) {
+	e := NewEngine(nil)
+	repoPath := "/home/romeo/work/meta-repo"
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+	p := e.PutPrompt(Prompt{ID: "prompt-quota-job", Title: "Quota Job Test", Engine: "agent", Status: "READY"})
+
+	_, err := e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, "cursor-123")
+	if err != nil {
+		t.Fatalf("ExecutePromptWithResume failed: %v", err)
+	}
+	job1, _, _, _ := e.PollHost("mac-mini")
+	_ = e.PostExit(job1.ID, 1, ExitOptions{DiagnosticCode: "QUOTA_EXHAUSTED", Reason: "QUOTA_EXHAUSTED"})
+
+	// ResumeJob from parent that had quota exhausted on agent (Finding B3)
+	resumeSch, err := e.ResumeJob(job1.ID)
+	if err != nil {
+		t.Fatalf("ResumeJob failed: %v", err)
+	}
+	if resumeSch.Engine != "agy" {
+		t.Fatalf("expected rewritten engine 'agy', got %q", resumeSch.Engine)
+	}
+	if resumeSch.ResumeMode != "fallback_new_conversation" {
+		t.Fatalf("expected ResumeMode 'fallback_new_conversation' after quota switch, got %q", resumeSch.ResumeMode)
+	}
+	if !strings.Contains(resumeSch.ResumeFallbackReason, "cross-engine") {
+		t.Fatalf("expected cross-engine fallback reason, got %q", resumeSch.ResumeFallbackReason)
+	}
+	if resumeSch.ResumeConversationID != "" {
+		t.Fatalf("expected empty ResumeConversationID for cross-engine, got %q", resumeSch.ResumeConversationID)
+	}
+}
+
+func TestEngine_ResumeJob_BodyOverrideIgnored(t *testing.T) {
+	e := NewEngine(nil)
+	repoPath := "/home/romeo/work/meta-repo"
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+	p := e.PutPrompt(Prompt{ID: "prompt-body-override", Title: "Body Override Test", Engine: "agy", Status: "READY"})
+
+	_, err := e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, "aad902c8-bda6-44c7-8a68-c468a1562399")
+	if err != nil {
+		t.Fatalf("ExecutePromptWithResume failed: %v", err)
+	}
+	job1, _, _, _ := e.PollHost("mac-mini")
+	_ = e.PostExit(job1.ID, 1, ExitOptions{Reason: "FAILED"})
+
+	// Client passes ResumeMode="same_conversation" to ResumeJob (Finding B3)
+	resumeSch, err := e.ResumeJob(job1.ID, ResumeOptions{
+		ResumeMode: "same_conversation",
+	})
+	if err != nil {
+		t.Fatalf("ResumeJob failed: %v", err)
+	}
+	if resumeSch.ResumeMode != "pending" {
+		t.Fatalf("expected client-passed same_conversation to be ignored and remain 'pending', got %q", resumeSch.ResumeMode)
+	}
+}
