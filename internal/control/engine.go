@@ -2701,7 +2701,8 @@ func (e *Engine) GetAssociatedJobsForScheduleLocked(schID string) []string {
 					isTerminalSuccess := (prevStatus == "SUCCESS" || prevStatus == "COMPLETED")
 					gap := cand.CreatedAt.Sub(prev.CreatedAt)
 
-					if !isTerminalSuccess && gap >= 0 && gap <= LegacyMaxCorrelationGap {
+					totalSpan := cand.CreatedAt.Sub(curCluster[0].CreatedAt)
+					if !isTerminalSuccess && gap >= 0 && gap <= LegacyMaxCorrelationGap && totalSpan <= LegacyMaxCorrelationGap && len(curCluster) < 10 {
 						curCluster = append(curCluster, cand)
 					} else {
 						clusters = append(clusters, curCluster)
@@ -2735,14 +2736,32 @@ func (e *Engine) GetAssociatedJobsForScheduleLocked(schID string) []string {
 		return []string{}
 	}
 
-	// Deterministic stable chronological sort of associated jobs
+	parseJobNum := func(id string) int {
+		if idx := strings.LastIndex(id, "-"); idx >= 0 {
+			if n, err := strconv.Atoi(id[idx+1:]); err == nil {
+				return n
+			}
+		}
+		return 0
+	}
+
+	// Deterministic stable chronological sort of associated jobs with numeric tie-break
 	sort.SliceStable(ordered, func(i, j int) bool {
 		tI, okI := jobTime[ordered[i]]
 		tJ, okJ := jobTime[ordered[j]]
-		if okI && okJ {
+		if okI && okJ && !tI.IsZero() && !tJ.IsZero() {
 			if !tI.Equal(tJ) {
 				return tI.Before(tJ)
 			}
+		} else if okI && !tI.IsZero() {
+			return true
+		} else if okJ && !tJ.IsZero() {
+			return false
+		}
+		nI := parseJobNum(ordered[i])
+		nJ := parseJobNum(ordered[j])
+		if nI != nJ && nI > 0 && nJ > 0 {
+			return nI < nJ
 		}
 		return ordered[i] < ordered[j]
 	})
