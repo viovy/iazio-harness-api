@@ -2057,22 +2057,16 @@ func TestGetScheduleEndpoint_HistoricalFallbackAndLineage(t *testing.T) {
 		t.Errorf("expected host_id mac-mini, got %v", schedMap["host_id"])
 	}
 
-	// Verify associated_jobs contains both job-1311 and job-1313
+	// Verify associated_jobs contains exactly job-1311 and job-1313 in chronological order (AC1)
 	assocJobs, ok := schedMap["associated_jobs"].([]any)
 	if !ok {
 		t.Fatalf("expected associated_jobs array, got %T: %v", schedMap["associated_jobs"], schedMap["associated_jobs"])
 	}
-	jobSet := make(map[string]bool)
-	for _, j := range assocJobs {
-		if s, ok := j.(string); ok {
-			jobSet[s] = true
-		}
+	if len(assocJobs) != 2 {
+		t.Fatalf("expected exactly 2 associated jobs, got %d: %v", len(assocJobs), assocJobs)
 	}
-	if !jobSet["job-1311"] {
-		t.Errorf("expected associated_jobs to contain initial job-1311, got: %v", assocJobs)
-	}
-	if !jobSet["job-1313"] {
-		t.Errorf("expected associated_jobs to contain resume job-1313, got: %v", assocJobs)
+	if assocJobs[0] != "job-1311" || assocJobs[1] != "job-1313" {
+		t.Errorf("expected associated_jobs [job-1311, job-1313], got: %v", assocJobs)
 	}
 
 	// 2. GET /v1/schedules must list historical schedules sch-1310 and sch-1312

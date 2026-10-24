@@ -2518,10 +2518,14 @@ func (e *Engine) SetSchedulePriority(scheduleID string, priority int) (Schedule,
 	return *sch, nil
 }
 
+// LegacyMaxCorrelationGap is the maximum time gap between consecutive legacy runs to consider them part of the same attempt cluster.
+const LegacyMaxCorrelationGap = 24 * time.Hour
+
 // GetAssociatedJobsForScheduleLocked finds all job IDs associated with a schedule's execution lineage.
 func (e *Engine) GetAssociatedJobsForScheduleLocked(schID string) []string {
 	sch := e.schedules[schID]
 	jobSet := make(map[string]bool)
+	jobTime := make(map[string]time.Time)
 	var ordered []string
 
 	addJob := func(id string) {
@@ -2530,6 +2534,10 @@ func (e *Engine) GetAssociatedJobsForScheduleLocked(schID string) []string {
 			ordered = append(ordered, id)
 		}
 	}
+
+	// 1. Resolve deterministic target metadata and seed explicit pointers
+	var latestRow *HistoryRow
+	var latestHost, latestPath string
 
 	if sch != nil {
 		for _, id := range sch.AssociatedJobs {
@@ -2541,28 +2549,66 @@ func (e *Engine) GetAssociatedJobsForScheduleLocked(schID string) []string {
 		if sch.ParentJobID != "" {
 			addJob(sch.ParentJobID)
 		}
+	} else {
+		// Reconstruct deterministic latest history row for this schedule ID
+		for key, rows := range e.history {
+			h, p := "", ""
+			if idx := strings.Index(key, "\x00"); idx >= 0 {
+				h, p = key[:idx], key[idx+1:]
+			}
+			for i := range rows {
+				r := &rows[i]
+				if r.ScheduleID == schID || r.JobID == schID {
+					if latestRow == nil || r.CreatedAt.After(latestRow.CreatedAt) || (r.CreatedAt.Equal(latestRow.CreatedAt) && r.JobID > latestRow.JobID) {
+						latestRow = r
+						latestHost, latestPath = h, p
+					}
+				}
+			}
+		}
+		if latestRow != nil {
+			if latestRow.RootJobID != "" {
+				addJob(latestRow.RootJobID)
+			}
+			if latestRow.ParentJobID != "" {
+				addJob(latestRow.ParentJobID)
+			}
+		}
 	}
 
+	// Index known timestamps for stable chronological ordering
 	for _, j := range e.jobs {
-		if j.ScheduleID == schID || (sch != nil && sch.RootJobID != "" && (j.RootJobID == sch.RootJobID || j.ID == sch.RootJobID)) || (sch != nil && sch.ParentJobID != "" && (j.ParentJobID == sch.ParentJobID || j.ID == sch.ParentJobID)) {
+		jobTime[j.ID] = j.StartedAt
+		if j.ScheduleID == schID || (sch != nil && sch.RootJobID != "" && (j.RootJobID == sch.RootJobID || j.ID == sch.RootJobID)) || (sch != nil && sch.ParentJobID != "" && (j.ParentJobID == sch.ParentJobID || j.ID == sch.ParentJobID)) || (latestRow != nil && latestRow.RootJobID != "" && (j.RootJobID == latestRow.RootJobID || j.ID == latestRow.RootJobID)) || (latestRow != nil && latestRow.ParentJobID != "" && (j.ParentJobID == latestRow.ParentJobID || j.ID == latestRow.ParentJobID)) {
 			addJob(j.ID)
 		}
 	}
 	for _, rows := range e.history {
 		for _, r := range rows {
-			if r.ScheduleID == schID || (sch != nil && sch.RootJobID != "" && (r.RootJobID == sch.RootJobID || r.JobID == sch.RootJobID)) || (sch != nil && sch.ParentJobID != "" && (r.ParentJobID == sch.ParentJobID || r.JobID == sch.ParentJobID)) {
+			jobTime[r.JobID] = r.CreatedAt
+			if r.ScheduleID == schID || r.JobID == schID || (sch != nil && sch.RootJobID != "" && (r.RootJobID == sch.RootJobID || r.JobID == sch.RootJobID)) || (sch != nil && sch.ParentJobID != "" && (r.ParentJobID == sch.ParentJobID || r.JobID == sch.ParentJobID)) || (latestRow != nil && latestRow.RootJobID != "" && (r.RootJobID == latestRow.RootJobID || r.JobID == latestRow.RootJobID)) || (latestRow != nil && latestRow.ParentJobID != "" && (r.ParentJobID == latestRow.ParentJobID || r.JobID == latestRow.ParentJobID)) {
 				addJob(r.JobID)
 			}
 		}
 	}
 
-	// Transitive lineage closure: any job whose parent or root is in the associated set belongs to the schedule lineage
+	// Transitive bidirectional lineage closure for explicit parent/root graph
 	for {
 		added := false
 		for _, j := range e.jobs {
 			if !jobSet[j.ID] && ((j.ParentJobID != "" && jobSet[j.ParentJobID]) || (j.RootJobID != "" && jobSet[j.RootJobID])) {
 				addJob(j.ID)
 				added = true
+			}
+			if jobSet[j.ID] {
+				if j.ParentJobID != "" && !jobSet[j.ParentJobID] {
+					addJob(j.ParentJobID)
+					added = true
+				}
+				if j.RootJobID != "" && !jobSet[j.RootJobID] {
+					addJob(j.RootJobID)
+					added = true
+				}
 			}
 		}
 		for _, rows := range e.history {
@@ -2571,6 +2617,16 @@ func (e *Engine) GetAssociatedJobsForScheduleLocked(schID string) []string {
 					addJob(r.JobID)
 					added = true
 				}
+				if jobSet[r.JobID] {
+					if r.ParentJobID != "" && !jobSet[r.ParentJobID] {
+						addJob(r.ParentJobID)
+						added = true
+					}
+					if r.RootJobID != "" && !jobSet[r.RootJobID] {
+						addJob(r.RootJobID)
+						added = true
+					}
+				}
 			}
 		}
 		if !added {
@@ -2578,49 +2634,97 @@ func (e *Engine) GetAssociatedJobsForScheduleLocked(schID string) []string {
 		}
 	}
 
-	// Legacy fallback: correlate historical runs sharing the same prompt title, host, and repo
-	// Story Req 2: Only apply when explicit parent/root lineage is absent on the schedule
-	hasExplicitLineage := (sch != nil && (sch.ParentJobID != "" || sch.RootJobID != "" || len(sch.AssociatedJobs) > 0))
+	// 2. Legacy fallback: correlate historical runs sharing the same prompt title, host, and repo
+	// Story Req 2 & Review F1:
+	// Only apply when explicit parent/root lineage is absent on BOTH schedule and history rows,
+	// and when there is at least one executed job in jobSet (fresh unexecuted schedules never scoop history).
+	hasExplicitLineage := (sch != nil && (sch.ParentJobID != "" || sch.RootJobID != "" || len(sch.AssociatedJobs) > 0)) ||
+		(latestRow != nil && (latestRow.ParentJobID != "" || latestRow.RootJobID != ""))
 
-	if !hasExplicitLineage {
-		targetPrompt := ""
-		targetHost := ""
-		targetPath := ""
-		if sch != nil {
-			targetPrompt = sch.PromptTitle
-			targetHost = sch.HostID
-			targetPath = sch.WorktreePath
-		} else {
-			for key, rows := range e.history {
-				for _, r := range rows {
-					if jobSet[r.JobID] || r.ScheduleID == schID {
-						targetPrompt = r.PromptTitle
-						if idx := strings.Index(key, "\x00"); idx >= 0 {
-							targetHost, targetPath = key[:idx], key[idx+1:]
-						}
-						break
-					}
-				}
-				if targetPrompt != "" {
-					break
+	targetPrompt := ""
+	targetHost := ""
+	targetPath := ""
+	if sch != nil {
+		targetPrompt = sch.PromptTitle
+		targetHost = sch.HostID
+		targetPath = sch.WorktreePath
+	} else if latestRow != nil {
+		targetPrompt = latestRow.PromptTitle
+		targetHost = latestHost
+		targetPath = latestPath
+	}
+
+	if !hasExplicitLineage && len(jobSet) > 0 && targetPrompt != "" && targetHost != "" {
+		cleanTargetPath := filepath.Clean(targetPath)
+		var candidateRows []HistoryRow
+		prefix := targetHost + "\x00"
+
+		for key, rows := range e.history {
+			if !strings.HasPrefix(key, prefix) {
+				continue
+			}
+			path := key[len(prefix):]
+			if targetPath != "" && filepath.Clean(path) != cleanTargetPath {
+				continue
+			}
+			for _, r := range rows {
+				// Only candidate rows that themselves lack explicit lineage pointers and match prompt
+				if r.PromptTitle == targetPrompt && r.ParentJobID == "" && r.RootJobID == "" {
+					candidateRows = append(candidateRows, r)
+					jobTime[r.JobID] = r.CreatedAt
 				}
 			}
 		}
 
-		if targetPrompt != "" && targetHost != "" {
-			cleanTargetPath := filepath.Clean(targetPath)
-			for key, rows := range e.history {
-				host, path := "", ""
-				if idx := strings.Index(key, "\x00"); idx >= 0 {
-					host, path = key[:idx], key[idx+1:]
+		if len(candidateRows) > 0 {
+			// Sort candidates chronologically
+			sort.Slice(candidateRows, func(i, j int) bool {
+				if candidateRows[i].CreatedAt.Equal(candidateRows[j].CreatedAt) {
+					return candidateRows[i].JobID < candidateRows[j].JobID
 				}
-				cleanPath := filepath.Clean(path)
-				if host == targetHost && (targetPath == "" || cleanPath == cleanTargetPath) {
-					for _, r := range rows {
-						// Only correlate candidate rows that themselves lack explicit lineage pointers
-						if r.PromptTitle == targetPrompt && r.ParentJobID == "" && r.RootJobID == "" {
-							addJob(r.JobID)
-						}
+				return candidateRows[i].CreatedAt.Before(candidateRows[j].CreatedAt)
+			})
+
+			// Cluster candidates into contiguous execution lineages:
+			// A cluster breaks if:
+			// 1) The time gap between consecutive runs exceeds LegacyMaxCorrelationGap (24 hours), OR
+			// 2) The prior run terminated successfully (SUCCESS / COMPLETED), marking completion.
+			var clusters [][]HistoryRow
+			var curCluster []HistoryRow
+
+			for _, cand := range candidateRows {
+				if len(curCluster) == 0 {
+					curCluster = append(curCluster, cand)
+				} else {
+					prev := curCluster[len(curCluster)-1]
+					prevStatus := strings.ToUpper(prev.Status)
+					isTerminalSuccess := (prevStatus == "SUCCESS" || prevStatus == "COMPLETED")
+					gap := cand.CreatedAt.Sub(prev.CreatedAt)
+
+					if !isTerminalSuccess && gap >= 0 && gap <= LegacyMaxCorrelationGap {
+						curCluster = append(curCluster, cand)
+					} else {
+						clusters = append(clusters, curCluster)
+						curCluster = []HistoryRow{cand}
+					}
+				}
+			}
+			if len(curCluster) > 0 {
+				clusters = append(clusters, curCluster)
+			}
+
+			// Find cluster(s) that contain any job already in jobSet (the target schedule's own jobs)
+			for _, cluster := range clusters {
+				matchesSchedule := false
+				for _, r := range cluster {
+					if jobSet[r.JobID] || r.ScheduleID == schID {
+						matchesSchedule = true
+						break
+					}
+				}
+				if matchesSchedule {
+					for _, r := range cluster {
+						addJob(r.JobID)
 					}
 				}
 			}
@@ -2630,6 +2734,19 @@ func (e *Engine) GetAssociatedJobsForScheduleLocked(schID string) []string {
 	if ordered == nil {
 		return []string{}
 	}
+
+	// Deterministic stable chronological sort of associated jobs
+	sort.SliceStable(ordered, func(i, j int) bool {
+		tI, okI := jobTime[ordered[i]]
+		tJ, okJ := jobTime[ordered[j]]
+		if okI && okJ {
+			if !tI.Equal(tJ) {
+				return tI.Before(tJ)
+			}
+		}
+		return ordered[i] < ordered[j]
+	})
+
 	return ordered
 }
 

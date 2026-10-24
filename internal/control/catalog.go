@@ -845,9 +845,27 @@ func (e *Engine) ListSchedules(hostID, repoPath, status string) []Schedule {
 		}
 	}
 
+	matchesScheduleStatus := func(rowStatus, filterStatus string) bool {
+		if filterStatus == "" {
+			return true
+		}
+		if strings.EqualFold(rowStatus, filterStatus) {
+			return true
+		}
+		fLower := strings.ToLower(filterStatus)
+		rLower := strings.ToLower(rowStatus)
+		if fLower == "failed" && (rLower == "execution_timeout" || rLower == "error") {
+			return true
+		}
+		if fLower == "completed" && rLower == "success" {
+			return true
+		}
+		return false
+	}
+
 	for schID, cand := range historicalMap {
 		r := cand.row
-		if status != "" && !strings.EqualFold(r.Status, status) {
+		if !matchesScheduleStatus(r.Status, status) {
 			continue
 		}
 		sCopy := Schedule{
