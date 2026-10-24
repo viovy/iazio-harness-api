@@ -665,3 +665,198 @@ func TestReleaseService_ConcurrentListAndSync(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestReleaseService_ConsecutiveReleasesAutoAdvanceTracking(t *testing.T) {
+	currentVersion := "0.0.492"
+	var mu sync.Mutex
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		ver := currentVersion
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tag_name":     ver,
+			"html_url":     "https://github.com/viovy/autopilot-plugins-internal/releases/tag/" + ver,
+			"published_at": time.Now().UTC().Format(time.RFC3339),
+		})
+	}))
+	defer ts.Close()
+
+	svc := NewReleaseService()
+	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
+
+	e := NewEngine(time.Now)
+	e.Releases = svc
+
+	// Seed profile with implicit latest tracking (empty TargetVersion)
+	_, _ = e.UpsertProfile(DistributionProfile{
+		Name: "tracking-profile",
+		Tools: []ProfileTool{
+			{Name: "autopilot-plugins-internal", Repository: "viovy/autopilot-plugins-internal", TargetVersion: ""},
+		},
+	})
+
+	// First sync: advances from "" to 0.0.492
+	adv1 := svc.SyncAllProfiles(context.Background(), e, nil)
+	if adv1 != 1 {
+		t.Fatalf("expected 1 tool advanced on first sync, got %d", adv1)
+	}
+	p1, _ := e.GetProfile("tracking-profile")
+	if p1.Tools[0].TargetVersion != "0.0.492" {
+		t.Fatalf("expected target 0.0.492 after first sync, got %s", p1.Tools[0].TargetVersion)
+	}
+	if !p1.Tools[0].TrackLatest {
+		t.Fatalf("expected TrackLatest true to be preserved after first advance")
+	}
+
+	// Bump upstream release to 0.0.493
+	mu.Lock()
+	currentVersion = "0.0.493"
+	mu.Unlock()
+
+	// Second sync: must auto-advance from 0.0.492 to 0.0.493 (N1 regression guard)
+	adv2 := svc.SyncAllProfiles(context.Background(), e, nil)
+	if adv2 != 1 {
+		t.Fatalf("expected 1 tool advanced on second sync, got %d", adv2)
+	}
+	p2, _ := e.GetProfile("tracking-profile")
+	if p2.Tools[0].TargetVersion != "0.0.493" {
+		t.Fatalf("expected target 0.0.493 after second sync, got %s", p2.Tools[0].TargetVersion)
+	}
+	if !p2.Tools[0].TrackLatest {
+		t.Fatalf("expected TrackLatest still true after second advance")
+	}
+}
+
+func TestReleaseService_PrereleasesExcludedFromResolution(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/releases/latest") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/releases") {
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"tag_name": "0.0.493-rc1", "prerelease": true, "draft": false, "html_url": "url-rc"},
+				{"tag_name": "0.0.492", "prerelease": false, "draft": false, "html_url": "url-stable"},
+				{"tag_name": "0.0.494-beta", "prerelease": false, "draft": false, "html_url": "url-beta"},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	svc := NewReleaseService()
+	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
+
+	rel, err := svc.GetToolRelease(context.Background(), "viovy/autopilot-plugins-internal", "autopilot-plugins-internal", "latest")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rel.LatestVersion != "0.0.492" {
+		t.Fatalf("expected stable release 0.0.492, but got prerelease: %s", rel.LatestVersion)
+	}
+}
+
+func TestReleaseService_FallbackConditionalETagAnd304(t *testing.T) {
+	var requestCount int
+	var receivedIfNoneMatch string
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/releases/latest") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/releases") {
+			requestCount++
+			receivedIfNoneMatch = r.Header.Get("If-None-Match")
+			if receivedIfNoneMatch == `"etag-releases-fallback"` {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+			w.Header().Set("ETag", `"etag-releases-fallback"`)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"tag_name": "0.0.492", "prerelease": false, "draft": false},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	svc := NewReleaseService()
+	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
+
+	e := NewEngine(time.Now)
+	e.Releases = svc
+	_, _ = e.UpsertProfile(DistributionProfile{
+		Name: "fallback-profile",
+		Tools: []ProfileTool{
+			{Name: "test-tool", Repository: "viovy/test-tool", TargetVersion: "latest"},
+		},
+	})
+
+	// First sync: fetches 200 with ETag
+	svc.SyncAllProfiles(context.Background(), e, nil)
+	if requestCount != 1 {
+		t.Fatalf("expected 1 request to /releases fallback, got %d", requestCount)
+	}
+
+	// Second sync: sends If-None-Match and receives 304 Not Modified
+	svc.SyncAllProfiles(context.Background(), e, nil)
+	if requestCount != 2 {
+		t.Fatalf("expected 2 requests, got %d", requestCount)
+	}
+	if receivedIfNoneMatch != `"etag-releases-fallback"` {
+		t.Fatalf("expected If-None-Match header on fallback tier, got %q", receivedIfNoneMatch)
+	}
+	p, _ := e.GetProfile("fallback-profile")
+	if p.Tools[0].LastSyncStatus != "not_modified" && p.Tools[0].LastSyncStatus != "ok" {
+		t.Fatalf("expected valid sync status after 304, got %s", p.Tools[0].LastSyncStatus)
+	}
+}
+
+func TestReleaseService_MultiToolAC1Fixtures(t *testing.T) {
+	fixtureReleases := map[string]string{
+		"autopilot-plugins-internal": "0.0.492",
+		"iazio-agent":                "0.0.67",
+		"iazio-harvester":            "0.0.98",
+		"iazio-mcp":                  "0.0.79",
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		for tool, ver := range fixtureReleases {
+			if strings.Contains(r.URL.Path, tool) {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"tag_name":     ver,
+					"html_url":     "https://github.com/viovy/" + tool + "/releases/tag/" + ver,
+					"published_at": "2026-10-24T12:00:00Z",
+				})
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	svc := NewReleaseService()
+	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
+
+	for tool, expectedVer := range fixtureReleases {
+		rel, err := svc.GetToolRelease(context.Background(), "viovy/"+tool, tool, "latest")
+		if err != nil {
+			t.Fatalf("failed to resolve release for %s: %v", tool, err)
+		}
+		if rel.LatestVersion != expectedVer {
+			t.Fatalf("expected %s version %s, got %s", tool, expectedVer, rel.LatestVersion)
+		}
+	}
+}

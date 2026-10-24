@@ -156,7 +156,9 @@ func run(ctx context.Context, args []string) error {
 		srv.SaveProfile = func(p control.DistributionProfile) {
 			_ = store.SaveProfile(context.Background(), p)
 		}
-		srv.Engine.OnSaveProfile = srv.SaveProfile
+		srv.Engine.OnSaveProfile = func(p control.DistributionProfile) error {
+			return store.SaveProfile(context.Background(), p)
+		}
 		srv.DeleteProfile = func(name string) {
 			_ = store.DeleteProfile(context.Background(), name)
 		}
@@ -184,11 +186,6 @@ func run(ctx context.Context, args []string) error {
 			}
 		}
 		srv.Engine.Releases.StartBackgroundSync(ctx, srv.Engine, syncInterval, func(profileName string, tool control.ProfileTool, oldVersion, newVersion string) {
-			if srv.SaveProfile != nil {
-				if p, err := srv.Engine.GetProfile(profileName); err == nil && p != nil {
-					srv.SaveProfile(*p)
-				}
-			}
 			srv.RecordNotification(httpserver.NotificationRecord{
 				Title:    "Release Detected",
 				Message:  fmt.Sprintf("New release detected for %s: %s (was %s). Profile '%s' updated.", tool.Name, newVersion, oldVersion, profileName),

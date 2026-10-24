@@ -2270,3 +2270,52 @@ func TestSyncAllProfilesEndpoint_AndCacheControl(t *testing.T) {
 		t.Errorf("expected category release, got %s", notifs[0].Category)
 	}
 }
+
+func TestServer_RefreshPinnedProfileCannotDowngrade(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tag_name":     "0.0.490",
+			"html_url":     "https://github.com/viovy/autopilot-plugins-internal/releases/tag/0.0.490",
+			"published_at": time.Now().UTC().Format(time.RFC3339),
+		})
+	}))
+	defer ts.Close()
+
+	s := &Server{Engine: control.NewEngine(nil)}
+	relSvc := control.NewReleaseService()
+	relSvc.SetBaseURL(ts.URL)
+	s.Engine.SetReleaseService(relSvc)
+
+	// Seed profile with explicit pinned TargetVersion 0.0.492 (ahead of upstream 0.0.490) and TrackLatest false
+	_, _ = s.Engine.UpsertProfile(control.DistributionProfile{
+		Name: "pinned-profile",
+		Tools: []control.ProfileTool{
+			{
+				Name:          "autopilot-plugins-internal",
+				Repository:    "viovy/autopilot-plugins-internal",
+				TargetVersion: "0.0.492",
+				TrackLatest:   false,
+			},
+		},
+	})
+
+	handler := s.Handler()
+	req := httptest.NewRequest(http.MethodPost, "/v1/fleet/profiles/pinned-profile/refresh", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	prof, _ := s.Engine.GetProfile("pinned-profile")
+	// TargetVersion must NOT be downgraded to 0.0.490
+	if prof.Tools[0].TargetVersion != "0.0.492" {
+		t.Fatalf("expected pinned target 0.0.492 preserved, but got %s", prof.Tools[0].TargetVersion)
+	}
+	// LatestAvailableVersion reflects upstream
+	if prof.Tools[0].LatestAvailableVersion != "0.0.490" {
+		t.Fatalf("expected latest available version 0.0.490, got %s", prof.Tools[0].LatestAvailableVersion)
+	}
+}

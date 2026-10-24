@@ -125,7 +125,7 @@ func (e *Engine) SetReleaseService(r *ReleaseService) {
 	e.Releases = r
 }
 
-// GetProfile returns a distribution profile by name.
+// GetProfile returns a distribution profile by name with deep-copied Tools and Endpoints.
 func (e *Engine) GetProfile(name string) (*DistributionProfile, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -134,7 +134,48 @@ func (e *Engine) GetProfile(name string) (*DistributionProfile, error) {
 		return nil, ErrProfileNotFound
 	}
 	cp := *p
+	if len(p.Tools) > 0 {
+		cp.Tools = make([]ProfileTool, len(p.Tools))
+		copy(cp.Tools, p.Tools)
+	}
+	if len(p.Endpoints) > 0 {
+		cp.Endpoints = make(map[string]string, len(p.Endpoints))
+		for k, v := range p.Endpoints {
+			cp.Endpoints[k] = v
+		}
+	}
 	return &cp, nil
+}
+
+// UpdateProfileTools atomically updates the tools slice of an existing profile.
+// If configChanged is true, UpdatedAt is updated and OnSaveProfile is invoked.
+func (e *Engine) UpdateProfileTools(name string, updater func(tools []ProfileTool) ([]ProfileTool, bool)) (*DistributionProfile, bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	p, ok := e.profiles[strings.TrimSpace(name)]
+	if !ok {
+		return nil, false, ErrProfileNotFound
+	}
+
+	newTools, configChanged := updater(p.Tools)
+	p.Tools = newTools
+
+	if configChanged {
+		p.UpdatedAt = e.now()
+		if e.OnSaveProfile != nil {
+			if err := e.OnSaveProfile(*p); err != nil {
+				return nil, false, fmt.Errorf("persist profile %s: %w", name, err)
+			}
+		}
+	}
+
+	cp := *p
+	if len(p.Tools) > 0 {
+		cp.Tools = make([]ProfileTool, len(p.Tools))
+		copy(cp.Tools, p.Tools)
+	}
+	return &cp, configChanged, nil
 }
 
 // UpsertProfile inserts or updates a distribution profile.
@@ -198,12 +239,13 @@ func parseFleetDistribution(raw []byte) (*DistributionProfile, error) {
 				IsPrivate bool   `yaml:"is_private" json:"is_private"`
 			} `yaml:"repositories" json:"repositories"`
 			Tools []struct {
-				Name        string       `yaml:"name" json:"name"`
-				Repository  string       `yaml:"repository" json:"repository"`
-				BinaryName  string       `yaml:"binary_name" json:"binary_name"`
-				Description string       `yaml:"description" json:"description"`
-				Tier        string       `yaml:"tier" json:"tier"`
-				Service     *ToolService `yaml:"service" json:"service"`
+				Name          string       `yaml:"name" json:"name"`
+				Repository    string       `yaml:"repository" json:"repository"`
+				BinaryName    string       `yaml:"binary_name" json:"binary_name"`
+				Description   string       `yaml:"description" json:"description"`
+				Tier          string       `yaml:"tier" json:"tier"`
+				TargetVersion string       `yaml:"target_version" json:"target_version"`
+				Service       *ToolService `yaml:"service" json:"service"`
 			} `yaml:"tools" json:"tools"`
 		} `yaml:"fleet_distribution" json:"fleet_distribution"`
 	}
@@ -240,13 +282,16 @@ func parseFleetDistribution(raw []byte) (*DistributionProfile, error) {
 		if repoDef, ok := fd.Repositories[t.Repository]; ok && repoDef.Repo != "" {
 			repo = repoDef.Repo
 		}
+		trackLatest := t.TargetVersion == "" || t.TargetVersion == "latest"
 		profile.Tools = append(profile.Tools, ProfileTool{
-			Name:        t.Name,
-			Repository:  repo,
-			BinaryName:  t.BinaryName,
-			Description: t.Description,
-			Tier:        t.Tier,
-			Service:     t.Service,
+			Name:          t.Name,
+			Repository:    repo,
+			BinaryName:    t.BinaryName,
+			Description:   t.Description,
+			Tier:          t.Tier,
+			TargetVersion: t.TargetVersion,
+			TrackLatest:   trackLatest,
+			Service:       t.Service,
 		})
 	}
 	return &profile, nil

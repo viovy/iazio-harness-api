@@ -1883,73 +1883,40 @@ func (s *Server) testGitCredentialPayload(w http.ResponseWriter, r *http.Request
 
 func (s *Server) refreshProfileReleases(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	p, err := s.Engine.GetProfile(name)
-	if err != nil {
+	if _, err := s.Engine.GetProfile(name); err != nil {
 		writeErr(w, http.StatusNotFound, control.ErrNotFound)
 		return
 	}
-	if s.Engine.Releases == nil {
-		s.Engine.Releases = control.NewReleaseService()
+	relSvc := s.Engine.GetReleaseService()
+	if relSvc == nil {
+		relSvc = control.NewReleaseService()
+		s.Engine.SetReleaseService(relSvc)
 	}
-	releases, err := s.Engine.Releases.RefreshProfileReleases(r.Context(), *p)
-	if err != nil && len(releases) == 0 {
+
+	advanced, err := relSvc.SyncProfile(r.Context(), s.Engine, name, func(prof string, tool control.ProfileTool, fromVer, toVer string) {
+		s.RecordNotification(NotificationRecord{
+			Title:    "Release Detected",
+			Message:  fmt.Sprintf("New release detected for %s: %s (was %s). Profile '%s' updated.", tool.Name, toVer, fromVer, prof),
+			Category: "release",
+			Source:   "release-watcher",
+		})
+	})
+	if err != nil {
 		writeErr(w, http.StatusBadGateway, err)
 		return
 	}
 
-	updated := false
-	for i := range p.Tools {
-		toolName := strings.ToLower(p.Tools[i].Name)
-		repoName := strings.ToLower(p.Tools[i].Repository)
-		for _, rel := range releases {
-			relTool := strings.ToLower(rel.Name)
-			relRepo := strings.ToLower(rel.Repository)
-			if (relTool == toolName || relRepo == repoName || strings.HasSuffix(relRepo, "/"+toolName)) &&
-				rel.LatestVersion != "" && rel.Error == "" {
-				if p.Tools[i].TargetVersion != rel.LatestVersion {
-					p.Tools[i].TargetVersion = rel.LatestVersion
-					updated = true
-				}
-				p.Tools[i].LatestAvailableVersion = rel.LatestVersion
-				p.Tools[i].LatestReleaseURL = rel.HTMLURL
-				if !rel.PublishedAt.IsZero() {
-					pub := rel.PublishedAt
-					p.Tools[i].LatestPublishedAt = &pub
-				}
-				now := time.Now()
-				p.Tools[i].LastCheckedAt = &now
-				p.Tools[i].LastSyncStatus = "ok"
-				p.Tools[i].LastSyncError = ""
-				break
-			}
-		}
-	}
-	if updated {
-		saved, uErr := s.Engine.UpsertProfile(*p)
-		if uErr == nil && s.SaveProfile != nil && saved != nil {
-			s.SaveProfile(*saved)
-		}
-	}
-
+	updatedProfile, _ := s.Engine.GetProfile(name)
 	s.RecordNotification(NotificationRecord{
 		Title:    "Profile Releases Refreshed",
-		Message:  fmt.Sprintf("Refreshed release versions for profile '%s'. Updated target versions: %v", name, updated),
+		Message:  fmt.Sprintf("Refreshed release versions for profile '%s'. Advanced tools: %d", name, advanced),
 		Category: "release",
 		Source:   "harness-api",
-		Metadata: map[string]any{
-			"profile": name,
-			"updated": updated,
-			"tools":   len(releases),
-		},
 	})
-
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Expires", "0")
-	writeJSON(w, http.StatusOK, map[string]any{
-		"profile":  name,
-		"releases": releases,
-	})
+	writeJSON(w, http.StatusOK, updatedProfile)
 }
 
 func (s *Server) syncAllProfiles(w http.ResponseWriter, r *http.Request) {
