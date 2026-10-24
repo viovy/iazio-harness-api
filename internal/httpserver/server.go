@@ -1650,7 +1650,10 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 	toolParam := strings.TrimSpace(r.PathValue("tool"))
 	if toolParam != "" {
 		body.Tools = []string{toolParam}
-		body.Force = true
+		// R3: only force when route is explicitly a force-update endpoint
+		if strings.HasSuffix(r.URL.Path, "/force-update") {
+			body.Force = true
+		}
 	}
 	if body.TargetVersion == "" && body.Version != "" {
 		body.TargetVersion = body.Version
@@ -1662,13 +1665,16 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve target profile for the host, falling back to generic default profile (F6)
+	// Resolve target profile for the host, falling back to generic default profile (F6, R8)
 	profileName := hostDet.Host.DistributionProfile
 	if profileName == "" {
 		profileName = "generic"
 	}
 	p, err := s.Engine.GetProfile(profileName)
 	if err != nil || p == nil {
+		if profileName != "generic" {
+			fmt.Fprintf(os.Stderr, "[server] host %s profile %q not found, falling back to generic: %v\n", hostID, profileName, err)
+		}
 		p, _ = s.Engine.GetProfile("generic")
 	}
 
@@ -1689,7 +1695,17 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusNotFound, fmt.Errorf("unknown tool: %s", toolParam))
 			return
 		}
-		// Prefer LatestAvailableVersion for force update when target_version is not explicitly supplied (F6)
+
+		// R2: validate explicit target_version if supplied; return 422 if invalid or unknown
+		if body.TargetVersion != "" {
+			cleanTV := strings.TrimPrefix(strings.TrimSpace(body.TargetVersion), "v")
+			if cleanTV == "" || strings.Contains(cleanTV, " ") {
+				writeErr(w, http.StatusUnprocessableEntity, fmt.Errorf("invalid target_version: %s", body.TargetVersion))
+				return
+			}
+		}
+
+		// Prefer LatestAvailableVersion for force update when target_version is not explicitly supplied (F6, R2)
 		if body.TargetVersion == "" && foundTool != nil {
 			if foundTool.LatestAvailableVersion != "" {
 				body.TargetVersion = foundTool.LatestAvailableVersion

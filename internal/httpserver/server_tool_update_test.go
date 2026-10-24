@@ -429,4 +429,52 @@ func TestServer_ForceUpdateToolEndpoint(t *testing.T) {
 	if rec7.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for malformed json body, got %d: %s", rec7.Code, rec7.Body.String())
 	}
+
+	// 8. Non-generic host profile resolution (R2, R6)
+	e.RegisterHost("edge-runner", "edge", "edge-profile")
+	_, _ = e.UpsertProfile(control.DistributionProfile{
+		Name: "edge-profile",
+		Tools: []control.ProfileTool{
+			{
+				Name:                   "autopilot-plugins-internal",
+				Repository:             "viovy/autopilot-plugins-internal",
+				BinaryName:             "autopilot",
+				TargetVersion:          "0.0.999",
+				LatestAvailableVersion: "0.0.999",
+				Tier:                   "baseline",
+			},
+		},
+	})
+	rec8 := httptest.NewRecorder()
+	req8 := httptest.NewRequest("POST", "/api/agents/edge-runner/tools/autopilot-plugins-internal/force-update", nil)
+	handler.ServeHTTP(rec8, req8)
+	if rec8.Code != http.StatusOK {
+		t.Fatalf("expected 200 for edge-runner force update, got %d: %s", rec8.Code, rec8.Body.String())
+	}
+	var res8 map[string]any
+	_ = json.Unmarshal(rec8.Body.Bytes(), &res8)
+	if res8["target_version"] != "0.0.999" {
+		t.Fatalf("expected target_version 0.0.999 from edge-profile, got %v", res8["target_version"])
+	}
+
+	// 9. Standard /update route is unforced unless specified (R3)
+	rec9 := httptest.NewRecorder()
+	req9 := httptest.NewRequest("POST", "/v1/hosts/mac-mini/tools/autopilot-plugins-internal/update", bytes.NewReader([]byte(`{}`)))
+	handler.ServeHTTP(rec9, req9)
+	if rec9.Code != http.StatusOK {
+		t.Fatalf("expected 200 on /update route, got %d: %s", rec9.Code, rec9.Body.String())
+	}
+	var res9 map[string]any
+	_ = json.Unmarshal(rec9.Body.Bytes(), &res9)
+	if res9["force"] != false {
+		t.Fatalf("expected force=false for standard /update route (R3), got %v", res9["force"])
+	}
+
+	// 10. Invalid target_version returns 422 (R2)
+	rec10 := httptest.NewRecorder()
+	req10 := httptest.NewRequest("POST", "/api/agents/mac-mini/tools/autopilot-plugins-internal/force-update", bytes.NewReader([]byte(`{"target_version":"invalid version with spaces"}`)))
+	handler.ServeHTTP(rec10, req10)
+	if rec10.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for invalid target_version, got %d: %s", rec10.Code, rec10.Body.String())
+	}
 }
