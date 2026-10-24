@@ -3869,21 +3869,21 @@ func TestEngine_AssociatedJobsAndHistoricalScheduleLineage(t *testing.T) {
 		},
 		{
 			JobID:       "job-1310",
-			ScheduleID:  "sch-1310",
+			ScheduleID:  "sch-prior",
 			PromptTitle: "autonomous feature delivery",
 			Status:      "completed", // terminal success marks boundary
 			CreatedAt:   t1,
 		},
 		{
 			JobID:       "job-1311",
-			ScheduleID:  "sch-1311",
+			ScheduleID:  "sch-1310", // exact incident shape: initial run was scheduled under sch-1310
 			PromptTitle: "autonomous feature delivery",
 			Status:      "execution_timeout",
 			CreatedAt:   t2,
 		},
 		{
 			JobID:       "job-1313",
-			ScheduleID:  "sch-1312",
+			ScheduleID:  "sch-1312", // resume run scheduled under sch-1312
 			PromptTitle: "autonomous feature delivery",
 			Status:      "running",
 			CreatedAt:   t3,
@@ -3931,10 +3931,10 @@ func TestEngine_AssociatedJobsAndHistoricalScheduleLineage(t *testing.T) {
 		}
 	}
 
-	// Verify earlier schedule sch-1310 isolates to its own cluster and does NOT scoop subsequent jobs
-	jobs1310 := e.GetAssociatedJobsForSchedule("sch-1310")
-	if len(jobs1310) != 1 || jobs1310[0] != "job-1310" {
-		t.Fatalf("expected sch-1310 to isolate to [job-1310], got %v", jobs1310)
+	// Verify earlier schedule sch-prior isolates to its own cluster and does NOT scoop subsequent jobs
+	jobsPrior := e.GetAssociatedJobsForSchedule("sch-prior")
+	if len(jobsPrior) != 1 || jobsPrior[0] != "job-1310" {
+		t.Fatalf("expected sch-prior to isolate to [job-1310], got %v", jobsPrior)
 	}
 
 	// 2. Fresh schedule in memory with recurring prompt must NOT scoop past historical jobs
@@ -4006,13 +4006,50 @@ func TestEngine_AssociatedJobsAndHistoricalScheduleLineage(t *testing.T) {
 	listFailedTimeout := e.ListSchedules("mac-mini", "/work/fleet-repo-03", "failed")
 	foundTimeout := false
 	for _, s := range listFailedTimeout {
-		if s.ID == "sch-1311" {
+		if s.ID == "sch-1310" {
 			foundTimeout = true
 			break
 		}
 	}
 	if !foundTimeout {
 		t.Errorf("expected ListSchedules with status=failed to match historical row with status=execution_timeout")
+	}
+
+	// 6. F3 check: failure chain spanning > 24 hours total does NOT form a single runaway cluster
+	tDay1 := time.Date(2026, 10, 20, 10, 0, 0, 0, time.UTC)
+	tDay2 := time.Date(2026, 10, 21, 6, 0, 0, 0, time.UTC) // +20h
+	tDay3 := time.Date(2026, 10, 22, 2, 0, 0, 0, time.UTC) // +20h from Day 2, +40h from Day 1
+	e.history["mac-mini\x00/work/span-repo"] = []HistoryRow{
+		{JobID: "job-chain-1", ScheduleID: "sch-chain-1", PromptTitle: "daily cron", Status: "failed", CreatedAt: tDay1},
+		{JobID: "job-chain-2", ScheduleID: "sch-chain-2", PromptTitle: "daily cron", Status: "failed", CreatedAt: tDay2},
+		{JobID: "job-chain-3", ScheduleID: "sch-chain-3", PromptTitle: "daily cron", Status: "failed", CreatedAt: tDay3},
+	}
+	chainJobs := e.GetAssociatedJobsForSchedule("sch-chain-3")
+	for _, j := range chainJobs {
+		if j == "job-chain-1" {
+			t.Fatalf("F3 violation: cluster exceeded max total span of 24h: %v", chainJobs)
+		}
+	}
+
+	// 7. F9 check: in-memory pre-restart schedule with explicit parent pointer
+	e.schedules["sch-pre-restart"] = &Schedule{
+		ID:           "sch-pre-restart",
+		HostID:       "mac-mini",
+		WorktreePath: "/work/fleet-repo-03",
+		PromptTitle:  "autonomous feature delivery",
+		ParentJobID:  "job-1311",
+		Status:       "running",
+	}
+	preRestartJobs := e.GetAssociatedJobsForSchedule("sch-pre-restart")
+	foundParent := false
+	for _, j := range preRestartJobs {
+		if j == "job-1311" {
+			foundParent = true
+			break
+		}
+	}
+	if !foundParent {
+		t.Fatalf("expected in-memory schedule with ParentJobID to include parent job-1311, got: %v", preRestartJobs)
 	}
 }
 
