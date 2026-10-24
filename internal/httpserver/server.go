@@ -541,10 +541,14 @@ func (s *Server) resumeJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errors.New("invalid conversation_id: contains illegal characters or path traversal"))
 		return
 	}
-	if opts.InitialConversationID != "" && !control.IsValidConversationID(opts.InitialConversationID) {
-		writeErr(w, http.StatusBadRequest, errors.New("invalid initial_conversation_id: contains illegal characters or path traversal"))
-		return
-	}
+	// C5: Strip server-derived fields from client request body
+	opts.ParentJobID = ""
+	opts.RootJobID = ""
+	opts.InitialConversationID = ""
+	opts.InterruptedASEState = nil
+	opts.ResumeFallbackReason = ""
+	opts.HostID = ""
+	opts.WorktreePath = ""
 	if opts.ResumeMode != "fallback_new_conversation" {
 		opts.ResumeMode = ""
 	}

@@ -3631,14 +3631,84 @@ func TestEngine_ResumeJob_BodyOverrideIgnored(t *testing.T) {
 	job1, _, _, _ := e.PollHost("mac-mini")
 	_ = e.PostExit(job1.ID, 1, ExitOptions{Reason: "FAILED"})
 
-	// Client passes ResumeMode="same_conversation" to ResumeJob (Finding B3)
+	// Client passes overrides to ResumeJob (Finding B3, C5)
 	resumeSch, err := e.ResumeJob(job1.ID, ResumeOptions{
-		ResumeMode: "same_conversation",
+		ResumeMode:            "same_conversation",
+		ParentJobID:           "job-attacker-override",
+		RootJobID:             "job-attacker-root",
+		InitialConversationID: "00000000-0000-0000-0000-000000000000",
+		InterruptedASEState: map[string]any{
+			"step": "injected-step-payload",
+		},
 	})
 	if err != nil {
 		t.Fatalf("ResumeJob failed: %v", err)
 	}
 	if resumeSch.ResumeMode != "pending" {
 		t.Fatalf("expected client-passed same_conversation to be ignored and remain 'pending', got %q", resumeSch.ResumeMode)
+	}
+	if resumeSch.ParentJobID != job1.ID {
+		t.Fatalf("expected ParentJobID to be %s, got %s", job1.ID, resumeSch.ParentJobID)
+	}
+	if resumeSch.InitialConversationID != "aad902c8-bda6-44c7-8a68-c468a1562399" {
+		t.Fatalf("expected InitialConversationID to be preserved from parent job, got %s", resumeSch.InitialConversationID)
+	}
+}
+
+func TestEngine_ResumeJob_HistoryFallbackPinsActiveInitialConversation(t *testing.T) {
+	e := NewEngine(nil)
+	repoPath := "/home/romeo/work/meta-repo"
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	initialID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	leakedID1 := "1d446877-5bf9-44eb-9db5-e1c007a9fe31"
+	leakedID2 := "14de9a1f-5679-4f11-a08f-f32bc7e47663"
+
+	// Seed history entry with multiple conversation IDs where job is no longer in e.jobs (C1)
+	key := repoKey("mac-mini", repoPath)
+	e.history[key] = append(e.history[key], HistoryRow{
+		JobID:                 "job-1311",
+		PromptTitle:           "Story STORY-GOV-3678 deterministic resume",
+		Engine:                "agy",
+		Status:                "FAILED",
+		Reason:                "HALTED_DIRTY",
+		InitialConversationID: initialID,
+		ActiveConversationID:  initialID,
+		ConversationIDs:       []string{initialID, leakedID1, leakedID2},
+		InterruptedASEState: map[string]any{
+			"phase": "IMPLEMENTATION",
+			"step":  2,
+		},
+	})
+
+	// Job is NOT in e.jobs
+	if _, ok := e.jobs["job-1311"]; ok {
+		t.Fatal("expected job-1311 to be absent from e.jobs")
+	}
+
+	// Resume job-1311 from history
+	sch, err := e.ResumeJob("job-1311")
+	if err != nil {
+		t.Fatalf("ResumeJob failed: %v", err)
+	}
+
+	// C1 Verification: must pin initialID, NOT leakedID2!
+	if sch.ResumeConversationID != initialID {
+		t.Fatalf("expected ResumeConversationID to be %s (active/initial), but got %s (leaked tertiary)", initialID, sch.ResumeConversationID)
+	}
+	if sch.InitialConversationID != initialID {
+		t.Fatalf("expected InitialConversationID to be %s, but got %s", initialID, sch.InitialConversationID)
+	}
+	if sch.ParentJobID != "job-1311" {
+		t.Fatalf("expected ParentJobID to be job-1311, but got %s", sch.ParentJobID)
+	}
+	if sch.InterruptedASEState["phase"] != "IMPLEMENTATION" {
+		t.Fatalf("expected phase IMPLEMENTATION, got %v", sch.InterruptedASEState["phase"])
 	}
 }

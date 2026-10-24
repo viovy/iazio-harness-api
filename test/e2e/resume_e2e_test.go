@@ -229,3 +229,106 @@ func TestE2E_ResumeControlledFallback_AndMetrics(t *testing.T) {
 		t.Fatalf("expected fallback_new_conversation_total >= 1, got %v", resMetrics["fallback_new_conversation_total"])
 	}
 }
+
+func TestE2E_ResumeJob_HistoryOnly_BindsParentAndActiveConversation(t *testing.T) {
+	eng := control.NewEngine(nil)
+	srv := &httpserver.Server{Engine: eng}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	eng.RegisterHost("mac-mini", "permanent")
+	repoPath := "/Users/romeo/work/meta-repo-03"
+	_ = eng.UpsertRepo(control.Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        control.QueueOpen,
+		Lock:         control.LockIdle,
+	})
+
+	initialConvID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	leakedConvID := "14de9a1f-5679-4f11-a08f-f32bc7e47663"
+
+	p := eng.PutPrompt(control.Prompt{
+		ID:     "prompt-hist-test",
+		Title:  "History Test STORY-GOV-3678",
+		Engine: "agy",
+		Status: "READY",
+	})
+	sch1, err := eng.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, initialConvID)
+	if err != nil {
+		t.Fatalf("failed to execute prompt: %v", err)
+	}
+
+	job1, _, _, ok := eng.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("expected job1 on poll")
+	}
+
+	// Post initial conversation
+	conv1Payload := []byte(`{"conversation_id":"` + initialConvID + `","role":"initial_active","cli_args":"--conversation=` + initialConvID + `"}`)
+	resp, err := http.Post(ts.URL+"/v1/jobs/"+job1.ID+"/conversations", "application/json", bytes.NewReader(conv1Payload))
+	if err != nil || resp.StatusCode >= 300 {
+		t.Fatalf("failed to post conversation 1: %v", err)
+	}
+
+	// Post dropped tertiary conversation (leaked ID)
+	leakedPayload := []byte(`{"conversation_id":"` + leakedConvID + `","role":"dropped_unpinned","cli_args":""}`)
+	resp, err = http.Post(ts.URL+"/v1/jobs/"+job1.ID+"/conversations", "application/json", bytes.NewReader(leakedPayload))
+	if err != nil || resp.StatusCode >= 300 {
+		t.Fatalf("failed to post leaked conversation: %v", err)
+	}
+
+	// Exit 1
+	resp, err = http.Post(ts.URL+"/v1/jobs/"+job1.ID+"/exit", "application/json", bytes.NewReader([]byte(`{"exit_code":1}`)))
+	if err != nil || resp.StatusCode >= 300 {
+		t.Fatalf("failed to post exit 1: %v", err)
+	}
+
+	// Purge active in-memory jobs and schedule to simulate API restart / memory reaping (C1)
+	eng.PurgeJobsForTest()
+
+	// Call POST /v1/jobs/{id}/resume with attempt to override parent_job_id and inject step (C5)
+	overrideBody := []byte(`{
+		"parent_job_id": "job-attacker-override",
+		"initial_conversation_id": "bad-bad-bad",
+		"interrupted_ase_state": {"step": "exploit"}
+	}`)
+	resp, err = http.Post(ts.URL+"/v1/jobs/"+job1.ID+"/resume", "application/json", bytes.NewReader(overrideBody))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("failed to resume job from history: %v, status: %v", err, resp.StatusCode)
+	}
+
+	var resSch map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&resSch)
+
+	// Poll host to inspect resumed job2
+	job2, _, _, ok := eng.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("expected job2 on poll after history resume")
+	}
+
+	// C1 Verification: must pin initialConvID, not leakedConvID
+	if job2.InitialConversationID != initialConvID {
+		t.Fatalf("expected job2 InitialConversationID=%s, got %s", initialConvID, job2.InitialConversationID)
+	}
+	if job2.ResumeConversationID != initialConvID {
+		t.Fatalf("expected job2 ResumeConversationID=%s, got %s", initialConvID, job2.ResumeConversationID)
+	}
+
+	// C5 Verification: server authoritatively derived ParentJobID and ignored client override
+	if job2.ParentJobID != job1.ID {
+		t.Fatalf("expected job2 ParentJobID=%s, got %s", job1.ID, job2.ParentJobID)
+	}
+
+	// Verify schedule associated jobs includes job1 and job2
+	resp, err = http.Get(ts.URL + "/v1/schedules/" + sch1.ID)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("failed to get schedule detail: %v", err)
+	}
+	var schDetail map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&schDetail)
+	assocJobs, _ := schDetail["associated_jobs"].([]any)
+	if len(assocJobs) < 2 {
+		t.Fatalf("expected at least 2 associated jobs, got %+v", assocJobs)
+	}
+}

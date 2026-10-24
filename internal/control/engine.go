@@ -2781,7 +2781,7 @@ func (e *Engine) AddJobConversationWithOptions(jobID, convID string, opts ...Con
 	}
 
 	cliArgs := opt.CLIArgs
-	if cliArgs == "" {
+	if cliArgs == "" && (job.ResumeMode == "same_conversation" || (job.InitialConversationID != "" && convID == job.InitialConversationID)) && !opt.Fallback {
 		cliArgs = fmt.Sprintf("--conversation=%s", convID)
 	}
 
@@ -3210,12 +3210,16 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 				} else if pj.InitialConversationID != "" {
 					resumeConvID = pj.InitialConversationID
 				} else if len(pj.ConversationIDs) > 0 {
-					resumeConvID = pj.ConversationIDs[len(pj.ConversationIDs)-1]
+					resumeConvID = pj.ConversationIDs[0]
 				}
 			}
 			if initConvID == "" {
 				if pj.InitialConversationID != "" {
 					initConvID = pj.InitialConversationID
+				} else if pj.ActiveConversationID != "" {
+					initConvID = pj.ActiveConversationID
+				} else if len(pj.ConversationIDs) > 0 {
+					initConvID = pj.ConversationIDs[0]
 				} else {
 					initConvID = resumeConvID
 				}
@@ -3230,6 +3234,8 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 				"parent_job_id": parentJobID,
 				"parent_status": pj.Status,
 				"parent_engine": parentEngine,
+				"phase":         "UNKNOWN",
+				"step":          0,
 			}
 			if pj.InterruptedASEState != nil {
 				for k, v := range pj.InterruptedASEState {
@@ -3256,12 +3262,16 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 							} else if r.InitialConversationID != "" {
 								resumeConvID = r.InitialConversationID
 							} else if len(r.ConversationIDs) > 0 {
-								resumeConvID = r.ConversationIDs[len(r.ConversationIDs)-1]
+								resumeConvID = r.ConversationIDs[0]
 							}
 						}
 						if initConvID == "" {
 							if r.InitialConversationID != "" {
 								initConvID = r.InitialConversationID
+							} else if r.ActiveConversationID != "" {
+								initConvID = r.ActiveConversationID
+							} else if len(r.ConversationIDs) > 0 {
+								initConvID = r.ConversationIDs[0]
 							} else {
 								initConvID = resumeConvID
 							}
@@ -3271,6 +3281,8 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 							"parent_job_id": parentJobID,
 							"parent_status": r.Status,
 							"parent_engine": r.Engine,
+							"phase":         "UNKNOWN",
+							"step":          0,
 						}
 						if r.InterruptedASEState != nil {
 							for k, v := range r.InterruptedASEState {
@@ -3554,6 +3566,13 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 		opt = opts[0]
 	}
 
+	// C1 & C5: Authoritatively bind parent job ID and reset server-derived overrides
+	opt.ParentJobID = jobID
+	opt.RootJobID = ""
+	opt.InitialConversationID = ""
+	opt.InterruptedASEState = nil
+	opt.ResumeFallbackReason = ""
+
 	job, ok := e.jobs[jobID]
 	if !ok {
 		// Fallback 1: Search history for matching jobID across all repositories
@@ -3563,12 +3582,11 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 					parts := strings.Split(k, "\x00")
 					if len(parts) == 2 {
 						histHost, histPath := parts[0], parts[1]
-						if opt.ConversationID == "" && len(rows[i].ConversationIDs) > 0 {
-							opt.ConversationID = rows[i].ConversationIDs[len(rows[i].ConversationIDs)-1]
-						}
 						if opt.PromptTitle == "" {
 							opt.PromptTitle = rows[i].PromptTitle
 						}
+						// Leave opt.ConversationID alone if empty, so resumeRepoInPlaceLocked
+						// applies the single parent-first resolver (C1).
 						return e.resumeRepoInPlaceLocked(histHost, histPath, opt)
 					}
 				}
@@ -3585,14 +3603,9 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 
 	origSch, ok := e.schedules[job.ScheduleID]
 	if !ok {
-		// Fallback 3: Job exists in memory but original schedule was purged; recover via repository or history (F4)
+		// Fallback 3: Job exists in memory but original schedule was purged; recover via repository or history (F4, C1)
 		for _, repo := range e.repos {
 			if repo.RunningJobID == job.ID {
-				if opt.ConversationID == "" && job.ResumeConversationID != "" {
-					opt.ConversationID = job.ResumeConversationID
-				} else if opt.ConversationID == "" && len(job.ConversationIDs) > 0 {
-					opt.ConversationID = job.ConversationIDs[len(job.ConversationIDs)-1]
-				}
 				return e.resumeRepoInPlaceLocked(repo.HostID, repo.WorktreePath, opt)
 			}
 		}
@@ -3602,13 +3615,6 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 					parts := strings.Split(k, "\x00")
 					if len(parts) == 2 {
 						histHost, histPath := parts[0], parts[1]
-						if opt.ConversationID == "" && job.ResumeConversationID != "" {
-							opt.ConversationID = job.ResumeConversationID
-						} else if opt.ConversationID == "" && len(job.ConversationIDs) > 0 {
-							opt.ConversationID = job.ConversationIDs[len(job.ConversationIDs)-1]
-						} else if opt.ConversationID == "" && len(entry.ConversationIDs) > 0 {
-							opt.ConversationID = entry.ConversationIDs[len(entry.ConversationIDs)-1]
-						}
 						if opt.PromptTitle == "" {
 							opt.PromptTitle = entry.PromptTitle
 						}
@@ -3623,19 +3629,23 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 		return Schedule{}, ErrNotFound
 	}
 
-	// Capture latest conversation ID if available (prefer active pinned conversation - F3).
+	// Capture latest conversation ID if available (prefer active pinned conversation - F3, C1).
 	resumeConvID := opt.ConversationID
 	if resumeConvID == "" {
 		if job.ActiveConversationID != "" {
 			resumeConvID = job.ActiveConversationID
 		} else if job.ResumeConversationID != "" {
 			resumeConvID = job.ResumeConversationID
+		} else if job.InitialConversationID != "" {
+			resumeConvID = job.InitialConversationID
 		} else if len(job.ConversationIDs) > 0 {
-			resumeConvID = job.ConversationIDs[len(job.ConversationIDs)-1]
+			resumeConvID = job.ConversationIDs[0]
 		} else if origSch.ActiveConversationID != "" {
 			resumeConvID = origSch.ActiveConversationID
 		} else if origSch.ResumeConversationID != "" {
 			resumeConvID = origSch.ResumeConversationID
+		} else if origSch.InitialConversationID != "" {
+			resumeConvID = origSch.InitialConversationID
 		}
 	}
 
@@ -3975,4 +3985,12 @@ func (e *Engine) UpdateStorySyncState(id, syncState string) error {
 		go e.OnStoryChange(cp)
 	}
 	return nil
+}
+
+// PurgeJobsForTest clears in-memory jobs to simulate an engine restart / memory sweep
+// while preserving history and repos.
+func (e *Engine) PurgeJobsForTest() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.jobs = make(map[string]*Job)
 }
