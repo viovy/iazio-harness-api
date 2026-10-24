@@ -169,41 +169,73 @@ func (e *Engine) GetProfile(name string) (*DistributionProfile, error) {
 }
 
 // UpdateProfileTools atomically updates the tools slice of an existing profile.
-// If configChanged is true, UpdatedAt is updated and OnSaveProfile is invoked.
+// If configChanged is true, UpdatedAt is updated and OnSaveProfile is invoked outside e.mu (CAS pattern, F6).
 func (e *Engine) UpdateProfileTools(name string, updater func(tools []ProfileTool) ([]ProfileTool, bool)) (*DistributionProfile, bool, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	trimmedName := strings.TrimSpace(name)
+	const maxRetries = 3
 
-	p, ok := e.profiles[strings.TrimSpace(name)]
-	if !ok {
-		return nil, false, ErrProfileNotFound
-	}
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		e.mu.Lock()
+		p, ok := e.profiles[trimmedName]
+		if !ok {
+			e.mu.Unlock()
+			return nil, false, ErrProfileNotFound
+		}
 
-	clonedTools := make([]ProfileTool, len(p.Tools))
-	copy(clonedTools, p.Tools)
+		clonedTools := make([]ProfileTool, len(p.Tools))
+		copy(clonedTools, p.Tools)
+		initialUpdatedAt := p.UpdatedAt
 
-	newTools, configChanged := updater(clonedTools)
+		newTools, configChanged := updater(clonedTools)
+		if !configChanged {
+			p.Tools = newTools
+			cp := *p
+			if len(p.Tools) > 0 {
+				cp.Tools = make([]ProfileTool, len(p.Tools))
+				copy(cp.Tools, p.Tools)
+			}
+			e.mu.Unlock()
+			return &cp, false, nil
+		}
 
-	if configChanged {
 		candidate := *p
 		candidate.Tools = newTools
 		candidate.UpdatedAt = e.now()
-		if e.OnSaveProfile != nil {
-			if err := e.OnSaveProfile(candidate); err != nil {
+		saveFn := e.OnSaveProfile
+		e.mu.Unlock()
+
+		// Persist outside e.mu lock to prevent blocking heartbeats/telemetry (F6)
+		if saveFn != nil {
+			if err := saveFn(candidate); err != nil {
 				return nil, false, fmt.Errorf("persist profile %s: %w", name, err)
 			}
 		}
-		p.UpdatedAt = candidate.UpdatedAt
+
+		// Re-acquire lock and commit CAS if profile was not concurrently modified
+		e.mu.Lock()
+		p, ok = e.profiles[trimmedName]
+		if !ok {
+			e.mu.Unlock()
+			return nil, false, ErrProfileNotFound
+		}
+
+		if p.UpdatedAt.Equal(initialUpdatedAt) {
+			p.Tools = newTools
+			p.UpdatedAt = candidate.UpdatedAt
+			cp := *p
+			if len(p.Tools) > 0 {
+				cp.Tools = make([]ProfileTool, len(p.Tools))
+				copy(cp.Tools, p.Tools)
+			}
+			e.mu.Unlock()
+			return &cp, true, nil
+		}
+
+		// Concurrently modified, retry with fresh snapshot
+		e.mu.Unlock()
 	}
 
-	p.Tools = newTools
-
-	cp := *p
-	if len(p.Tools) > 0 {
-		cp.Tools = make([]ProfileTool, len(p.Tools))
-		copy(cp.Tools, p.Tools)
-	}
-	return &cp, configChanged, nil
+	return nil, false, fmt.Errorf("failed to update profile %s: concurrent conflict after %d attempts", name, maxRetries)
 }
 
 // UpsertProfile inserts or updates a distribution profile.
@@ -221,6 +253,36 @@ func (e *Engine) UpsertProfile(p DistributionProfile) (*DistributionProfile, err
 		p.UpdatedAt = now
 		if name == "generic" {
 			p.IsDefault = true
+		}
+		// F1: Preserve existing tool TrackLatest and telemetry fields if incoming value is nil or empty
+		existingToolsByName := make(map[string]ProfileTool, len(existing.Tools))
+		for _, t := range existing.Tools {
+			existingToolsByName[t.Name] = t
+		}
+		for i := range p.Tools {
+			if exTool, found := existingToolsByName[p.Tools[i].Name]; found {
+				if p.Tools[i].TrackLatest == nil {
+					p.Tools[i].TrackLatest = exTool.TrackLatest
+				}
+				if p.Tools[i].LatestAvailableVersion == "" {
+					p.Tools[i].LatestAvailableVersion = exTool.LatestAvailableVersion
+				}
+				if p.Tools[i].LatestReleaseURL == "" {
+					p.Tools[i].LatestReleaseURL = exTool.LatestReleaseURL
+				}
+				if p.Tools[i].LatestPublishedAt == nil {
+					p.Tools[i].LatestPublishedAt = exTool.LatestPublishedAt
+				}
+				if p.Tools[i].LastCheckedAt == nil {
+					p.Tools[i].LastCheckedAt = exTool.LastCheckedAt
+				}
+				if p.Tools[i].LastSyncStatus == "" {
+					p.Tools[i].LastSyncStatus = exTool.LastSyncStatus
+				}
+				if p.Tools[i].LastSyncError == "" {
+					p.Tools[i].LastSyncError = exTool.LastSyncError
+				}
+			}
 		}
 	} else {
 		p.CreatedAt = now

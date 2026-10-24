@@ -132,14 +132,17 @@ type GitCredentialStore interface {
 
 // ReleaseService queries and caches latest Git release versions for profile tools.
 type ReleaseService struct {
-	mu          sync.RWMutex
-	cache       map[string]cachedRelease
-	credentials map[string]GitCredential
-	client      *http.Client
-	now         func() time.Time
-	token       string
-	store       GitCredentialStore
-	baseURL     string
+	mu               sync.RWMutex
+	cache            map[string]cachedRelease
+	endpointETags    map[string]string    // URL -> ETag mapping (prevents cross-endpoint ETag contamination, F5)
+	rateLimits       map[string]time.Time // repo -> backoff expiry time (F5)
+	noFormalReleases map[string]bool      // repo -> true if /releases/latest returned 404 (F5)
+	credentials      map[string]GitCredential
+	client           *http.Client
+	now              func() time.Time
+	token            string
+	store            GitCredentialStore
+	baseURL          string
 }
 
 // NewReleaseService creates a ReleaseService with in-memory caching.
@@ -154,12 +157,15 @@ func NewReleaseService() *ReleaseService {
 		}
 	}
 	return &ReleaseService{
-		cache:       make(map[string]cachedRelease),
-		credentials: make(map[string]GitCredential),
-		client:      &http.Client{Timeout: 10 * time.Second},
-		now:         time.Now,
-		token:       token,
-		baseURL:     "https://api.github.com",
+		cache:            make(map[string]cachedRelease),
+		endpointETags:    make(map[string]string),
+		rateLimits:       make(map[string]time.Time),
+		noFormalReleases: make(map[string]bool),
+		credentials:      make(map[string]GitCredential),
+		client:           &http.Client{Timeout: 10 * time.Second},
+		now:              time.Now,
+		token:            token,
+		baseURL:          "https://api.github.com",
 	}
 }
 
@@ -168,6 +174,13 @@ func (s *ReleaseService) SetBaseURL(u string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.baseURL = strings.TrimSuffix(u, "/")
+}
+
+// SetHTTPClient overrides the HTTP client (useful for testing with mock servers).
+func (s *ReleaseService) SetHTTPClient(c *http.Client) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.client = c
 }
 
 // SetStore attaches a persistence store and loads existing credentials into memory.
@@ -388,6 +401,23 @@ func (s *ReleaseService) tokenForRepo(repo string) string {
 	return ""
 }
 
+func parseRateLimitBackoff(header http.Header, now time.Time) time.Duration {
+	if retryAfter := header.Get("Retry-After"); retryAfter != "" {
+		if secs, err := strconv.Atoi(retryAfter); err == nil && secs > 0 {
+			return time.Duration(secs) * time.Second
+		}
+	}
+	if reset := header.Get("X-RateLimit-Reset"); reset != "" {
+		if unixSec, err := strconv.ParseInt(reset, 10, 64); err == nil {
+			t := time.Unix(unixSec, 0)
+			if t.After(now) {
+				return t.Sub(now)
+			}
+		}
+	}
+	return 5 * time.Minute // default backoff
+}
+
 // GetToolRelease returns the latest release for a repository.
 func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, targetVersion string) (ToolRelease, error) {
 	if !strings.Contains(repo, "/") {
@@ -401,16 +431,43 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 		cacheKey = repo + ":latest"
 	}
 
+	now := s.now()
+
+	// Check per-repo rate limit backoff (F5)
+	s.mu.RLock()
+	backoffUntil, isRateLimited := s.rateLimits[repo]
+	s.mu.RUnlock()
+	if isRateLimited && now.Before(backoffUntil) {
+		err := fmt.Errorf("rate limit backoff active for %s until %s", repo, backoffUntil.Format(time.RFC3339))
+		fallbackVer := targetVersion
+		if fallbackVer == "" || fallbackVer == "latest" {
+			fallbackVer = "0.0.0"
+		}
+		return ToolRelease{
+			Name:           toolName,
+			Repository:     repo,
+			LatestVersion:  fallbackVer,
+			TargetVersion:  targetVersion,
+			TagName:        fallbackVer,
+			LastCheckedAt:  now,
+			LastSyncStatus: "rate_limited",
+			Error:          err.Error(),
+		}, err
+	}
+
 	s.mu.RLock()
 	cached, ok := s.cache[cacheKey]
 	s.mu.RUnlock()
 
-	now := s.now()
 	if ok && now.Before(cached.expiresAt) {
 		r := cached.release
 		r.Name = toolName
 		if !isLatestLookup {
 			r.TargetVersion = targetVersion
+		}
+		// Treat cached negative results as errors (F4)
+		if r.Error != "" {
+			return r, fmt.Errorf("lookup release for %s: %s", repo, r.Error)
 		}
 		return r, nil
 	}
@@ -432,17 +489,21 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 			fmt.Sprintf("%s/repos/%s/releases/tags/%s", base, repo, bareTag),
 		)
 	} else {
-		candidateURLs = append(candidateURLs, fmt.Sprintf("%s/repos/%s/releases/latest", base, repo))
-	}
-
-	var cachedEtag string
-	if ok {
-		cachedEtag = cached.etag
+		s.mu.RLock()
+		skipLatest := s.noFormalReleases[repo]
+		s.mu.RUnlock()
+		if !skipLatest {
+			candidateURLs = append(candidateURLs, fmt.Sprintf("%s/repos/%s/releases/latest", base, repo))
+		}
 	}
 
 	var lastErr error
 	for _, candURL := range candidateURLs {
-		rel, newEtag, notModified, err := s.fetchReleaseURL(ctx, candURL, repo, toolName, targetVersion, token, cachedEtag)
+		s.mu.RLock()
+		urlEtag := s.endpointETags[candURL]
+		s.mu.RUnlock()
+
+		rel, newEtag, notModified, err := s.fetchReleaseURL(ctx, candURL, repo, toolName, targetVersion, token, urlEtag)
 		if notModified && ok {
 			s.mu.Lock()
 			cached.expiresAt = now.Add(10 * time.Minute)
@@ -456,6 +517,11 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 				r.TargetVersion = targetVersion
 			}
 			return r, nil
+		}
+		if newEtag != "" {
+			s.mu.Lock()
+			s.endpointETags[candURL] = newEtag
+			s.mu.Unlock()
 		}
 		if err == nil && rel.LatestVersion != "" {
 			rel.LastCheckedAt = now
@@ -485,13 +551,18 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 	s.mu.RLock()
 	cachedList, okList := s.cache[listKey]
 	s.mu.RUnlock()
-	listEtag := ""
-	if okList {
-		listEtag = cachedList.etag
-	}
 
 	listURL := fmt.Sprintf("%s/repos/%s/releases?per_page=15", base, repo)
+	s.mu.RLock()
+	listEtag := s.endpointETags[listURL]
+	s.mu.RUnlock()
+
 	listRel, listNewEtag, listNotMod, listErr := s.fetchReleaseListURL(ctx, listURL, repo, toolName, token, listEtag)
+	if listNewEtag != "" {
+		s.mu.Lock()
+		s.endpointETags[listURL] = listNewEtag
+		s.mu.Unlock()
+	}
 	if listNotMod && okList {
 		s.mu.Lock()
 		cachedList.expiresAt = now.Add(10 * time.Minute)
@@ -535,13 +606,18 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 	s.mu.RLock()
 	cachedTags, okTags := s.cache[tagsKey]
 	s.mu.RUnlock()
-	tagsEtag := ""
-	if okTags {
-		tagsEtag = cachedTags.etag
-	}
 
 	tagsURL := fmt.Sprintf("%s/repos/%s/tags?per_page=15", base, repo)
+	s.mu.RLock()
+	tagsEtag := s.endpointETags[tagsURL]
+	s.mu.RUnlock()
+
 	tagRel, tagsNewEtag, tagsNotMod, tagErr := s.fetchTagsURL(ctx, tagsURL, repo, toolName, token, tagsEtag)
+	if tagsNewEtag != "" {
+		s.mu.Lock()
+		s.endpointETags[tagsURL] = tagsNewEtag
+		s.mu.Unlock()
+	}
 	if tagsNotMod && okTags {
 		s.mu.Lock()
 		cachedTags.expiresAt = now.Add(10 * time.Minute)
@@ -649,6 +725,20 @@ func (s *ReleaseService) fetchReleaseURL(ctx context.Context, url, repo, toolNam
 		return ToolRelease{Name: toolName, Repository: repo}, ifNoneMatch, true, nil
 	}
 
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		backoffDur := parseRateLimitBackoff(resp.Header, s.now())
+		s.mu.Lock()
+		s.rateLimits[repo] = s.now().Add(backoffDur)
+		s.mu.Unlock()
+		return ToolRelease{Name: toolName, Repository: repo, LatestVersion: targetVersion, TagName: targetVersion}, "", false, fmt.Errorf("rate limited (status %d)", resp.StatusCode)
+	}
+
+	if resp.StatusCode == http.StatusNotFound && strings.HasSuffix(url, "/releases/latest") {
+		s.mu.Lock()
+		s.noFormalReleases[repo] = true
+		s.mu.Unlock()
+	}
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return ToolRelease{Name: toolName, Repository: repo, LatestVersion: targetVersion, TagName: targetVersion}, "", false, fmt.Errorf("status %d", resp.StatusCode)
 	}
@@ -711,6 +801,14 @@ func (s *ReleaseService) fetchReleaseListURL(ctx context.Context, url, repo, too
 
 	if resp.StatusCode == http.StatusNotModified {
 		return ToolRelease{Name: toolName, Repository: repo}, cachedEtag, true, nil
+	}
+
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		backoffDur := parseRateLimitBackoff(resp.Header, s.now())
+		s.mu.Lock()
+		s.rateLimits[repo] = s.now().Add(backoffDur)
+		s.mu.Unlock()
+		return ToolRelease{Name: toolName, Repository: repo}, "", false, fmt.Errorf("rate limited (status %d)", resp.StatusCode)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -789,6 +887,14 @@ func (s *ReleaseService) fetchTagsURL(ctx context.Context, url, repo, toolName, 
 		return ToolRelease{Name: toolName, Repository: repo}, cachedEtag, true, nil
 	}
 
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		backoffDur := parseRateLimitBackoff(resp.Header, s.now())
+		s.mu.Lock()
+		s.rateLimits[repo] = s.now().Add(backoffDur)
+		s.mu.Unlock()
+		return ToolRelease{Name: toolName, Repository: repo}, "", false, fmt.Errorf("rate limited (status %d)", resp.StatusCode)
+	}
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return ToolRelease{Name: toolName, Repository: repo}, "", false, fmt.Errorf("status %d", resp.StatusCode)
 	}
@@ -841,12 +947,14 @@ func (s *ReleaseService) GetProfileReleases(ctx context.Context, p DistributionP
 		// Query the latest upstream release for the tool
 		rel, err := s.GetToolRelease(ctx, repo, t.Name, "latest")
 		rel.TargetVersion = t.TargetVersion
-		if err != nil {
-			rel.Error = err.Error()
+		if err != nil || rel.Error != "" {
+			if rel.Error == "" && err != nil {
+				rel.Error = err.Error()
+			}
 			if rel.LatestVersion == "" || rel.LatestVersion == "0.0.0" {
 				rel.LatestVersion = t.TargetVersion
 			}
-			errs = append(errs, fmt.Sprintf("%s (%s): %v", t.Name, repo, err))
+			errs = append(errs, fmt.Sprintf("%s (%s): %s", t.Name, repo, rel.Error))
 		}
 		out = append(out, rel)
 	}

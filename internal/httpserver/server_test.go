@@ -2319,3 +2319,80 @@ func TestServer_RefreshPinnedProfileCannotDowngrade(t *testing.T) {
 		t.Fatalf("expected latest available version 0.0.490, got %s", prof.Tools[0].LatestAvailableVersion)
 	}
 }
+
+func TestServer_RefreshProfileReleases_MixedToolOutcomesPartialStatus(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "repo-good/releases/latest"):
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"tag_name": "v2.0.0", "html_url": "https://github.com/viovy/repo-good/releases/tag/v2.0.0"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	s := &Server{Engine: control.NewEngine(nil)}
+	s.Engine.Releases.SetBaseURL(ts.URL)
+	s.Engine.Releases.SetHTTPClient(ts.Client())
+
+	_, err := s.Engine.UpsertProfile(control.DistributionProfile{
+		Name: "mixed-profile",
+		Tools: []control.ProfileTool{
+			{
+				Name:          "tool-good",
+				Repository:    "viovy/repo-good",
+				TargetVersion: "1.0.0",
+				TrackLatest:   control.BoolPtr(true),
+			},
+			{
+				Name:          "tool-bad",
+				Repository:    "viovy/repo-bad",
+				TargetVersion: "1.0.0",
+				TrackLatest:   control.BoolPtr(true),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create profile failed: %v", err)
+	}
+
+	handler := s.Handler()
+	req := httptest.NewRequest(http.MethodPost, "/v1/fleet/profiles/mixed-profile/refresh", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	// F2: Must return 200 OK (NOT 502) on partial failure
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for partial refresh, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		Status       string                      `json:"status"`
+		ToolsUpdated int                         `json:"tools_updated"`
+		Error        string                      `json:"error"`
+		Profile      control.DistributionProfile `json:"profile"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if resp.Status != "partial" {
+		t.Fatalf("expected status 'partial', got '%s'", resp.Status)
+	}
+	if resp.ToolsUpdated != 1 {
+		t.Fatalf("expected tools_updated=1, got %d", resp.ToolsUpdated)
+	}
+	if resp.Error == "" {
+		t.Fatalf("expected non-empty error field describing failed tool")
+	}
+
+	// Verify good tool was advanced and bad tool remained at target
+	prof, _ := s.Engine.GetProfile("mixed-profile")
+	if prof.Tools[0].TargetVersion != "2.0.0" {
+		t.Fatalf("expected tool-good target to advance to 2.0.0, got %s", prof.Tools[0].TargetVersion)
+	}
+	if prof.Tools[1].TargetVersion != "1.0.0" {
+		t.Fatalf("expected tool-bad target to remain 1.0.0, got %s", prof.Tools[1].TargetVersion)
+	}
+}

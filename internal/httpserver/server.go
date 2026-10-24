@@ -1901,22 +1901,36 @@ func (s *Server) refreshProfileReleases(w http.ResponseWriter, r *http.Request) 
 			Source:   "release-watcher",
 		})
 	})
+	status := "ok"
+	var errStr string
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, err)
-		return
+		errStr = err.Error()
+		if advanced > 0 {
+			status = "partial"
+		} else {
+			status = "error"
+		}
 	}
 
 	updatedProfile, _ := s.Engine.GetProfile(name)
 	s.RecordNotification(NotificationRecord{
 		Title:    "Profile Releases Refreshed",
-		Message:  fmt.Sprintf("Refreshed release versions for profile '%s'. Advanced tools: %d", name, advanced),
+		Message:  fmt.Sprintf("Refreshed release versions for profile '%s'. Status: %s, advanced tools: %d", name, status, advanced),
 		Category: "release",
 		Source:   "harness-api",
 	})
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Expires", "0")
-	writeJSON(w, http.StatusOK, updatedProfile)
+	resp := map[string]any{
+		"status":        status,
+		"tools_updated": advanced,
+		"profile":       updatedProfile,
+	}
+	if errStr != "" {
+		resp["error"] = errStr
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) syncAllProfiles(w http.ResponseWriter, r *http.Request) {

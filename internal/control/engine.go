@@ -1704,10 +1704,16 @@ func (e *Engine) DeregisterRepoStatusWaiter(key string) {
 	delete(e.repoWaiters, key)
 }
 
+// StaleRepoThreshold defines the age after which a repository telemetry entry is considered stale
+// and pruned from the host's RepoStatuses map during fleet aggregation.
+const StaleRepoThreshold = 10 * time.Minute
+
 // UpdateRepoRuntimeStatus updates repository fields based on continuous agent telemetry.
 func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeStatus) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	now := e.now().UTC()
 
 	h, hasHost := e.hosts[hostID]
 	if hasHost && h != nil {
@@ -1716,8 +1722,19 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 		}
 		for _, st := range statuses {
 			cleanPath := filepath.Clean(st.RepoPath)
+			if st.LastCheckedAt.IsZero() {
+				st.LastCheckedAt = now
+			}
 			h.RepoStatuses[cleanPath] = st
 		}
+
+		// Prune stale repos that have not reported within StaleRepoThreshold (F7)
+		for path, st := range h.RepoStatuses {
+			if !st.LastCheckedAt.IsZero() && now.Sub(st.LastCheckedAt) > StaleRepoThreshold {
+				delete(h.RepoStatuses, path)
+			}
+		}
+
 		allClean := true
 		for _, st := range h.RepoStatuses {
 			if !st.IsClean {
@@ -1726,7 +1743,6 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 			}
 		}
 		h.FleetGitClean = allClean
-		now := time.Now().UTC()
 		h.FleetCheckedAt = &now
 	}
 

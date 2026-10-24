@@ -971,16 +971,41 @@ func TestReleaseService_NegativeCaching404(t *testing.T) {
 	svc.SetBaseURL(ts.URL)
 
 	// First request: hits upstream 404
-	_, _ = svc.GetToolRelease(context.Background(), "viovy/missing-repo", "missing-repo", "latest")
-	if requestCount != 3 { // latest, releases list, tags list fallbacks
-		t.Logf("first lookup hit upstream %d times across fallbacks", requestCount)
+	rel1, err1 := svc.GetToolRelease(context.Background(), "viovy/missing-repo", "missing-repo", "latest")
+	if err1 == nil {
+		t.Fatalf("expected error on first lookup for 404 repo")
+	}
+	if rel1.Error == "" {
+		t.Fatalf("expected rel1.Error populated")
 	}
 	initialHits := requestCount
 
 	// Second request: served from negative cache, upstream hit count must NOT increase
-	_, _ = svc.GetToolRelease(context.Background(), "viovy/missing-repo", "missing-repo", "latest")
+	rel2, err2 := svc.GetToolRelease(context.Background(), "viovy/missing-repo", "missing-repo", "latest")
 	if requestCount != initialHits {
 		t.Fatalf("expected negative cache hit with 0 additional upstream requests, got %d", requestCount-initialHits)
+	}
+	// Cached negative hit MUST return error (F4)
+	if err2 == nil {
+		t.Fatalf("expected error returned on cached negative hit (F4)")
+	}
+	if rel2.Error == "" {
+		t.Fatalf("expected rel2.Error populated on cached negative hit")
+	}
+
+	// Verify error propagation in GetProfileReleases on cached negative hit
+	prof := DistributionProfile{
+		Name: "missing-prof",
+		Tools: []ProfileTool{
+			{Name: "missing-tool", Repository: "viovy/missing-repo", TargetVersion: "1.0.0"},
+		},
+	}
+	releases, profErr := svc.GetProfileReleases(context.Background(), prof)
+	if profErr == nil {
+		t.Fatalf("expected GetProfileReleases to report error on cached negative hit (F4)")
+	}
+	if len(releases) != 1 || releases[0].LatestVersion != "1.0.0" {
+		t.Fatalf("expected fallback to TargetVersion 1.0.0 on error, got %+v", releases)
 	}
 }
 
@@ -1237,5 +1262,180 @@ func TestReleaseService_SyncAllProfiles_ErrorPropagation(t *testing.T) {
 	}
 	if res.TotalAdvanced != 0 {
 		t.Fatalf("expected 0 tools advanced on error, got %d", res.TotalAdvanced)
+	}
+}
+
+func TestEngine_UpsertProfile_PreservesOperatorPinAndTelemetryWhenNil(t *testing.T) {
+	e := NewEngine(time.Now)
+	checkTime := time.Date(2026, 10, 24, 10, 0, 0, 0, time.UTC)
+	// Initial profile creation with operator pin (track_latest=false) and telemetry
+	_, err := e.UpsertProfile(DistributionProfile{
+		Name: "pinned-service",
+		Tools: []ProfileTool{
+			{
+				Name:                   "iazio-mcp",
+				Repository:             "viovy/iazio-mcp",
+				TargetVersion:          "0.0.95",
+				TrackLatest:            BoolPtr(false),
+				LatestAvailableVersion: "0.0.98",
+				LatestReleaseURL:       "https://github.com/viovy/iazio-mcp/releases/tag/v0.0.98",
+				LastCheckedAt:          &checkTime,
+				LastSyncStatus:         "ok",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("initial upsert failed: %v", err)
+	}
+
+	// Web UI or client submits an update with TrackLatest=nil (omitted in request body) and empty telemetry
+	updated, err := e.UpsertProfile(DistributionProfile{
+		Name:        "pinned-service",
+		Description: "Updated description via web UI",
+		Tools: []ProfileTool{
+			{
+				Name:          "iazio-mcp",
+				Repository:    "viovy/iazio-mcp",
+				TargetVersion: "0.0.95",
+				TrackLatest:   nil, // omitted in web edit
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("secondary upsert failed: %v", err)
+	}
+
+	// Verify TrackLatest remains explicitly false (F1)
+	if updated.Tools[0].TrackLatest == nil || *updated.Tools[0].TrackLatest != false {
+		t.Fatalf("expected operator pin (TrackLatest=false) to be preserved, got %+v", updated.Tools[0].TrackLatest)
+	}
+	// Verify telemetry was preserved
+	if updated.Tools[0].LatestAvailableVersion != "0.0.98" {
+		t.Fatalf("expected LatestAvailableVersion=0.0.98 preserved, got %s", updated.Tools[0].LatestAvailableVersion)
+	}
+	if updated.Tools[0].LastSyncStatus != "ok" {
+		t.Fatalf("expected LastSyncStatus=ok preserved, got %s", updated.Tools[0].LastSyncStatus)
+	}
+}
+
+func TestEngine_RepoRuntimeStatus_StaleRepoPruning(t *testing.T) {
+	currTime := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return currTime })
+	hostID := "host-stale-test"
+	e.RegisterHost(hostID, "linux", "generic")
+
+	// Post 1: repo-1 is dirty at t=0
+	e.UpdateRepoRuntimeStatus(hostID, []RepoRuntimeStatus{
+		{
+			RepoPath:      "/workspace/stale-dirty-repo",
+			IsClean:       false,
+			LastCheckedAt: currTime,
+		},
+	})
+	if e.hosts[hostID].FleetGitClean {
+		t.Fatalf("expected host to be dirty initially")
+	}
+
+	// Advance time by 15 minutes (> 10m StaleRepoThreshold)
+	currTime = currTime.Add(15 * time.Minute)
+
+	// Post 2: repo-2 is clean at t+15m
+	e.UpdateRepoRuntimeStatus(hostID, []RepoRuntimeStatus{
+		{
+			RepoPath:      "/workspace/active-clean-repo",
+			IsClean:       true,
+			LastCheckedAt: currTime,
+		},
+	})
+
+	// The stale dirty repo must have been pruned from h.RepoStatuses,
+	// and the host FleetGitClean should now be true!
+	h := e.hosts[hostID]
+	if _, exists := h.RepoStatuses["/workspace/stale-dirty-repo"]; exists {
+		t.Fatalf("expected stale dirty repo to be pruned from RepoStatuses (F7)")
+	}
+	if !h.FleetGitClean {
+		t.Fatalf("expected FleetGitClean=true after stale dirty repo pruned (F7)")
+	}
+}
+
+func TestReleaseService_RateLimitBackoffAndNoFormalReleasesSkipping(t *testing.T) {
+	var latestCalls int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		latestCalls++
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer ts.Close()
+
+	currTime := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	svc := NewReleaseService()
+	svc.now = func() time.Time { return currTime }
+	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
+
+	// 1. Initial call receives 403 with Retry-After 120s
+	_, err := svc.GetToolRelease(context.Background(), "viovy/rate-limited-repo", "rate-tool", "latest")
+	if err == nil {
+		t.Fatalf("expected error from rate limited response")
+	}
+	initialCalls := latestCalls
+
+	// 2. Immediate second call within backoff window must fail fast without HTTP hit
+	_, err = svc.GetToolRelease(context.Background(), "viovy/rate-limited-repo", "rate-tool", "latest")
+	if err == nil || !strings.Contains(err.Error(), "rate limit backoff active") {
+		t.Fatalf("expected rate limit backoff error, got: %v", err)
+	}
+	if latestCalls != initialCalls {
+		t.Fatalf("expected 0 HTTP requests during rate limit backoff window, got %d", latestCalls-initialCalls)
+	}
+
+	// 3. Test tags-only repo skipping /releases/latest after 404
+	var tagsRepoLatestCalls int
+	var tagsRepoTagsCalls int
+	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/releases/latest"):
+			tagsRepoLatestCalls++
+			w.WriteHeader(http.StatusNotFound)
+		case strings.HasSuffix(r.URL.Path, "/releases"):
+			w.WriteHeader(http.StatusNotFound)
+		case strings.HasSuffix(r.URL.Path, "/tags"):
+			tagsRepoTagsCalls++
+			w.Header().Set("ETag", `"tag-etag-2"`)
+			w.Write([]byte(`[{"name": "v0.5.0"}]`))
+		}
+	}))
+	defer ts2.Close()
+
+	svc2 := NewReleaseService()
+	svc2.now = func() time.Time { return currTime }
+	svc2.client = ts2.Client()
+	svc2.SetBaseURL(ts2.URL)
+
+	// Pass 1: hits /releases/latest (404), falls back to tags (200)
+	rel, err := svc2.GetToolRelease(context.Background(), "viovy/tags-only-repo", "tags-tool", "latest")
+	if err != nil {
+		t.Fatalf("expected success on tags fallback: %v", err)
+	}
+	if rel.LatestVersion != "0.5.0" {
+		t.Fatalf("expected 0.5.0 from tags, got %s", rel.LatestVersion)
+	}
+	if tagsRepoLatestCalls != 1 {
+		t.Fatalf("expected 1 call to /releases/latest on first pass")
+	}
+
+	// Expire cache TTL to simulate next poll tick
+	svc2.InvalidateProfileCache(DistributionProfile{
+		Tools: []ProfileTool{{Name: "tags-tool", Repository: "viovy/tags-only-repo"}},
+	})
+
+	// Pass 2: should skip /releases/latest because noFormalReleases is true (F5)
+	_, err = svc2.GetToolRelease(context.Background(), "viovy/tags-only-repo", "tags-tool", "latest")
+	if err != nil {
+		t.Fatalf("expected success on second pass: %v", err)
+	}
+	if tagsRepoLatestCalls != 1 {
+		t.Fatalf("expected /releases/latest to be skipped on second pass, but was called %d times (F5)", tagsRepoLatestCalls)
 	}
 }
