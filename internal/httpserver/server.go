@@ -1690,9 +1690,9 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		// If tool name was in URL path (/tools/{tool}/update or force-update), validate existence (F6)
-		if toolParam != "" && foundTool == nil {
-			writeErr(w, http.StatusNotFound, fmt.Errorf("unknown tool: %s", toolParam))
+		// Validate tool existence in profile when profile has defined tools or when explicitly targeted (F6, N4-R)
+		if (toolParam != "" || body.TargetVersion != "" || (p != nil && len(p.Tools) > 0)) && foundTool == nil {
+			writeErr(w, http.StatusNotFound, fmt.Errorf("unknown tool: %s", toolName))
 			return
 		}
 
@@ -1714,9 +1714,10 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 					isKnown = true
 				}
 				if !isKnown && s.Engine != nil && s.Engine.Releases != nil && foundTool.Repository != "" {
-					if rel, err := s.Engine.Releases.GetToolRelease(r.Context(), foundTool.Repository, foundTool.Name, cleanTV); err == nil && rel.LatestVersion != "" {
+					if rel, err := s.Engine.Releases.GetToolRelease(r.Context(), foundTool.Repository, foundTool.Name, cleanTV); err == nil && rel.Error == "" && rel.LastSyncStatus != "error" {
 						relNorm := strings.TrimPrefix(strings.TrimSpace(rel.LatestVersion), "v")
-						if relNorm == normClean {
+						tagNorm := strings.TrimPrefix(strings.TrimSpace(rel.TagName), "v")
+						if relNorm == normClean || tagNorm == normClean {
 							isKnown = true
 						}
 					}
@@ -1765,7 +1766,10 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 			Payload: payload,
 			Status:  dispatch.JobStatusPending,
 		}
-		if enqJob, err := s.Queue.Enqueue(r.Context(), job); err == nil && enqJob != nil {
+		if enqJob, err := s.Queue.Enqueue(r.Context(), job); err != nil {
+			writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("failed to enqueue tool update job: %w", err))
+			return
+		} else if enqJob != nil {
 			jobID = enqJob.ID
 		}
 	}

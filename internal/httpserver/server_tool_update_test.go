@@ -2,7 +2,9 @@ package httpserver
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -493,4 +495,37 @@ func TestServer_ForceUpdateToolEndpoint(t *testing.T) {
 	if !strings.Contains(rec11.Body.String(), "unknown target_version") {
 		t.Fatalf("expected error message to mention unknown target_version, got: %s", rec11.Body.String())
 	}
+
+	// 12. Unknown tool on body-only path returns 404 (N4-R)
+	rec12 := httptest.NewRecorder()
+	req12 := httptest.NewRequest("POST", "/v1/hosts/mac-mini/tools/update", bytes.NewReader([]byte(`{"tools":["nonexistent-tool"]}`)))
+	handler.ServeHTTP(rec12, req12)
+	if rec12.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown tool on body-only path (N4-R), got %d: %s", rec12.Code, rec12.Body.String())
+	}
+	if !strings.Contains(rec12.Body.String(), "unknown tool") {
+		t.Fatalf("expected error message to mention unknown tool, got: %s", rec12.Body.String())
+	}
+
+	// 13. Enqueue error returns 503 (N4-R)
+	failingQueue := &failingMockQueue{err: errors.New("simulated queue storage failure")}
+	srv.Queue = failingQueue
+	rec13 := httptest.NewRecorder()
+	req13 := httptest.NewRequest("POST", "/v1/hosts/mac-mini/tools/autopilot-plugins-internal/update", bytes.NewReader([]byte(`{}`)))
+	handler.ServeHTTP(rec13, req13)
+	if rec13.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 on queue failure (N4-R), got %d: %s", rec13.Code, rec13.Body.String())
+	}
+	if !strings.Contains(rec13.Body.String(), "failed to enqueue tool update job") {
+		t.Fatalf("expected error message to mention failed to enqueue, got: %s", rec13.Body.String())
+	}
+}
+
+type failingMockQueue struct {
+	dispatch.Queue
+	err error
+}
+
+func (f *failingMockQueue) Enqueue(ctx context.Context, job *dispatch.Job) (*dispatch.Job, error) {
+	return nil, f.err
 }
