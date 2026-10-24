@@ -29,6 +29,7 @@ type DistributionProfile struct {
 	Endpoints    map[string]string   `json:"endpoints,omitempty" yaml:"endpoints,omitempty"`
 	Tools        []ProfileTool       `json:"tools" yaml:"tools"`
 	Version      string              `json:"version,omitempty" yaml:"version,omitempty"`
+	VersionSeq   uint64              `json:"version_seq,omitempty" yaml:"version_seq,omitempty"`
 	SourceRepo   string              `json:"source_repo,omitempty" yaml:"source_repo,omitempty"`
 	SourceHost   string              `json:"source_host,omitempty" yaml:"source_host,omitempty"`
 	CreatedAt    time.Time           `json:"created_at" yaml:"created_at"`
@@ -169,88 +170,89 @@ func (e *Engine) GetProfile(name string) (*DistributionProfile, error) {
 }
 
 // UpdateProfileTools atomically updates the tools slice of an existing profile.
-// If configChanged is true, UpdatedAt is updated and OnSaveProfile is invoked outside e.mu (CAS pattern, F6).
+// It holds a per-profile lock to ensure consistency between persistence and in-memory state (G3).
+// If configChanged is true, UpdatedAt and VersionSeq are updated, and OnSaveProfile is invoked outside e.mu.
 func (e *Engine) UpdateProfileTools(name string, updater func(tools []ProfileTool) ([]ProfileTool, bool)) (*DistributionProfile, bool, error) {
 	trimmedName := strings.TrimSpace(name)
-	const maxRetries = 3
+	pMu := e.getProfileLock(trimmedName)
+	pMu.Lock()
+	defer pMu.Unlock()
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		e.mu.Lock()
-		p, ok := e.profiles[trimmedName]
-		if !ok {
-			e.mu.Unlock()
-			return nil, false, ErrProfileNotFound
-		}
-
-		clonedTools := make([]ProfileTool, len(p.Tools))
-		copy(clonedTools, p.Tools)
-		initialUpdatedAt := p.UpdatedAt
-
-		newTools, configChanged := updater(clonedTools)
-		if !configChanged {
-			p.Tools = newTools
-			cp := *p
-			if len(p.Tools) > 0 {
-				cp.Tools = make([]ProfileTool, len(p.Tools))
-				copy(cp.Tools, p.Tools)
-			}
-			e.mu.Unlock()
-			return &cp, false, nil
-		}
-
-		candidate := *p
-		candidate.Tools = newTools
-		candidate.UpdatedAt = e.now()
-		saveFn := e.OnSaveProfile
+	e.mu.Lock()
+	p, ok := e.profiles[trimmedName]
+	if !ok {
 		e.mu.Unlock()
-
-		// Persist outside e.mu lock to prevent blocking heartbeats/telemetry (F6)
-		if saveFn != nil {
-			if err := saveFn(candidate); err != nil {
-				return nil, false, fmt.Errorf("persist profile %s: %w", name, err)
-			}
-		}
-
-		// Re-acquire lock and commit CAS if profile was not concurrently modified
-		e.mu.Lock()
-		p, ok = e.profiles[trimmedName]
-		if !ok {
-			e.mu.Unlock()
-			return nil, false, ErrProfileNotFound
-		}
-
-		if p.UpdatedAt.Equal(initialUpdatedAt) {
-			p.Tools = newTools
-			p.UpdatedAt = candidate.UpdatedAt
-			cp := *p
-			if len(p.Tools) > 0 {
-				cp.Tools = make([]ProfileTool, len(p.Tools))
-				copy(cp.Tools, p.Tools)
-			}
-			e.mu.Unlock()
-			return &cp, true, nil
-		}
-
-		// Concurrently modified, retry with fresh snapshot
-		e.mu.Unlock()
+		return nil, false, ErrProfileNotFound
 	}
 
-	return nil, false, fmt.Errorf("failed to update profile %s: concurrent conflict after %d attempts", name, maxRetries)
+	clonedTools := make([]ProfileTool, len(p.Tools))
+	copy(clonedTools, p.Tools)
+
+	newTools, configChanged := updater(clonedTools)
+	if !configChanged {
+		p.Tools = newTools
+		cp := *p
+		if len(p.Tools) > 0 {
+			cp.Tools = make([]ProfileTool, len(p.Tools))
+			copy(cp.Tools, p.Tools)
+		}
+		e.mu.Unlock()
+		return &cp, false, nil
+	}
+
+	candidate := *p
+	candidate.Tools = newTools
+	candidate.UpdatedAt = e.now()
+	candidate.VersionSeq = p.VersionSeq + 1
+	saveFn := e.OnSaveProfile
+	e.mu.Unlock()
+
+	// Persist outside e.mu while holding per-profile lock (G3)
+	if saveFn != nil {
+		if err := saveFn(candidate); err != nil {
+			return nil, false, fmt.Errorf("persist profile %s: %w", name, err)
+		}
+	}
+
+	// Commit updated candidate to in-memory profile
+	e.mu.Lock()
+	p, ok = e.profiles[trimmedName]
+	if !ok {
+		e.mu.Unlock()
+		return nil, false, ErrProfileNotFound
+	}
+	p.Tools = candidate.Tools
+	p.UpdatedAt = candidate.UpdatedAt
+	p.VersionSeq = candidate.VersionSeq
+
+	cp := *p
+	if len(p.Tools) > 0 {
+		cp.Tools = make([]ProfileTool, len(p.Tools))
+		copy(cp.Tools, p.Tools)
+	}
+	e.mu.Unlock()
+	return &cp, true, nil
 }
 
 // UpsertProfile inserts or updates a distribution profile.
+// It holds a per-profile lock to ensure consistency between persistence and in-memory state (G3).
 func (e *Engine) UpsertProfile(p DistributionProfile) (*DistributionProfile, error) {
 	name := strings.TrimSpace(p.Name)
 	if name == "" {
 		return nil, fmt.Errorf("profile name is required")
 	}
+
+	pMu := e.getProfileLock(name)
+	pMu.Lock()
+	defer pMu.Unlock()
+
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	now := e.now()
 	existing, ok := e.profiles[name]
 	if ok {
 		p.CreatedAt = existing.CreatedAt
 		p.UpdatedAt = now
+		p.VersionSeq = existing.VersionSeq + 1
 		if name == "generic" {
 			p.IsDefault = true
 		}
@@ -287,9 +289,24 @@ func (e *Engine) UpsertProfile(p DistributionProfile) (*DistributionProfile, err
 	} else {
 		p.CreatedAt = now
 		p.UpdatedAt = now
+		p.VersionSeq = 1
 	}
-	e.profiles[name] = &p
-	cp := p
+
+	candidate := p
+	saveFn := e.OnSaveProfile
+	e.mu.Unlock()
+
+	// Persist outside e.mu while holding per-profile lock (G3)
+	if saveFn != nil {
+		if err := saveFn(candidate); err != nil {
+			return nil, fmt.Errorf("persist profile %s: %w", name, err)
+		}
+	}
+
+	e.mu.Lock()
+	e.profiles[name] = &candidate
+	cp := candidate
+	e.mu.Unlock()
 	return &cp, nil
 }
 

@@ -132,17 +132,18 @@ type GitCredentialStore interface {
 
 // ReleaseService queries and caches latest Git release versions for profile tools.
 type ReleaseService struct {
-	mu               sync.RWMutex
-	cache            map[string]cachedRelease
-	endpointETags    map[string]string    // URL -> ETag mapping (prevents cross-endpoint ETag contamination, F5)
-	rateLimits       map[string]time.Time // repo -> backoff expiry time (F5)
-	noFormalReleases map[string]bool      // repo -> true if /releases/latest returned 404 (F5)
-	credentials      map[string]GitCredential
-	client           *http.Client
-	now              func() time.Time
-	token            string
-	store            GitCredentialStore
-	baseURL          string
+	mu                   sync.RWMutex
+	cache                map[string]cachedRelease
+	endpointETags        map[string]string    // URL -> ETag mapping (prevents cross-endpoint ETag contamination, F5)
+	rateLimits           map[string]time.Time // repo -> backoff expiry time (F5)
+	globalRateLimitUntil time.Time            // shared backoff expiry time across repos (G6)
+	noFormalReleases     map[string]time.Time // repo -> expiry time of 404 cache for /releases/latest (G6)
+	credentials          map[string]GitCredential
+	client               *http.Client
+	now                  func() time.Time
+	token                string
+	store                GitCredentialStore
+	baseURL              string
 }
 
 // NewReleaseService creates a ReleaseService with in-memory caching.
@@ -160,7 +161,7 @@ func NewReleaseService() *ReleaseService {
 		cache:            make(map[string]cachedRelease),
 		endpointETags:    make(map[string]string),
 		rateLimits:       make(map[string]time.Time),
-		noFormalReleases: make(map[string]bool),
+		noFormalReleases: make(map[string]time.Time),
 		credentials:      make(map[string]GitCredential),
 		client:           &http.Client{Timeout: 10 * time.Second},
 		now:              time.Now,
@@ -433,9 +434,15 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 
 	now := s.now()
 
-	// Check per-repo rate limit backoff (F5)
+	// Check per-repo and global rate limit backoff (F5, G6)
 	s.mu.RLock()
 	backoffUntil, isRateLimited := s.rateLimits[repo]
+	if !isRateLimited || backoffUntil.Before(s.globalRateLimitUntil) {
+		backoffUntil = s.globalRateLimitUntil
+		if now.Before(backoffUntil) {
+			isRateLimited = true
+		}
+	}
 	s.mu.RUnlock()
 	if isRateLimited && now.Before(backoffUntil) {
 		err := fmt.Errorf("rate limit backoff active for %s until %s", repo, backoffUntil.Format(time.RFC3339))
@@ -490,7 +497,8 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 		)
 	} else {
 		s.mu.RLock()
-		skipLatest := s.noFormalReleases[repo]
+		skipUntil := s.noFormalReleases[repo]
+		skipLatest := !skipUntil.IsZero() && now.Before(skipUntil)
 		s.mu.RUnlock()
 		if !skipLatest {
 			candidateURLs = append(candidateURLs, fmt.Sprintf("%s/repos/%s/releases/latest", base, repo))
@@ -524,6 +532,13 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 			s.mu.Unlock()
 		}
 		if err == nil && rel.LatestVersion != "" {
+			// SemVer ordering guard: never downgrade LatestAvailableVersion if an existing cached release has higher SemVer (G7)
+			if ok && cached.release.LatestVersion != "" && compareSemVer(rel.LatestVersion, cached.release.LatestVersion) < 0 {
+				rel.LatestVersion = cached.release.LatestVersion
+				rel.TagName = cached.release.TagName
+				rel.HTMLURL = cached.release.HTMLURL
+				rel.PublishedAt = cached.release.PublishedAt
+			}
 			rel.LastCheckedAt = now
 			rel.LastSyncStatus = "ok"
 			if !isLatestLookup {
@@ -543,6 +558,23 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 		}
 		if err != nil {
 			lastErr = err
+			if strings.Contains(err.Error(), "rate limited") {
+				// Stop immediately on rate limit without spending quota on list or tags (G6)
+				fallbackVer := targetVersion
+				if fallbackVer == "" || fallbackVer == "latest" {
+					fallbackVer = "0.0.0"
+				}
+				return ToolRelease{
+					Name:           toolName,
+					Repository:     repo,
+					LatestVersion:  fallbackVer,
+					TargetVersion:  targetVersion,
+					TagName:        fallbackVer,
+					LastCheckedAt:  now,
+					LastSyncStatus: "rate_limited",
+					Error:          err.Error(),
+				}, err
+			}
 		}
 	}
 
@@ -725,17 +757,23 @@ func (s *ReleaseService) fetchReleaseURL(ctx context.Context, url, repo, toolNam
 		return ToolRelease{Name: toolName, Repository: repo}, ifNoneMatch, true, nil
 	}
 
-	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+	if resp.StatusCode == http.StatusTooManyRequests || (resp.StatusCode == http.StatusForbidden && (resp.Header.Get("X-RateLimit-Remaining") == "0" || resp.Header.Get("Retry-After") != "")) {
 		backoffDur := parseRateLimitBackoff(resp.Header, s.now())
 		s.mu.Lock()
-		s.rateLimits[repo] = s.now().Add(backoffDur)
+		expiry := s.now().Add(backoffDur)
+		s.rateLimits[repo] = expiry
+		s.globalRateLimitUntil = expiry
 		s.mu.Unlock()
-		return ToolRelease{Name: toolName, Repository: repo, LatestVersion: targetVersion, TagName: targetVersion}, "", false, fmt.Errorf("rate limited (status %d)", resp.StatusCode)
+		return ToolRelease{Name: toolName, Repository: repo, LatestVersion: targetVersion, TagName: targetVersion, LastSyncStatus: "rate_limited"}, "", false, fmt.Errorf("rate limited (status %d)", resp.StatusCode)
+	}
+
+	if resp.StatusCode == http.StatusForbidden {
+		return ToolRelease{Name: toolName, Repository: repo, LatestVersion: targetVersion, TagName: targetVersion}, "", false, fmt.Errorf("forbidden (HTTP 403, check token scopes / SSO)")
 	}
 
 	if resp.StatusCode == http.StatusNotFound && strings.HasSuffix(url, "/releases/latest") {
 		s.mu.Lock()
-		s.noFormalReleases[repo] = true
+		s.noFormalReleases[repo] = s.now().Add(1 * time.Hour)
 		s.mu.Unlock()
 	}
 
@@ -803,12 +841,18 @@ func (s *ReleaseService) fetchReleaseListURL(ctx context.Context, url, repo, too
 		return ToolRelease{Name: toolName, Repository: repo}, cachedEtag, true, nil
 	}
 
-	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+	if resp.StatusCode == http.StatusTooManyRequests || (resp.StatusCode == http.StatusForbidden && (resp.Header.Get("X-RateLimit-Remaining") == "0" || resp.Header.Get("Retry-After") != "")) {
 		backoffDur := parseRateLimitBackoff(resp.Header, s.now())
 		s.mu.Lock()
-		s.rateLimits[repo] = s.now().Add(backoffDur)
+		expiry := s.now().Add(backoffDur)
+		s.rateLimits[repo] = expiry
+		s.globalRateLimitUntil = expiry
 		s.mu.Unlock()
-		return ToolRelease{Name: toolName, Repository: repo}, "", false, fmt.Errorf("rate limited (status %d)", resp.StatusCode)
+		return ToolRelease{Name: toolName, Repository: repo, LastSyncStatus: "rate_limited"}, "", false, fmt.Errorf("rate limited (status %d)", resp.StatusCode)
+	}
+
+	if resp.StatusCode == http.StatusForbidden {
+		return ToolRelease{Name: toolName, Repository: repo}, "", false, fmt.Errorf("forbidden (HTTP 403, check token scopes / SSO)")
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -887,12 +931,18 @@ func (s *ReleaseService) fetchTagsURL(ctx context.Context, url, repo, toolName, 
 		return ToolRelease{Name: toolName, Repository: repo}, cachedEtag, true, nil
 	}
 
-	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+	if resp.StatusCode == http.StatusTooManyRequests || (resp.StatusCode == http.StatusForbidden && (resp.Header.Get("X-RateLimit-Remaining") == "0" || resp.Header.Get("Retry-After") != "")) {
 		backoffDur := parseRateLimitBackoff(resp.Header, s.now())
 		s.mu.Lock()
-		s.rateLimits[repo] = s.now().Add(backoffDur)
+		expiry := s.now().Add(backoffDur)
+		s.rateLimits[repo] = expiry
+		s.globalRateLimitUntil = expiry
 		s.mu.Unlock()
-		return ToolRelease{Name: toolName, Repository: repo}, "", false, fmt.Errorf("rate limited (status %d)", resp.StatusCode)
+		return ToolRelease{Name: toolName, Repository: repo, LastSyncStatus: "rate_limited"}, "", false, fmt.Errorf("rate limited (status %d)", resp.StatusCode)
+	}
+
+	if resp.StatusCode == http.StatusForbidden {
+		return ToolRelease{Name: toolName, Repository: repo}, "", false, fmt.Errorf("forbidden (HTTP 403, check token scopes / SSO)")
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -1119,7 +1169,11 @@ func (s *ReleaseService) syncProfileWithCachePolicy(
 					updatedTools[i].LastCheckedAt = &now
 
 					if rel.Error != "" {
-						updatedTools[i].LastSyncStatus = "error"
+						if rel.LastSyncStatus == "rate_limited" {
+							updatedTools[i].LastSyncStatus = "rate_limited"
+						} else {
+							updatedTools[i].LastSyncStatus = "error"
+						}
 						updatedTools[i].LastSyncError = rel.Error
 						break
 					}

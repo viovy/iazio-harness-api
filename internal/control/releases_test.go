@@ -1439,3 +1439,99 @@ func TestReleaseService_RateLimitBackoffAndNoFormalReleasesSkipping(t *testing.T
 		t.Fatalf("expected /releases/latest to be skipped on second pass, but was called %d times (F5)", tagsRepoLatestCalls)
 	}
 }
+
+func TestEngine_RepoRuntimeStatus_EmptyInventoryUnknown(t *testing.T) {
+	e := NewEngine(time.Now)
+	hostID := "host-empty-test"
+	e.RegisterHost(hostID, "linux", "generic")
+
+	// Post empty inventory
+	e.UpdateRepoRuntimeStatus(hostID, []RepoRuntimeStatus{})
+
+	h := e.hosts[hostID]
+	if h.FleetCheckedAt != nil {
+		t.Fatalf("expected FleetCheckedAt=nil when inventory is empty (G1)")
+	}
+	if h.FleetGitClean {
+		t.Fatalf("expected FleetGitClean=false (unknown) when inventory is empty (G1)")
+	}
+}
+
+func TestEngine_RepoRuntimeStatus_ClockSkewImmunity(t *testing.T) {
+	currTime := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return currTime })
+	hostID := "host-skew-test"
+	e.RegisterHost(hostID, "linux", "generic")
+
+	// Agent clock is 1 hour in the past (severe clock skew)
+	agentSkewedTime := currTime.Add(-1 * time.Hour)
+	e.UpdateRepoRuntimeStatus(hostID, []RepoRuntimeStatus{
+		{
+			RepoPath:      "/workspace/skewed-repo",
+			IsClean:       true,
+			LastCheckedAt: agentSkewedTime,
+		},
+	})
+
+	h := e.hosts[hostID]
+	if len(h.RepoStatuses) != 1 {
+		t.Fatalf("expected skewed repo NOT to be pruned immediately (G1)")
+	}
+	if !h.FleetGitClean {
+		t.Fatalf("expected FleetGitClean=true for clean repo despite agent clock skew")
+	}
+	if h.FleetCheckedAt == nil {
+		t.Fatalf("expected FleetCheckedAt to be set by server receive time")
+	}
+}
+
+func TestEngine_UpdateProfileTools_ConcurrentUpsertConsistency(t *testing.T) {
+	e := NewEngine(time.Now)
+	var persistedVersion uint64
+	var saveMu sync.Mutex
+	e.OnSaveProfile = func(p DistributionProfile) error {
+		saveMu.Lock()
+		persistedVersion = p.VersionSeq
+		saveMu.Unlock()
+		return nil
+	}
+
+	_, _ = e.UpsertProfile(DistributionProfile{
+		Name: "race-profile",
+		Tools: []ProfileTool{
+			{Name: "tool1", Repository: "viovy/tool1", TargetVersion: "1.0.0"},
+		},
+	})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(2)
+		go func(idx int) {
+			defer wg.Done()
+			_, _, _ = e.UpdateProfileTools("race-profile", func(tools []ProfileTool) ([]ProfileTool, bool) {
+				tools[0].TargetVersion = fmt.Sprintf("1.0.%d", idx)
+				return tools, true
+			})
+		}(i)
+		go func(idx int) {
+			defer wg.Done()
+			_, _ = e.UpsertProfile(DistributionProfile{
+				Name:        "race-profile",
+				Description: fmt.Sprintf("edit-%d", idx),
+				Tools: []ProfileTool{
+					{Name: "tool1", Repository: "viovy/tool1", TargetVersion: "1.0.0"},
+				},
+			})
+		}(i)
+	}
+	wg.Wait()
+
+	p, _ := e.GetProfile("race-profile")
+	saveMu.Lock()
+	lastSaved := persistedVersion
+	saveMu.Unlock()
+
+	if p.VersionSeq != lastSaved {
+		t.Fatalf("expected in-memory VersionSeq (%d) to equal persisted VersionSeq (%d) (G3)", p.VersionSeq, lastSaved)
+	}
+}
