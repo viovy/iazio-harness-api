@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -105,6 +106,18 @@ ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS diagnostic_code text NOT NU
 ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS model text NOT NULL DEFAULT '';
 ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS remediation text NOT NULL DEFAULT '';
 ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS trace_id text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS parent_job_id text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS root_job_id text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS initial_conversation_id text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS active_conversation_id text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS resume_mode text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS resume_fallback_reason text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS interrupted_ase_state jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS conversation_lineage jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS execution_attempt integer NOT NULL DEFAULT 1;
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS execution_chain jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS same_conversation_confirmed boolean NOT NULL DEFAULT false;
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS attach_confirmation text NOT NULL DEFAULT '';
 
 DELETE FROM harness_history h1
 WHERE h1.status = 'DECLINED'
@@ -582,9 +595,31 @@ func (s *Store) SaveHistory(ctx context.Context, hostID, worktreePath string, ro
 	if err != nil {
 		convBytes = []byte("[]")
 	}
+	interruptedBytes, err := json.Marshal(row.InterruptedASEState)
+	if err != nil || len(row.InterruptedASEState) == 0 {
+		interruptedBytes = []byte("{}")
+	}
+	lineageBytes, err := json.Marshal(row.ConversationLineage)
+	if err != nil || len(row.ConversationLineage) == 0 {
+		lineageBytes = []byte("[]")
+	}
+	chainBytes, err := json.Marshal(row.ExecutionChain)
+	if err != nil || len(row.ExecutionChain) == 0 {
+		chainBytes = []byte("[]")
+	}
+	attempt := row.ExecutionAttempt
+	if attempt <= 0 {
+		attempt = 1
+	}
 	_, err = s.db.ExecContext(ctx, `
-INSERT INTO harness_history (job_id, host_id, worktree_path, schedule_id, prompt_title, engine, status, clean, ase_complete, conversation_ids, reason, error_message, diagnostic_code, model, remediation, trace_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+INSERT INTO harness_history (
+  job_id, host_id, worktree_path, schedule_id, prompt_title, engine, status, clean,
+  ase_complete, conversation_ids, reason, error_message, diagnostic_code, model,
+  remediation, trace_id, parent_job_id, root_job_id, initial_conversation_id,
+  active_conversation_id, resume_mode, resume_fallback_reason, interrupted_ase_state,
+  conversation_lineage, execution_attempt, execution_chain, same_conversation_confirmed, attach_confirmation
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
 ON CONFLICT (job_id) DO UPDATE SET
   host_id = EXCLUDED.host_id,
   worktree_path = EXCLUDED.worktree_path,
@@ -600,8 +635,20 @@ ON CONFLICT (job_id) DO UPDATE SET
   diagnostic_code = EXCLUDED.diagnostic_code,
   model = EXCLUDED.model,
   remediation = EXCLUDED.remediation,
-  trace_id = EXCLUDED.trace_id
-`, row.JobID, hostID, worktreePath, row.ScheduleID, row.PromptTitle, row.Engine, row.Status, row.Clean, row.ASEComplete, string(convBytes), row.Reason, row.ErrorMessage, row.DiagnosticCode, row.Model, row.Remediation, row.TraceID)
+  trace_id = EXCLUDED.trace_id,
+  parent_job_id = EXCLUDED.parent_job_id,
+  root_job_id = EXCLUDED.root_job_id,
+  initial_conversation_id = EXCLUDED.initial_conversation_id,
+  active_conversation_id = EXCLUDED.active_conversation_id,
+  resume_mode = EXCLUDED.resume_mode,
+  resume_fallback_reason = EXCLUDED.resume_fallback_reason,
+  interrupted_ase_state = EXCLUDED.interrupted_ase_state,
+  conversation_lineage = EXCLUDED.conversation_lineage,
+  execution_attempt = EXCLUDED.execution_attempt,
+  execution_chain = EXCLUDED.execution_chain,
+  same_conversation_confirmed = EXCLUDED.same_conversation_confirmed,
+  attach_confirmation = EXCLUDED.attach_confirmation
+`, row.JobID, hostID, worktreePath, row.ScheduleID, row.PromptTitle, row.Engine, row.Status, row.Clean, row.ASEComplete, string(convBytes), row.Reason, row.ErrorMessage, row.DiagnosticCode, row.Model, row.Remediation, row.TraceID, row.ParentJobID, row.RootJobID, row.InitialConversationID, row.ActiveConversationID, row.ResumeMode, row.ResumeFallbackReason, string(interruptedBytes), string(lineageBytes), attempt, string(chainBytes), row.SameConversationConfirmed, row.AttachConfirmation)
 	if err != nil {
 		return fmt.Errorf("save history: %w", err)
 	}
@@ -638,7 +685,12 @@ func (s *Store) LoadHistory(ctx context.Context) (map[string][]control.HistoryRo
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT job_id, host_id, worktree_path, schedule_id, prompt_title, engine, status, clean, ase_complete, conversation_ids, reason, error_message, diagnostic_code, model, remediation, trace_id, created_at
+SELECT
+  job_id, host_id, worktree_path, schedule_id, prompt_title, engine, status, clean,
+  ase_complete, conversation_ids, reason, error_message, diagnostic_code, model,
+  remediation, trace_id, created_at, parent_job_id, root_job_id, initial_conversation_id,
+  active_conversation_id, resume_mode, resume_fallback_reason, interrupted_ase_state,
+  conversation_lineage, execution_attempt, execution_chain, same_conversation_confirmed, attach_confirmation
 FROM harness_history ORDER BY created_at ASC
 `)
 	if err != nil {
@@ -650,8 +702,15 @@ FROM harness_history ORDER BY created_at ASC
 	for rows.Next() {
 		var r control.HistoryRow
 		var hostID, worktreePath string
-		var convRaw []byte
-		if err := rows.Scan(&r.JobID, &hostID, &worktreePath, &r.ScheduleID, &r.PromptTitle, &r.Engine, &r.Status, &r.Clean, &r.ASEComplete, &convRaw, &r.Reason, &r.ErrorMessage, &r.DiagnosticCode, &r.Model, &r.Remediation, &r.TraceID, &r.CreatedAt); err != nil {
+		var convRaw, interruptedRaw, lineageRaw, chainRaw []byte
+		if err := rows.Scan(
+			&r.JobID, &hostID, &worktreePath, &r.ScheduleID, &r.PromptTitle, &r.Engine,
+			&r.Status, &r.Clean, &r.ASEComplete, &convRaw, &r.Reason, &r.ErrorMessage,
+			&r.DiagnosticCode, &r.Model, &r.Remediation, &r.TraceID, &r.CreatedAt,
+			&r.ParentJobID, &r.RootJobID, &r.InitialConversationID, &r.ActiveConversationID,
+			&r.ResumeMode, &r.ResumeFallbackReason, &interruptedRaw, &lineageRaw,
+			&r.ExecutionAttempt, &chainRaw, &r.SameConversationConfirmed, &r.AttachConfirmation,
+		); err != nil {
 			return nil, err
 		}
 		if len(convRaw) > 0 {
@@ -659,6 +718,25 @@ FROM harness_history ORDER BY created_at ASC
 		}
 		if r.ConversationIDs == nil {
 			r.ConversationIDs = []string{}
+		}
+		if len(interruptedRaw) > 0 {
+			if errU := json.Unmarshal(interruptedRaw, &r.InterruptedASEState); errU != nil {
+				log.Printf("[pgstore] warning: corrupt interrupted_ase_state JSON for job %s: %v", r.JobID, errU)
+			}
+		}
+		if len(lineageRaw) > 0 {
+			if errU := json.Unmarshal(lineageRaw, &r.ConversationLineage); errU != nil {
+				log.Printf("[pgstore] warning: corrupt conversation_lineage JSON for job %s: %v", r.JobID, errU)
+			}
+		}
+		if r.ConversationLineage == nil {
+			r.ConversationLineage = []control.ConversationLineage{}
+		}
+		if len(chainRaw) > 0 {
+			_ = json.Unmarshal(chainRaw, &r.ExecutionChain)
+		}
+		if r.ExecutionChain == nil {
+			r.ExecutionChain = []string{}
 		}
 		key := hostID + "\x00" + worktreePath
 		out[key] = append(out[key], r)

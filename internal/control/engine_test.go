@@ -2846,3 +2846,1005 @@ func TestReapExpired_ReconcilesIdleRepoRunningJobID(t *testing.T) {
 		}
 	}
 }
+
+func TestEngine_DeterministicResumeConversationPinning_SameConversation(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	repoPath := "/Users/romeo/work/meta-repo-03"
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	initialConvID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+
+	// 1. Initial job-1311
+	p := e.PutPrompt(Prompt{
+		ID:     "prompt-ase-1",
+		Title:  "Autonomous Story Execution",
+		Engine: "agy",
+		Status: "READY",
+	})
+	_, err := e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, initialConvID)
+	if err != nil {
+		t.Fatalf("execute sch1 failed: %v", err)
+	}
+
+	job1, _, _, ok := e.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("poll failed for job1")
+	}
+	if job1.InitialConversationID != initialConvID || job1.ActiveConversationID != initialConvID {
+		t.Fatalf("job1 conversation mismatch: init=%s active=%s", job1.InitialConversationID, job1.ActiveConversationID)
+	}
+
+	// Job1 fails/halts
+	_ = e.PostExit(job1.ID, 1, ExitOptions{Reason: "FAILED"})
+
+	// 2. Resume job-1311 -> creates job-1313
+	resumeSch, err := e.ResumeRepoInPlace("mac-mini", repoPath, ResumeOptions{
+		JobID:                 job1.ID,
+		ParentJobID:           job1.ID,
+		InitialConversationID: initialConvID,
+		StoryID:               "STORY-GOV-3678",
+		Engine:                "agy",
+	})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace failed: %v", err)
+	}
+	if resumeSch.ParentJobID != job1.ID {
+		t.Fatalf("expected ParentJobID %s, got %s", job1.ID, resumeSch.ParentJobID)
+	}
+	if resumeSch.InitialConversationID != initialConvID {
+		t.Fatalf("expected InitialConversationID %s, got %s", initialConvID, resumeSch.InitialConversationID)
+	}
+	if resumeSch.ResumeMode != "pending" {
+		t.Fatalf("expected initial ResumeMode pending, got %s", resumeSch.ResumeMode)
+	}
+
+	// 3. Poll host leases resumed job (job-1313)
+	jobResume, _, _, ok := e.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("poll failed for resume job")
+	}
+	if jobResume.ParentJobID != job1.ID {
+		t.Fatalf("resumed job ParentJobID %s want %s", jobResume.ParentJobID, job1.ID)
+	}
+	if jobResume.InitialConversationID != initialConvID {
+		t.Fatalf("resumed job InitialConversationID %s want %s", jobResume.InitialConversationID, initialConvID)
+	}
+	if jobResume.ActiveConversationID != initialConvID {
+		t.Fatalf("resumed job ActiveConversationID %s want %s", jobResume.ActiveConversationID, initialConvID)
+	}
+
+	// 4. Runner reattaches to same conversation
+	err = e.AddJobConversationWithOptions(jobResume.ID, initialConvID, ConversationAttachOptions{
+		Role:     "initial_resumed",
+		CLIArgs:  "--conversation=" + initialConvID,
+		ASEPhase: "RESUME",
+	})
+	if err != nil {
+		t.Fatalf("AddJobConversationWithOptions failed: %v", err)
+	}
+
+	det, ok := e.GetJob(jobResume.ID)
+	if !ok {
+		t.Fatal("GetJob failed")
+	}
+	if len(det.ConversationIDs) != 1 || det.ConversationIDs[0] != initialConvID {
+		t.Fatalf("expected only initial conversation ID %v, got %v", initialConvID, det.ConversationIDs)
+	}
+	if det.ResumeMode != "same_conversation" {
+		t.Fatalf("expected confirmed ResumeMode same_conversation, got %s", det.ResumeMode)
+	}
+
+	// 5. If an unpinned tertiary conversation (e.g. 14de9a1f-...) is reported, it must be ignored!
+	tertiaryConvID := "14de9a1f-5679-4f11-a08f-f32bc7e47663"
+	_ = e.AddJobConversation(jobResume.ID, tertiaryConvID)
+
+	detAfter, _ := e.GetJob(jobResume.ID)
+	if len(detAfter.ConversationIDs) != 1 || detAfter.ConversationIDs[0] != initialConvID {
+		t.Fatalf("unpinned tertiary conversation leaked into job! got %v", detAfter.ConversationIDs)
+	}
+}
+
+func TestEngine_DeterministicResumeConversationPinning_ControlledFallback(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	repoPath := "/Users/romeo/work/meta-repo-03"
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	initialConvID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	fallbackConvID := "1d446877-5bf9-44eb-9db5-e1c007a9fe31"
+
+	p := e.PutPrompt(Prompt{
+		ID:     "prompt-ase-2",
+		Title:  "Autonomous Story Execution Fallback",
+		Engine: "agy",
+		Status: "READY",
+	})
+	_, err := e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, initialConvID)
+	if err != nil {
+		t.Fatalf("execute sch failed: %v", err)
+	}
+
+	job, _, _, ok := e.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("poll failed")
+	}
+
+	// Initial conversation could not be attached -> runner triggers controlled fallback
+	fallbackReason := "session not found on host disk for engine agy"
+	err = e.AddJobConversationWithOptions(job.ID, fallbackConvID, ConversationAttachOptions{
+		Fallback:       true,
+		FallbackReason: fallbackReason,
+		Role:           "fallback_primary",
+		CLIArgs:        "--conversation=" + fallbackConvID,
+		ASEPhase:       "FALLBACK_START",
+	})
+	if err != nil {
+		t.Fatalf("AddJobConversationWithOptions fallback failed: %v", err)
+	}
+
+	det, ok := e.GetJob(job.ID)
+	if !ok {
+		t.Fatal("GetJob failed")
+	}
+	if det.ActiveConversationID != fallbackConvID {
+		t.Fatalf("expected ActiveConversationID %s, got %s", fallbackConvID, det.ActiveConversationID)
+	}
+	if det.InitialConversationID != initialConvID {
+		t.Fatalf("expected InitialConversationID %s, got %s", initialConvID, det.InitialConversationID)
+	}
+	if det.ResumeMode != "fallback_new_conversation" {
+		t.Fatalf("expected ResumeMode fallback_new_conversation, got %s", det.ResumeMode)
+	}
+	if det.ResumeFallbackReason != fallbackReason {
+		t.Fatalf("expected ResumeFallbackReason %q, got %q", fallbackReason, det.ResumeFallbackReason)
+	}
+	if len(det.ConversationIDs) != 2 || det.ConversationIDs[0] != initialConvID || det.ConversationIDs[1] != fallbackConvID {
+		t.Fatalf("expected conversation_ids [%s, %s], got %v", initialConvID, fallbackConvID, det.ConversationIDs)
+	}
+
+	// 6. Verify subsequent arbitrary conversation is ignored (pinned to fallbackConvID)
+	arbitraryConvID := "14de9a1f-5679-4f11-a08f-f32bc7e47663"
+	_ = e.AddJobConversation(job.ID, arbitraryConvID)
+
+	detAfter, _ := e.GetJob(job.ID)
+	if len(detAfter.ConversationIDs) != 2 {
+		t.Fatalf("arbitrary conversation corrupted job! got: %v", detAfter.ConversationIDs)
+	}
+	if detAfter.ActiveConversationID != fallbackConvID {
+		t.Fatalf("active conversation shifted unexpectedly to %s", detAfter.ActiveConversationID)
+	}
+}
+
+func TestEngine_MultiHopChainResume_LineageAndAttempt(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	repoPath := "/Users/romeo/work/meta-repo-03"
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	initialConvID := "conv-hop-1-init"
+	fallbackConvID := "conv-hop-2-fallback"
+
+	p := e.PutPrompt(Prompt{
+		ID:     "prompt-hop-1",
+		Title:  "Multi-Hop Resume",
+		Engine: "agy",
+		Status: "READY",
+	})
+
+	// Job 1: Initial Run
+	_, err := e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, initialConvID)
+	if err != nil {
+		t.Fatalf("ExecutePromptWithResume failed: %v", err)
+	}
+	job1, _, _, ok := e.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("poll job1 failed")
+	}
+	_ = e.PostExit(job1.ID, 1, ExitOptions{Reason: "HALTED_DIRTY"})
+
+	// Job 2: First resume -> falls back to conversation B
+	sch2, err := e.ResumeRepoInPlace("mac-mini", repoPath, ResumeOptions{
+		JobID:       job1.ID,
+		ParentJobID: job1.ID,
+		AllowDirty:  true,
+	})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace job2 failed: %v", err)
+	}
+	job2, _, _, ok := e.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("poll job2 failed")
+	}
+	if sch2.ExecutionAttempt != 2 {
+		t.Fatalf("expected attempt 2 for job2, got %d", sch2.ExecutionAttempt)
+	}
+	// Simulate fallback on job2
+	_ = e.AddJobConversationWithOptions(job2.ID, fallbackConvID, ConversationAttachOptions{
+		Fallback:       true,
+		FallbackReason: "initial session corrupted",
+		Role:           "fallback_primary",
+		CLIArgs:        "--conversation=" + fallbackConvID,
+		ASEPhase:       "FALLBACK_START",
+	})
+	_ = e.PostExit(job2.ID, 1, ExitOptions{Reason: "HALTED_DIRTY"})
+
+	// Job 3: Second resume -> MUST resume conversation B (ActiveConversationID of Job 2) (F3)
+	sch3, err := e.ResumeRepoInPlace("mac-mini", repoPath, ResumeOptions{
+		JobID:       job2.ID,
+		ParentJobID: job2.ID,
+		AllowDirty:  true,
+	})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace job3 failed: %v", err)
+	}
+	if sch3.ResumeConversationID != fallbackConvID {
+		t.Fatalf("Job 3 ResumeConversationID want %s, got %s", fallbackConvID, sch3.ResumeConversationID)
+	}
+	if sch3.ActiveConversationID != fallbackConvID {
+		t.Fatalf("Job 3 ActiveConversationID want %s, got %s", fallbackConvID, sch3.ActiveConversationID)
+	}
+	if sch3.InitialConversationID != initialConvID {
+		t.Fatalf("Job 3 InitialConversationID want %s, got %s", initialConvID, sch3.InitialConversationID)
+	}
+	// Verify attempt is 3 and chain contains job1 and job2 (F8)
+	if sch3.ExecutionAttempt != 3 {
+		t.Fatalf("Job 3 ExecutionAttempt want 3, got %d", sch3.ExecutionAttempt)
+	}
+	if len(sch3.ExecutionChain) != 2 || sch3.ExecutionChain[0] != job1.ID || sch3.ExecutionChain[1] != job2.ID {
+		t.Fatalf("Job 3 ExecutionChain want [%s, %s], got %v", job1.ID, job2.ID, sch3.ExecutionChain)
+	}
+	if len(sch3.AssociatedJobs) != 2 || sch3.AssociatedJobs[0] != job1.ID || sch3.AssociatedJobs[1] != job2.ID {
+		t.Fatalf("Job 3 AssociatedJobs want [%s, %s], got %v", job1.ID, job2.ID, sch3.AssociatedJobs)
+	}
+}
+
+func TestEngine_DroppedUnpinnedLineageOnly_NoMutation(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	repoPath := "/Users/romeo/work/meta-repo-03"
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	initialConvID := "conv-active-pinned"
+	p := e.PutPrompt(Prompt{
+		ID:     "prompt-f5",
+		Title:  "F5 Test",
+		Engine: "agy",
+		Status: "READY",
+	})
+	_, _ = e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, initialConvID)
+	job, _, _, ok := e.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("poll failed")
+	}
+
+	// Post dropped_unpinned out-of-order
+	err := e.AddJobConversationWithOptions(job.ID, "conv-unpinned-garbage", ConversationAttachOptions{
+		Role:     "dropped_unpinned",
+		CLIArgs:  "--conversation=conv-unpinned-garbage",
+		ASEPhase: "STEP_X",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error adding dropped_unpinned: %v", err)
+	}
+
+	det, _ := e.GetJob(job.ID)
+	if det.ActiveConversationID != initialConvID {
+		t.Fatalf("ActiveConversationID mutated! got %s want %s", det.ActiveConversationID, initialConvID)
+	}
+	if det.ResumeMode == "fallback_new_conversation" {
+		t.Fatalf("ResumeMode unexpectedly mutated to fallback_new_conversation")
+	}
+	if len(det.ConversationIDs) != 1 || det.ConversationIDs[0] != initialConvID {
+		t.Fatalf("ConversationIDs corrupted! got %v", det.ConversationIDs)
+	}
+	if len(det.ConversationLineage) != 2 || det.ConversationLineage[1].Role != "dropped_unpinned" {
+		t.Fatalf("ConversationLineage missing dropped_unpinned! got %v", det.ConversationLineage)
+	}
+}
+
+func TestEngine_CrossEngineResume_MismatchFallback(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	repoPath := "/Users/romeo/work/meta-repo-03"
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	initialConvID := "cursor-conv-session-12345"
+	p := e.PutPrompt(Prompt{
+		ID:     "prompt-engine-mismatch",
+		Title:  "Engine Mismatch Test",
+		Engine: "agent",
+		Status: "READY",
+	})
+
+	// Parent job executed with engine "agent"
+	_, err := e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, initialConvID)
+	if err != nil {
+		t.Fatalf("ExecutePromptWithResume failed: %v", err)
+	}
+	parentJob, _, _, ok := e.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("poll failed")
+	}
+	_ = e.PostExit(parentJob.ID, 1, ExitOptions{Reason: "FAILED"})
+
+	// Resume requesting engine "agy" (mismatch with parent "agent")
+	sch, err := e.ResumeRepoInPlace("mac-mini", repoPath, ResumeOptions{
+		JobID:       parentJob.ID,
+		ParentJobID: parentJob.ID,
+		Engine:      "agy",
+		AllowDirty:  true,
+	})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace failed: %v", err)
+	}
+
+	if sch.ResumeMode != "fallback_new_conversation" {
+		t.Fatalf("expected ResumeMode fallback_new_conversation for cross-engine resume, got %s", sch.ResumeMode)
+	}
+	if sch.ResumeConversationID != "" {
+		t.Fatalf("expected empty ResumeConversationID for cross-engine resume, got %s", sch.ResumeConversationID)
+	}
+	if sch.ResumeFallbackReason == "" || !strings.Contains(sch.ResumeFallbackReason, "cross-engine") {
+		t.Fatalf("expected cross-engine fallback reason, got %q", sch.ResumeFallbackReason)
+	}
+}
+
+func TestEngine_PendingResumeMode_UntilAttachmentConfirmed(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	repoPath := "/Users/romeo/work/meta-repo-03"
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	convID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	p := e.PutPrompt(Prompt{
+		ID:     "prompt-pending-test",
+		Title:  "Pending Mode Test",
+		Engine: "agy",
+		Status: "READY",
+	})
+	_, err := e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, convID)
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	job1, _, _, _ := e.PollHost("mac-mini")
+	_ = e.PostExit(job1.ID, 1, ExitOptions{Reason: "FAILED"})
+
+	// Resumed schedule is created: ResumeMode MUST be "pending" before harness confirmation!
+	resumeSch, err := e.ResumeRepoInPlace("mac-mini", repoPath, ResumeOptions{
+		JobID:       job1.ID,
+		ParentJobID: job1.ID,
+		AllowDirty:  true,
+	})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace failed: %v", err)
+	}
+	if resumeSch.ResumeMode != "pending" {
+		t.Fatalf("expected initial ResumeMode 'pending', got %q", resumeSch.ResumeMode)
+	}
+
+	job2, _, _, ok := e.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("poll job2 failed")
+	}
+	if job2.ResumeMode != "pending" {
+		t.Fatalf("expected initial Job ResumeMode 'pending', got %q", job2.ResumeMode)
+	}
+
+	// Now confirm attachment:
+	_ = e.AddJobConversationWithOptions(job2.ID, convID, ConversationAttachOptions{
+		Role:     "initial_resumed",
+		CLIArgs:  "--conversation=" + convID,
+		ASEPhase: "RESUME_RUN",
+	})
+
+	det, _ := e.GetJob(job2.ID)
+	if det.ResumeMode != "same_conversation" {
+		t.Fatalf("expected confirmed ResumeMode 'same_conversation', got %q", det.ResumeMode)
+	}
+	if !det.SameConversationConfirmed {
+		t.Fatalf("expected SameConversationConfirmed true")
+	}
+}
+
+func TestEngine_PendingToImplicitSameConversation_OnExit(t *testing.T) {
+	e := NewEngine(nil)
+	repoPath := "/home/romeo/work/meta-repo"
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+	p := e.PutPrompt(Prompt{ID: "prompt-1", Title: "Ready ASE prompt", Engine: "agy", Status: "READY"})
+
+	_, err := e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, "aad902c8-bda6-44c7-8a68-c468a1562399")
+	if err != nil {
+		t.Fatalf("ExecutePromptWithResume failed: %v", err)
+	}
+	job1, _, _, _ := e.PollHost("mac-mini")
+	_ = e.PostExit(job1.ID, 1, ExitOptions{Reason: "FAILED"})
+
+	resumeSch, err := e.ResumeRepoInPlace("mac-mini", repoPath, ResumeOptions{
+		JobID:       job1.ID,
+		ParentJobID: job1.ID,
+		AllowDirty:  true,
+	})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace failed: %v", err)
+	}
+	if resumeSch.ResumeMode != "pending" {
+		t.Fatalf("expected initial ResumeMode 'pending', got %q", resumeSch.ResumeMode)
+	}
+
+	job2, _, _, ok := e.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("poll job2 failed")
+	}
+
+	// Exit 0 with no explicit marker: should map to same_conversation_unverified (Finding M3)
+	_ = e.PostExit(job2.ID, 0)
+
+	det, _ := e.GetJob(job2.ID)
+	if det.ResumeMode != "same_conversation_unverified" {
+		t.Fatalf("expected exit-time ResumeMode 'same_conversation_unverified', got %q", det.ResumeMode)
+	}
+	if det.SameConversationConfirmed {
+		t.Fatalf("expected SameConversationConfirmed false on exit without positive attach evidence")
+	}
+	if det.AttachConfirmation != "unverified" {
+		t.Fatalf("expected AttachConfirmation 'unverified', got %q", det.AttachConfirmation)
+	}
+
+	// Verify history record also updated
+	lastRow, _, _, found := e.FindHistoryRow(job2.ID)
+	if !found {
+		t.Fatal("expected history row for job2")
+	}
+	if lastRow.ResumeMode != "same_conversation_unverified" {
+		t.Fatalf("expected history ResumeMode 'same_conversation_unverified', got %q", lastRow.ResumeMode)
+	}
+	if lastRow.AttachConfirmation != "unverified" {
+		t.Fatalf("expected history AttachConfirmation 'unverified', got %q", lastRow.AttachConfirmation)
+	}
+}
+
+func TestEngine_CrossEngineResume_QuotaOrRewriteFallback(t *testing.T) {
+	e := NewEngine(nil)
+	repoPath := "/home/romeo/work/meta-repo"
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+	p := e.PutPrompt(Prompt{ID: "prompt-1", Title: "Ready ASE prompt", Engine: "agent", Status: "READY"})
+
+	// Parent job ran with engine "agent"
+	_, err := e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, "cursor-123")
+	if err != nil {
+		t.Fatalf("ExecutePromptWithResume failed: %v", err)
+	}
+	job1, _, _, _ := e.PollHost("mac-mini")
+	_ = e.PostExit(job1.ID, 1, ExitOptions{DiagnosticCode: "QUOTA_EXHAUSTED", Reason: "QUOTA_EXHAUSTED"})
+
+	// Resume: repo is quota-exhausted so engine rewrites from agent to agy
+	resumeSch, err := e.ResumeRepoInPlace("mac-mini", repoPath, ResumeOptions{
+		JobID:       job1.ID,
+		ParentJobID: job1.ID,
+		AllowDirty:  true,
+	})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace failed: %v", err)
+	}
+	if resumeSch.Engine != "agy" {
+		t.Fatalf("expected rewritten engine 'agy', got %q", resumeSch.Engine)
+	}
+	if resumeSch.ResumeMode != "fallback_new_conversation" {
+		t.Fatalf("expected ResumeMode 'fallback_new_conversation' after engine rewrite, got %q", resumeSch.ResumeMode)
+	}
+	if !strings.Contains(resumeSch.ResumeFallbackReason, "cross-engine") {
+		t.Fatalf("expected cross-engine fallback reason, got %q", resumeSch.ResumeFallbackReason)
+	}
+	if resumeSch.ResumeConversationID != "" {
+		t.Fatalf("expected empty ResumeConversationID for cross-engine, got %q", resumeSch.ResumeConversationID)
+	}
+}
+
+func TestEngine_ResumeMode_BodyOverrideIgnored(t *testing.T) {
+	e := NewEngine(nil)
+	repoPath := "/home/romeo/work/meta-repo"
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+	p := e.PutPrompt(Prompt{ID: "prompt-1", Title: "Ready ASE prompt", Engine: "agy", Status: "READY"})
+
+	_, err := e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, "aad902c8-bda6-44c7-8a68-c468a1562399")
+	if err != nil {
+		t.Fatalf("ExecutePromptWithResume failed: %v", err)
+	}
+	job1, _, _, _ := e.PollHost("mac-mini")
+	_ = e.PostExit(job1.ID, 1, ExitOptions{Reason: "FAILED"})
+
+	// Client maliciously passes ResumeMode="same_conversation"
+	resumeSch, err := e.ResumeRepoInPlace("mac-mini", repoPath, ResumeOptions{
+		JobID:       job1.ID,
+		ParentJobID: job1.ID,
+		ResumeMode:  "same_conversation",
+		AllowDirty:  true,
+	})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace failed: %v", err)
+	}
+	if resumeSch.ResumeMode != "pending" {
+		t.Fatalf("expected client-passed same_conversation to be ignored and remain 'pending', got %q", resumeSch.ResumeMode)
+	}
+}
+
+func TestEngine_FallbackTerminal_RePostActiveID_StaysFallback(t *testing.T) {
+	e := NewEngine(nil)
+	repoPath := "/home/romeo/work/meta-repo"
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+	p := e.PutPrompt(Prompt{ID: "prompt-1", Title: "Ready ASE prompt", Engine: "agy", Status: "READY"})
+
+	_, err := e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, "aad902c8-bda6-44c7-8a68-c468a1562399")
+	if err != nil {
+		t.Fatalf("ExecutePromptWithResume failed: %v", err)
+	}
+	job1, _, _, _ := e.PollHost("mac-mini")
+	_ = e.PostExit(job1.ID, 1, ExitOptions{Reason: "FAILED"})
+
+	_, _ = e.ResumeRepoInPlace("mac-mini", repoPath, ResumeOptions{
+		JobID:       job1.ID,
+		ParentJobID: job1.ID,
+		AllowDirty:  true,
+	})
+
+	job2, _, _, _ := e.PollHost("mac-mini")
+
+	// Trigger fallback:
+	fallbackConvID := "11112222-3333-4444-5555-666677778888"
+	_ = e.AddJobConversationWithOptions(job2.ID, fallbackConvID, ConversationAttachOptions{
+		Fallback:       true,
+		FallbackReason: "session unattachable",
+		Role:           "fallback_primary",
+	})
+
+	det, _ := e.GetJob(job2.ID)
+	if det.ResumeMode != "fallback_new_conversation" {
+		t.Fatalf("expected fallback_new_conversation, got %q", det.ResumeMode)
+	}
+
+	// Now re-post the active fallback ID without options (Finding A4)
+	_ = e.AddJobConversation(job2.ID, fallbackConvID)
+
+	detAfter, _ := e.GetJob(job2.ID)
+	if detAfter.ResumeMode != "fallback_new_conversation" {
+		t.Fatalf("expected ResumeMode to remain 'fallback_new_conversation', but got relabelled to %q", detAfter.ResumeMode)
+	}
+	if detAfter.SameConversationConfirmed {
+		t.Fatalf("expected SameConversationConfirmed to remain false on fallback job")
+	}
+}
+
+func TestEngine_PendingToExitNonZero_NotConfirmedSameConversation(t *testing.T) {
+	e := NewEngine(nil)
+	repoPath := "/home/romeo/work/meta-repo"
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+	p := e.PutPrompt(Prompt{ID: "prompt-1", Title: "Ready ASE prompt", Engine: "agy", Status: "READY"})
+
+	_, err := e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, "aad902c8-bda6-44c7-8a68-c468a1562399")
+	if err != nil {
+		t.Fatalf("ExecutePromptWithResume failed: %v", err)
+	}
+	job1, _, _, _ := e.PollHost("mac-mini")
+	_ = e.PostExit(job1.ID, 1, ExitOptions{Reason: "FAILED"})
+
+	resumeSch, err := e.ResumeRepoInPlace("mac-mini", repoPath, ResumeOptions{
+		JobID:       job1.ID,
+		ParentJobID: job1.ID,
+		AllowDirty:  true,
+	})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace failed: %v", err)
+	}
+	if resumeSch.ResumeMode != "pending" {
+		t.Fatalf("expected initial ResumeMode 'pending', got %q", resumeSch.ResumeMode)
+	}
+
+	job2, _, _, ok := e.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("poll job2 failed")
+	}
+
+	// Exit 1 without marker: must NOT confirm same_conversation (Finding B1)
+	_ = e.PostExit(job2.ID, 1, ExitOptions{Reason: "FAILED"})
+
+	det, _ := e.GetJob(job2.ID)
+	if det.ResumeMode != "same_conversation_unverified" {
+		t.Fatalf("expected non-zero exit ResumeMode 'same_conversation_unverified', got %q", det.ResumeMode)
+	}
+	if det.SameConversationConfirmed {
+		t.Fatalf("expected SameConversationConfirmed false on non-zero exit")
+	}
+	if det.AttachConfirmation != "unknown" {
+		t.Fatalf("expected AttachConfirmation 'unknown', got %q", det.AttachConfirmation)
+	}
+
+	// Verify history record also unverified
+	lastRow, _, _, found := e.FindHistoryRow(job2.ID)
+	if !found {
+		t.Fatal("expected history row for job2")
+	}
+	if lastRow.ResumeMode != "same_conversation_unverified" {
+		t.Fatalf("expected history ResumeMode 'same_conversation_unverified', got %q", lastRow.ResumeMode)
+	}
+	if lastRow.SameConversationConfirmed {
+		t.Fatalf("expected history SameConversationConfirmed false on non-zero exit")
+	}
+	if lastRow.AttachConfirmation != "unknown" {
+		t.Fatalf("expected history AttachConfirmation 'unknown', got %q", lastRow.AttachConfirmation)
+	}
+}
+
+func TestEngine_ResumeJob_SharedResolver_ParentHarnessAlias(t *testing.T) {
+	e := NewEngine(nil)
+	repoPath := "/home/romeo/work/meta-repo"
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+	p := e.PutPrompt(Prompt{ID: "prompt-harness-alias", Title: "Parent Harness Alias", Engine: "harness", Status: "READY"})
+
+	convID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	_, err := e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, convID)
+	if err != nil {
+		t.Fatalf("ExecutePromptWithResume failed: %v", err)
+	}
+	job1, _, _, _ := e.PollHost("mac-mini")
+	_ = e.PostExit(job1.ID, 1, ExitOptions{Reason: "FAILED"})
+
+	// ResumeJob from parent with Engine="harness" (Finding B4)
+	resumeSch, err := e.ResumeJob(job1.ID)
+	if err != nil {
+		t.Fatalf("ResumeJob failed: %v", err)
+	}
+	if resumeSch.Engine != "agy" {
+		t.Fatalf("expected canonical engine 'agy', got %q", resumeSch.Engine)
+	}
+	if resumeSch.ResumeMode != "pending" {
+		t.Fatalf("expected ResumeMode 'pending' (no false cross-engine fallback!), got %q", resumeSch.ResumeMode)
+	}
+	if resumeSch.ResumeConversationID != convID {
+		t.Fatalf("expected ResumeConversationID %q to be preserved, got %q", convID, resumeSch.ResumeConversationID)
+	}
+	if resumeSch.ResumeFallbackReason != "" {
+		t.Fatalf("expected empty ResumeFallbackReason, got %q", resumeSch.ResumeFallbackReason)
+	}
+}
+
+func TestEngine_ResumeJob_QuotaExhausted_SharedResolverFallback(t *testing.T) {
+	e := NewEngine(nil)
+	repoPath := "/home/romeo/work/meta-repo"
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+	p := e.PutPrompt(Prompt{ID: "prompt-quota-job", Title: "Quota Job Test", Engine: "agent", Status: "READY"})
+
+	_, err := e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, "cursor-123")
+	if err != nil {
+		t.Fatalf("ExecutePromptWithResume failed: %v", err)
+	}
+	job1, _, _, _ := e.PollHost("mac-mini")
+	_ = e.PostExit(job1.ID, 1, ExitOptions{DiagnosticCode: "QUOTA_EXHAUSTED", Reason: "QUOTA_EXHAUSTED"})
+
+	// ResumeJob from parent that had quota exhausted on agent (Finding B3)
+	resumeSch, err := e.ResumeJob(job1.ID)
+	if err != nil {
+		t.Fatalf("ResumeJob failed: %v", err)
+	}
+	if resumeSch.Engine != "agy" {
+		t.Fatalf("expected rewritten engine 'agy', got %q", resumeSch.Engine)
+	}
+	if resumeSch.ResumeMode != "fallback_new_conversation" {
+		t.Fatalf("expected ResumeMode 'fallback_new_conversation' after quota switch, got %q", resumeSch.ResumeMode)
+	}
+	if !strings.Contains(resumeSch.ResumeFallbackReason, "cross-engine") {
+		t.Fatalf("expected cross-engine fallback reason, got %q", resumeSch.ResumeFallbackReason)
+	}
+	if resumeSch.ResumeConversationID != "" {
+		t.Fatalf("expected empty ResumeConversationID for cross-engine, got %q", resumeSch.ResumeConversationID)
+	}
+}
+
+func TestEngine_ResumeJob_BodyOverrideIgnored(t *testing.T) {
+	e := NewEngine(nil)
+	repoPath := "/home/romeo/work/meta-repo"
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+	p := e.PutPrompt(Prompt{ID: "prompt-body-override", Title: "Body Override Test", Engine: "agy", Status: "READY"})
+
+	_, err := e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, "aad902c8-bda6-44c7-8a68-c468a1562399")
+	if err != nil {
+		t.Fatalf("ExecutePromptWithResume failed: %v", err)
+	}
+	job1, _, _, _ := e.PollHost("mac-mini")
+	_ = e.PostExit(job1.ID, 1, ExitOptions{Reason: "FAILED"})
+
+	// Client passes overrides to ResumeJob (Finding B3, C5)
+	resumeSch, err := e.ResumeJob(job1.ID, ResumeOptions{
+		ResumeMode:            "same_conversation",
+		ParentJobID:           "job-attacker-override",
+		RootJobID:             "job-attacker-root",
+		InitialConversationID: "00000000-0000-0000-0000-000000000000",
+		InterruptedASEState: map[string]any{
+			"step": "injected-step-payload",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ResumeJob failed: %v", err)
+	}
+	if resumeSch.ResumeMode != "pending" {
+		t.Fatalf("expected client-passed same_conversation to be ignored and remain 'pending', got %q", resumeSch.ResumeMode)
+	}
+	if resumeSch.ParentJobID != job1.ID {
+		t.Fatalf("expected ParentJobID to be %s, got %s", job1.ID, resumeSch.ParentJobID)
+	}
+	if resumeSch.InitialConversationID != "aad902c8-bda6-44c7-8a68-c468a1562399" {
+		t.Fatalf("expected InitialConversationID to be preserved from parent job, got %s", resumeSch.InitialConversationID)
+	}
+}
+
+func TestEngine_ResumeJob_HistoryFallbackPinsActiveInitialConversation(t *testing.T) {
+	e := NewEngine(nil)
+	repoPath := "/home/romeo/work/meta-repo"
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	initialID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	leakedID1 := "1d446877-5bf9-44eb-9db5-e1c007a9fe31"
+	leakedID2 := "14de9a1f-5679-4f11-a08f-f32bc7e47663"
+
+	// Seed history entry with multiple conversation IDs where job is no longer in e.jobs (C1)
+	key := repoKey("mac-mini", repoPath)
+	e.history[key] = append(e.history[key], HistoryRow{
+		JobID:                 "job-1311",
+		PromptTitle:           "Story STORY-GOV-3678 deterministic resume",
+		Engine:                "agy",
+		Status:                "FAILED",
+		Reason:                "HALTED_DIRTY",
+		InitialConversationID: initialID,
+		ActiveConversationID:  initialID,
+		ConversationIDs:       []string{initialID, leakedID1, leakedID2},
+		InterruptedASEState: map[string]any{
+			"phase": "IMPLEMENTATION",
+			"step":  2,
+		},
+	})
+
+	// Job is NOT in e.jobs
+	if _, ok := e.jobs["job-1311"]; ok {
+		t.Fatal("expected job-1311 to be absent from e.jobs")
+	}
+
+	// Resume job-1311 from history
+	sch, err := e.ResumeJob("job-1311")
+	if err != nil {
+		t.Fatalf("ResumeJob failed: %v", err)
+	}
+
+	// C1 Verification: must pin initialID, NOT leakedID2!
+	if sch.ResumeConversationID != initialID {
+		t.Fatalf("expected ResumeConversationID to be %s (active/initial), but got %s (leaked tertiary)", initialID, sch.ResumeConversationID)
+	}
+	if sch.InitialConversationID != initialID {
+		t.Fatalf("expected InitialConversationID to be %s, but got %s", initialID, sch.InitialConversationID)
+	}
+	if sch.ParentJobID != "job-1311" {
+		t.Fatalf("expected ParentJobID to be job-1311, but got %s", sch.ParentJobID)
+	}
+	if sch.InterruptedASEState["phase"] != "IMPLEMENTATION" {
+		t.Fatalf("expected phase IMPLEMENTATION, got %v", sch.InterruptedASEState["phase"])
+	}
+}
+
+func TestEngine_AddJobConversationWithOptions_EmptyParentDoesNotConfirmSameConversation(t *testing.T) {
+	e := NewEngine(nil)
+	repoPath := "/home/romeo/work/meta-repo"
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	// Parent job had NO registered conversation
+	jobParent := &Job{
+		ID:     "job-parent-empty",
+		HostID: "mac-mini",
+		Status: "FAILED",
+	}
+	e.jobs[jobParent.ID] = jobParent
+
+	// Resumed job starts pending with empty InitialConversationID
+	jobResume := &Job{
+		ID:          "job-resume-test",
+		ParentJobID: jobParent.ID,
+		HostID:      "mac-mini",
+		Status:      "RUNNING",
+		ResumeMode:  "pending",
+	}
+	e.jobs[jobResume.ID] = jobResume
+
+	newConvID := "1d446877-5bf9-44eb-9db5-e1c007a9fe31"
+	// First conversation reported without fallback flag
+	err := e.AddJobConversationWithOptions(jobResume.ID, newConvID, ConversationAttachOptions{Role: "initial_active"})
+	if err != nil {
+		t.Fatalf("AddJobConversationWithOptions failed: %v", err)
+	}
+
+	// Must NOT confirm same_conversation because parent had no initial conversation (Finding M1)
+	if jobResume.SameConversationConfirmed {
+		t.Fatalf("expected SameConversationConfirmed to be false when parent has no initial conversation, got true")
+	}
+	if jobResume.ResumeMode == "same_conversation" {
+		t.Fatalf("expected ResumeMode NOT to be same_conversation, got %q", jobResume.ResumeMode)
+	}
+}
+
+func TestEngine_AddJobConversationWithOptions_DifferingNonFallbackDoesNotConfirmSameConversation(t *testing.T) {
+	e := NewEngine(nil)
+	repoPath := "/home/romeo/work/meta-repo"
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	initialID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	jobResume := &Job{
+		ID:                    "job-resume-diff",
+		ParentJobID:           "job-parent-001",
+		InitialConversationID: initialID,
+		HostID:                "mac-mini",
+		Status:                "RUNNING",
+		ResumeMode:            "pending",
+	}
+	e.jobs[jobResume.ID] = jobResume
+
+	differingID := "99998888-7777-6666-5555-444433332222"
+	// Non-fallback report with a differing conversation ID
+	err := e.AddJobConversationWithOptions(jobResume.ID, differingID, ConversationAttachOptions{Role: "initial_active"})
+	if err != nil {
+		t.Fatalf("AddJobConversationWithOptions failed: %v", err)
+	}
+
+	// Must NOT confirm same_conversation because differingID != initialID (Finding M1, M2)
+	if jobResume.SameConversationConfirmed {
+		t.Fatalf("expected SameConversationConfirmed to be false when differing conversation reported without fallback, got true")
+	}
+	if jobResume.ResumeMode != "fallback_new_conversation" {
+		t.Fatalf("expected ResumeMode to be fallback_new_conversation, got %q", jobResume.ResumeMode)
+	}
+
+	// Now call PostExit(jobResume.ID, 0) - must remain fallback_new_conversation and NOT become same_conversation (Finding M2)
+	err = e.PostExit(jobResume.ID, 0)
+	if err != nil {
+		t.Fatalf("PostExit failed: %v", err)
+	}
+
+	if jobResume.SameConversationConfirmed {
+		t.Fatalf("expected SameConversationConfirmed to remain false after PostExit(0), got true")
+	}
+	if jobResume.ResumeMode != "fallback_new_conversation" {
+		t.Fatalf("expected ResumeMode to remain fallback_new_conversation after PostExit(0), got %q", jobResume.ResumeMode)
+	}
+}
+
+func TestEngine_PostExit_PendingWithoutMarker_MapsToUnverified(t *testing.T) {
+	e := NewEngine(nil)
+	repoPath := "/home/romeo/work/meta-repo"
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	initialID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	jobResume := &Job{
+		ID:                    "job-resume-unverified",
+		ParentJobID:           "job-parent-001",
+		InitialConversationID: initialID,
+		HostID:                "mac-mini",
+		Status:                "RUNNING",
+		ResumeMode:            "pending",
+	}
+	e.jobs[jobResume.ID] = jobResume
+
+	// No conversation attach marker ever reported. Process exits with code 0.
+	err := e.PostExit(jobResume.ID, 0)
+	if err != nil {
+		t.Fatalf("PostExit failed: %v", err)
+	}
+
+	// Finding M3: exit 0 without positive evidence MUST be mapped to same_conversation_unverified
+	if jobResume.SameConversationConfirmed {
+		t.Fatalf("expected SameConversationConfirmed to be false without positive attach evidence, got true")
+	}
+	if jobResume.ResumeMode != "same_conversation_unverified" {
+		t.Fatalf("expected ResumeMode to be same_conversation_unverified, got %q", jobResume.ResumeMode)
+	}
+	if jobResume.AttachConfirmation != "unverified" {
+		t.Fatalf("expected AttachConfirmation to be unverified, got %q", jobResume.AttachConfirmation)
+	}
+}
