@@ -507,7 +507,8 @@ func TestServer_ForceUpdateToolEndpoint(t *testing.T) {
 		t.Fatalf("expected error message to mention unknown tool, got: %s", rec12.Body.String())
 	}
 
-	// 13. Enqueue error returns 503 (N4-R)
+	// 13. Enqueue error returns 503 and leaves no residual desired state (N4-R, H3)
+	_ = e.ConsumePendingToolUpdate("mac-mini") // clear prior pending update from earlier subtest
 	failingQueue := &failingMockQueue{err: errors.New("simulated queue storage failure")}
 	srv.Queue = failingQueue
 	rec13 := httptest.NewRecorder()
@@ -518,6 +519,10 @@ func TestServer_ForceUpdateToolEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(rec13.Body.String(), "failed to enqueue tool update job") {
 		t.Fatalf("expected error message to mention failed to enqueue, got: %s", rec13.Body.String())
+	}
+	h13, ok := e.GetHostDetail("mac-mini")
+	if !ok || h13.Host.PendingToolUpdate != nil {
+		t.Fatalf("expected no residual desired state on enqueue failure (H3), got: %+v", h13.Host.PendingToolUpdate)
 	}
 
 	// 14. Unknown tool in multi-tool body returns 404 (R4)

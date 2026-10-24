@@ -1678,7 +1678,7 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 		p, _ = s.Engine.GetProfile("generic")
 	}
 
-	// Validate tool existence across all requested tools (F6, N4-R, R4)
+	// Validate tool existence across all requested tools (F6, N4-R, R4, H2)
 	if p != nil && len(p.Tools) > 0 {
 		for _, toolName := range body.Tools {
 			found := false
@@ -1790,7 +1790,10 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.Engine.QueueToolUpdate(hostID, body.Tools, body.Force, body.TargetVersion); err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "not found") {
+		if s.Queue != nil && jobID != "" {
+			_, _ = s.Queue.Cancel(r.Context(), jobID, fmt.Sprintf("failed to update host desired state: %v", err))
+		}
+		if errors.Is(err, control.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, err)
 		} else {
 			writeErr(w, http.StatusInternalServerError, err)
