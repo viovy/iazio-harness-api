@@ -1986,7 +1986,11 @@ func (s *Server) syncAllProfiles(w http.ResponseWriter, r *http.Request) {
 	if len(syncRes.Errors) > 0 {
 		resp["errors"] = syncRes.Errors
 	}
-	writeJSON(w, http.StatusOK, resp)
+	httpCode := http.StatusOK
+	if status == "error" {
+		httpCode = http.StatusBadGateway
+	}
+	writeJSON(w, httpCode, resp)
 }
 
 func (s *Server) pingAck(w http.ResponseWriter, r *http.Request) {
