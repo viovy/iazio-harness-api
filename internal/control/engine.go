@@ -2447,10 +2447,7 @@ func (e *Engine) SetSchedulePriority(scheduleID string, priority int) (Schedule,
 
 // GetAssociatedJobsForScheduleLocked finds all job IDs associated with a schedule's execution lineage.
 func (e *Engine) GetAssociatedJobsForScheduleLocked(schID string) []string {
-	sch, ok := e.schedules[schID]
-	if !ok {
-		return nil
-	}
+	sch := e.schedules[schID]
 	jobSet := make(map[string]bool)
 	var ordered []string
 
@@ -2461,24 +2458,26 @@ func (e *Engine) GetAssociatedJobsForScheduleLocked(schID string) []string {
 		}
 	}
 
-	for _, id := range sch.AssociatedJobs {
-		addJob(id)
-	}
-	if sch.RootJobID != "" {
-		addJob(sch.RootJobID)
-	}
-	if sch.ParentJobID != "" {
-		addJob(sch.ParentJobID)
+	if sch != nil {
+		for _, id := range sch.AssociatedJobs {
+			addJob(id)
+		}
+		if sch.RootJobID != "" {
+			addJob(sch.RootJobID)
+		}
+		if sch.ParentJobID != "" {
+			addJob(sch.ParentJobID)
+		}
 	}
 
 	for _, j := range e.jobs {
-		if j.ScheduleID == schID || (sch.RootJobID != "" && (j.RootJobID == sch.RootJobID || j.ID == sch.RootJobID)) || (sch.ParentJobID != "" && (j.ParentJobID == sch.ParentJobID || j.ID == sch.ParentJobID)) {
+		if j.ScheduleID == schID || (sch != nil && sch.RootJobID != "" && (j.RootJobID == sch.RootJobID || j.ID == sch.RootJobID)) || (sch != nil && sch.ParentJobID != "" && (j.ParentJobID == sch.ParentJobID || j.ID == sch.ParentJobID)) {
 			addJob(j.ID)
 		}
 	}
 	for _, rows := range e.history {
 		for _, r := range rows {
-			if r.ScheduleID == schID || (sch.RootJobID != "" && (r.RootJobID == sch.RootJobID || r.JobID == sch.RootJobID)) || (sch.ParentJobID != "" && (r.ParentJobID == sch.ParentJobID || r.JobID == sch.ParentJobID)) {
+			if r.ScheduleID == schID || (sch != nil && sch.RootJobID != "" && (r.RootJobID == sch.RootJobID || r.JobID == sch.RootJobID)) || (sch != nil && sch.ParentJobID != "" && (r.ParentJobID == sch.ParentJobID || r.JobID == sch.ParentJobID)) {
 				addJob(r.JobID)
 			}
 		}
@@ -2505,6 +2504,51 @@ func (e *Engine) GetAssociatedJobsForScheduleLocked(schID string) []string {
 			break
 		}
 	}
+
+	// Legacy fallback: correlate historical runs sharing the same prompt title, host, and repo
+	targetPrompt := ""
+	targetHost := ""
+	targetPath := ""
+	if sch != nil {
+		targetPrompt = sch.PromptTitle
+		targetHost = sch.HostID
+		targetPath = sch.WorktreePath
+	} else {
+		for key, rows := range e.history {
+			for _, r := range rows {
+				if jobSet[r.JobID] || r.ScheduleID == schID {
+					targetPrompt = r.PromptTitle
+					if idx := strings.Index(key, "\x00"); idx >= 0 {
+						targetHost, targetPath = key[:idx], key[idx+1:]
+					}
+					break
+				}
+			}
+			if targetPrompt != "" {
+				break
+			}
+		}
+	}
+
+	if targetPrompt != "" && targetHost != "" {
+		for key, rows := range e.history {
+			host, path := "", ""
+			if idx := strings.Index(key, "\x00"); idx >= 0 {
+				host, path = key[:idx], key[idx+1:]
+			}
+			if host == targetHost && (targetPath == "" || path == targetPath) {
+				for _, r := range rows {
+					if r.PromptTitle == targetPrompt {
+						addJob(r.JobID)
+					}
+				}
+			}
+		}
+	}
+
+	if ordered == nil {
+		return []string{}
+	}
 	return ordered
 }
 
@@ -2521,6 +2565,29 @@ func (e *Engine) GetSchedule(scheduleID string) (Schedule, bool) {
 	defer e.mu.Unlock()
 	sch, ok := e.schedules[scheduleID]
 	if !ok {
+		// Fallback to history records for persisted schedules
+		for key, rows := range e.history {
+			for _, r := range rows {
+				if r.ScheduleID == scheduleID {
+					host, path := "", ""
+					if idx := strings.Index(key, "\x00"); idx >= 0 {
+						host, path = key[:idx], key[idx+1:]
+					}
+					s := Schedule{
+						ID:           r.ScheduleID,
+						HostID:       host,
+						WorktreePath: path,
+						PromptTitle:  r.PromptTitle,
+						Engine:       r.Engine,
+						Status:       r.Status,
+						ParentJobID:  r.ParentJobID,
+						RootJobID:    r.RootJobID,
+					}
+					s.AssociatedJobs = e.GetAssociatedJobsForScheduleLocked(scheduleID)
+					return s, true
+				}
+			}
+		}
 		return Schedule{}, false
 	}
 	res := *sch

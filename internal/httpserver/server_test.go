@@ -2008,6 +2008,99 @@ func TestGetScheduleEndpointAndJobFallback(t *testing.T) {
 	}
 }
 
+func TestGetScheduleEndpoint_HistoricalFallbackAndLineage(t *testing.T) {
+	e := control.NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(control.Repo{HostID: "mac-mini", WorktreePath: "/work/fleet-repo-03"})
+
+	// Seed history with legacy runs (e.g. job-1311 and job-1313) where sch-1312 is not in e.schedules
+	e.SetHistory("mac-mini\x00/work/fleet-repo-03", []control.HistoryRow{
+		{
+			JobID:           "job-1311",
+			ScheduleID:      "sch-1310",
+			PromptTitle:     "autopilot update-all",
+			Engine:          "agy",
+			Status:          "execution_timeout",
+			ConversationIDs: []string{"aad902c8-bda6-44c7-8a68-c468a1562399"},
+		},
+		{
+			JobID:           "job-1313",
+			ScheduleID:      "sch-1312",
+			PromptTitle:     "autopilot update-all",
+			Engine:          "agy",
+			Status:          "execution_timeout",
+			ConversationIDs: []string{"1d446877-5bf9-44eb-9db5-e1c007a9fe31", "14de9a1f-5679-4f11-a08f-f32bc7e47663"},
+		},
+	})
+
+	s := &Server{Engine: e}
+	handler := s.Handler()
+
+	// 1. GET /v1/schedules/sch-1312 must return 200 OK via historical fallback
+	req := httptest.NewRequest(http.MethodGet, "/v1/schedules/sch-1312", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for historical schedule /v1/schedules/sch-1312, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var schedMap map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &schedMap); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+
+	if schedMap["id"] != "sch-1312" {
+		t.Errorf("expected schedule ID sch-1312, got %v", schedMap["id"])
+	}
+	if schedMap["host_id"] != "mac-mini" {
+		t.Errorf("expected host_id mac-mini, got %v", schedMap["host_id"])
+	}
+
+	// Verify associated_jobs contains both job-1311 and job-1313
+	assocJobs, ok := schedMap["associated_jobs"].([]any)
+	if !ok {
+		t.Fatalf("expected associated_jobs array, got %T: %v", schedMap["associated_jobs"], schedMap["associated_jobs"])
+	}
+	jobSet := make(map[string]bool)
+	for _, j := range assocJobs {
+		if s, ok := j.(string); ok {
+			jobSet[s] = true
+		}
+	}
+	if !jobSet["job-1311"] {
+		t.Errorf("expected associated_jobs to contain initial job-1311, got: %v", assocJobs)
+	}
+	if !jobSet["job-1313"] {
+		t.Errorf("expected associated_jobs to contain resume job-1313, got: %v", assocJobs)
+	}
+
+	// 2. GET /v1/schedules must list historical schedules sch-1310 and sch-1312
+	reqList := httptest.NewRequest(http.MethodGet, "/v1/schedules", nil)
+	rrList := httptest.NewRecorder()
+	handler.ServeHTTP(rrList, reqList)
+	if rrList.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /v1/schedules, got %d: %s", rrList.Code, rrList.Body.String())
+	}
+	var listResp struct {
+		Schedules []map[string]any `json:"schedules"`
+	}
+	if err := json.Unmarshal(rrList.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("unmarshal list error: %v", err)
+	}
+	schedIDs := make(map[string]bool)
+	for _, sc := range listResp.Schedules {
+		if id, ok := sc["id"].(string); ok {
+			schedIDs[id] = true
+		}
+	}
+	if !schedIDs["sch-1312"] {
+		t.Errorf("expected /v1/schedules to contain sch-1312, got: %+v", listResp.Schedules)
+	}
+	if !schedIDs["sch-1310"] {
+		t.Errorf("expected /v1/schedules to contain sch-1310, got: %+v", listResp.Schedules)
+	}
+}
+
 func TestGetProfileReleasesEndpoint_Graceful200OnToolErrors(t *testing.T) {
 	s := &Server{Engine: control.NewEngine(nil)}
 	handler := s.Handler()
