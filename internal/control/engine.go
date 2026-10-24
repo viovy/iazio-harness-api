@@ -2680,6 +2680,19 @@ func (e *Engine) AddJobConversationWithOptions(jobID, convID string, opts ...Con
 		}
 	}
 
+	if opt.Role == "dropped_unpinned" {
+		// Explicit dropped unpinned conversation: record in lineage only, NEVER mutate active or fallback state (F5)
+		job.ConversationLineage = append(job.ConversationLineage, ConversationLineage{
+			ConversationID: convID,
+			Role:           "dropped_unpinned",
+			AttachedAt:     e.now(),
+			CLIArgs:        cliArgs,
+			ASEPhase:       opt.ASEPhase,
+			Reason:         fmt.Sprintf("ignored unpinned tertiary conversation %s; active is %s", convID, job.ActiveConversationID),
+		})
+		return nil
+	}
+
 	if opt.Fallback {
 		// Guard against duplicate fallback posts for the same fallback ID (F6)
 		if job.ActiveConversationID == convID && job.ResumeMode == "fallback_new_conversation" {
@@ -2700,6 +2713,13 @@ func (e *Engine) AddJobConversationWithOptions(jobID, convID string, opts ...Con
 
 		// Explicit fallback from initial conversation failure
 		job.ActiveConversationID = convID
+		if job.ScheduleID != "" {
+			if sch, ok := e.schedules[job.ScheduleID]; ok && sch != nil {
+				if repo, ok := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; ok && repo != nil {
+					repo.DetectedConversationID = job.ActiveConversationID
+				}
+			}
+		}
 		job.ResumeMode = "fallback_new_conversation"
 		if opt.FallbackReason != "" {
 			job.ResumeFallbackReason = opt.FallbackReason
@@ -2730,6 +2750,13 @@ func (e *Engine) AddJobConversationWithOptions(jobID, convID string, opts ...Con
 			job.ActiveConversationID = convID
 			if job.InitialConversationID == "" {
 				job.InitialConversationID = convID
+			}
+			if job.ScheduleID != "" {
+				if sch, ok := e.schedules[job.ScheduleID]; ok && sch != nil {
+					if repo, ok := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; ok && repo != nil {
+						repo.DetectedConversationID = job.ActiveConversationID
+					}
+				}
 			}
 			job.ConversationLineage = append(job.ConversationLineage, ConversationLineage{
 				ConversationID: convID,
@@ -3056,6 +3083,7 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		parentJobID = opt.JobID
 	}
 	rootJobID := opt.RootJobID
+	initConvID := opt.InitialConversationID
 	var interruptedState map[string]any
 
 	if parentJobID != "" {
@@ -3069,15 +3097,22 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 					rootJobID = pj.ID
 				}
 			}
-			if resumeConvID == "" {
-				if pj.InitialConversationID != "" {
-					resumeConvID = pj.InitialConversationID
-				} else if pj.ActiveConversationID != "" {
+			if opt.ConversationID == "" {
+				if pj.ActiveConversationID != "" {
 					resumeConvID = pj.ActiveConversationID
 				} else if pj.ResumeConversationID != "" {
 					resumeConvID = pj.ResumeConversationID
+				} else if pj.InitialConversationID != "" {
+					resumeConvID = pj.InitialConversationID
 				} else if len(pj.ConversationIDs) > 0 {
 					resumeConvID = pj.ConversationIDs[len(pj.ConversationIDs)-1]
+				}
+			}
+			if initConvID == "" {
+				if pj.InitialConversationID != "" {
+					initConvID = pj.InitialConversationID
+				} else {
+					initConvID = resumeConvID
 				}
 			}
 			var ps *Schedule
@@ -3118,13 +3153,20 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 								rootJobID = r.JobID
 							}
 						}
-						if resumeConvID == "" {
-							if r.InitialConversationID != "" {
-								resumeConvID = r.InitialConversationID
-							} else if r.ActiveConversationID != "" {
+						if opt.ConversationID == "" {
+							if r.ActiveConversationID != "" {
 								resumeConvID = r.ActiveConversationID
+							} else if r.InitialConversationID != "" {
+								resumeConvID = r.InitialConversationID
 							} else if len(r.ConversationIDs) > 0 {
 								resumeConvID = r.ConversationIDs[len(r.ConversationIDs)-1]
+							}
+						}
+						if initConvID == "" {
+							if r.InitialConversationID != "" {
+								initConvID = r.InitialConversationID
+							} else {
+								initConvID = resumeConvID
 							}
 						}
 						if engineName == "" && r.Engine != "" {
@@ -3150,30 +3192,83 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 	if rootJobID == "" && parentJobID != "" {
 		rootJobID = parentJobID
 	}
-	initConvID := opt.InitialConversationID
 	if initConvID == "" {
 		initConvID = resumeConvID
 	}
 	if interruptedState == nil {
 		interruptedState = map[string]any{
 			"story_id": targetStoryID,
-			"phase":    repo.ASEState,
 		}
-		if opt.InterruptedASEState != nil {
-			for k, v := range opt.InterruptedASEState {
-				interruptedState[k] = v
-			}
+	}
+	if interruptedState["story_id"] == nil || interruptedState["story_id"] == "" {
+		interruptedState["story_id"] = targetStoryID
+	}
+	if interruptedState["phase"] == nil || interruptedState["phase"] == "" {
+		if repo.ASEState != "" {
+			interruptedState["phase"] = repo.ASEState
+		} else if repo.Reason == "HALTED_DIRTY" {
+			interruptedState["phase"] = "IMPLEMENTATION"
+		} else {
+			interruptedState["phase"] = "SPECIFICATION"
+		}
+	}
+	if interruptedState["step"] == nil {
+		switch interruptedState["phase"] {
+		case "IMPLEMENTATION":
+			interruptedState["step"] = 2
+		case "VERIFICATION":
+			interruptedState["step"] = 3
+		case "QUALITY_GATE":
+			interruptedState["step"] = 4
+		case "RELEASE":
+			interruptedState["step"] = 5
+		default:
+			interruptedState["step"] = 1
+		}
+	}
+	if opt.InterruptedASEState != nil {
+		for k, v := range opt.InterruptedASEState {
+			interruptedState[k] = v
 		}
 	}
 
-	var associatedJobs []string
-	if rootJobID != "" && rootJobID != parentJobID {
-		associatedJobs = []string{rootJobID, parentJobID}
-	} else if parentJobID != "" {
-		associatedJobs = []string{parentJobID}
+	var execChain []string
+	execAttempt := 1
+	if parentJobID != "" {
+		if pj, ok := e.jobs[parentJobID]; ok {
+			if len(pj.ExecutionChain) > 0 {
+				execChain = append([]string(nil), pj.ExecutionChain...)
+			}
+			if pj.ExecutionAttempt > 0 {
+				execAttempt = pj.ExecutionAttempt + 1
+			}
+		} else {
+			for _, rows := range e.history {
+				for _, r := range rows {
+					if r.JobID == parentJobID {
+						if len(r.ExecutionChain) > 0 {
+							execChain = append([]string(nil), r.ExecutionChain...)
+						}
+						if r.ExecutionAttempt > 0 {
+							execAttempt = r.ExecutionAttempt + 1
+						}
+						break
+					}
+				}
+			}
+		}
 	}
-	execAttempt := len(associatedJobs) + 1
-	execChain := append([]string(nil), associatedJobs...)
+	if len(execChain) == 0 {
+		if rootJobID != "" && rootJobID != parentJobID {
+			execChain = []string{rootJobID, parentJobID}
+		} else if parentJobID != "" {
+			execChain = []string{parentJobID}
+		}
+	}
+	if execAttempt <= 1 && len(execChain) > 0 {
+		execAttempt = len(execChain) + 1
+	}
+	associatedJobs := append([]string(nil), execChain...)
 
 	newSch := &Schedule{
 		ID:                    schID,
@@ -3200,7 +3295,7 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		ExecutionAttempt:      execAttempt,
 		ExecutionChain:        execChain,
 		InitialConversationID: initConvID,
-		ActiveConversationID:  initConvID,
+		ActiveConversationID:  resumeConvID,
 		ResumeMode:            "same_conversation",
 		InterruptedASEState:   interruptedState,
 	}
@@ -3288,14 +3383,20 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 		return Schedule{}, ErrNotFound
 	}
 
-	// Capture latest conversation ID if available.
-	resumeConvID := job.ResumeConversationID
-	if opt.ConversationID != "" {
-		resumeConvID = opt.ConversationID
-	} else if len(job.ConversationIDs) > 0 {
-		resumeConvID = job.ConversationIDs[len(job.ConversationIDs)-1]
-	} else if origSch.ResumeConversationID != "" {
-		resumeConvID = origSch.ResumeConversationID
+	// Capture latest conversation ID if available (prefer active pinned conversation - F3).
+	resumeConvID := opt.ConversationID
+	if resumeConvID == "" {
+		if job.ActiveConversationID != "" {
+			resumeConvID = job.ActiveConversationID
+		} else if job.ResumeConversationID != "" {
+			resumeConvID = job.ResumeConversationID
+		} else if len(job.ConversationIDs) > 0 {
+			resumeConvID = job.ConversationIDs[len(job.ConversationIDs)-1]
+		} else if origSch.ActiveConversationID != "" {
+			resumeConvID = origSch.ActiveConversationID
+		} else if origSch.ResumeConversationID != "" {
+			resumeConvID = origSch.ResumeConversationID
+		}
 	}
 
 	targetStoryID := opt.StoryID
@@ -3413,6 +3514,23 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 			interruptedState[k] = v
 		}
 	}
+	if interruptedState["phase"] == nil || interruptedState["phase"] == "" {
+		interruptedState["phase"] = "IMPLEMENTATION"
+	}
+	if interruptedState["step"] == nil {
+		switch interruptedState["phase"] {
+		case "IMPLEMENTATION":
+			interruptedState["step"] = 2
+		case "VERIFICATION":
+			interruptedState["step"] = 3
+		case "QUALITY_GATE":
+			interruptedState["step"] = 4
+		case "RELEASE":
+			interruptedState["step"] = 5
+		default:
+			interruptedState["step"] = 1
+		}
+	}
 
 	var associatedJobs []string
 	if len(job.ExecutionChain) > 0 {
@@ -3422,7 +3540,10 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 	} else if parentJobID != "" {
 		associatedJobs = []string{parentJobID}
 	}
-	execAttempt := len(associatedJobs) + 1
+	execAttempt := job.ExecutionAttempt + 1
+	if execAttempt <= 1 && len(associatedJobs) > 0 {
+		execAttempt = len(associatedJobs) + 1
+	}
 	execChain := append([]string(nil), associatedJobs...)
 
 	// Create new schedule to resume execution with KindResume.
@@ -3454,7 +3575,7 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 		ExecutionAttempt:      execAttempt,
 		ExecutionChain:        execChain,
 		InitialConversationID: initConvID,
-		ActiveConversationID:  initConvID,
+		ActiveConversationID:  resumeConvID,
 		ResumeMode:            "same_conversation",
 		InterruptedASEState:   interruptedState,
 	}

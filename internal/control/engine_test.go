@@ -3022,3 +3022,140 @@ func TestEngine_DeterministicResumeConversationPinning_ControlledFallback(t *tes
 		t.Fatalf("active conversation shifted unexpectedly to %s", detAfter.ActiveConversationID)
 	}
 }
+
+func TestEngine_MultiHopChainResume_LineageAndAttempt(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	repoPath := "/Users/romeo/work/meta-repo-03"
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	initialConvID := "conv-hop-1-init"
+	fallbackConvID := "conv-hop-2-fallback"
+
+	p := e.PutPrompt(Prompt{
+		ID:     "prompt-hop-1",
+		Title:  "Multi-Hop Resume",
+		Engine: "agy",
+		Status: "READY",
+	})
+
+	// Job 1: Initial Run
+	_, err := e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, initialConvID)
+	if err != nil {
+		t.Fatalf("ExecutePromptWithResume failed: %v", err)
+	}
+	job1, _, _, ok := e.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("poll job1 failed")
+	}
+	_ = e.PostExit(job1.ID, 1, ExitOptions{Reason: "HALTED_DIRTY"})
+
+	// Job 2: First resume -> falls back to conversation B
+	sch2, err := e.ResumeRepoInPlace("mac-mini", repoPath, ResumeOptions{
+		JobID:       job1.ID,
+		ParentJobID: job1.ID,
+		AllowDirty:  true,
+	})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace job2 failed: %v", err)
+	}
+	job2, _, _, ok := e.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("poll job2 failed")
+	}
+	if sch2.ExecutionAttempt != 2 {
+		t.Fatalf("expected attempt 2 for job2, got %d", sch2.ExecutionAttempt)
+	}
+	// Simulate fallback on job2
+	_ = e.AddJobConversationWithOptions(job2.ID, fallbackConvID, ConversationAttachOptions{
+		Fallback:       true,
+		FallbackReason: "initial session corrupted",
+		Role:           "fallback_primary",
+		CLIArgs:        "--conversation=" + fallbackConvID,
+		ASEPhase:       "FALLBACK_START",
+	})
+	_ = e.PostExit(job2.ID, 1, ExitOptions{Reason: "HALTED_DIRTY"})
+
+	// Job 3: Second resume -> MUST resume conversation B (ActiveConversationID of Job 2) (F3)
+	sch3, err := e.ResumeRepoInPlace("mac-mini", repoPath, ResumeOptions{
+		JobID:       job2.ID,
+		ParentJobID: job2.ID,
+		AllowDirty:  true,
+	})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace job3 failed: %v", err)
+	}
+	if sch3.ResumeConversationID != fallbackConvID {
+		t.Fatalf("Job 3 ResumeConversationID want %s, got %s", fallbackConvID, sch3.ResumeConversationID)
+	}
+	if sch3.ActiveConversationID != fallbackConvID {
+		t.Fatalf("Job 3 ActiveConversationID want %s, got %s", fallbackConvID, sch3.ActiveConversationID)
+	}
+	if sch3.InitialConversationID != initialConvID {
+		t.Fatalf("Job 3 InitialConversationID want %s, got %s", initialConvID, sch3.InitialConversationID)
+	}
+	// Verify attempt is 3 and chain contains job1 and job2 (F8)
+	if sch3.ExecutionAttempt != 3 {
+		t.Fatalf("Job 3 ExecutionAttempt want 3, got %d", sch3.ExecutionAttempt)
+	}
+	if len(sch3.ExecutionChain) != 2 || sch3.ExecutionChain[0] != job1.ID || sch3.ExecutionChain[1] != job2.ID {
+		t.Fatalf("Job 3 ExecutionChain want [%s, %s], got %v", job1.ID, job2.ID, sch3.ExecutionChain)
+	}
+	if len(sch3.AssociatedJobs) != 2 || sch3.AssociatedJobs[0] != job1.ID || sch3.AssociatedJobs[1] != job2.ID {
+		t.Fatalf("Job 3 AssociatedJobs want [%s, %s], got %v", job1.ID, job2.ID, sch3.AssociatedJobs)
+	}
+}
+
+func TestEngine_DroppedUnpinnedLineageOnly_NoMutation(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	repoPath := "/Users/romeo/work/meta-repo-03"
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	initialConvID := "conv-active-pinned"
+	p := e.PutPrompt(Prompt{
+		ID:     "prompt-f5",
+		Title:  "F5 Test",
+		Engine: "agy",
+		Status: "READY",
+	})
+	_, _ = e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, initialConvID)
+	job, _, _, ok := e.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("poll failed")
+	}
+
+	// Post dropped_unpinned out-of-order
+	err := e.AddJobConversationWithOptions(job.ID, "conv-unpinned-garbage", ConversationAttachOptions{
+		Role:     "dropped_unpinned",
+		CLIArgs:  "--conversation=conv-unpinned-garbage",
+		ASEPhase: "STEP_X",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error adding dropped_unpinned: %v", err)
+	}
+
+	det, _ := e.GetJob(job.ID)
+	if det.ActiveConversationID != initialConvID {
+		t.Fatalf("ActiveConversationID mutated! got %s want %s", det.ActiveConversationID, initialConvID)
+	}
+	if det.ResumeMode == "fallback_new_conversation" {
+		t.Fatalf("ResumeMode unexpectedly mutated to fallback_new_conversation")
+	}
+	if len(det.ConversationIDs) != 1 || det.ConversationIDs[0] != initialConvID {
+		t.Fatalf("ConversationIDs corrupted! got %v", det.ConversationIDs)
+	}
+	if len(det.ConversationLineage) != 2 || det.ConversationLineage[1].Role != "dropped_unpinned" {
+		t.Fatalf("ConversationLineage missing dropped_unpinned! got %v", det.ConversationLineage)
+	}
+}
