@@ -503,8 +503,9 @@ type RepoRequest struct {
 
 // PendingToolUpdate describes an update command queued for an agent host.
 type PendingToolUpdate struct {
-	Tools []string `json:"tools,omitempty"`
-	Force bool     `json:"force,omitempty"`
+	Tools         []string `json:"tools,omitempty"`
+	Force         bool     `json:"force,omitempty"`
+	TargetVersion string   `json:"target_version,omitempty"`
 }
 
 // CommandEnvelope represents a command sent from the control plane to an agent.

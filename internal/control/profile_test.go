@@ -184,3 +184,49 @@ func TestScanRepoProfile_Validation(t *testing.T) {
 		t.Error("expected error for missing metadata.yml")
 	}
 }
+
+func TestProfileTool_IsTrackingLatest_OptionalTier(t *testing.T) {
+	// F7: ProfileTool with tier: optional in default profile must auto-track latest
+	toolOptional := ProfileTool{
+		Name:          "iazio-mcp",
+		Repository:    "viovy/iazio-mcp",
+		BinaryName:    "iazio-mcp",
+		TargetVersion: "0.0.42",
+		Tier:          "optional",
+	}
+
+	if !toolOptional.IsTrackingLatest(true) {
+		t.Errorf("expected optional tier tool in default profile to track latest, got false")
+	}
+
+	// In non-default profile with pinned version, it should not track latest unless explicit
+	if toolOptional.IsTrackingLatest(false) {
+		t.Errorf("expected optional tier tool in non-default profile with pinned version not to track latest, got true")
+	}
+
+	// Explicit false must always be honored
+	explicitFalse := ProfileTool{
+		Name:          "iazio-mcp",
+		Repository:    "viovy/iazio-mcp",
+		BinaryName:    "iazio-mcp",
+		TargetVersion: "0.0.42",
+		Tier:          "optional",
+		TrackLatest:   BoolPtr(false),
+	}
+	if explicitFalse.IsTrackingLatest(true) {
+		t.Errorf("expected explicit TrackLatest=false to be honored even in default profile, got true")
+	}
+
+	// Explicit true must always be honored
+	explicitTrue := ProfileTool{
+		Name:          "iazio-mcp",
+		Repository:    "viovy/iazio-mcp",
+		BinaryName:    "iazio-mcp",
+		TargetVersion: "0.0.42",
+		Tier:          "optional",
+		TrackLatest:   BoolPtr(true),
+	}
+	if !explicitTrue.IsTrackingLatest(false) {
+		t.Errorf("expected explicit TrackLatest=true to be honored in non-default profile, got false")
+	}
+}

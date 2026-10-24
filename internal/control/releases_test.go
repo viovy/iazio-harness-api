@@ -1735,3 +1735,106 @@ func TestReleaseService_BackoffNeverShortened(t *testing.T) {
 		t.Fatalf("expected global rate limit not to be shortened by smaller Retry-After (E7)")
 	}
 }
+
+func TestReleaseService_SyncProfile_LegacyPinMigration(t *testing.T) {
+	// H4, A1: Verify that a legacy pinned optional-tier tool in the default profile
+	// is migrated to TrackLatest=true and its TargetVersion is auto-advanced to upstream latest,
+	// while a legacy pinned tool in a custom profile preserves its pin and TrackLatest remains nil.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tag_name": "v2.0.0",
+			"html_url": "https://github.com/viovy/opt-tool/releases/tag/v2.0.0",
+		})
+	}))
+	defer ts.Close()
+
+	svc := NewReleaseService()
+	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
+
+	e := NewEngine(time.Now)
+
+	// 1. Register default profile "generic" with legacy pinned optional tool (TrackLatest == nil)
+	_, err := e.UpsertProfile(DistributionProfile{
+		Name:      "generic",
+		IsDefault: true,
+		Tools: []ProfileTool{
+			{
+				Name:          "opt-tool",
+				Repository:    "viovy/opt-tool",
+				BinaryName:    "opt-tool",
+				TargetVersion: "1.0.0",
+				Tier:          "optional",
+				TrackLatest:   nil, // legacy un-migrated row
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to upsert generic profile: %v", err)
+	}
+
+	// 2. Register custom non-default profile with same legacy pinned optional tool
+	_, err = e.UpsertProfile(DistributionProfile{
+		Name:      "custom-env",
+		IsDefault: false,
+		Tools: []ProfileTool{
+			{
+				Name:          "opt-tool",
+				Repository:    "viovy/opt-tool",
+				BinaryName:    "opt-tool",
+				TargetVersion: "1.0.0",
+				Tier:          "optional",
+				TrackLatest:   nil, // legacy pin in custom profile
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to upsert custom-env profile: %v", err)
+	}
+
+	// 3. Sync default profile
+	n, err := svc.SyncProfile(context.Background(), e, "generic", nil)
+	if err != nil {
+		t.Fatalf("unexpected error syncing generic profile: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 tool auto-advanced in default profile, got %d", n)
+	}
+
+	pGen, err := e.GetProfile("generic")
+	if err != nil {
+		t.Fatalf("failed to get generic profile: %v", err)
+	}
+	if len(pGen.Tools) != 1 {
+		t.Fatalf("expected 1 tool in generic profile, got %d", len(pGen.Tools))
+	}
+	toolGen := pGen.Tools[0]
+	if toolGen.TargetVersion != "2.0.0" {
+		t.Fatalf("expected default profile tool TargetVersion to advance to 2.0.0, got %s", toolGen.TargetVersion)
+	}
+	if toolGen.TrackLatest == nil || !*toolGen.TrackLatest {
+		t.Fatalf("expected default profile tool TrackLatest to be migrated to true, got %v", toolGen.TrackLatest)
+	}
+
+	// 4. Sync custom profile
+	nCustom, err := svc.SyncProfile(context.Background(), e, "custom-env", nil)
+	if err != nil {
+		t.Fatalf("unexpected error syncing custom profile: %v", err)
+	}
+	if nCustom != 0 {
+		t.Fatalf("expected 0 tools auto-advanced in custom profile, got %d", nCustom)
+	}
+
+	pCust, err := e.GetProfile("custom-env")
+	if err != nil {
+		t.Fatalf("failed to get custom-env profile: %v", err)
+	}
+	toolCust := pCust.Tools[0]
+	if toolCust.TargetVersion != "1.0.0" {
+		t.Fatalf("expected custom profile tool TargetVersion to remain pinned at 1.0.0, got %s", toolCust.TargetVersion)
+	}
+	if toolCust.TrackLatest != nil {
+		t.Fatalf("expected custom profile tool TrackLatest to remain nil, got %v", toolCust.TrackLatest)
+	}
+}

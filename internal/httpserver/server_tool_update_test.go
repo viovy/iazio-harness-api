@@ -2,7 +2,9 @@ package httpserver
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-harness-api/internal/control"
+	"github.com/viovy/iazio-harness-api/internal/dispatch"
 )
 
 func TestServer_ToolUpdateAndReleases(t *testing.T) {
@@ -301,4 +304,245 @@ func TestServer_NotificationsAndToolUpdateQueue(t *testing.T) {
 	if recPostNotif.Code != http.StatusCreated {
 		t.Fatalf("expected 201 on POST /v1/notifications, got %d: %s", recPostNotif.Code, recPostNotif.Body.String())
 	}
+}
+
+func TestServer_ForceUpdateToolEndpoint(t *testing.T) {
+	e := control.NewEngine(time.Now)
+	srv := &Server{Engine: e}
+	handler := srv.Handler()
+
+	// Register host and seed generic profile with a tool
+	e.RegisterHost("mac-mini", "desktop", "generic")
+	_, _ = e.UpsertProfile(control.DistributionProfile{
+		Name:      "generic",
+		IsDefault: true,
+		Tools: []control.ProfileTool{
+			{
+				Name:                   "autopilot-plugins-internal",
+				Repository:             "viovy/autopilot-plugins-internal",
+				BinaryName:             "autopilot",
+				TargetVersion:          "0.0.492",
+				LatestAvailableVersion: "0.0.492",
+				Tier:                   "baseline",
+			},
+		},
+	})
+
+	// 1. POST /api/agents/mac-mini/tools/autopilot-plugins-internal/force-update with explicit target_version
+	rec1 := httptest.NewRecorder()
+	body1 := `{"target_version":"0.0.492"}`
+	req1 := httptest.NewRequest("POST", "/api/agents/mac-mini/tools/autopilot-plugins-internal/force-update", bytes.NewReader([]byte(body1)))
+	handler.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("expected 200 from force-update, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+	var res1 map[string]any
+	if err := json.Unmarshal(rec1.Body.Bytes(), &res1); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if res1["status"] != "queued" || res1["target_version"] != "0.0.492" {
+		t.Fatalf("unexpected force update response: %v", res1)
+	}
+
+	// Verify pending tool update on host
+	pending := e.ConsumePendingToolUpdate("mac-mini")
+	if pending == nil {
+		t.Fatal("expected pending tool update on host")
+	}
+	if !pending.Force || len(pending.Tools) != 1 || pending.Tools[0] != "autopilot-plugins-internal" || pending.TargetVersion != "0.0.492" {
+		t.Fatalf("unexpected pending tool update: %+v", pending)
+	}
+
+	// 2. POST /api/v1/agents/mac-mini/tools/autopilot-plugins-internal/force-update without body, resolving from profile
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest("POST", "/api/v1/agents/mac-mini/tools/autopilot-plugins-internal/force-update", nil)
+	handler.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected 200 from profile-resolved force-update, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	var res2 map[string]any
+	if err := json.Unmarshal(rec2.Body.Bytes(), &res2); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if res2["target_version"] != "0.0.492" {
+		t.Fatalf("expected profile-resolved target_version 0.0.492, got %v", res2["target_version"])
+	}
+
+	// 3. POST /v1/fleet/agents/mac-mini/tools/autopilot-plugins-internal/force-update with s.Queue populated (F7, N4)
+	e.Releases.SetCachedRelease("viovy/autopilot-plugins-internal", "0.0.493", control.ToolRelease{
+		Name:          "autopilot-plugins-internal",
+		Repository:    "viovy/autopilot-plugins-internal",
+		LatestVersion: "0.0.493",
+	}, time.Hour)
+	q := dispatch.NewInMemoryQueue()
+	srv.Queue = q
+	rec3 := httptest.NewRecorder()
+	req3 := httptest.NewRequest("POST", "/v1/fleet/agents/mac-mini/tools/autopilot-plugins-internal/force-update", bytes.NewReader([]byte(`{"target_version":"0.0.493"}`)))
+	handler.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("expected 200 from fleet force-update route, got %d: %s", rec3.Code, rec3.Body.String())
+	}
+	var res3 map[string]any
+	if err := json.Unmarshal(rec3.Body.Bytes(), &res3); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	jobID, ok := res3["job_id"].(string)
+	if !ok || jobID == "" {
+		t.Fatalf("expected job_id returned in response when Queue is present, got %v", res3)
+	}
+	job, ok := q.Get(jobID)
+	if !ok || job == nil {
+		t.Fatalf("expected enqueued job %s in queue, found=%v", jobID, ok)
+	}
+	if job.Type != "agent.tools.update" || job.TargetHost != "mac-mini" {
+		t.Fatalf("unexpected job properties: %+v", job)
+	}
+	var payloadMap map[string]any
+	if err := json.Unmarshal(job.Payload, &payloadMap); err != nil {
+		t.Fatalf("failed to unmarshal job payload: %v", err)
+	}
+	if payloadMap["target_version"] != "0.0.493" {
+		t.Fatalf("expected target_version 0.0.493 in job payload, got %v", payloadMap["target_version"])
+	}
+
+	// 4. Unknown host must return 404 (F6, F7)
+	rec4 := httptest.NewRecorder()
+	req4 := httptest.NewRequest("POST", "/api/agents/unknown-host/tools/autopilot-plugins-internal/force-update", nil)
+	handler.ServeHTTP(rec4, req4)
+	if rec4.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown host, got %d: %s", rec4.Code, rec4.Body.String())
+	}
+
+	// 5. Unknown tool must return 404 (F6, F7)
+	rec5 := httptest.NewRecorder()
+	req5 := httptest.NewRequest("POST", "/api/agents/mac-mini/tools/unknown-tool/force-update", nil)
+	handler.ServeHTTP(rec5, req5)
+	if rec5.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown tool, got %d: %s", rec5.Code, rec5.Body.String())
+	}
+
+	// 6. Multiple tools with target_version must return 400 (F2, F7)
+	rec6 := httptest.NewRecorder()
+	req6 := httptest.NewRequest("POST", "/v1/hosts/mac-mini/tools/update", bytes.NewReader([]byte(`{"tools":["toolA","toolB"],"target_version":"1.0.0"}`)))
+	handler.ServeHTTP(rec6, req6)
+	if rec6.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when target_version is provided with multiple tools, got %d: %s", rec6.Code, rec6.Body.String())
+	}
+
+	// 7. Malformed JSON body must return 400 (F6, F7)
+	rec7 := httptest.NewRecorder()
+	req7 := httptest.NewRequest("POST", "/api/agents/mac-mini/tools/autopilot-plugins-internal/force-update", bytes.NewReader([]byte(`{not valid json`)))
+	handler.ServeHTTP(rec7, req7)
+	if rec7.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for malformed json body, got %d: %s", rec7.Code, rec7.Body.String())
+	}
+
+	// 8. Non-generic host profile resolution (R2, R6)
+	e.RegisterHost("edge-runner", "edge", "edge-profile")
+	_, _ = e.UpsertProfile(control.DistributionProfile{
+		Name: "edge-profile",
+		Tools: []control.ProfileTool{
+			{
+				Name:                   "autopilot-plugins-internal",
+				Repository:             "viovy/autopilot-plugins-internal",
+				BinaryName:             "autopilot",
+				TargetVersion:          "0.0.999",
+				LatestAvailableVersion: "0.0.999",
+				Tier:                   "baseline",
+			},
+		},
+	})
+	rec8 := httptest.NewRecorder()
+	req8 := httptest.NewRequest("POST", "/api/agents/edge-runner/tools/autopilot-plugins-internal/force-update", nil)
+	handler.ServeHTTP(rec8, req8)
+	if rec8.Code != http.StatusOK {
+		t.Fatalf("expected 200 for edge-runner force update, got %d: %s", rec8.Code, rec8.Body.String())
+	}
+	var res8 map[string]any
+	_ = json.Unmarshal(rec8.Body.Bytes(), &res8)
+	if res8["target_version"] != "0.0.999" {
+		t.Fatalf("expected target_version 0.0.999 from edge-profile, got %v", res8["target_version"])
+	}
+
+	// 9. Standard /update route is unforced unless specified (R3)
+	rec9 := httptest.NewRecorder()
+	req9 := httptest.NewRequest("POST", "/v1/hosts/mac-mini/tools/autopilot-plugins-internal/update", bytes.NewReader([]byte(`{}`)))
+	handler.ServeHTTP(rec9, req9)
+	if rec9.Code != http.StatusOK {
+		t.Fatalf("expected 200 on /update route, got %d: %s", rec9.Code, rec9.Body.String())
+	}
+	var res9 map[string]any
+	_ = json.Unmarshal(rec9.Body.Bytes(), &res9)
+	if res9["force"] != false {
+		t.Fatalf("expected force=false for standard /update route (R3), got %v", res9["force"])
+	}
+
+	// 10. Invalid target_version returns 422 (R2)
+	rec10 := httptest.NewRecorder()
+	req10 := httptest.NewRequest("POST", "/api/agents/mac-mini/tools/autopilot-plugins-internal/force-update", bytes.NewReader([]byte(`{"target_version":"invalid version with spaces"}`)))
+	handler.ServeHTTP(rec10, req10)
+	if rec10.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for invalid target_version, got %d: %s", rec10.Code, rec10.Body.String())
+	}
+
+	// 11. Unknown target_version returns 422 (N4)
+	rec11 := httptest.NewRecorder()
+	req11 := httptest.NewRequest("POST", "/api/agents/mac-mini/tools/autopilot-plugins-internal/force-update", bytes.NewReader([]byte(`{"target_version":"9.9.9"}`)))
+	handler.ServeHTTP(rec11, req11)
+	if rec11.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for unknown target_version (N4), got %d: %s", rec11.Code, rec11.Body.String())
+	}
+	if !strings.Contains(rec11.Body.String(), "unknown target_version") {
+		t.Fatalf("expected error message to mention unknown target_version, got: %s", rec11.Body.String())
+	}
+
+	// 12. Unknown tool on body-only path returns 404 (N4-R)
+	rec12 := httptest.NewRecorder()
+	req12 := httptest.NewRequest("POST", "/v1/hosts/mac-mini/tools/update", bytes.NewReader([]byte(`{"tools":["nonexistent-tool"]}`)))
+	handler.ServeHTTP(rec12, req12)
+	if rec12.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown tool on body-only path (N4-R), got %d: %s", rec12.Code, rec12.Body.String())
+	}
+	if !strings.Contains(rec12.Body.String(), "unknown tool") {
+		t.Fatalf("expected error message to mention unknown tool, got: %s", rec12.Body.String())
+	}
+
+	// 13. Enqueue error returns 503 and leaves no residual desired state (N4-R, H3)
+	_ = e.ConsumePendingToolUpdate("mac-mini") // clear prior pending update from earlier subtest
+	failingQueue := &failingMockQueue{err: errors.New("simulated queue storage failure")}
+	srv.Queue = failingQueue
+	rec13 := httptest.NewRecorder()
+	req13 := httptest.NewRequest("POST", "/v1/hosts/mac-mini/tools/autopilot-plugins-internal/update", bytes.NewReader([]byte(`{}`)))
+	handler.ServeHTTP(rec13, req13)
+	if rec13.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 on queue failure (N4-R), got %d: %s", rec13.Code, rec13.Body.String())
+	}
+	if !strings.Contains(rec13.Body.String(), "failed to enqueue tool update job") {
+		t.Fatalf("expected error message to mention failed to enqueue, got: %s", rec13.Body.String())
+	}
+	h13, ok := e.GetHostDetail("mac-mini")
+	if !ok || h13.Host.PendingToolUpdate != nil {
+		t.Fatalf("expected no residual desired state on enqueue failure (H3), got: %+v", h13.Host.PendingToolUpdate)
+	}
+
+	// 14. Unknown tool in multi-tool body returns 404 (R4)
+	srv.Queue = nil // restore queue
+	rec14 := httptest.NewRecorder()
+	req14 := httptest.NewRequest("POST", "/v1/hosts/mac-mini/tools/update", bytes.NewReader([]byte(`{"tools":["autopilot-plugins-internal", "nonexistent-tool-2"]}`)))
+	handler.ServeHTTP(rec14, req14)
+	if rec14.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown tool in multi-tool body (R4), got %d: %s", rec14.Code, rec14.Body.String())
+	}
+	if !strings.Contains(rec14.Body.String(), "unknown tool") {
+		t.Fatalf("expected error message to mention unknown tool, got: %s", rec14.Body.String())
+	}
+}
+
+type failingMockQueue struct {
+	dispatch.Queue
+	err error
+}
+
+func (f *failingMockQueue) Enqueue(ctx context.Context, job *dispatch.Job) (*dispatch.Job, error) {
+	return nil, f.err
 }

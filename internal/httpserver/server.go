@@ -261,6 +261,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/hosts/{id}", s.hostDetail)
 	mux.HandleFunc("POST /v1/hosts/{id}/heartbeat", s.heartbeat)
 	mux.HandleFunc("POST /v1/hosts/{id}/tools/update", s.queueToolUpdate)
+	mux.HandleFunc("POST /v1/hosts/{id}/tools/{tool}/update", s.queueToolUpdate)
+	mux.HandleFunc("POST /v1/fleet/agents/{id}/tools/{tool}/force-update", s.queueToolUpdate)
+	mux.HandleFunc("POST /api/v1/agents/{id}/tools/{tool}/force-update", s.queueToolUpdate)
+	mux.HandleFunc("POST /api/agents/{id}/tools/{tool}/force-update", s.queueToolUpdate)
 	mux.HandleFunc("POST /v1/hosts/{id}/poll", s.pollHost)
 	mux.HandleFunc("GET /v1/hosts/{host}/repos", s.repoDetail)
 	mux.HandleFunc("DELETE /v1/hosts/{host}/repos", s.unregisterRepo)
@@ -1628,25 +1632,146 @@ func (s *Server) createNotification(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 	hostID := r.PathValue("id")
+	hostDet, ok := s.Engine.GetHostDetail(hostID)
+	if !ok {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("host not found: %s", hostID))
+		return
+	}
+
 	var body struct {
-		Tools []string `json:"tools"`
-		Force bool     `json:"force"`
+		Tools         []string `json:"tools"`
+		Force         bool     `json:"force"`
+		TargetVersion string   `json:"target_version,omitempty"`
+		Version       string   `json:"version,omitempty"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		dec := json.NewDecoder(r.Body)
+		if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid json body: %w", err))
+			return
+		}
 	}
-	if err := s.Engine.QueueToolUpdate(hostID, body.Tools, body.Force); err != nil {
-		writeErr(w, http.StatusNotFound, err)
+	toolParam := strings.TrimSpace(r.PathValue("tool"))
+	if toolParam != "" {
+		body.Tools = []string{toolParam}
+		// R3: only force when route is explicitly a force-update endpoint
+		if strings.HasSuffix(r.URL.Path, "/force-update") {
+			body.Force = true
+		}
+	}
+	if body.TargetVersion == "" && body.Version != "" {
+		body.TargetVersion = body.Version
+	}
+
+	// Single-tool guard (F2): reject target_version unless exactly one tool is specified
+	if body.TargetVersion != "" && len(body.Tools) != 1 {
+		writeErr(w, http.StatusBadRequest, errors.New("target_version can only be specified when exactly one tool is targeted"))
 		return
+	}
+
+	// Resolve target profile for the host, falling back to generic default profile (F6, R8)
+	profileName := hostDet.Host.DistributionProfile
+	if profileName == "" {
+		profileName = "generic"
+	}
+	p, err := s.Engine.GetProfile(profileName)
+	if err != nil || p == nil {
+		if profileName != "generic" {
+			fmt.Fprintf(os.Stderr, "[server] host %s profile %q not found, falling back to generic: %v\n", hostID, profileName, err)
+		}
+		p, _ = s.Engine.GetProfile("generic")
+	}
+
+	// Validate tool existence across all requested tools (F6, N4-R, R4, H2)
+	if p != nil && len(p.Tools) > 0 {
+		for _, toolName := range body.Tools {
+			found := false
+			for _, pt := range p.Tools {
+				if strings.EqualFold(pt.Name, toolName) || strings.EqualFold(pt.BinaryName, toolName) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				writeErr(w, http.StatusNotFound, fmt.Errorf("unknown tool: %s", toolName))
+				return
+			}
+		}
+	} else if toolParam != "" || body.TargetVersion != "" {
+		// When no profile is configured or profile has no tools, explicit tool targets cannot be validated (F6, S4)
+		for _, toolName := range body.Tools {
+			writeErr(w, http.StatusNotFound, fmt.Errorf("unknown tool: %s", toolName))
+			return
+		}
+	}
+
+	if len(body.Tools) == 1 {
+		toolName := body.Tools[0]
+		var foundTool *control.ProfileTool
+		if p != nil {
+			for _, pt := range p.Tools {
+				if strings.EqualFold(pt.Name, toolName) || strings.EqualFold(pt.BinaryName, toolName) {
+					toolCopy := pt
+					foundTool = &toolCopy
+					break
+				}
+			}
+		}
+
+		// R2, N4: validate explicit target_version if supplied; return 422 if invalid or unknown
+		if body.TargetVersion != "" {
+			cleanTV := strings.TrimPrefix(strings.TrimSpace(body.TargetVersion), "v")
+			if cleanTV == "" || strings.Contains(cleanTV, " ") {
+				writeErr(w, http.StatusUnprocessableEntity, fmt.Errorf("invalid target_version: %s", body.TargetVersion))
+				return
+			}
+			if foundTool != nil {
+				normClean := strings.TrimPrefix(strings.TrimSpace(cleanTV), "v")
+				knownLatest := strings.TrimPrefix(strings.TrimSpace(foundTool.LatestAvailableVersion), "v")
+				knownTarget := strings.TrimPrefix(strings.TrimSpace(foundTool.TargetVersion), "v")
+
+				isKnown := false
+				if (knownLatest != "" && normClean == knownLatest) ||
+					(knownTarget != "" && knownTarget != "latest" && normClean == knownTarget) {
+					isKnown = true
+				}
+				if !isKnown && s.Engine != nil && s.Engine.Releases != nil && foundTool.Repository != "" {
+					if rel, err := s.Engine.Releases.GetToolRelease(r.Context(), foundTool.Repository, foundTool.Name, cleanTV); err == nil && rel.Error == "" && rel.LastSyncStatus != "error" {
+						relNorm := strings.TrimPrefix(strings.TrimSpace(rel.LatestVersion), "v")
+						tagNorm := strings.TrimPrefix(strings.TrimSpace(rel.TagName), "v")
+						if relNorm == normClean || tagNorm == normClean {
+							isKnown = true
+						}
+					}
+				}
+				if !isKnown {
+					writeErr(w, http.StatusUnprocessableEntity, fmt.Errorf("unknown target_version: %s (known latest: %s)", body.TargetVersion, foundTool.LatestAvailableVersion))
+					return
+				}
+			}
+		}
+
+		// Prefer LatestAvailableVersion for force update when target_version is not explicitly supplied (F6, R2)
+		if body.TargetVersion == "" && foundTool != nil {
+			if foundTool.LatestAvailableVersion != "" {
+				body.TargetVersion = foundTool.LatestAvailableVersion
+			} else if foundTool.TargetVersion != "" && foundTool.TargetVersion != "latest" {
+				body.TargetVersion = foundTool.TargetVersion
+			}
+		}
 	}
 
 	var jobID string
 	if s.Queue != nil {
-		payload, _ := json.Marshal(map[string]any{
+		payloadMap := map[string]any{
 			"host_id": hostID,
 			"tools":   body.Tools,
 			"force":   body.Force,
-		})
+		}
+		if body.TargetVersion != "" {
+			payloadMap["target_version"] = body.TargetVersion
+		}
+		payload, _ := json.Marshal(payloadMap)
 		job := &dispatch.Job{
 			Type:       "agent.tools.update",
 			Repo:       "fleet",
@@ -1658,9 +1783,34 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 			Payload: payload,
 			Status:  dispatch.JobStatusPending,
 		}
-		if enqJob, err := s.Queue.Enqueue(r.Context(), job); err == nil && enqJob != nil {
+		enqJob, err := s.Queue.Enqueue(r.Context(), job)
+		if err != nil {
+			writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("failed to enqueue tool update job: %w", err))
+			return
+		}
+		if enqJob != nil {
 			jobID = enqJob.ID
 		}
+	}
+
+	if err := s.Engine.QueueToolUpdate(hostID, body.Tools, body.Force, body.TargetVersion); err != nil {
+		if s.Queue != nil && jobID != "" {
+			_, _ = s.Queue.Cancel(r.Context(), jobID, fmt.Sprintf("failed to update host desired state: %v", err))
+		}
+		if errors.Is(err, control.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, err)
+		} else {
+			writeErr(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+
+	meta := map[string]any{
+		"tools": body.Tools,
+		"force": body.Force,
+	}
+	if body.TargetVersion != "" {
+		meta["target_version"] = body.TargetVersion
 	}
 
 	s.RecordNotification(NotificationRecord{
@@ -1670,19 +1820,20 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 		Source:   "harness-api",
 		JobID:    jobID,
 		HostID:   hostID,
-		Metadata: map[string]any{
-			"tools": body.Tools,
-			"force": body.Force,
-		},
+		Metadata: meta,
 	})
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"status":  "queued",
 		"host_id": hostID,
 		"job_id":  jobID,
 		"tools":   body.Tools,
 		"force":   body.Force,
-	})
+	}
+	if body.TargetVersion != "" {
+		resp["target_version"] = body.TargetVersion
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) queueAllToolsUpdate(w http.ResponseWriter, r *http.Request) {
