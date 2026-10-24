@@ -365,11 +365,11 @@ func historyJobDetailView(r control.HistoryRow, host, path string) map[string]an
 	return map[string]any{
 		"id":                             r.JobID,
 		"schedule_id":                    r.ScheduleID,
-		"kind":                           "story_execution",
+		"kind":                           "",
 		"status":                         r.Status,
 		"engine":                         r.Engine,
 		"prompt":                         r.PromptTitle,
-		"story_id":                       r.PromptTitle,
+		"story_id":                       "",
 		"source_idea_id":                 "",
 		"transcript":                     "",
 		"worktree_path":                  path,

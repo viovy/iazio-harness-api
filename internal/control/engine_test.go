@@ -3877,6 +3877,7 @@ func TestEngine_AssociatedJobsAndHistoricalScheduleLineage(t *testing.T) {
 		{
 			JobID:       "job-1311",
 			ScheduleID:  "sch-1310", // exact incident shape: initial run was scheduled under sch-1310
+			Engine:      "agy",
 			PromptTitle: "autonomous feature delivery",
 			Status:      "execution_timeout",
 			CreatedAt:   t2,
@@ -4066,13 +4067,34 @@ func TestEngine_AssociatedJobsAndHistoricalScheduleLineage(t *testing.T) {
 		t.Fatalf("F2 violation: in-memory schedule failed to correlate legacy parent: got %v, expected [job-1311, job-1313]", inMemLineage)
 	}
 
-	// 9. F1 check: GetJob returns historical job from e.history when not present in e.jobs
+	// 9. F1 & F3 check: GetJob returns historical job from e.history with honest field mapping (empty Kind/StoryID) and deterministic selection
 	histJobDetail, ok := e.GetJob("job-1311")
 	if !ok {
 		t.Fatalf("F1 violation: GetJob('job-1311') failed to find historical job in e.history")
 	}
 	if histJobDetail.ID != "job-1311" || histJobDetail.ScheduleID != "sch-1310" || histJobDetail.HostID != "mac-mini" {
 		t.Fatalf("F1 violation: unexpected job detail from history: %+v", histJobDetail)
+	}
+	if histJobDetail.Kind != "" || histJobDetail.StoryID != "" {
+		t.Fatalf("F3 violation: expected empty Kind and StoryID on unannotated historical job fallback, got Kind=%q, StoryID=%q", histJobDetail.Kind, histJobDetail.StoryID)
+	}
+	if histJobDetail.Engine != "agy" || histJobDetail.Prompt != "autonomous feature delivery" {
+		t.Fatalf("F3 violation: unexpected engine or prompt: Engine=%q, Prompt=%q", histJobDetail.Engine, histJobDetail.Prompt)
+	}
+
+	// Test deterministic selection of latest row when multiple history keys contain the same JobID
+	e.history["older-key"] = []HistoryRow{
+		{
+			JobID:       "job-1311",
+			ScheduleID:  "sch-older",
+			Engine:      "older-engine",
+			CreatedAt:   t1.Add(-48 * time.Hour),
+			PromptTitle: "older prompt",
+		},
+	}
+	resolvedDetail, ok := e.GetJob("job-1311")
+	if !ok || resolvedDetail.ScheduleID != "sch-1310" {
+		t.Fatalf("F3 violation: GetJob should deterministically select latest history row, got: %+v", resolvedDetail)
 	}
 }
 
