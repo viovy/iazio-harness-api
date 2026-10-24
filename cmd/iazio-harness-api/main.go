@@ -114,6 +114,18 @@ func run(ctx context.Context, args []string) error {
 			log.Printf("loaded %d stories from database", len(stories))
 		}
 
+		srv.ReconcileLineage = func(ctx context.Context) error {
+			return store.ReconcileHistoricalLineage(ctx)
+		}
+		if err := store.ReconcileHistoricalLineage(ctx); err != nil {
+			log.Printf("warn: reconcile historical lineage on db: %v", err)
+		}
+		if count, err := srv.Engine.ReconcileHistoricalLineage(); err != nil {
+			log.Printf("warn: reconcile historical lineage on engine: %v", err)
+		} else if count > 0 {
+			log.Printf("reconciled %d historical job lineages on startup", count)
+		}
+
 		seedDefaults(ctx, srv.Engine, store, srv.CodebaseStore)
 
 		if cRepos, err := store.LoadCodebaseRepos(ctx); err == nil && len(cRepos) > 0 {

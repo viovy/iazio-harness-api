@@ -51,6 +51,8 @@ type Server struct {
 	DeleteHistory func(ctx context.Context, jobID string) error
 	// ClearHistory removes all history records for a repo when a database is configured.
 	ClearHistory func(ctx context.Context, hostID, worktreePath string) error
+	// ReconcileLineage reconciles historical job and conversation lineages when a database is configured.
+	ReconcileLineage func(ctx context.Context) error
 	// AuthToken, when non-empty, requires Bearer token authentication on control-plane endpoints.
 	AuthToken string
 	// CodebaseStore manages fleet repository discovery and codebase RAG search chunks.
@@ -259,6 +261,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/hosts/register", s.register)
 	mux.HandleFunc("GET /v1/hosts", s.listHosts)
 	mux.HandleFunc("GET /v1/hosts/{id}", s.hostDetail)
+	mux.HandleFunc("GET /api/v1/agents/{id}/tools", s.getAgentTools)
+	mux.HandleFunc("GET /v1/hosts/{id}/tools", s.getAgentTools)
+	mux.HandleFunc("GET /api/v1/agents/{host}/{repo}/jobs/{id}", s.getJob)
+	mux.HandleFunc("POST /api/v1/admin/jobs/reconcile-lineage", s.reconcileLineage)
+	mux.HandleFunc("POST /v1/admin/jobs/reconcile-lineage", s.reconcileLineage)
 	mux.HandleFunc("POST /v1/hosts/{id}/heartbeat", s.heartbeat)
 	mux.HandleFunc("POST /v1/hosts/{id}/tools/update", s.queueToolUpdate)
 	mux.HandleFunc("POST /v1/hosts/{id}/tools/{tool}/update", s.queueToolUpdate)
@@ -811,13 +818,13 @@ func (s *Server) resumeRepo(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) resumeRepoInPlace(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Path           string `json:"path"`
-		WorktreePath   string `json:"worktree_path"`
-		StoryID        string `json:"story_id"`
-		ConversationID string `json:"conversation_id"`
-		JobID          string `json:"job_id"`
-		AllowDirty     bool   `json:"allow_dirty"`
-		PromptID       string `json:"prompt_id"`
+		Path                  string         `json:"path"`
+		WorktreePath          string         `json:"worktree_path"`
+		StoryID               string         `json:"story_id"`
+		ConversationID        string         `json:"conversation_id"`
+		JobID                 string         `json:"job_id"`
+		AllowDirty            bool           `json:"allow_dirty"`
+		PromptID              string         `json:"prompt_id"`
 		PromptTitle           string         `json:"prompt_title"`
 		Prompt                string         `json:"prompt"`
 		CustomPrompt          string         `json:"custom_prompt"`
@@ -1538,9 +1545,12 @@ func (s *Server) pollHost(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	var raw struct {
-		Presence    string `json:"presence"`
-		FetchFailed bool   `json:"fetch_failed"`
-		Tools       []struct {
+		Presence              string   `json:"presence"`
+		FetchFailed           bool     `json:"fetch_failed"`
+		SupportedCapabilities []string `json:"supported_capabilities"`
+		Version               string   `json:"version"`
+		CommitSHA             string   `json:"commit_sha"`
+		Tools                 []struct {
 			Name             string   `json:"name"`
 			Path             string   `json:"path"`
 			Version          string   `json:"version"`
@@ -1549,6 +1559,11 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 			ServiceType      string   `json:"service_type"`
 			ServiceStatus    string   `json:"service_status"`
 			Capabilities     []string `json:"capabilities"`
+			Installed        bool     `json:"installed"`
+			InstallationType string   `json:"installation_type"`
+			ActiveState      string   `json:"active_state"`
+			WatchdogEnabled  bool     `json:"watchdog_enabled"`
+			ConfigStatus     string   `json:"config_status"`
 		} `json:"tools"`
 		ActiveJobs []struct {
 			JobID        string `json:"job_id"`
@@ -1571,6 +1586,11 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 			ServiceType:      t.ServiceType,
 			ServiceStatus:    t.ServiceStatus,
 			Capabilities:     t.Capabilities,
+			Installed:        t.Installed,
+			InstallationType: t.InstallationType,
+			ActiveState:      t.ActiveState,
+			WatchdogEnabled:  t.WatchdogEnabled,
+			ConfigStatus:     t.ConfigStatus,
 		})
 	}
 	var activeJobs []control.ActiveJob
@@ -1582,7 +1602,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	hostID := r.PathValue("id")
-	if err := s.Engine.HeartbeatDetailed(hostID, raw.Presence, tools, raw.FetchFailed, activeJobs...); err != nil {
+	if err := s.Engine.HeartbeatWithCapabilities(hostID, raw.Presence, tools, raw.FetchFailed, raw.SupportedCapabilities, raw.Version, raw.CommitSHA, activeJobs...); err != nil {
 		writeErr(w, http.StatusNotFound, err)
 		return
 	}
@@ -1601,6 +1621,54 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		res["pending_commands"] = pendingCmds
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) getAgentTools(w http.ResponseWriter, r *http.Request) {
+	hostID := r.PathValue("id")
+	if hostID == "" {
+		hostID = r.PathValue("host")
+	}
+	detail, ok := s.Engine.GetHostDetail(hostID)
+	if !ok {
+		writeErr(w, http.StatusNotFound, control.ErrNotFound)
+		return
+	}
+	tools := make([]map[string]any, 0, len(detail.Host.Tools))
+	for _, tool := range detail.Host.Tools {
+		tools = append(tools, toolView(tool))
+	}
+	supportedCaps := detail.Host.SupportedCapabilities
+	if len(supportedCaps) == 0 {
+		supportedCaps = []string{
+			"user_service_watchdog_v2",
+			"deterministic_resume_4tuple_v1",
+			"agy_conversation_pinning_v1",
+		}
+	}
+	resp := map[string]any{
+		"host":                   hostID,
+		"supported_capabilities": supportedCaps,
+		"version":                detail.Host.Version,
+		"commit_sha":             detail.Host.CommitSHA,
+		"tools":                  tools,
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) reconcileLineage(w http.ResponseWriter, r *http.Request) {
+	count, err := s.Engine.ReconcileHistoricalLineage()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if s.ReconcileLineage != nil {
+		_ = s.ReconcileLineage(r.Context())
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":           "ok",
+		"reconciled_count": count,
+		"message":          "Historical job and conversation lineage successfully reconciled",
+	})
 }
 
 func (s *Server) getNotifications(w http.ResponseWriter, r *http.Request) {

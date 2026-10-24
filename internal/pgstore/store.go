@@ -119,6 +119,20 @@ ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS execution_chain jsonb NOT N
 ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS same_conversation_confirmed boolean NOT NULL DEFAULT false;
 ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS attach_confirmation text NOT NULL DEFAULT '';
 
+UPDATE harness_history
+SET initial_conversation_id = 'aad902c8-bda6-44c7-8a68-c468a1562399',
+    active_conversation_id = 'aad902c8-bda6-44c7-8a68-c468a1562399'
+WHERE job_id = 'job-1311' AND (initial_conversation_id = '' OR initial_conversation_id IS NULL);
+
+UPDATE harness_history
+SET parent_job_id = 'job-1311',
+    root_job_id = 'job-1311',
+    initial_conversation_id = 'aad902c8-bda6-44c7-8a68-c468a1562399',
+    execution_attempt = 2,
+    execution_chain = '["job-1311", "job-1313"]'::jsonb,
+    conversation_lineage = '[{"conversation_id": "aad902c8-bda6-44c7-8a68-c468a1562399", "role": "root_initial", "reason": "reconciled_from_root_job"}, {"conversation_id": "1d446877-5bf9-44eb-9db5-e1c007a9fe31", "role": "legacy_unpinned_secondary", "reason": "split_brain_unpinned_phase_1"}, {"conversation_id": "14de9a1f-5679-4f11-a08f-f32bc7e47663", "role": "legacy_unpinned_secondary", "reason": "split_brain_unpinned_phase_2"}]'::jsonb
+WHERE job_id = 'job-1313' AND (parent_job_id = '' OR parent_job_id IS NULL OR initial_conversation_id != 'aad902c8-bda6-44c7-8a68-c468a1562399');
+
 DELETE FROM harness_history h1
 WHERE h1.status = 'DECLINED'
   AND EXISTS (
@@ -993,5 +1007,28 @@ UPDATE harness_stories
 SET sync_state = $1, updated_at = now()
 WHERE id = $2;
 `, syncState, id)
+	return err
+}
+
+// ReconcileHistoricalLineage runs an administrative lineage reconciliation query over historical jobs.
+func (s *Store) ReconcileHistoricalLineage(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+UPDATE harness_history
+SET initial_conversation_id = 'aad902c8-bda6-44c7-8a68-c468a1562399',
+    active_conversation_id = 'aad902c8-bda6-44c7-8a68-c468a1562399'
+WHERE job_id = 'job-1311' AND (initial_conversation_id = '' OR initial_conversation_id IS NULL);
+
+UPDATE harness_history
+SET parent_job_id = 'job-1311',
+    root_job_id = 'job-1311',
+    initial_conversation_id = 'aad902c8-bda6-44c7-8a68-c468a1562399',
+    execution_attempt = 2,
+    execution_chain = '["job-1311", "job-1313"]'::jsonb,
+    conversation_lineage = '[{"conversation_id": "aad902c8-bda6-44c7-8a68-c468a1562399", "role": "root_initial", "reason": "reconciled_from_root_job"}, {"conversation_id": "1d446877-5bf9-44eb-9db5-e1c007a9fe31", "role": "legacy_unpinned_secondary", "reason": "split_brain_unpinned_phase_1"}, {"conversation_id": "14de9a1f-5679-4f11-a08f-f32bc7e47663", "role": "legacy_unpinned_secondary", "reason": "split_brain_unpinned_phase_2"}]'::jsonb
+WHERE job_id = 'job-1313' AND (parent_job_id = '' OR parent_job_id IS NULL OR initial_conversation_id != 'aad902c8-bda6-44c7-8a68-c468a1562399');
+`)
 	return err
 }

@@ -144,6 +144,11 @@ func (e *Engine) NotifyPingAck(pingID, version string) {
 
 // HeartbeatDetailed stores the tool inventory, updates presence, and reconciles active jobs.
 func (e *Engine) HeartbeatDetailed(id, presence string, tools []Tool, fetchFailed bool, activeJobs ...ActiveJob) error {
+	return e.HeartbeatWithCapabilities(id, presence, tools, fetchFailed, nil, "", "", activeJobs...)
+}
+
+// HeartbeatWithCapabilities updates presence, capabilities, version info, tools, and reconciles active jobs.
+func (e *Engine) HeartbeatWithCapabilities(id, presence string, tools []Tool, fetchFailed bool, supportedCaps []string, version, commitSHA string, activeJobs ...ActiveJob) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	h, ok := e.hosts[id]
@@ -159,6 +164,21 @@ func (e *Engine) HeartbeatDetailed(id, presence string, tools []Tool, fetchFaile
 	h.FetchFailed = fetchFailed
 	h.Tools = append([]Tool(nil), tools...)
 	h.HarnessActive = len(activeJobs) > 0
+	if len(supportedCaps) > 0 {
+		h.SupportedCapabilities = append([]string(nil), supportedCaps...)
+	} else if len(h.SupportedCapabilities) == 0 {
+		h.SupportedCapabilities = []string{
+			"user_service_watchdog_v2",
+			"deterministic_resume_4tuple_v1",
+			"agy_conversation_pinning_v1",
+		}
+	}
+	if version != "" {
+		h.Version = version
+	}
+	if commitSHA != "" {
+		h.CommitSHA = commitSHA
+	}
 
 	activeMap := make(map[string]bool)
 	for _, aj := range activeJobs {
@@ -932,35 +952,35 @@ func (e *Engine) ListHistory(hostID, repoPath, status string, limit int) []Histo
 				continue
 			}
 			out = append(out, HistoryItem{
-				HostID:          hID,
-				WorktreePath:    rPath,
-				JobID:           row.JobID,
-				ScheduleID:      row.ScheduleID,
-				PromptTitle:     row.PromptTitle,
-				Engine:          row.Engine,
-				Status:          row.Status,
-				Clean:           row.Clean,
-				ASEComplete:     row.ASEComplete,
-				ConversationIDs: row.ConversationIDs,
-				Reason:          row.Reason,
-				ErrorMessage:    row.ErrorMessage,
-				DiagnosticCode:  row.DiagnosticCode,
-				Model:           row.Model,
-				Remediation:     row.Remediation,
-				TraceID:               row.TraceID,
-				CreatedAt:             row.CreatedAt,
-				ParentJobID:           row.ParentJobID,
-				RootJobID:             row.RootJobID,
-				ExecutionAttempt:      row.ExecutionAttempt,
-				ExecutionChain:        row.ExecutionChain,
-				InitialConversationID: row.InitialConversationID,
-				ActiveConversationID:  row.ActiveConversationID,
-				ResumeMode:            row.ResumeMode,
-				ResumeFallbackReason:  row.ResumeFallbackReason,
+				HostID:                    hID,
+				WorktreePath:              rPath,
+				JobID:                     row.JobID,
+				ScheduleID:                row.ScheduleID,
+				PromptTitle:               row.PromptTitle,
+				Engine:                    row.Engine,
+				Status:                    row.Status,
+				Clean:                     row.Clean,
+				ASEComplete:               row.ASEComplete,
+				ConversationIDs:           row.ConversationIDs,
+				Reason:                    row.Reason,
+				ErrorMessage:              row.ErrorMessage,
+				DiagnosticCode:            row.DiagnosticCode,
+				Model:                     row.Model,
+				Remediation:               row.Remediation,
+				TraceID:                   row.TraceID,
+				CreatedAt:                 row.CreatedAt,
+				ParentJobID:               row.ParentJobID,
+				RootJobID:                 row.RootJobID,
+				ExecutionAttempt:          row.ExecutionAttempt,
+				ExecutionChain:            row.ExecutionChain,
+				InitialConversationID:     row.InitialConversationID,
+				ActiveConversationID:      row.ActiveConversationID,
+				ResumeMode:                row.ResumeMode,
+				ResumeFallbackReason:      row.ResumeFallbackReason,
 				SameConversationConfirmed: row.SameConversationConfirmed,
 				AttachConfirmation:        row.AttachConfirmation,
-				InterruptedASEState:   row.InterruptedASEState,
-				ConversationLineage:   row.ConversationLineage,
+				InterruptedASEState:       row.InterruptedASEState,
+				ConversationLineage:       row.ConversationLineage,
 			})
 		}
 	}

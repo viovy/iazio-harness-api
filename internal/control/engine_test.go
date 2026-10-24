@@ -4097,4 +4097,3 @@ func TestEngine_AssociatedJobsAndHistoricalScheduleLineage(t *testing.T) {
 		t.Fatalf("F3 violation: GetJob should deterministically select latest history row, got: %+v", resolvedDetail)
 	}
 }
-
