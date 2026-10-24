@@ -801,10 +801,20 @@ func (e *Engine) ListSchedules(hostID, repoPath, status string) []Schedule {
 		out = append(out, sCopy)
 	}
 
+	// Track all known in-memory schedule IDs so we never generate phantom duplicates
 	existingScheds := make(map[string]bool)
-	for _, s := range out {
-		existingScheds[s.ID] = true
+	for id := range e.schedules {
+		existingScheds[id] = true
 	}
+
+	// Group historical rows by ScheduleID to deterministically pick the latest row
+	type histSchedCand struct {
+		row  HistoryRow
+		host string
+		path string
+	}
+	historicalMap := make(map[string]histSchedCand)
+
 	for key, rows := range e.history {
 		parts := strings.SplitN(key, "\x00", 2)
 		hID := ""
@@ -823,23 +833,34 @@ func (e *Engine) ListSchedules(hostID, repoPath, status string) []Schedule {
 			if r.ScheduleID == "" || existingScheds[r.ScheduleID] {
 				continue
 			}
-			if status != "" && !strings.EqualFold(r.Status, status) {
-				continue
+			cand, exists := historicalMap[r.ScheduleID]
+			if !exists || r.CreatedAt.After(cand.row.CreatedAt) || (r.CreatedAt.Equal(cand.row.CreatedAt) && r.JobID > cand.row.JobID) {
+				historicalMap[r.ScheduleID] = histSchedCand{
+					row:  r,
+					host: hID,
+					path: rPath,
+				}
 			}
-			existingScheds[r.ScheduleID] = true
-			sCopy := Schedule{
-				ID:           r.ScheduleID,
-				HostID:       hID,
-				WorktreePath: rPath,
-				PromptTitle:  r.PromptTitle,
-				Engine:       r.Engine,
-				Status:       r.Status,
-				ParentJobID:  r.ParentJobID,
-				RootJobID:    r.RootJobID,
-			}
-			sCopy.AssociatedJobs = e.GetAssociatedJobsForScheduleLocked(r.ScheduleID)
-			out = append(out, sCopy)
 		}
+	}
+
+	for schID, cand := range historicalMap {
+		r := cand.row
+		if status != "" && !strings.EqualFold(r.Status, status) {
+			continue
+		}
+		sCopy := Schedule{
+			ID:           schID,
+			HostID:       cand.host,
+			WorktreePath: cand.path,
+			PromptTitle:  r.PromptTitle,
+			Engine:       r.Engine,
+			Status:       r.Status,
+			ParentJobID:  r.ParentJobID,
+			RootJobID:    r.RootJobID,
+		}
+		sCopy.AssociatedJobs = e.GetAssociatedJobsForScheduleLocked(schID)
+		out = append(out, sCopy)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Priority != out[j].Priority {

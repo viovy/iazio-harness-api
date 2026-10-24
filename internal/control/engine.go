@@ -2506,40 +2506,48 @@ func (e *Engine) GetAssociatedJobsForScheduleLocked(schID string) []string {
 	}
 
 	// Legacy fallback: correlate historical runs sharing the same prompt title, host, and repo
-	targetPrompt := ""
-	targetHost := ""
-	targetPath := ""
-	if sch != nil {
-		targetPrompt = sch.PromptTitle
-		targetHost = sch.HostID
-		targetPath = sch.WorktreePath
-	} else {
-		for key, rows := range e.history {
-			for _, r := range rows {
-				if jobSet[r.JobID] || r.ScheduleID == schID {
-					targetPrompt = r.PromptTitle
-					if idx := strings.Index(key, "\x00"); idx >= 0 {
-						targetHost, targetPath = key[:idx], key[idx+1:]
+	// Story Req 2: Only apply when explicit parent/root lineage is absent on the schedule
+	hasExplicitLineage := (sch != nil && (sch.ParentJobID != "" || sch.RootJobID != "" || len(sch.AssociatedJobs) > 0))
+
+	if !hasExplicitLineage {
+		targetPrompt := ""
+		targetHost := ""
+		targetPath := ""
+		if sch != nil {
+			targetPrompt = sch.PromptTitle
+			targetHost = sch.HostID
+			targetPath = sch.WorktreePath
+		} else {
+			for key, rows := range e.history {
+				for _, r := range rows {
+					if jobSet[r.JobID] || r.ScheduleID == schID {
+						targetPrompt = r.PromptTitle
+						if idx := strings.Index(key, "\x00"); idx >= 0 {
+							targetHost, targetPath = key[:idx], key[idx+1:]
+						}
+						break
 					}
+				}
+				if targetPrompt != "" {
 					break
 				}
 			}
-			if targetPrompt != "" {
-				break
-			}
 		}
-	}
 
-	if targetPrompt != "" && targetHost != "" {
-		for key, rows := range e.history {
-			host, path := "", ""
-			if idx := strings.Index(key, "\x00"); idx >= 0 {
-				host, path = key[:idx], key[idx+1:]
-			}
-			if host == targetHost && (targetPath == "" || path == targetPath) {
-				for _, r := range rows {
-					if r.PromptTitle == targetPrompt {
-						addJob(r.JobID)
+		if targetPrompt != "" && targetHost != "" {
+			cleanTargetPath := filepath.Clean(targetPath)
+			for key, rows := range e.history {
+				host, path := "", ""
+				if idx := strings.Index(key, "\x00"); idx >= 0 {
+					host, path = key[:idx], key[idx+1:]
+				}
+				cleanPath := filepath.Clean(path)
+				if host == targetHost && (targetPath == "" || cleanPath == cleanTargetPath) {
+					for _, r := range rows {
+						// Only correlate candidate rows that themselves lack explicit lineage pointers
+						if r.PromptTitle == targetPrompt && r.ParentJobID == "" && r.RootJobID == "" {
+							addJob(r.JobID)
+						}
 					}
 				}
 			}
@@ -2559,36 +2567,52 @@ func (e *Engine) GetAssociatedJobsForSchedule(schID string) []string {
 	return e.GetAssociatedJobsForScheduleLocked(schID)
 }
 
+// ReconstructScheduleFromHistoryLocked deterministically reconstructs a Schedule from the latest matching history record.
+func (e *Engine) ReconstructScheduleFromHistoryLocked(scheduleID string) (Schedule, bool) {
+	var latestRow *HistoryRow
+	var host, path string
+
+	for key, rows := range e.history {
+		h, p := "", ""
+		if idx := strings.Index(key, "\x00"); idx >= 0 {
+			h, p = key[:idx], key[idx+1:]
+		}
+		for i := range rows {
+			r := &rows[i]
+			if r.ScheduleID == scheduleID {
+				if latestRow == nil || r.CreatedAt.After(latestRow.CreatedAt) || (r.CreatedAt.Equal(latestRow.CreatedAt) && r.JobID > latestRow.JobID) {
+					latestRow = r
+					host, path = h, p
+				}
+			}
+		}
+	}
+
+	if latestRow == nil {
+		return Schedule{}, false
+	}
+
+	s := Schedule{
+		ID:           latestRow.ScheduleID,
+		HostID:       host,
+		WorktreePath: path,
+		PromptTitle:  latestRow.PromptTitle,
+		Engine:       latestRow.Engine,
+		Status:       latestRow.Status,
+		ParentJobID:  latestRow.ParentJobID,
+		RootJobID:    latestRow.RootJobID,
+	}
+	s.AssociatedJobs = e.GetAssociatedJobsForScheduleLocked(scheduleID)
+	return s, true
+}
+
 // GetSchedule retrieves a schedule by ID with complete associated execution jobs.
 func (e *Engine) GetSchedule(scheduleID string) (Schedule, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	sch, ok := e.schedules[scheduleID]
 	if !ok {
-		// Fallback to history records for persisted schedules
-		for key, rows := range e.history {
-			for _, r := range rows {
-				if r.ScheduleID == scheduleID {
-					host, path := "", ""
-					if idx := strings.Index(key, "\x00"); idx >= 0 {
-						host, path = key[:idx], key[idx+1:]
-					}
-					s := Schedule{
-						ID:           r.ScheduleID,
-						HostID:       host,
-						WorktreePath: path,
-						PromptTitle:  r.PromptTitle,
-						Engine:       r.Engine,
-						Status:       r.Status,
-						ParentJobID:  r.ParentJobID,
-						RootJobID:    r.RootJobID,
-					}
-					s.AssociatedJobs = e.GetAssociatedJobsForScheduleLocked(scheduleID)
-					return s, true
-				}
-			}
-		}
-		return Schedule{}, false
+		return e.ReconstructScheduleFromHistoryLocked(scheduleID)
 	}
 	res := *sch
 	res.AssociatedJobs = e.GetAssociatedJobsForScheduleLocked(scheduleID)
