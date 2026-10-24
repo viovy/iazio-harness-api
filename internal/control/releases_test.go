@@ -165,6 +165,7 @@ func TestReleaseService_EmptyReleaseError(t *testing.T) {
 	}))
 	defer ts.Close()
 	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
 
 	_, err := svc.GetToolRelease(context.Background(), "repo-none", "tool-none", "")
 	if err == nil {
@@ -185,6 +186,7 @@ func TestReleaseService_GetProfileReleases_FailureSurfaced(t *testing.T) {
 	}))
 	defer ts.Close()
 	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
 
 	profile := DistributionProfile{
 		Name: "test-profile",
@@ -231,6 +233,7 @@ func TestReleaseService_ExpiredCacheFailsClosed(t *testing.T) {
 	}))
 	defer ts.Close()
 	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
 
 	rel, err := svc.GetToolRelease(context.Background(), repo, "stale-tool", targetVersion)
 	if err == nil {
