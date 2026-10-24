@@ -1757,11 +1757,6 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := s.Engine.QueueToolUpdate(hostID, body.Tools, body.Force, body.TargetVersion); err != nil {
-		writeErr(w, http.StatusNotFound, err)
-		return
-	}
-
 	var jobID string
 	if s.Queue != nil {
 		payloadMap := map[string]any{
@@ -1784,12 +1779,23 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 			Payload: payload,
 			Status:  dispatch.JobStatusPending,
 		}
-		if enqJob, err := s.Queue.Enqueue(r.Context(), job); err != nil {
+		enqJob, err := s.Queue.Enqueue(r.Context(), job)
+		if err != nil {
 			writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("failed to enqueue tool update job: %w", err))
 			return
-		} else if enqJob != nil {
+		}
+		if enqJob != nil {
 			jobID = enqJob.ID
 		}
+	}
+
+	if err := s.Engine.QueueToolUpdate(hostID, body.Tools, body.Force, body.TargetVersion); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "not found") {
+			writeErr(w, http.StatusNotFound, err)
+		} else {
+			writeErr(w, http.StatusInternalServerError, err)
+		}
+		return
 	}
 
 	meta := map[string]any{
