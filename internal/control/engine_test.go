@@ -3313,18 +3313,18 @@ func TestEngine_PendingToImplicitSameConversation_OnExit(t *testing.T) {
 		t.Fatal("poll job2 failed")
 	}
 
-	// Exit 0 with no explicit marker: should implicitly confirm same_conversation
+	// Exit 0 with no explicit marker: should map to same_conversation_unverified (Finding M3)
 	_ = e.PostExit(job2.ID, 0)
 
 	det, _ := e.GetJob(job2.ID)
-	if det.ResumeMode != "same_conversation" {
-		t.Fatalf("expected exit-time ResumeMode 'same_conversation', got %q", det.ResumeMode)
+	if det.ResumeMode != "same_conversation_unverified" {
+		t.Fatalf("expected exit-time ResumeMode 'same_conversation_unverified', got %q", det.ResumeMode)
 	}
-	if !det.SameConversationConfirmed {
-		t.Fatalf("expected SameConversationConfirmed true on exit")
+	if det.SameConversationConfirmed {
+		t.Fatalf("expected SameConversationConfirmed false on exit without positive attach evidence")
 	}
-	if det.AttachConfirmation != "implicit" {
-		t.Fatalf("expected AttachConfirmation 'implicit', got %q", det.AttachConfirmation)
+	if det.AttachConfirmation != "unverified" {
+		t.Fatalf("expected AttachConfirmation 'unverified', got %q", det.AttachConfirmation)
 	}
 
 	// Verify history record also updated
@@ -3332,11 +3332,11 @@ func TestEngine_PendingToImplicitSameConversation_OnExit(t *testing.T) {
 	if !found {
 		t.Fatal("expected history row for job2")
 	}
-	if lastRow.ResumeMode != "same_conversation" {
-		t.Fatalf("expected history ResumeMode 'same_conversation', got %q", lastRow.ResumeMode)
+	if lastRow.ResumeMode != "same_conversation_unverified" {
+		t.Fatalf("expected history ResumeMode 'same_conversation_unverified', got %q", lastRow.ResumeMode)
 	}
-	if lastRow.AttachConfirmation != "implicit" {
-		t.Fatalf("expected history AttachConfirmation 'implicit', got %q", lastRow.AttachConfirmation)
+	if lastRow.AttachConfirmation != "unverified" {
+		t.Fatalf("expected history AttachConfirmation 'unverified', got %q", lastRow.AttachConfirmation)
 	}
 }
 
@@ -3787,11 +3787,64 @@ func TestEngine_AddJobConversationWithOptions_DifferingNonFallbackDoesNotConfirm
 		t.Fatalf("AddJobConversationWithOptions failed: %v", err)
 	}
 
-	// Must NOT confirm same_conversation because differingID != initialID (Finding M1)
+	// Must NOT confirm same_conversation because differingID != initialID (Finding M1, M2)
 	if jobResume.SameConversationConfirmed {
 		t.Fatalf("expected SameConversationConfirmed to be false when differing conversation reported without fallback, got true")
 	}
-	if jobResume.ResumeMode == "same_conversation" {
-		t.Fatalf("expected ResumeMode NOT to be same_conversation, got %q", jobResume.ResumeMode)
+	if jobResume.ResumeMode != "fallback_new_conversation" {
+		t.Fatalf("expected ResumeMode to be fallback_new_conversation, got %q", jobResume.ResumeMode)
+	}
+
+	// Now call PostExit(jobResume.ID, 0) - must remain fallback_new_conversation and NOT become same_conversation (Finding M2)
+	err = e.PostExit(jobResume.ID, 0)
+	if err != nil {
+		t.Fatalf("PostExit failed: %v", err)
+	}
+
+	if jobResume.SameConversationConfirmed {
+		t.Fatalf("expected SameConversationConfirmed to remain false after PostExit(0), got true")
+	}
+	if jobResume.ResumeMode != "fallback_new_conversation" {
+		t.Fatalf("expected ResumeMode to remain fallback_new_conversation after PostExit(0), got %q", jobResume.ResumeMode)
+	}
+}
+
+func TestEngine_PostExit_PendingWithoutMarker_MapsToUnverified(t *testing.T) {
+	e := NewEngine(nil)
+	repoPath := "/home/romeo/work/meta-repo"
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	initialID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	jobResume := &Job{
+		ID:                    "job-resume-unverified",
+		ParentJobID:           "job-parent-001",
+		InitialConversationID: initialID,
+		HostID:                "mac-mini",
+		Status:                "RUNNING",
+		ResumeMode:            "pending",
+	}
+	e.jobs[jobResume.ID] = jobResume
+
+	// No conversation attach marker ever reported. Process exits with code 0.
+	err := e.PostExit(jobResume.ID, 0)
+	if err != nil {
+		t.Fatalf("PostExit failed: %v", err)
+	}
+
+	// Finding M3: exit 0 without positive evidence MUST be mapped to same_conversation_unverified
+	if jobResume.SameConversationConfirmed {
+		t.Fatalf("expected SameConversationConfirmed to be false without positive attach evidence, got true")
+	}
+	if jobResume.ResumeMode != "same_conversation_unverified" {
+		t.Fatalf("expected ResumeMode to be same_conversation_unverified, got %q", jobResume.ResumeMode)
+	}
+	if jobResume.AttachConfirmation != "unverified" {
+		t.Fatalf("expected AttachConfirmation to be unverified, got %q", jobResume.AttachConfirmation)
 	}
 }

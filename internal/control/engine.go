@@ -1221,29 +1221,22 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 			}
 		}
 	} else if job.Status == "RUNNING" || job.Status == "LEASED" {
-		// Resolve pending resume mode at exit (Finding A1, hardened in Finding B1, M1):
-		// If job resumed on an initial session and no fallback occurred:
-		// Only confirm implicit attachment on exit code 0 if a non-empty initial conversation existed; on non-zero, mark unverified.
-		if job.ParentJobID != "" && job.ResumeMode == "pending" && job.ResumeFallbackReason == "" && job.InitialConversationID != "" {
+		// Resolve pending resume mode at exit (Finding A1, hardened in Finding B1, M1, M2, M3):
+		// If job resumed on an initial session and positive confirmation (marker) was never received:
+		// Map exit-0 without positive evidence to same_conversation_unverified (Finding M3).
+		// Never confirm same_conversation if active conversation differs from initial (Finding M2).
+		if job.ParentJobID != "" && job.ResumeMode == "pending" {
+			job.ResumeMode = "same_conversation_unverified"
+			job.SameConversationConfirmed = false
 			if code == 0 {
-				job.ResumeMode = "same_conversation"
-				job.SameConversationConfirmed = true
-				job.AttachConfirmation = "implicit"
-				if job.ActiveConversationID == "" && job.InitialConversationID != "" {
-					job.ActiveConversationID = job.InitialConversationID
-				}
+				job.AttachConfirmation = "unverified"
 			} else {
-				job.ResumeMode = "same_conversation_unverified"
-				job.SameConversationConfirmed = false
 				job.AttachConfirmation = "unknown"
 			}
 			if sch, ok := e.schedules[job.ScheduleID]; ok {
 				sch.ResumeMode = job.ResumeMode
 				sch.SameConversationConfirmed = job.SameConversationConfirmed
 				sch.AttachConfirmation = job.AttachConfirmation
-				if code == 0 && sch.ActiveConversationID == "" && sch.InitialConversationID != "" {
-					sch.ActiveConversationID = sch.InitialConversationID
-				}
 			}
 		}
 		if code != 0 {
@@ -2877,15 +2870,31 @@ func (e *Engine) AddJobConversationWithOptions(jobID, convID string, opts ...Con
 				job.InitialConversationID = convID
 			}
 			// Only confirm same_conversation if a pre-existing initial conversation was present and matched (Finding M1)
-			if job.ParentJobID != "" && job.ResumeMode == "pending" && priorInitial != "" && convID == priorInitial {
-				job.ResumeMode = "same_conversation"
-				job.SameConversationConfirmed = true
-				job.AttachConfirmation = "marker"
-				if job.ScheduleID != "" {
-					if sch, ok := e.schedules[job.ScheduleID]; ok && sch != nil {
-						sch.ResumeMode = job.ResumeMode
-						sch.SameConversationConfirmed = job.SameConversationConfirmed
-						sch.AttachConfirmation = job.AttachConfirmation
+			if job.ParentJobID != "" && job.ResumeMode == "pending" {
+				if priorInitial != "" && convID == priorInitial {
+					job.ResumeMode = "same_conversation"
+					job.SameConversationConfirmed = true
+					job.AttachConfirmation = "marker"
+					if job.ScheduleID != "" {
+						if sch, ok := e.schedules[job.ScheduleID]; ok && sch != nil {
+							sch.ResumeMode = job.ResumeMode
+							sch.SameConversationConfirmed = job.SameConversationConfirmed
+							sch.AttachConfirmation = job.AttachConfirmation
+						}
+					}
+				} else if priorInitial != "" && convID != priorInitial {
+					// Implicit fallback on differing first conversation ID (Finding M2)
+					job.ResumeMode = "fallback_new_conversation"
+					job.ResumeFallbackReason = fmt.Sprintf("initial conversation %s could not be attached; active conversation %s started", priorInitial, convID)
+					job.SameConversationConfirmed = false
+					job.AttachConfirmation = "fallback"
+					if job.ScheduleID != "" {
+						if sch, ok := e.schedules[job.ScheduleID]; ok && sch != nil {
+							sch.ResumeMode = job.ResumeMode
+							sch.ResumeFallbackReason = job.ResumeFallbackReason
+							sch.SameConversationConfirmed = job.SameConversationConfirmed
+							sch.AttachConfirmation = job.AttachConfirmation
+						}
 					}
 				}
 			}
