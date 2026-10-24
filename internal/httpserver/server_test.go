@@ -2506,3 +2506,49 @@ func TestProfileHandlers_SinglePersistencePathNoRedundantWrite(t *testing.T) {
 	}
 	mu.Unlock()
 }
+
+func TestSyncAllProfiles_TotalFailureReturns502(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	mockRelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer mockRelServer.Close()
+
+	relSvc := control.NewReleaseService()
+	relSvc.SetBaseURL(mockRelServer.URL)
+	relSvc.SetHTTPClient(mockRelServer.Client())
+	s.Engine.Releases = relSvc
+
+	_, err := s.Engine.UpsertProfile(control.DistributionProfile{
+		Name: "fail-all-profile",
+		Tools: []control.ProfileTool{
+			{
+				Name:          "tool-fail",
+				Repository:    "viovy/repo-fail",
+				TargetVersion: "1.0.0",
+				TrackLatest:   control.BoolPtr(true),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create profile failed: %v", err)
+	}
+
+	handler := s.Handler()
+	req := httptest.NewRequest(http.MethodPost, "/v1/fleet/profiles/sync", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	// L1, N3: Total failure across profiles must return 502 Bad Gateway
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 Bad Gateway for total sync-all failure, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp["status"] != "error" {
+		t.Fatalf("expected status 'error', got %v", resp["status"])
+	}
+}
