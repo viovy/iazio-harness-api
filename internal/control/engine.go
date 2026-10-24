@@ -1220,7 +1220,7 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 				changedRepo = repo
 			}
 		}
-	} else if job.Status == "RUNNING" {
+	} else if job.Status == "RUNNING" || job.Status == "LEASED" {
 		// Resolve pending resume mode at exit (Finding A1, hardened in Finding B1):
 		// If job resumed on an initial session and no fallback occurred:
 		// Only confirm implicit attachment on exit code 0; on non-zero, mark unverified.
@@ -2490,6 +2490,28 @@ func (e *Engine) GetAssociatedJobsForScheduleLocked(schID string) []string {
 			}
 		}
 	}
+
+	// Transitive lineage closure: any job whose parent or root is in the associated set belongs to the schedule lineage
+	for {
+		added := false
+		for _, j := range e.jobs {
+			if !jobSet[j.ID] && ((j.ParentJobID != "" && jobSet[j.ParentJobID]) || (j.RootJobID != "" && jobSet[j.RootJobID])) {
+				addJob(j.ID)
+				added = true
+			}
+		}
+		for _, rows := range e.history {
+			for _, r := range rows {
+				if !jobSet[r.JobID] && ((r.ParentJobID != "" && jobSet[r.ParentJobID]) || (r.RootJobID != "" && jobSet[r.RootJobID])) {
+					addJob(r.JobID)
+					added = true
+				}
+			}
+		}
+		if !added {
+			break
+		}
+	}
 	return ordered
 }
 
@@ -2949,6 +2971,8 @@ func (e *Engine) AddJobConversationWithOptions(jobID, convID string, opts ...Con
 				rows[i].InitialConversationID = job.InitialConversationID
 				rows[i].ResumeMode = job.ResumeMode
 				rows[i].ResumeFallbackReason = job.ResumeFallbackReason
+				rows[i].SameConversationConfirmed = job.SameConversationConfirmed
+				rows[i].AttachConfirmation = job.AttachConfirmation
 				rows[i].ConversationLineage = append([]ConversationLineage(nil), job.ConversationLineage...)
 				rows[i].ConversationIDs = append([]string(nil), job.ConversationIDs...)
 				e.notifyHistoryLocked(sch.HostID, sch.WorktreePath, rows[i])
@@ -3026,6 +3050,9 @@ func canonicalizeEngine(engine, convID string) string {
 	case "agy":
 		return "agy"
 	case "agent", "cursor":
+		if convID != "" && !strings.HasPrefix(strings.ToLower(convID), "cursor-") {
+			return "agy"
+		}
 		return "agent"
 	default:
 		return raw
@@ -3132,6 +3159,26 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 	parentJobID := opt.ParentJobID
 	if parentJobID == "" && opt.JobID != "" {
 		parentJobID = opt.JobID
+	}
+	if parentJobID == "" {
+		if rows := e.history[repoKey(host, path)]; len(rows) > 0 {
+			for i := len(rows) - 1; i >= 0; i-- {
+				rowStory := extractStoryIDFromString(rows[i].PromptTitle)
+				if targetStoryID == "" || targetStoryID == "STORY-RESUME-INPLACE" || rowStory == targetStoryID {
+					parentJobID = rows[i].JobID
+					break
+				}
+			}
+		}
+	}
+	if parentJobID == "" {
+		for _, j := range e.jobs {
+			if sch := e.schedules[j.ScheduleID]; sch != nil && sch.HostID == host && sch.WorktreePath == path {
+				if targetStoryID == "" || targetStoryID == "STORY-RESUME-INPLACE" || sch.StoryID == targetStoryID {
+					parentJobID = j.ID
+				}
+			}
+		}
 	}
 	rootJobID := opt.RootJobID
 	initConvID := opt.InitialConversationID
@@ -3391,14 +3438,21 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 	if interruptedState["phase"] == nil || interruptedState["phase"] == "" {
 		if repo.ASEState != "" {
 			interruptedState["phase"] = repo.ASEState
+			interruptedState["phase_source"] = "repo_ase_state"
 		} else if repo.Reason == "HALTED_DIRTY" {
 			interruptedState["phase"] = "IMPLEMENTATION"
+			interruptedState["phase_source"] = "repo_halted_dirty"
 		} else {
-			interruptedState["phase"] = "SPECIFICATION"
+			interruptedState["phase"] = "UNKNOWN"
+			interruptedState["phase_source"] = "default"
 		}
+	} else if interruptedState["phase_source"] == nil {
+		interruptedState["phase_source"] = "parent_job"
 	}
 	if interruptedState["step"] == nil {
 		switch interruptedState["phase"] {
+		case "SPECIFICATION":
+			interruptedState["step"] = 1
 		case "IMPLEMENTATION":
 			interruptedState["step"] = 2
 		case "VERIFICATION":
@@ -3408,7 +3462,7 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		case "RELEASE":
 			interruptedState["step"] = 5
 		default:
-			interruptedState["step"] = 1
+			interruptedState["step"] = 0
 		}
 	}
 	if opt.InterruptedASEState != nil {

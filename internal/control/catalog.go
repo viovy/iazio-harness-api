@@ -871,6 +871,8 @@ func (e *Engine) ListHistory(hostID, repoPath, status string, limit int) []Histo
 				ActiveConversationID:  row.ActiveConversationID,
 				ResumeMode:            row.ResumeMode,
 				ResumeFallbackReason:  row.ResumeFallbackReason,
+				SameConversationConfirmed: row.SameConversationConfirmed,
+				AttachConfirmation:        row.AttachConfirmation,
 				InterruptedASEState:   row.InterruptedASEState,
 				ConversationLineage:   row.ConversationLineage,
 			})
