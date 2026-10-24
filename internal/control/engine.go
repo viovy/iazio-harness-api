@@ -134,6 +134,25 @@ type Prompt struct {
 	Revision     int
 }
 
+// ConversationLineage records attachment and role transitions of conversations bound to a job.
+type ConversationLineage struct {
+	ConversationID string    `json:"conversation_id"`
+	Role           string    `json:"role"` // "initial_resumed", "initial_active", "fallback_primary"
+	AttachedAt     time.Time `json:"attached_at"`
+	CLIArgs        string    `json:"cli_args,omitempty"`
+	ASEPhase       string    `json:"ase_phase,omitempty"`
+	Reason         string    `json:"reason,omitempty"`
+}
+
+// ConversationAttachOptions configures conversation attachment and fallback metadata.
+type ConversationAttachOptions struct {
+	Fallback       bool   `json:"fallback,omitempty"`
+	FallbackReason string `json:"fallback_reason,omitempty"`
+	Role           string `json:"role,omitempty"`
+	CLIArgs        string `json:"cli_args,omitempty"`
+	ASEPhase       string `json:"ase_phase,omitempty"`
+}
+
 // Schedule is one Execute click.
 type Schedule struct {
 	ID                   string
@@ -159,39 +178,54 @@ type Schedule struct {
 	IsGlobal             bool
 	CustomPrompt         string
 	TraceID              string
+	ParentJobID          string
+	RootJobID            string
+	InitialConversationID string
+	ActiveConversationID string
+	ResumeMode           string
+	ResumeFallbackReason string
+	InterruptedASEState  map[string]any
 }
 
 // JobDetail carries the execution payload for iazio-harness.
 type JobDetail struct {
-	ID                          string            `json:"id"`
-	ScheduleID                  string            `json:"schedule_id"`
-	Kind                        string            `json:"kind"`
-	Status                      string            `json:"status"`
-	Engine                      string            `json:"engine"`
-	Prompt                      string            `json:"prompt"`
-	StoryID                     string            `json:"story_id"`
-	SourceIdeaID                string            `json:"source_idea_id"`
-	Transcript                  string            `json:"transcript,omitempty"`
-	WorktreePath                string            `json:"worktree_path"`
-	DocsHubPath                 string            `json:"docs_hub_path"`
-	EnvVars                     map[string]string `json:"env_vars,omitempty"`
-	MaxExecutionDurationSeconds int               `json:"max_execution_duration_seconds"`
-	ResumeConversationID        string            `json:"resume_conversation_id,omitempty"`
-	ConversationIDs             []string          `json:"conversation_ids,omitempty"`
-	SilentForSeconds            int               `json:"silent_for_seconds,omitempty"`
-	IsStalled                   bool              `json:"is_stalled,omitempty"`
-	StartedAt                   string            `json:"started_at,omitempty"`
-	Reason                      string            `json:"reason,omitempty"`
-	Model                       string            `json:"model,omitempty"`
-	Agent                       string            `json:"agent,omitempty"`
-	DisableSlashCommands        *bool             `json:"disable_slash_commands,omitempty"`
-	HostID                      string            `json:"host_id,omitempty"`
-	TargetHost                  string            `json:"target_host,omitempty"`
-	HarnessPID                  int               `json:"harness_pid,omitempty"`
-	ToolPID                     int               `json:"tool_pid,omitempty"`
-	ElapsedSeconds              int64             `json:"elapsed_seconds,omitempty"`
-	ResumeCount                 int               `json:"resume_count,omitempty"`
-	TraceID                     string            `json:"trace_id,omitempty"`
+	ID                          string                 `json:"id"`
+	ScheduleID                  string                 `json:"schedule_id"`
+	Kind                        string                 `json:"kind"`
+	Status                      string                 `json:"status"`
+	Engine                      string                 `json:"engine"`
+	Prompt                      string                 `json:"prompt"`
+	StoryID                     string                 `json:"story_id"`
+	SourceIdeaID                string                 `json:"source_idea_id"`
+	Transcript                  string                 `json:"transcript,omitempty"`
+	WorktreePath                string                 `json:"worktree_path"`
+	DocsHubPath                 string                 `json:"docs_hub_path"`
+	EnvVars                     map[string]string      `json:"env_vars,omitempty"`
+	MaxExecutionDurationSeconds int                    `json:"max_execution_duration_seconds"`
+	ResumeConversationID        string                 `json:"resume_conversation_id,omitempty"`
+	ConversationIDs             []string               `json:"conversation_ids,omitempty"`
+	SilentForSeconds            int                    `json:"silent_for_seconds,omitempty"`
+	IsStalled                   bool                   `json:"is_stalled,omitempty"`
+	StartedAt                   string                 `json:"started_at,omitempty"`
+	Reason                      string                 `json:"reason,omitempty"`
+	Model                       string                 `json:"model,omitempty"`
+	Agent                       string                 `json:"agent,omitempty"`
+	DisableSlashCommands        *bool                  `json:"disable_slash_commands,omitempty"`
+	HostID                      string                 `json:"host_id,omitempty"`
+	TargetHost                  string                 `json:"target_host,omitempty"`
+	HarnessPID                  int                    `json:"harness_pid,omitempty"`
+	ToolPID                     int                    `json:"tool_pid,omitempty"`
+	ElapsedSeconds              int64                  `json:"elapsed_seconds,omitempty"`
+	ResumeCount                 int                    `json:"resume_count,omitempty"`
+	TraceID                     string                 `json:"trace_id,omitempty"`
+	ParentJobID                 string                 `json:"parent_job_id,omitempty"`
+	RootJobID                   string                 `json:"root_job_id,omitempty"`
+	InitialConversationID       string                 `json:"initial_conversation_id,omitempty"`
+	ActiveConversationID        string                 `json:"active_conversation_id,omitempty"`
+	ResumeMode                  string                 `json:"resume_mode,omitempty"`
+	ResumeFallbackReason        string                 `json:"resume_fallback_reason,omitempty"`
+	InterruptedASEState         map[string]any         `json:"interrupted_ase_state,omitempty"`
+	ConversationLineage         []ConversationLineage  `json:"conversation_lineage,omitempty"`
 }
 
 // ActiveJob describes an active job reported on heartbeat.
@@ -203,29 +237,37 @@ type ActiveJob struct {
 
 // Job is one leased execution.
 type Job struct {
-	ID                   string
-	ScheduleID           string
-	Kind                 string
-	Status               string
-	HostID               string
-	TargetHost           string
-	LeaseHolder          string
-	LeaseExpiry          time.Time
-	FrozenUntil          time.Time
-	ExitPosted           bool
-	Correlation          string
-	HealingUsed          bool
-	StartedAt            time.Time
-	LastChunkAt          time.Time
-	LastOutputAt         time.Time
-	ResumeConversationID string
-	ConversationIDs      []string
-	Reason               string
-	HarnessPID           int
-	ToolPID              int
-	ElapsedSeconds       int64
-	ResumeCount          int
-	TraceID              string
+	ID                    string
+	ScheduleID            string
+	Kind                  string
+	Status                string
+	HostID                string
+	TargetHost            string
+	LeaseHolder           string
+	LeaseExpiry           time.Time
+	FrozenUntil           time.Time
+	ExitPosted            bool
+	Correlation           string
+	HealingUsed           bool
+	StartedAt             time.Time
+	LastChunkAt           time.Time
+	LastOutputAt          time.Time
+	ResumeConversationID  string
+	ConversationIDs       []string
+	Reason                string
+	HarnessPID            int
+	ToolPID               int
+	ElapsedSeconds        int64
+	ResumeCount           int
+	TraceID               string
+	ParentJobID           string
+	RootJobID             string
+	InitialConversationID string
+	ActiveConversationID  string
+	ResumeMode            string
+	ResumeFallbackReason  string
+	InterruptedASEState   map[string]any
+	ConversationLineage   []ConversationLineage
 }
 
 // Repo is one registered checkout.
@@ -337,42 +379,58 @@ type Tool struct {
 
 // HistoryRow is one finished execution on a repo page.
 type HistoryRow struct {
-	JobID           string
-	ScheduleID      string
-	PromptTitle     string
-	Engine          string
-	Status          string
-	Clean           bool
-	ASEComplete     bool
-	ConversationIDs []string
-	Reason          string
-	ErrorMessage    string
-	DiagnosticCode  string
-	Model           string
-	Remediation     string
-	TraceID         string
-	CreatedAt       time.Time
+	JobID                 string
+	ScheduleID            string
+	PromptTitle           string
+	Engine                string
+	Status                string
+	Clean                 bool
+	ASEComplete           bool
+	ConversationIDs       []string
+	Reason                string
+	ErrorMessage          string
+	DiagnosticCode        string
+	Model                 string
+	Remediation           string
+	TraceID               string
+	CreatedAt             time.Time
+	ParentJobID           string
+	RootJobID             string
+	InitialConversationID string
+	ActiveConversationID  string
+	ResumeMode            string
+	ResumeFallbackReason  string
+	InterruptedASEState   map[string]any
+	ConversationLineage   []ConversationLineage
 }
 
 // HistoryItem is one execution record reported across repositories.
 type HistoryItem struct {
-	HostID          string
-	WorktreePath    string
-	JobID           string
-	ScheduleID      string
-	PromptTitle     string
-	Engine          string
-	Status          string
-	Clean           bool
-	ASEComplete     bool
-	ConversationIDs []string
-	Reason          string
-	ErrorMessage    string
-	DiagnosticCode  string
-	Model           string
-	Remediation     string
-	TraceID         string
-	CreatedAt       time.Time
+	HostID                string
+	WorktreePath          string
+	JobID                 string
+	ScheduleID            string
+	PromptTitle           string
+	Engine                string
+	Status                string
+	Clean                 bool
+	ASEComplete           bool
+	ConversationIDs       []string
+	Reason                string
+	ErrorMessage          string
+	DiagnosticCode        string
+	Model                 string
+	Remediation           string
+	TraceID               string
+	CreatedAt             time.Time
+	ParentJobID           string
+	RootJobID             string
+	InitialConversationID string
+	ActiveConversationID  string
+	ResumeMode            string
+	ResumeFallbackReason  string
+	InterruptedASEState   map[string]any
+	ConversationLineage   []ConversationLineage
 }
 
 // LogChunk is one stripped output event.
@@ -1955,19 +2013,60 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			targetHost = host
 		}
 		traceID := sch.TraceID
-		job := &Job{
-			ID: id, ScheduleID: sch.ID, Kind: sch.Kind, Status: "RUNNING",
-			HostID: host, TargetHost: targetHost,
-			LeaseHolder: host, LeaseExpiry: e.now().Add(LeaseInterval),
-			StartedAt:            e.now(),
-			LastChunkAt:          e.now(),
-			ResumeConversationID: sch.ResumeConversationID,
-			TraceID:              traceID,
+
+		initConvID := sch.InitialConversationID
+		if initConvID == "" {
+			initConvID = sch.ResumeConversationID
 		}
-		if sch.ResumeConversationID != "" {
-			job.ConversationIDs = []string{sch.ResumeConversationID}
+		actConvID := sch.ActiveConversationID
+		if actConvID == "" {
+			actConvID = initConvID
+		}
+		resMode := sch.ResumeMode
+		if resMode == "" && (initConvID != "" || sch.Kind == KindResume) {
+			resMode = "same_conversation"
+		}
+
+		job := &Job{
+			ID:                    id,
+			ScheduleID:            sch.ID,
+			Kind:                  sch.Kind,
+			Status:                "RUNNING",
+			HostID:                host,
+			TargetHost:            targetHost,
+			LeaseHolder:           host,
+			LeaseExpiry:           e.now().Add(LeaseInterval),
+			StartedAt:             e.now(),
+			LastChunkAt:           e.now(),
+			ResumeConversationID:  actConvID,
+			TraceID:               traceID,
+			ParentJobID:           sch.ParentJobID,
+			RootJobID:             sch.RootJobID,
+			InitialConversationID: initConvID,
+			ActiveConversationID:  actConvID,
+			ResumeMode:            resMode,
+			ResumeFallbackReason:  sch.ResumeFallbackReason,
+			InterruptedASEState:   sch.InterruptedASEState,
+		}
+		if actConvID != "" {
+			job.ConversationIDs = []string{actConvID}
+			cliArgs := fmt.Sprintf("--conversation=%s", actConvID)
+			role := "initial_resumed"
+			if sch.Kind != KindResume && sch.ParentJobID == "" {
+				role = "initial_active"
+			}
+			job.ConversationLineage = []ConversationLineage{
+				{
+					ConversationID: actConvID,
+					Role:           role,
+					AttachedAt:     e.now(),
+					CLIArgs:        cliArgs,
+					ASEPhase:       "START",
+				},
+			}
 		} else {
 			job.ConversationIDs = []string{}
+			job.ConversationLineage = []ConversationLineage{}
 		}
 		e.jobs[id] = job
 		if sch.CloneURL != "" {
@@ -1984,19 +2083,24 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			e.notifyRepoLocked(repo)
 		}
 		row := HistoryRow{
-			JobID:           id,
-			ScheduleID:      sch.ID,
-			PromptTitle:     sch.PromptTitle,
-			Engine:          sch.Engine,
-			Status:          "RUNNING",
-			Clean:           false,
-			ASEComplete:     false,
-			ConversationIDs: []string{},
-			TraceID:         traceID,
-			CreatedAt:       e.now(),
-		}
-		if sch.ResumeConversationID != "" {
-			row.ConversationIDs = append(row.ConversationIDs, sch.ResumeConversationID)
+			JobID:                 id,
+			ScheduleID:            sch.ID,
+			PromptTitle:           sch.PromptTitle,
+			Engine:                sch.Engine,
+			Status:                "RUNNING",
+			Clean:                 false,
+			ASEComplete:           false,
+			ConversationIDs:       append([]string(nil), job.ConversationIDs...),
+			TraceID:               traceID,
+			CreatedAt:             e.now(),
+			ParentJobID:           job.ParentJobID,
+			RootJobID:             job.RootJobID,
+			InitialConversationID: job.InitialConversationID,
+			ActiveConversationID:  job.ActiveConversationID,
+			ResumeMode:            job.ResumeMode,
+			ResumeFallbackReason:  job.ResumeFallbackReason,
+			InterruptedASEState:   job.InterruptedASEState,
+			ConversationLineage:   append([]ConversationLineage(nil), job.ConversationLineage...),
 		}
 		e.history[repoKey(host, sch.WorktreePath)] = append(e.history[repoKey(host, sch.WorktreePath)], row)
 		e.notifyHistoryLocked(host, sch.WorktreePath, row)
@@ -2272,19 +2376,27 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 		return JobDetail{}, false
 	}
 	detail := JobDetail{
-		ID:                   job.ID,
-		ScheduleID:           job.ScheduleID,
-		Kind:                 job.Kind,
-		Status:               job.Status,
-		ResumeConversationID: job.ResumeConversationID,
-		ConversationIDs:      append([]string(nil), job.ConversationIDs...),
-		Reason:               job.Reason,
-		HostID:               job.LeaseHolder,
-		TargetHost:           job.LeaseHolder,
-		HarnessPID:           job.HarnessPID,
-		ToolPID:              job.ToolPID,
-		ElapsedSeconds:       job.ElapsedSeconds,
-		ResumeCount:          job.ResumeCount,
+		ID:                    job.ID,
+		ScheduleID:            job.ScheduleID,
+		Kind:                  job.Kind,
+		Status:                job.Status,
+		ResumeConversationID:  job.ResumeConversationID,
+		ConversationIDs:       append([]string(nil), job.ConversationIDs...),
+		Reason:                job.Reason,
+		HostID:                job.LeaseHolder,
+		TargetHost:            job.LeaseHolder,
+		HarnessPID:            job.HarnessPID,
+		ToolPID:               job.ToolPID,
+		ElapsedSeconds:        job.ElapsedSeconds,
+		ResumeCount:           job.ResumeCount,
+		ParentJobID:           job.ParentJobID,
+		RootJobID:             job.RootJobID,
+		InitialConversationID: job.InitialConversationID,
+		ActiveConversationID:  job.ActiveConversationID,
+		ResumeMode:            job.ResumeMode,
+		ResumeFallbackReason:  job.ResumeFallbackReason,
+		InterruptedASEState:   job.InterruptedASEState,
+		ConversationLineage:   append([]ConversationLineage(nil), job.ConversationLineage...),
 	}
 	if !job.StartedAt.IsZero() {
 		detail.StartedAt = job.StartedAt.UTC().Format(time.RFC3339)
@@ -2305,6 +2417,27 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 		}
 		if detail.ResumeConversationID == "" {
 			detail.ResumeConversationID = sch.ResumeConversationID
+		}
+		if detail.ParentJobID == "" {
+			detail.ParentJobID = sch.ParentJobID
+		}
+		if detail.RootJobID == "" {
+			detail.RootJobID = sch.RootJobID
+		}
+		if detail.InitialConversationID == "" {
+			detail.InitialConversationID = sch.InitialConversationID
+		}
+		if detail.ActiveConversationID == "" {
+			detail.ActiveConversationID = sch.ActiveConversationID
+		}
+		if detail.ResumeMode == "" {
+			detail.ResumeMode = sch.ResumeMode
+		}
+		if detail.ResumeFallbackReason == "" {
+			detail.ResumeFallbackReason = sch.ResumeFallbackReason
+		}
+		if detail.InterruptedASEState == nil {
+			detail.InterruptedASEState = sch.InterruptedASEState
 		}
 		detail.Engine = sch.Engine
 		detail.WorktreePath = sch.WorktreePath
@@ -2379,6 +2512,11 @@ func (e *Engine) GetJobLeaseExpiry(id string) (time.Time, bool) {
 
 // AddJobConversation records an early or streamed conversation ID for a job.
 func (e *Engine) AddJobConversation(jobID, convID string) error {
+	return e.AddJobConversationWithOptions(jobID, convID, ConversationAttachOptions{})
+}
+
+// AddJobConversationWithOptions records a conversation attachment with strict pinning, lineage, and fallback tracking.
+func (e *Engine) AddJobConversationWithOptions(jobID, convID string, opts ...ConversationAttachOptions) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	job, ok := e.jobs[jobID]
@@ -2389,33 +2527,126 @@ func (e *Engine) AddJobConversation(jobID, convID string) error {
 	if convID == "" {
 		return errors.New("empty conversation id")
 	}
-	found := false
-	for _, c := range job.ConversationIDs {
-		if c == convID {
-			found = true
-			break
+
+	var opt ConversationAttachOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+
+	cliArgs := opt.CLIArgs
+	if cliArgs == "" {
+		cliArgs = fmt.Sprintf("--conversation=%s", convID)
+	}
+
+	role := opt.Role
+	if role == "" {
+		if opt.Fallback {
+			role = "fallback_primary"
+		} else if job.InitialConversationID != "" && convID == job.InitialConversationID {
+			role = "initial_resumed"
+		} else if job.ActiveConversationID == "" {
+			role = "initial_active"
+		} else {
+			role = "active_pinned"
 		}
 	}
-	if !found {
-		job.ConversationIDs = append(job.ConversationIDs, convID)
+
+	if opt.Fallback {
+		// Explicit fallback from initial conversation failure
+		job.ActiveConversationID = convID
+		job.ResumeMode = "fallback_new_conversation"
+		if opt.FallbackReason != "" {
+			job.ResumeFallbackReason = opt.FallbackReason
+		}
+		lineageRec := ConversationLineage{
+			ConversationID: convID,
+			Role:           "fallback_primary",
+			AttachedAt:     e.now(),
+			CLIArgs:        cliArgs,
+			ASEPhase:       opt.ASEPhase,
+			Reason:         opt.FallbackReason,
+		}
+		job.ConversationLineage = append(job.ConversationLineage, lineageRec)
+
+		found := false
+		for _, c := range job.ConversationIDs {
+			if c == convID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			job.ConversationIDs = append(job.ConversationIDs, convID)
+		}
+	} else {
+		// Strict pinning check:
+		if job.ActiveConversationID == "" {
+			job.ActiveConversationID = convID
+			if job.InitialConversationID == "" {
+				job.InitialConversationID = convID
+			}
+			job.ConversationLineage = append(job.ConversationLineage, ConversationLineage{
+				ConversationID: convID,
+				Role:           role,
+				AttachedAt:     e.now(),
+				CLIArgs:        cliArgs,
+				ASEPhase:       opt.ASEPhase,
+			})
+			job.ConversationIDs = append(job.ConversationIDs, convID)
+		} else if job.ActiveConversationID == convID || job.InitialConversationID == convID {
+			if job.InitialConversationID != "" && convID == job.InitialConversationID {
+				job.ResumeMode = "same_conversation_confirmed"
+			}
+			found := false
+			for _, c := range job.ConversationIDs {
+				if c == convID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				job.ConversationIDs = append(job.ConversationIDs, convID)
+			}
+		} else {
+			// A different conversation ID arrived without explicit opt.Fallback.
+			// If we haven't confirmed initial conversation yet and not in fallback mode,
+			// record this single fallback transition so the job tracks the new active session.
+			if job.ActiveConversationID == job.InitialConversationID && job.ResumeMode != "same_conversation_confirmed" {
+				job.ActiveConversationID = convID
+				job.ResumeMode = "fallback_new_conversation"
+				reason := fmt.Sprintf("streamed session fallback from %s to %s", job.InitialConversationID, convID)
+				if job.ResumeFallbackReason == "" {
+					job.ResumeFallbackReason = reason
+				}
+				job.ConversationLineage = append(job.ConversationLineage, ConversationLineage{
+					ConversationID: convID,
+					Role:           "fallback_primary",
+					AttachedAt:     e.now(),
+					CLIArgs:        cliArgs,
+					ASEPhase:       opt.ASEPhase,
+					Reason:         reason,
+				})
+				job.ConversationIDs = append(job.ConversationIDs, convID)
+			} else {
+				// Fragmented extra conversation ID! Ignore to prevent split-brain attachment.
+				return nil
+			}
+		}
 	}
+
 	sch, okSch := e.schedules[job.ScheduleID]
 	if okSch {
 		key := repoKey(sch.HostID, sch.WorktreePath)
 		rows := e.history[key]
 		for i := len(rows) - 1; i >= 0; i-- {
 			if rows[i].JobID == jobID {
-				has := false
-				for _, c := range rows[i].ConversationIDs {
-					if c == convID {
-						has = true
-						break
-					}
-				}
-				if !has {
-					rows[i].ConversationIDs = append(rows[i].ConversationIDs, convID)
-					e.notifyHistoryLocked(sch.HostID, sch.WorktreePath, rows[i])
-				}
+				rows[i].ActiveConversationID = job.ActiveConversationID
+				rows[i].InitialConversationID = job.InitialConversationID
+				rows[i].ResumeMode = job.ResumeMode
+				rows[i].ResumeFallbackReason = job.ResumeFallbackReason
+				rows[i].ConversationLineage = append([]ConversationLineage(nil), job.ConversationLineage...)
+				rows[i].ConversationIDs = append([]string(nil), job.ConversationIDs...)
+				e.notifyHistoryLocked(sch.HostID, sch.WorktreePath, rows[i])
 				break
 			}
 		}
@@ -2666,25 +2897,146 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 
 	// Create and enqueue new resume schedule
 	schID := e.next("sch-")
+	parentJobID := opt.ParentJobID
+	if parentJobID == "" && opt.JobID != "" {
+		parentJobID = opt.JobID
+	}
+	rootJobID := opt.RootJobID
+	var interruptedState map[string]any
+
+	if parentJobID != "" {
+		if pj, ok := e.jobs[parentJobID]; ok {
+			if rootJobID == "" {
+				rootJobID = pj.RootJobID
+				if rootJobID == "" {
+					rootJobID = pj.ParentJobID
+				}
+				if rootJobID == "" {
+					rootJobID = pj.ID
+				}
+			}
+			if resumeConvID == "" {
+				if pj.InitialConversationID != "" {
+					resumeConvID = pj.InitialConversationID
+				} else if pj.ActiveConversationID != "" {
+					resumeConvID = pj.ActiveConversationID
+				} else if pj.ResumeConversationID != "" {
+					resumeConvID = pj.ResumeConversationID
+				} else if len(pj.ConversationIDs) > 0 {
+					resumeConvID = pj.ConversationIDs[len(pj.ConversationIDs)-1]
+				}
+			}
+			var ps *Schedule
+			if pj.ScheduleID != "" {
+				ps = e.schedules[pj.ScheduleID]
+			}
+			parentEngine := ""
+			if ps != nil && ps.Engine != "" {
+				parentEngine = ps.Engine
+			}
+			if targetStoryID == "STORY-RESUME-INPLACE" && ps != nil && ps.StoryID != "" {
+				targetStoryID = ps.StoryID
+			}
+			if engineName == "" && parentEngine != "" {
+				engineName = parentEngine
+			}
+			interruptedState = map[string]any{
+				"story_id":      targetStoryID,
+				"parent_job_id": parentJobID,
+				"parent_status": pj.Status,
+				"parent_engine": parentEngine,
+			}
+			if pj.InterruptedASEState != nil {
+				for k, v := range pj.InterruptedASEState {
+					interruptedState[k] = v
+				}
+			}
+		} else {
+			for _, rows := range e.history {
+				for _, r := range rows {
+					if r.JobID == parentJobID {
+						if rootJobID == "" {
+							rootJobID = r.RootJobID
+							if rootJobID == "" {
+								rootJobID = r.ParentJobID
+							}
+							if rootJobID == "" {
+								rootJobID = r.JobID
+							}
+						}
+						if resumeConvID == "" {
+							if r.InitialConversationID != "" {
+								resumeConvID = r.InitialConversationID
+							} else if r.ActiveConversationID != "" {
+								resumeConvID = r.ActiveConversationID
+							} else if len(r.ConversationIDs) > 0 {
+								resumeConvID = r.ConversationIDs[len(r.ConversationIDs)-1]
+							}
+						}
+						if engineName == "" && r.Engine != "" {
+							engineName = r.Engine
+						}
+						interruptedState = map[string]any{
+							"story_id":      targetStoryID,
+							"parent_job_id": parentJobID,
+							"parent_status": r.Status,
+							"parent_engine": r.Engine,
+						}
+						if r.InterruptedASEState != nil {
+							for k, v := range r.InterruptedASEState {
+								interruptedState[k] = v
+							}
+						}
+						break
+					}
+				}
+			}
+		}
+	}
+	if rootJobID == "" && parentJobID != "" {
+		rootJobID = parentJobID
+	}
+	initConvID := opt.InitialConversationID
+	if initConvID == "" {
+		initConvID = resumeConvID
+	}
+	if interruptedState == nil {
+		interruptedState = map[string]any{
+			"story_id": targetStoryID,
+			"phase":    repo.ASEState,
+		}
+		if opt.InterruptedASEState != nil {
+			for k, v := range opt.InterruptedASEState {
+				interruptedState[k] = v
+			}
+		}
+	}
+
 	newSch := &Schedule{
-		ID:                   schID,
-		PromptID:             promptID,
-		Revision:             promptRev,
-		HostID:               host,
-		WorktreePath:         path,
-		CloneURL:             repo.CloneURL,
-		Kind:                 KindResume,
-		IterationsTotal:      1,
-		IterationsRemaining:  1,
-		IterationsCompleted:  0,
-		MaxExecutionDuration: DefaultMaxExec,
-		Status:               "QUEUED",
-		PromptTitle:          promptTitle,
-		Engine:               engineName,
-		Priority:             100, // Elevated priority for manual in-place resume
-		ResumeConversationID: resumeConvID,
-		StoryID:              targetStoryID,
-		CustomPrompt:         customPrompt,
+		ID:                    schID,
+		PromptID:              promptID,
+		Revision:              promptRev,
+		HostID:                host,
+		WorktreePath:          path,
+		CloneURL:              repo.CloneURL,
+		Kind:                  KindResume,
+		IterationsTotal:       1,
+		IterationsRemaining:   1,
+		IterationsCompleted:   0,
+		MaxExecutionDuration:  DefaultMaxExec,
+		Status:                "QUEUED",
+		PromptTitle:           promptTitle,
+		Engine:                engineName,
+		Priority:              100, // Elevated priority for manual in-place resume
+		ResumeConversationID:  resumeConvID,
+		StoryID:               targetStoryID,
+		CustomPrompt:          customPrompt,
+		ParentJobID:           parentJobID,
+		RootJobID:             rootJobID,
+		InitialConversationID: initConvID,
+		ActiveConversationID:  initConvID,
+		ResumeMode:            "same_conversation",
+		InterruptedASEState:   interruptedState,
 	}
 	e.schedules[schID] = newSch
 	return *newSch, nil
@@ -2859,29 +3211,72 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 		}
 	}
 
+	parentJobID := job.ID
+	rootJobID := job.RootJobID
+	if rootJobID == "" {
+		rootJobID = job.ParentJobID
+	}
+	if rootJobID == "" {
+		rootJobID = job.ID
+	}
+	initConvID := opt.InitialConversationID
+	if initConvID == "" {
+		if job.InitialConversationID != "" {
+			initConvID = job.InitialConversationID
+		} else if resumeConvID != "" {
+			initConvID = resumeConvID
+		}
+	}
+	if resumeConvID == "" {
+		resumeConvID = initConvID
+	}
+
+	interruptedState := map[string]any{
+		"story_id":      targetStoryID,
+		"parent_job_id": parentJobID,
+		"parent_status": job.Status,
+		"parent_engine": origSch.Engine,
+	}
+	if job.InterruptedASEState != nil {
+		for k, v := range job.InterruptedASEState {
+			interruptedState[k] = v
+		}
+	}
+	if opt.InterruptedASEState != nil {
+		for k, v := range opt.InterruptedASEState {
+			interruptedState[k] = v
+		}
+	}
+
 	// Create new schedule to resume execution with KindResume.
 	schID := e.next("sch-")
 	newSch := &Schedule{
-		ID:                   schID,
-		PromptID:             origSch.PromptID,
-		Revision:             origSch.Revision,
-		HostID:               origSch.HostID,
-		WorktreePath:         origSch.WorktreePath,
-		CloneURL:             origSch.CloneURL,
-		Kind:                 KindResume,
-		IterationsTotal:      1,
-		IterationsRemaining:  1,
-		IterationsCompleted:  0,
-		MaxExecutionDuration: origSch.MaxExecutionDuration,
-		EnvKeys:              origSch.EnvKeys,
-		EnvVars:              origSch.EnvVars,
-		Status:               "QUEUED",
-		PromptTitle:          promptTitle,
-		Engine:               resumeEngine,
-		Priority:             origSch.Priority + 10,
-		ResumeConversationID: resumeConvID,
-		StoryID:              targetStoryID,
-		CustomPrompt:         customPrompt,
+		ID:                    schID,
+		PromptID:              origSch.PromptID,
+		Revision:              origSch.Revision,
+		HostID:                origSch.HostID,
+		WorktreePath:          origSch.WorktreePath,
+		CloneURL:              origSch.CloneURL,
+		Kind:                  KindResume,
+		IterationsTotal:       1,
+		IterationsRemaining:   1,
+		IterationsCompleted:   0,
+		MaxExecutionDuration:  origSch.MaxExecutionDuration,
+		EnvKeys:               origSch.EnvKeys,
+		EnvVars:               origSch.EnvVars,
+		Status:                "QUEUED",
+		PromptTitle:           promptTitle,
+		Engine:                resumeEngine,
+		Priority:              origSch.Priority + 10,
+		ResumeConversationID:  resumeConvID,
+		StoryID:               targetStoryID,
+		CustomPrompt:          customPrompt,
+		ParentJobID:           parentJobID,
+		RootJobID:             rootJobID,
+		InitialConversationID: initConvID,
+		ActiveConversationID:  initConvID,
+		ResumeMode:            "same_conversation",
+		InterruptedASEState:   interruptedState,
 	}
 	e.schedules[schID] = newSch
 	return *newSch, nil

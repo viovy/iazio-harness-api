@@ -797,10 +797,17 @@ func (s *Server) resumeRepoInPlace(w http.ResponseWriter, r *http.Request) {
 		JobID          string `json:"job_id"`
 		AllowDirty     bool   `json:"allow_dirty"`
 		PromptID       string `json:"prompt_id"`
-		PromptTitle    string `json:"prompt_title"`
-		Prompt         string `json:"prompt"`
-		CustomPrompt   string `json:"custom_prompt"`
-		Engine         string `json:"engine"`
+		PromptTitle           string         `json:"prompt_title"`
+		Prompt                string         `json:"prompt"`
+		CustomPrompt          string         `json:"custom_prompt"`
+		Engine                string         `json:"engine"`
+		InitialConversationID string         `json:"initial_conversation_id"`
+		ActiveConversationID  string         `json:"active_conversation_id"`
+		ParentJobID           string         `json:"parent_job_id"`
+		RootJobID             string         `json:"root_job_id"`
+		ResumeMode            string         `json:"resume_mode"`
+		ResumeFallbackReason  string         `json:"resume_fallback_reason"`
+		InterruptedASEState   map[string]any `json:"interrupted_ase_state"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
 		writeErr(w, http.StatusBadRequest, err)
@@ -818,18 +825,33 @@ func (s *Server) resumeRepoInPlace(w http.ResponseWriter, r *http.Request) {
 	if customPrompt == "" {
 		customPrompt = strings.TrimSpace(body.Prompt)
 	}
+	parentJobID := body.ParentJobID
+	if parentJobID == "" {
+		parentJobID = body.JobID
+	}
+	initConvID := body.InitialConversationID
+	if initConvID == "" {
+		initConvID = body.ConversationID
+	}
 	opts := control.ResumeOptions{
-		ConversationID: body.ConversationID,
-		AllowDirty:     body.AllowDirty,
-		StoryID:        body.StoryID,
-		JobID:          body.JobID,
-		PromptID:       body.PromptID,
-		PromptTitle:    body.PromptTitle,
-		Prompt:         customPrompt,
-		CustomPrompt:   customPrompt,
-		Engine:         body.Engine,
-		HostID:         host,
-		WorktreePath:   targetPath,
+		ConversationID:        body.ConversationID,
+		InitialConversationID: initConvID,
+		ActiveConversationID:  body.ActiveConversationID,
+		ParentJobID:           parentJobID,
+		RootJobID:             body.RootJobID,
+		ResumeMode:            body.ResumeMode,
+		ResumeFallbackReason:  body.ResumeFallbackReason,
+		InterruptedASEState:   body.InterruptedASEState,
+		AllowDirty:            body.AllowDirty,
+		StoryID:               body.StoryID,
+		JobID:                 body.JobID,
+		PromptID:              body.PromptID,
+		PromptTitle:           body.PromptTitle,
+		Prompt:                customPrompt,
+		CustomPrompt:          customPrompt,
+		Engine:                body.Engine,
+		HostID:                host,
+		WorktreePath:          targetPath,
 	}
 	sch, err := s.Engine.ResumeRepoInPlace(host, targetPath, opts)
 	if err != nil {
@@ -1415,20 +1437,64 @@ func (s *Server) pollHost(w http.ResponseWriter, r *http.Request) {
 	if engine == "" {
 		engine = "agent"
 	}
+	initConvID := job.InitialConversationID
+	if initConvID == "" {
+		initConvID = sch.InitialConversationID
+	}
+	activeConvID := job.ActiveConversationID
+	if activeConvID == "" {
+		activeConvID = sch.ActiveConversationID
+	}
+	if activeConvID == "" {
+		activeConvID = initConvID
+	}
+	parentJobID := job.ParentJobID
+	if parentJobID == "" {
+		parentJobID = sch.ParentJobID
+	}
+	rootJobID := job.RootJobID
+	if rootJobID == "" {
+		rootJobID = sch.RootJobID
+	}
+	resumeMode := job.ResumeMode
+	if resumeMode == "" {
+		resumeMode = sch.ResumeMode
+	}
+	fallbackReason := job.ResumeFallbackReason
+	if fallbackReason == "" {
+		fallbackReason = sch.ResumeFallbackReason
+	}
+	interruptedASE := job.InterruptedASEState
+	if interruptedASE == nil {
+		interruptedASE = sch.InterruptedASEState
+	}
+
 	resp := map[string]any{
-		"id":                     job.ID,
-		"kind":                   job.Kind,
-		"worktree_path":          sch.WorktreePath,
-		"docs_hub_path":          docs,
-		"story_id":               sch.StoryID,
-		"schedule_id":            sch.ID,
-		"engine":                 engine,
-		"prompt":                 promptText,
-		"resume_conversation_id": resumeConvID,
-		"trace_id":               job.TraceID,
+		"id":                      job.ID,
+		"kind":                    job.Kind,
+		"worktree_path":           sch.WorktreePath,
+		"docs_hub_path":           docs,
+		"story_id":                sch.StoryID,
+		"schedule_id":             sch.ID,
+		"engine":                  engine,
+		"prompt":                  promptText,
+		"resume_conversation_id":  resumeConvID,
+		"trace_id":                job.TraceID,
+		"parent_job_id":           parentJobID,
+		"root_job_id":             rootJobID,
+		"initial_conversation_id": initConvID,
+		"active_conversation_id":  activeConvID,
+		"resume_mode":             resumeMode,
+		"resume_fallback_reason":  fallbackReason,
+	}
+	if interruptedASE != nil {
+		resp["interrupted_ase_state"] = interruptedASE
 	}
 	if len(job.ConversationIDs) > 0 {
 		resp["conversation_ids"] = job.ConversationIDs
+	}
+	if len(job.ConversationLineage) > 0 {
+		resp["conversation_lineage"] = job.ConversationLineage
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -2356,6 +2422,11 @@ func (s *Server) appendChunk(w http.ResponseWriter, r *http.Request) {
 func (s *Server) addJobConversation(w http.ResponseWriter, r *http.Request) {
 	var raw struct {
 		ConversationID string `json:"conversation_id"`
+		Fallback       bool   `json:"fallback"`
+		FallbackReason string `json:"fallback_reason"`
+		Role           string `json:"role"`
+		CLIArgs        string `json:"cli_args"`
+		ASEPhase       string `json:"ase_phase"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -2366,7 +2437,14 @@ func (s *Server) addJobConversation(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errors.New("conversation_id is required"))
 		return
 	}
-	if err := s.Engine.AddJobConversation(r.PathValue("id"), cid); err != nil {
+	opt := control.ConversationAttachOptions{
+		Fallback:       raw.Fallback,
+		FallbackReason: raw.FallbackReason,
+		Role:           raw.Role,
+		CLIArgs:        raw.CLIArgs,
+		ASEPhase:       raw.ASEPhase,
+	}
+	if err := s.Engine.AddJobConversationWithOptions(r.PathValue("id"), cid, opt); err != nil {
 		writeErr(w, http.StatusNotFound, err)
 		return
 	}

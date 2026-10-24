@@ -2846,3 +2846,179 @@ func TestReapExpired_ReconcilesIdleRepoRunningJobID(t *testing.T) {
 		}
 	}
 }
+
+func TestEngine_DeterministicResumeConversationPinning_SameConversation(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	repoPath := "/Users/romeo/work/meta-repo-03"
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	initialConvID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+
+	// 1. Initial job-1311
+	p := e.PutPrompt(Prompt{
+		ID:     "prompt-ase-1",
+		Title:  "Autonomous Story Execution",
+		Engine: "agy",
+		Status: "READY",
+	})
+	_, err := e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, initialConvID)
+	if err != nil {
+		t.Fatalf("execute sch1 failed: %v", err)
+	}
+
+	job1, _, _, ok := e.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("poll failed for job1")
+	}
+	if job1.InitialConversationID != initialConvID || job1.ActiveConversationID != initialConvID {
+		t.Fatalf("job1 conversation mismatch: init=%s active=%s", job1.InitialConversationID, job1.ActiveConversationID)
+	}
+
+	// Job1 fails/halts
+	_ = e.PostExit(job1.ID, 1, ExitOptions{Reason: "FAILED"})
+
+	// 2. Resume job-1311 -> creates job-1313
+	resumeSch, err := e.ResumeRepoInPlace("mac-mini", repoPath, ResumeOptions{
+		JobID:                 job1.ID,
+		ParentJobID:           job1.ID,
+		InitialConversationID: initialConvID,
+		StoryID:               "STORY-GOV-3678",
+		Engine:                "agy",
+	})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace failed: %v", err)
+	}
+	if resumeSch.ParentJobID != job1.ID {
+		t.Fatalf("expected ParentJobID %s, got %s", job1.ID, resumeSch.ParentJobID)
+	}
+	if resumeSch.InitialConversationID != initialConvID {
+		t.Fatalf("expected InitialConversationID %s, got %s", initialConvID, resumeSch.InitialConversationID)
+	}
+	if resumeSch.ResumeMode != "same_conversation" {
+		t.Fatalf("expected ResumeMode same_conversation, got %s", resumeSch.ResumeMode)
+	}
+
+	// 3. Poll host leases resumed job (job-1313)
+	jobResume, _, _, ok := e.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("poll failed for resume job")
+	}
+	if jobResume.ParentJobID != job1.ID {
+		t.Fatalf("resumed job ParentJobID %s want %s", jobResume.ParentJobID, job1.ID)
+	}
+	if jobResume.InitialConversationID != initialConvID {
+		t.Fatalf("resumed job InitialConversationID %s want %s", jobResume.InitialConversationID, initialConvID)
+	}
+	if jobResume.ActiveConversationID != initialConvID {
+		t.Fatalf("resumed job ActiveConversationID %s want %s", jobResume.ActiveConversationID, initialConvID)
+	}
+
+	// 4. Runner reattaches to same conversation
+	err = e.AddJobConversationWithOptions(jobResume.ID, initialConvID, ConversationAttachOptions{
+		Role:     "initial_resumed",
+		CLIArgs:  "--conversation=" + initialConvID,
+		ASEPhase: "RESUME",
+	})
+	if err != nil {
+		t.Fatalf("AddJobConversationWithOptions failed: %v", err)
+	}
+
+	det, ok := e.GetJob(jobResume.ID)
+	if !ok {
+		t.Fatal("GetJob failed")
+	}
+	if len(det.ConversationIDs) != 1 || det.ConversationIDs[0] != initialConvID {
+		t.Fatalf("expected only initial conversation ID %v, got %v", initialConvID, det.ConversationIDs)
+	}
+
+	// 5. If an unpinned tertiary conversation (e.g. 14de9a1f-...) is reported, it must be ignored!
+	tertiaryConvID := "14de9a1f-5679-4f11-a08f-f32bc7e47663"
+	_ = e.AddJobConversation(jobResume.ID, tertiaryConvID)
+
+	detAfter, _ := e.GetJob(jobResume.ID)
+	if len(detAfter.ConversationIDs) != 1 || detAfter.ConversationIDs[0] != initialConvID {
+		t.Fatalf("unpinned tertiary conversation leaked into job! got %v", detAfter.ConversationIDs)
+	}
+}
+
+func TestEngine_DeterministicResumeConversationPinning_ControlledFallback(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	repoPath := "/Users/romeo/work/meta-repo-03"
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	initialConvID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	fallbackConvID := "1d446877-5bf9-44eb-9db5-e1c007a9fe31"
+
+	p := e.PutPrompt(Prompt{
+		ID:     "prompt-ase-2",
+		Title:  "Autonomous Story Execution Fallback",
+		Engine: "agy",
+		Status: "READY",
+	})
+	_, err := e.ExecutePromptWithResume(p.ID, "mac-mini", repoPath, 1, nil, initialConvID)
+	if err != nil {
+		t.Fatalf("execute sch failed: %v", err)
+	}
+
+	job, _, _, ok := e.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("poll failed")
+	}
+
+	// Initial conversation could not be attached -> runner triggers controlled fallback
+	fallbackReason := "session not found on host disk for engine agy"
+	err = e.AddJobConversationWithOptions(job.ID, fallbackConvID, ConversationAttachOptions{
+		Fallback:       true,
+		FallbackReason: fallbackReason,
+		Role:           "fallback_primary",
+		CLIArgs:        "--conversation=" + fallbackConvID,
+		ASEPhase:       "FALLBACK_START",
+	})
+	if err != nil {
+		t.Fatalf("AddJobConversationWithOptions fallback failed: %v", err)
+	}
+
+	det, ok := e.GetJob(job.ID)
+	if !ok {
+		t.Fatal("GetJob failed")
+	}
+	if det.ActiveConversationID != fallbackConvID {
+		t.Fatalf("expected ActiveConversationID %s, got %s", fallbackConvID, det.ActiveConversationID)
+	}
+	if det.InitialConversationID != initialConvID {
+		t.Fatalf("expected InitialConversationID %s, got %s", initialConvID, det.InitialConversationID)
+	}
+	if det.ResumeMode != "fallback_new_conversation" {
+		t.Fatalf("expected ResumeMode fallback_new_conversation, got %s", det.ResumeMode)
+	}
+	if det.ResumeFallbackReason != fallbackReason {
+		t.Fatalf("expected ResumeFallbackReason %q, got %q", fallbackReason, det.ResumeFallbackReason)
+	}
+	if len(det.ConversationIDs) != 2 || det.ConversationIDs[0] != initialConvID || det.ConversationIDs[1] != fallbackConvID {
+		t.Fatalf("expected conversation_ids [%s, %s], got %v", initialConvID, fallbackConvID, det.ConversationIDs)
+	}
+
+	// 6. Verify subsequent arbitrary conversation is ignored (pinned to fallbackConvID)
+	arbitraryConvID := "14de9a1f-5679-4f11-a08f-f32bc7e47663"
+	_ = e.AddJobConversation(job.ID, arbitraryConvID)
+
+	detAfter, _ := e.GetJob(job.ID)
+	if len(detAfter.ConversationIDs) != 2 {
+		t.Fatalf("arbitrary conversation corrupted job! got: %v", detAfter.ConversationIDs)
+	}
+	if detAfter.ActiveConversationID != fallbackConvID {
+		t.Fatalf("active conversation shifted unexpectedly to %s", detAfter.ActiveConversationID)
+	}
+}

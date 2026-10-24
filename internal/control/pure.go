@@ -62,17 +62,24 @@ const (
 
 // ResumeOptions specifies parameters when resuming a stalled or abandoned execution.
 type ResumeOptions struct {
-	ConversationID string `json:"conversation_id,omitempty"`
-	AllowDirty     bool   `json:"allow_dirty,omitempty"`
-	StoryID        string `json:"story_id,omitempty"`
-	JobID          string `json:"job_id,omitempty"`
-	PromptID       string `json:"prompt_id,omitempty"`
-	PromptTitle    string `json:"prompt_title,omitempty"`
-	HostID         string `json:"host_id,omitempty"`
-	WorktreePath   string `json:"worktree_path,omitempty"`
-	Engine         string `json:"engine,omitempty"`
-	Prompt         string `json:"prompt,omitempty"`
-	CustomPrompt   string `json:"custom_prompt,omitempty"`
+	ConversationID        string         `json:"conversation_id,omitempty"`
+	InitialConversationID string         `json:"initial_conversation_id,omitempty"`
+	ActiveConversationID  string         `json:"active_conversation_id,omitempty"`
+	ParentJobID           string         `json:"parent_job_id,omitempty"`
+	RootJobID             string         `json:"root_job_id,omitempty"`
+	ResumeMode            string         `json:"resume_mode,omitempty"`
+	ResumeFallbackReason  string         `json:"resume_fallback_reason,omitempty"`
+	InterruptedASEState   map[string]any `json:"interrupted_ase_state,omitempty"`
+	AllowDirty            bool           `json:"allow_dirty,omitempty"`
+	StoryID               string         `json:"story_id,omitempty"`
+	JobID                 string         `json:"job_id,omitempty"`
+	PromptID              string         `json:"prompt_id,omitempty"`
+	PromptTitle           string         `json:"prompt_title,omitempty"`
+	HostID                string         `json:"host_id,omitempty"`
+	WorktreePath          string         `json:"worktree_path,omitempty"`
+	Engine                string         `json:"engine,omitempty"`
+	Prompt                string         `json:"prompt,omitempty"`
+	CustomPrompt          string         `json:"custom_prompt,omitempty"`
 }
 
 // ExitOptions provides additional diagnostic and error context when a job finishes.
