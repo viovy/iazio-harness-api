@@ -1338,20 +1338,24 @@ func (s *Server) listHistory(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	job, ok := s.Engine.GetJob(id)
-	if ok {
-		writeJSON(w, http.StatusOK, jobDetailView(job))
-		return
+	// 1. Active in-memory jobs take highest precedence
+	if s.Engine != nil {
+		if job, ok := s.Engine.GetActiveJob(id); ok {
+			writeJSON(w, http.StatusOK, jobDetailView(job))
+			return
+		}
 	}
+	// 2. Pending jobs in dispatch queue take precedence over archived history
 	if s.Queue != nil {
 		if qJob, found := s.Queue.Get(id); found && qJob != nil {
 			writeJSON(w, http.StatusOK, dispatchJobDetailView(qJob))
 			return
 		}
 	}
+	// 3. Historical/archived jobs from engine history
 	if s.Engine != nil {
-		if row, host, path, found := s.Engine.FindHistoryRow(id); found {
-			writeJSON(w, http.StatusOK, historyJobDetailView(row, host, path))
+		if job, ok := s.Engine.GetJob(id); ok {
+			writeJSON(w, http.StatusOK, jobDetailView(job))
 			return
 		}
 		if sch, found := s.Engine.GetSchedule(id); found {

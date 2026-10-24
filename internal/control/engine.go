@@ -2902,87 +2902,113 @@ func (e *Engine) GetIdea(id string) (Idea, bool) {
 	return *it, true
 }
 
-// GetJob returns execution details for the harness child.
-func (e *Engine) GetJob(id string) (JobDetail, bool) {
+// GetActiveJob returns execution details for an in-memory/active job without falling back to history.
+func (e *Engine) GetActiveJob(id string) (JobDetail, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.reapExpiredLocked()
 	job, ok := e.jobs[id]
 	if !ok {
-		// History fallback for finished/historical jobs across process restarts
-		for key, rows := range e.history {
-			for _, r := range rows {
-				if r.JobID == id {
-					host, path := "", ""
-					if idx := strings.Index(key, "\x00"); idx >= 0 {
-						host, path = key[:idx], key[idx+1:]
-					}
-					cids := r.ConversationIDs
-					if cids == nil {
-						cids = []string{}
-					}
-					detail := JobDetail{
-						ID:                        r.JobID,
-						ScheduleID:                r.ScheduleID,
-						Kind:                      r.Engine,
-						Status:                    r.Status,
-						Engine:                    r.Engine,
-						Prompt:                    r.PromptTitle,
-						StoryID:                   r.PromptTitle,
-						WorktreePath:              path,
-						HostID:                    host,
-						TargetHost:                host,
-						ConversationIDs:           append([]string(nil), cids...),
-						Reason:                    r.Reason,
-						ParentJobID:               r.ParentJobID,
-						RootJobID:                 r.RootJobID,
-						ExecutionAttempt:          r.ExecutionAttempt,
-						ExecutionChain:            append([]string(nil), r.ExecutionChain...),
-						InitialConversationID:     r.InitialConversationID,
-						ActiveConversationID:      r.ActiveConversationID,
-						ResumeMode:                r.ResumeMode,
-						ResumeFallbackReason:      r.ResumeFallbackReason,
-						SameConversationConfirmed: r.SameConversationConfirmed || r.ResumeMode == "same_conversation",
-						AttachConfirmation:        r.AttachConfirmation,
-						InterruptedASEState:       r.InterruptedASEState,
-						ConversationLineage:       append([]ConversationLineage(nil), r.ConversationLineage...),
-					}
-					if !r.CreatedAt.IsZero() {
-						detail.StartedAt = r.CreatedAt.UTC().Format(time.RFC3339)
-					}
-					if r.ScheduleID != "" {
-						detail.AssociatedJobs = e.GetAssociatedJobsForScheduleLocked(r.ScheduleID)
-					}
-					return detail, true
+		return JobDetail{}, false
+	}
+	return e.buildJobDetailLocked(job), true
+}
+
+// GetJob returns execution details for the harness child.
+// Precedence: active in-memory job, then fallback to historical job from e.history.
+func (e *Engine) GetJob(id string) (JobDetail, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.reapExpiredLocked()
+	job, ok := e.jobs[id]
+	if ok {
+		return e.buildJobDetailLocked(job), true
+	}
+
+	// Deterministic history fallback for finished/historical jobs across process restarts.
+	// Scans e.history and selects the latest row by CreatedAt without fabricating Kind/StoryID.
+	var latestRow *HistoryRow
+	var latestKey string
+	for key, rows := range e.history {
+		for i := range rows {
+			r := &rows[i]
+			if r.JobID == id {
+				if latestRow == nil || r.CreatedAt.After(latestRow.CreatedAt) {
+					latestRow = r
+					latestKey = key
 				}
 			}
 		}
-		return JobDetail{}, false
 	}
+	if latestRow != nil {
+		r := latestRow
+		host, path := "", ""
+		if idx := strings.Index(latestKey, "\x00"); idx >= 0 {
+			host, path = latestKey[:idx], latestKey[idx+1:]
+		}
+		cids := r.ConversationIDs
+		if cids == nil {
+			cids = []string{}
+		}
+		detail := JobDetail{
+			ID:                        r.JobID,
+			ScheduleID:                r.ScheduleID,
+			Kind:                      "",
+			Status:                    r.Status,
+			Engine:                    r.Engine,
+			Prompt:                    r.PromptTitle,
+			StoryID:                   "",
+			WorktreePath:              path,
+			HostID:                    host,
+			TargetHost:                host,
+			ConversationIDs:           append([]string(nil), cids...),
+			Reason:                    r.Reason,
+			ParentJobID:               r.ParentJobID,
+			RootJobID:                 r.RootJobID,
+			ExecutionAttempt:          r.ExecutionAttempt,
+			ExecutionChain:            append([]string(nil), r.ExecutionChain...),
+			InitialConversationID:     r.InitialConversationID,
+			ActiveConversationID:      r.ActiveConversationID,
+			ResumeMode:                r.ResumeMode,
+			ResumeFallbackReason:      r.ResumeFallbackReason,
+			SameConversationConfirmed: r.SameConversationConfirmed || r.ResumeMode == "same_conversation",
+			AttachConfirmation:        r.AttachConfirmation,
+			InterruptedASEState:       r.InterruptedASEState,
+			ConversationLineage:       append([]ConversationLineage(nil), r.ConversationLineage...),
+		}
+		if !r.CreatedAt.IsZero() {
+			detail.StartedAt = r.CreatedAt.UTC().Format(time.RFC3339)
+		}
+		return detail, true
+	}
+	return JobDetail{}, false
+}
+
+func (e *Engine) buildJobDetailLocked(job *Job) JobDetail {
 	detail := JobDetail{
-		ID:                    job.ID,
-		ScheduleID:            job.ScheduleID,
-		Kind:                  job.Kind,
-		Status:                job.Status,
-		ResumeConversationID:  job.ResumeConversationID,
-		ConversationIDs:       append([]string(nil), job.ConversationIDs...),
-		Reason:                job.Reason,
-		HostID:                job.LeaseHolder,
-		TargetHost:            job.LeaseHolder,
-		HarnessPID:            job.HarnessPID,
-		ToolPID:               job.ToolPID,
-		ElapsedSeconds:        job.ElapsedSeconds,
-		ResumeCount:           job.ResumeCount,
-		ParentJobID:           job.ParentJobID,
-		RootJobID:             job.RootJobID,
-		InitialConversationID: job.InitialConversationID,
-		ActiveConversationID:  job.ActiveConversationID,
-		ResumeMode:            job.ResumeMode,
-		ResumeFallbackReason:  job.ResumeFallbackReason,
+		ID:                        job.ID,
+		ScheduleID:                job.ScheduleID,
+		Kind:                      job.Kind,
+		Status:                    job.Status,
+		ResumeConversationID:      job.ResumeConversationID,
+		ConversationIDs:           append([]string(nil), job.ConversationIDs...),
+		Reason:                    job.Reason,
+		HostID:                    job.LeaseHolder,
+		TargetHost:                job.LeaseHolder,
+		HarnessPID:                job.HarnessPID,
+		ToolPID:                   job.ToolPID,
+		ElapsedSeconds:            job.ElapsedSeconds,
+		ResumeCount:               job.ResumeCount,
+		ParentJobID:               job.ParentJobID,
+		RootJobID:                 job.RootJobID,
+		InitialConversationID:     job.InitialConversationID,
+		ActiveConversationID:      job.ActiveConversationID,
+		ResumeMode:                job.ResumeMode,
+		ResumeFallbackReason:      job.ResumeFallbackReason,
 		SameConversationConfirmed: job.SameConversationConfirmed,
 		AttachConfirmation:        job.AttachConfirmation,
-		InterruptedASEState:   job.InterruptedASEState,
-		ConversationLineage:   append([]ConversationLineage(nil), job.ConversationLineage...),
+		InterruptedASEState:       job.InterruptedASEState,
+		ConversationLineage:       append([]ConversationLineage(nil), job.ConversationLineage...),
 	}
 	if !job.StartedAt.IsZero() {
 		detail.StartedAt = job.StartedAt.UTC().Format(time.RFC3339)
@@ -3082,7 +3108,7 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 			detail.Prompt = "Refine idea transcript at {{.SourceTranscriptPath}} into story {{.StoryID}}"
 		}
 	}
-	return detail, true
+	return detail
 }
 
 // GetJobLeaseExpiry returns the lease expiry for a job.
