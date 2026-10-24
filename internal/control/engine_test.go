@@ -3712,3 +3712,86 @@ func TestEngine_ResumeJob_HistoryFallbackPinsActiveInitialConversation(t *testin
 		t.Fatalf("expected phase IMPLEMENTATION, got %v", sch.InterruptedASEState["phase"])
 	}
 }
+
+func TestEngine_AddJobConversationWithOptions_EmptyParentDoesNotConfirmSameConversation(t *testing.T) {
+	e := NewEngine(nil)
+	repoPath := "/home/romeo/work/meta-repo"
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	// Parent job had NO registered conversation
+	jobParent := &Job{
+		ID:     "job-parent-empty",
+		HostID: "mac-mini",
+		Status: "FAILED",
+	}
+	e.jobs[jobParent.ID] = jobParent
+
+	// Resumed job starts pending with empty InitialConversationID
+	jobResume := &Job{
+		ID:          "job-resume-test",
+		ParentJobID: jobParent.ID,
+		HostID:      "mac-mini",
+		Status:      "RUNNING",
+		ResumeMode:  "pending",
+	}
+	e.jobs[jobResume.ID] = jobResume
+
+	newConvID := "1d446877-5bf9-44eb-9db5-e1c007a9fe31"
+	// First conversation reported without fallback flag
+	err := e.AddJobConversationWithOptions(jobResume.ID, newConvID, ConversationAttachOptions{Role: "initial_active"})
+	if err != nil {
+		t.Fatalf("AddJobConversationWithOptions failed: %v", err)
+	}
+
+	// Must NOT confirm same_conversation because parent had no initial conversation (Finding M1)
+	if jobResume.SameConversationConfirmed {
+		t.Fatalf("expected SameConversationConfirmed to be false when parent has no initial conversation, got true")
+	}
+	if jobResume.ResumeMode == "same_conversation" {
+		t.Fatalf("expected ResumeMode NOT to be same_conversation, got %q", jobResume.ResumeMode)
+	}
+}
+
+func TestEngine_AddJobConversationWithOptions_DifferingNonFallbackDoesNotConfirmSameConversation(t *testing.T) {
+	e := NewEngine(nil)
+	repoPath := "/home/romeo/work/meta-repo"
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	initialID := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	jobResume := &Job{
+		ID:                    "job-resume-diff",
+		ParentJobID:           "job-parent-001",
+		InitialConversationID: initialID,
+		HostID:                "mac-mini",
+		Status:                "RUNNING",
+		ResumeMode:            "pending",
+	}
+	e.jobs[jobResume.ID] = jobResume
+
+	differingID := "99998888-7777-6666-5555-444433332222"
+	// Non-fallback report with a differing conversation ID
+	err := e.AddJobConversationWithOptions(jobResume.ID, differingID, ConversationAttachOptions{Role: "initial_active"})
+	if err != nil {
+		t.Fatalf("AddJobConversationWithOptions failed: %v", err)
+	}
+
+	// Must NOT confirm same_conversation because differingID != initialID (Finding M1)
+	if jobResume.SameConversationConfirmed {
+		t.Fatalf("expected SameConversationConfirmed to be false when differing conversation reported without fallback, got true")
+	}
+	if jobResume.ResumeMode == "same_conversation" {
+		t.Fatalf("expected ResumeMode NOT to be same_conversation, got %q", jobResume.ResumeMode)
+	}
+}

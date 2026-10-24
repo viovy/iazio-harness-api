@@ -1221,10 +1221,10 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 			}
 		}
 	} else if job.Status == "RUNNING" || job.Status == "LEASED" {
-		// Resolve pending resume mode at exit (Finding A1, hardened in Finding B1):
+		// Resolve pending resume mode at exit (Finding A1, hardened in Finding B1, M1):
 		// If job resumed on an initial session and no fallback occurred:
-		// Only confirm implicit attachment on exit code 0; on non-zero, mark unverified.
-		if job.ParentJobID != "" && job.ResumeMode == "pending" && job.ResumeFallbackReason == "" {
+		// Only confirm implicit attachment on exit code 0 if a non-empty initial conversation existed; on non-zero, mark unverified.
+		if job.ParentJobID != "" && job.ResumeMode == "pending" && job.ResumeFallbackReason == "" && job.InitialConversationID != "" {
 			if code == 0 {
 				job.ResumeMode = "same_conversation"
 				job.SameConversationConfirmed = true
@@ -2871,11 +2871,13 @@ func (e *Engine) AddJobConversationWithOptions(jobID, convID string, opts ...Con
 	} else {
 		// Strict pinning check:
 		if job.ActiveConversationID == "" {
+			priorInitial := job.InitialConversationID
 			job.ActiveConversationID = convID
 			if job.InitialConversationID == "" {
 				job.InitialConversationID = convID
 			}
-			if job.ParentJobID != "" && job.ResumeMode == "pending" && (convID == job.InitialConversationID || convID == job.ActiveConversationID) {
+			// Only confirm same_conversation if a pre-existing initial conversation was present and matched (Finding M1)
+			if job.ParentJobID != "" && job.ResumeMode == "pending" && priorInitial != "" && convID == priorInitial {
 				job.ResumeMode = "same_conversation"
 				job.SameConversationConfirmed = true
 				job.AttachConfirmation = "marker"
