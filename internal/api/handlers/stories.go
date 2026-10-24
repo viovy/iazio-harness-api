@@ -72,12 +72,12 @@ type GlobalScheduler interface {
 
 // StoriesHandler handles semantic story validation and dispatch.
 type StoriesHandler struct {
-	store          codebase.Store
-	queue          dispatch.Queue
-	idempotency    *IdempotencyStore
-	dispatchWait   time.Duration
-	scheduler      GlobalScheduler
-	engine         *control.Engine
+	store        codebase.Store
+	queue        dispatch.Queue
+	idempotency  *IdempotencyStore
+	dispatchWait time.Duration
+	scheduler    GlobalScheduler
+	engine       *control.Engine
 }
 
 // SetEngine injects the control plane engine for story persistence.

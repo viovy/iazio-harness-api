@@ -1438,10 +1438,14 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		Presence    string `json:"presence"`
 		FetchFailed bool   `json:"fetch_failed"`
 		Tools       []struct {
-			Name    string `json:"name"`
-			Path    string `json:"path"`
-			Version string `json:"version"`
-			Status  string `json:"status"`
+			Name             string   `json:"name"`
+			Path             string   `json:"path"`
+			Version          string   `json:"version"`
+			Status           string   `json:"status"`
+			ServiceInstalled bool     `json:"service_installed"`
+			ServiceType      string   `json:"service_type"`
+			ServiceStatus    string   `json:"service_status"`
+			Capabilities     []string `json:"capabilities"`
 		} `json:"tools"`
 		ActiveJobs []struct {
 			JobID        string `json:"job_id"`
@@ -1455,7 +1459,16 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	tools := make([]control.Tool, 0, len(raw.Tools))
 	for _, t := range raw.Tools {
-		tools = append(tools, control.Tool{Name: t.Name, Path: t.Path, Version: t.Version, Status: t.Status})
+		tools = append(tools, control.Tool{
+			Name:             t.Name,
+			Path:             t.Path,
+			Version:          t.Version,
+			Status:           t.Status,
+			ServiceInstalled: t.ServiceInstalled,
+			ServiceType:      t.ServiceType,
+			ServiceStatus:    t.ServiceStatus,
+			Capabilities:     t.Capabilities,
+		})
 	}
 	var activeJobs []control.ActiveJob
 	for _, aj := range raw.ActiveJobs {

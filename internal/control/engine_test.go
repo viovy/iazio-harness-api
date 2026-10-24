@@ -2703,8 +2703,8 @@ func TestPollHost_GlobalScheduleSkipsDirtyRepo(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("pc1", "permanent")
 	_ = e.UpsertRepo(Repo{
-		HostID:                      "pc1",
-		WorktreePath:                "C:\\work\\target-repo",
+		HostID:                       "pc1",
+		WorktreePath:                 "C:\\work\\target-repo",
 		GlobalQueueAllocationEnabled: true,
 	})
 
@@ -2736,8 +2736,8 @@ func TestDeclineJob_GlobalScheduleRequeuedOnPreflightDecline(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("pc1", "permanent")
 	_ = e.UpsertRepo(Repo{
-		HostID:                      "pc1",
-		WorktreePath:                "C:\\work\\target-repo",
+		HostID:                       "pc1",
+		WorktreePath:                 "C:\\work\\target-repo",
 		GlobalQueueAllocationEnabled: true,
 	})
 
@@ -2774,8 +2774,8 @@ func TestPostExit_ClearsRunningJobIDOnCompletionAndFailure(t *testing.T) {
 	e.RegisterHost("mac-mini", "permanent")
 	repoPath := "/Users/romeo/work/target-repo-04"
 	_ = e.UpsertRepo(Repo{
-		HostID:                      "mac-mini",
-		WorktreePath:                repoPath,
+		HostID:                       "mac-mini",
+		WorktreePath:                 repoPath,
 		GlobalQueueAllocationEnabled: true,
 	})
 

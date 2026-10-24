@@ -2069,11 +2069,11 @@ func TestObservabilityMetricsEndpoint(t *testing.T) {
 	// Add sample history entries
 	s.Engine.SetHistory("mac-mini\x00/work/sample-repo", []control.HistoryRow{
 		{
-			JobID:          "job-101",
-			Status:         "RUN_FINISHED",
-			Engine:         "autopilot",
-			Clean:          true,
-			TraceID:        "4bf92f3577b34da6a3ce929d0e0e4736",
+			JobID:   "job-101",
+			Status:  "RUN_FINISHED",
+			Engine:  "autopilot",
+			Clean:   true,
+			TraceID: "4bf92f3577b34da6a3ce929d0e0e4736",
 		},
 		{
 			JobID:          "job-102",
@@ -2117,3 +2117,79 @@ func TestObservabilityMetricsEndpoint(t *testing.T) {
 	}
 }
 
+func TestHostHeartbeat_ToolServiceMetadata(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	h := s.Handler()
+	hostID := "debian-host"
+
+	// Register host
+	regBody := `{"id":"debian-host","kind":"permanent"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/hosts/register", bytes.NewReader([]byte(regBody)))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("register failed: %d", rr.Code)
+	}
+
+	// Send heartbeat with tool service metadata & capabilities
+	hbData := map[string]any{
+		"presence":     "ONLINE",
+		"fetch_failed": false,
+		"tools": []map[string]any{
+			{
+				"name":              "iazio-agent",
+				"path":              "/home/romeo/.iazio/bin/iazio-agent",
+				"version":           "0.0.67",
+				"status":            "OK",
+				"service_installed": true,
+				"service_type":      "user_service",
+				"service_status":    "active",
+				"capabilities":      []string{"watchdog", "auto_restart", "path_watcher"},
+			},
+		},
+	}
+	hbBytes, _ := json.Marshal(hbData)
+	req = httptest.NewRequest(http.MethodPost, "/v1/hosts/"+hostID+"/heartbeat", bytes.NewReader(hbBytes))
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("heartbeat failed: %d", rr.Code)
+	}
+
+	// GET /v1/hosts/:id and verify tool service fields
+	req = httptest.NewRequest(http.MethodGet, "/v1/hosts/"+hostID, nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("get host failed: %d", rr.Code)
+	}
+
+	var detail map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	tools, ok := detail["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("expected 1 tool, got %v", detail["tools"])
+	}
+	toolMap, ok := tools[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected tool map, got %T", tools[0])
+	}
+	if toolMap["name"] != "iazio-agent" {
+		t.Errorf("expected tool name iazio-agent, got %v", toolMap["name"])
+	}
+	if toolMap["service_installed"] != true {
+		t.Errorf("expected service_installed=true, got %v", toolMap["service_installed"])
+	}
+	if toolMap["service_type"] != "user_service" {
+		t.Errorf("expected service_type=user_service, got %v", toolMap["service_type"])
+	}
+	if toolMap["service_status"] != "active" {
+		t.Errorf("expected service_status=active, got %v", toolMap["service_status"])
+	}
+	caps, ok := toolMap["capabilities"].([]any)
+	if !ok || len(caps) != 3 {
+		t.Errorf("expected 3 capabilities, got %v", toolMap["capabilities"])
+	}
+}

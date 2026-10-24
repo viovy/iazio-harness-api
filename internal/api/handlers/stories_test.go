@@ -253,14 +253,14 @@ func TestStoriesHandler_GetAndListStories_DBAuthoritative(t *testing.T) {
 	handler.SetEngine(engine)
 
 	testStory := control.Story{
-		ID:         "STORY-DB-9999",
-		Title:      "DB Authoritative Title",
-		Submodule:  "iazio-mcp",
-		Status:     "in_progress",
-		Priority:   "P0",
-		Body:       "# DB Story Body\n\nMust take precedence over disk.",
-		CreatedAt:  time.Now().UTC(),
-		UpdatedAt:  time.Now().UTC(),
+		ID:        "STORY-DB-9999",
+		Title:     "DB Authoritative Title",
+		Submodule: "iazio-mcp",
+		Status:    "in_progress",
+		Priority:  "P0",
+		Body:      "# DB Story Body\n\nMust take precedence over disk.",
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
 	}
 	if err := engine.SaveStory(testStory); err != nil {
 		t.Fatalf("failed to save story in engine: %v", err)

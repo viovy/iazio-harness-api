@@ -319,4 +319,3 @@ func TestJobLifecycleHandler_GetJob_HistoryFallback(t *testing.T) {
 		t.Fatalf("unexpected detail: %+v", detail)
 	}
 }
-
