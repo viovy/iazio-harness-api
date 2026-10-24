@@ -366,7 +366,12 @@ func TestServer_ForceUpdateToolEndpoint(t *testing.T) {
 		t.Fatalf("expected profile-resolved target_version 0.0.492, got %v", res2["target_version"])
 	}
 
-	// 3. POST /v1/fleet/agents/mac-mini/tools/autopilot-plugins-internal/force-update with s.Queue populated (F7)
+	// 3. POST /v1/fleet/agents/mac-mini/tools/autopilot-plugins-internal/force-update with s.Queue populated (F7, N4)
+	e.Releases.SetCachedRelease("viovy/autopilot-plugins-internal", "0.0.493", control.ToolRelease{
+		Name:          "autopilot-plugins-internal",
+		Repository:    "viovy/autopilot-plugins-internal",
+		LatestVersion: "0.0.493",
+	}, time.Hour)
 	q := dispatch.NewInMemoryQueue()
 	srv.Queue = q
 	rec3 := httptest.NewRecorder()
@@ -476,5 +481,16 @@ func TestServer_ForceUpdateToolEndpoint(t *testing.T) {
 	handler.ServeHTTP(rec10, req10)
 	if rec10.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 for invalid target_version, got %d: %s", rec10.Code, rec10.Body.String())
+	}
+
+	// 11. Unknown target_version returns 422 (N4)
+	rec11 := httptest.NewRecorder()
+	req11 := httptest.NewRequest("POST", "/api/agents/mac-mini/tools/autopilot-plugins-internal/force-update", bytes.NewReader([]byte(`{"target_version":"9.9.9"}`)))
+	handler.ServeHTTP(rec11, req11)
+	if rec11.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for unknown target_version (N4), got %d: %s", rec11.Code, rec11.Body.String())
+	}
+	if !strings.Contains(rec11.Body.String(), "unknown target_version") {
+		t.Fatalf("expected error message to mention unknown target_version, got: %s", rec11.Body.String())
 	}
 }

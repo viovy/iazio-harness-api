@@ -1696,12 +1696,35 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// R2: validate explicit target_version if supplied; return 422 if invalid or unknown
+		// R2, N4: validate explicit target_version if supplied; return 422 if invalid or unknown
 		if body.TargetVersion != "" {
 			cleanTV := strings.TrimPrefix(strings.TrimSpace(body.TargetVersion), "v")
 			if cleanTV == "" || strings.Contains(cleanTV, " ") {
 				writeErr(w, http.StatusUnprocessableEntity, fmt.Errorf("invalid target_version: %s", body.TargetVersion))
 				return
+			}
+			if foundTool != nil {
+				normClean := strings.TrimPrefix(strings.TrimSpace(cleanTV), "v")
+				knownLatest := strings.TrimPrefix(strings.TrimSpace(foundTool.LatestAvailableVersion), "v")
+				knownTarget := strings.TrimPrefix(strings.TrimSpace(foundTool.TargetVersion), "v")
+
+				isKnown := false
+				if (knownLatest != "" && normClean == knownLatest) ||
+					(knownTarget != "" && knownTarget != "latest" && normClean == knownTarget) {
+					isKnown = true
+				}
+				if !isKnown && s.Engine != nil && s.Engine.Releases != nil && foundTool.Repository != "" {
+					if rel, err := s.Engine.Releases.GetToolRelease(r.Context(), foundTool.Repository, foundTool.Name, cleanTV); err == nil && rel.LatestVersion != "" {
+						relNorm := strings.TrimPrefix(strings.TrimSpace(rel.LatestVersion), "v")
+						if relNorm == normClean {
+							isKnown = true
+						}
+					}
+				}
+				if !isKnown {
+					writeErr(w, http.StatusUnprocessableEntity, fmt.Errorf("unknown target_version: %s (known latest: %s)", body.TargetVersion, foundTool.LatestAvailableVersion))
+					return
+				}
 			}
 		}
 
