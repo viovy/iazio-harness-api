@@ -1744,9 +1744,12 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 		}
 
 		// Prune stale repos that have not reported within StaleRepoThreshold based on server receive time (G1)
-		for path, st := range h.RepoStatuses {
-			if now.Sub(st.LastCheckedAt) > StaleRepoThreshold {
-				delete(h.RepoStatuses, path)
+		// Skip pruning while HarnessActive is true on the host so status is not dropped during long harness runs (F-4)
+		if !h.HarnessActive {
+			for path, st := range h.RepoStatuses {
+				if now.Sub(st.LastCheckedAt) > StaleRepoThreshold {
+					delete(h.RepoStatuses, path)
+				}
 			}
 		}
 

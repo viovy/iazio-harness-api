@@ -822,6 +822,103 @@ func TestReleaseService_FallbackConditionalETagAnd304(t *testing.T) {
 	}
 }
 
+func TestReleaseService_FallbackChain_ShortCircuitsOnListRateLimit(t *testing.T) {
+	var tagsHit bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/releases/latest") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/releases") {
+			w.Header().Set("Retry-After", "120")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"message":"rate limit exceeded"}`))
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/tags") {
+			tagsHit = true
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"name": "0.0.492"},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	svc := NewReleaseService()
+	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
+
+	rel, err := svc.GetToolRelease(context.Background(), "viovy/test-rate-limit", "test-tool", "latest")
+	if err == nil {
+		t.Fatalf("expected error on rate limit, got nil")
+	}
+	if tagsHit {
+		t.Fatalf("expected tags fallback NOT to be hit when releases list returned 429 rate limit (F-2)")
+	}
+	if rel.LastSyncStatus != "rate_limited" {
+		t.Fatalf("expected status rate_limited, got %s", rel.LastSyncStatus)
+	}
+}
+
+func TestReleaseService_FallbackChain_UnsortedSemVerAC1(t *testing.T) {
+	unsortedToolReleases := map[string][]string{
+		"autopilot-plugins-internal": {"0.0.482", "0.0.492", "0.0.480"},
+		"iazio-agent":                {"0.0.60", "0.0.67", "0.0.65"},
+		"iazio-harvester":            {"0.0.10", "0.0.98", "0.0.95"},
+		"iazio-mcp":                  {"0.0.70", "0.0.79", "0.0.75"},
+	}
+	expectedVersions := map[string]string{
+		"autopilot-plugins-internal": "0.0.492",
+		"iazio-agent":                "0.0.67",
+		"iazio-harvester":            "0.0.98",
+		"iazio-mcp":                  "0.0.79",
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/releases/latest") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/releases") {
+			for tool, versions := range unsortedToolReleases {
+				if strings.Contains(r.URL.Path, tool) {
+					var raw []map[string]any
+					for _, v := range versions {
+						raw = append(raw, map[string]any{
+							"tag_name":     v,
+							"prerelease":   false,
+							"draft":        false,
+							"published_at": "2026-10-24T10:00:00Z",
+						})
+					}
+					_ = json.NewEncoder(w).Encode(raw)
+					return
+				}
+			}
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	svc := NewReleaseService()
+	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
+
+	for tool, expectedVer := range expectedVersions {
+		rel, err := svc.GetToolRelease(context.Background(), "viovy/"+tool, tool, "latest")
+		if err != nil {
+			t.Fatalf("failed to resolve release for %s: %v", tool, err)
+		}
+		if rel.LatestVersion != expectedVer {
+			t.Fatalf("tool %s: expected highest SemVer %s from unsorted list, got %s (AC1)", tool, expectedVer, rel.LatestVersion)
+		}
+	}
+}
+
 func TestReleaseService_MultiToolAC1Fixtures(t *testing.T) {
 	fixtureReleases := map[string]string{
 		"autopilot-plugins-internal": "0.0.492",

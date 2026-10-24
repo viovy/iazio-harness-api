@@ -533,7 +533,8 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 		}
 		if err == nil && rel.LatestVersion != "" {
 			// SemVer ordering guard: never downgrade LatestAvailableVersion if an existing cached release has higher SemVer (G7)
-			if ok && cached.release.LatestVersion != "" && compareSemVer(rel.LatestVersion, cached.release.LatestVersion) < 0 {
+			// Expire the guard if the cached release is past its TTL so retracted releases are not permanently pinned (F-8)
+			if ok && cached.release.LatestVersion != "" && !cached.expiresAt.Before(now) && compareSemVer(rel.LatestVersion, cached.release.LatestVersion) < 0 {
 				rel.LatestVersion = cached.release.LatestVersion
 				rel.TagName = cached.release.TagName
 				rel.HTMLURL = cached.release.HTMLURL
@@ -599,20 +600,38 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 		s.endpointETags[listURL] = listNewEtag
 		s.mu.Unlock()
 	}
-	if listNotMod && okList {
-		s.mu.Lock()
-		cachedList.expiresAt = now.Add(10 * time.Minute)
-		s.cache[listKey] = cachedList
-		s.cache[cacheKey] = cachedList
-		s.mu.Unlock()
-		r := cachedList.release
-		r.Name = toolName
-		r.LastCheckedAt = now
-		r.LastSyncStatus = "not_modified"
-		if !isLatestLookup {
-			r.TargetVersion = targetVersion
+	if listNotMod {
+		if okList {
+			s.mu.Lock()
+			cachedList.expiresAt = now.Add(10 * time.Minute)
+			s.cache[listKey] = cachedList
+			s.cache[cacheKey] = cachedList
+			s.mu.Unlock()
+			r := cachedList.release
+			r.Name = toolName
+			r.LastCheckedAt = now
+			r.LastSyncStatus = "not_modified"
+			if !isLatestLookup {
+				r.TargetVersion = targetVersion
+			}
+			return r, nil
 		}
-		return r, nil
+		s.mu.RLock()
+		candRel, okCand := s.cache[repo+":latest"]
+		if !okCand {
+			candRel, okCand = s.cache[cacheKey]
+		}
+		s.mu.RUnlock()
+		if okCand {
+			r := candRel.release
+			r.Name = toolName
+			r.LastCheckedAt = now
+			r.LastSyncStatus = "not_modified"
+			if !isLatestLookup {
+				r.TargetVersion = targetVersion
+			}
+			return r, nil
+		}
 	}
 	if listErr == nil && listRel.LatestVersion != "" {
 		listRel.LastCheckedAt = now
@@ -635,6 +654,27 @@ func (s *ReleaseService) GetToolRelease(ctx context.Context, repo, toolName, tar
 	}
 	if listErr != nil {
 		lastErr = listErr
+		if strings.Contains(listErr.Error(), "rate limited") || strings.Contains(listErr.Error(), "forbidden") {
+			// Stop immediately on rate limit or forbidden without spending quota on tags fallback (F-2)
+			fallbackVer := targetVersion
+			if fallbackVer == "" || fallbackVer == "latest" {
+				fallbackVer = "0.0.0"
+			}
+			status := "rate_limited"
+			if strings.Contains(listErr.Error(), "forbidden") {
+				status = "forbidden"
+			}
+			return ToolRelease{
+				Name:           toolName,
+				Repository:     repo,
+				LatestVersion:  fallbackVer,
+				TargetVersion:  targetVersion,
+				TagName:        fallbackVer,
+				LastCheckedAt:  now,
+				LastSyncStatus: status,
+				Error:          listErr.Error(),
+			}, listErr
+		}
 	}
 
 	// Fallback 2: check repository tags with SemVer sorting
@@ -813,16 +853,12 @@ func (s *ReleaseService) fetchReleaseURL(ctx context.Context, url, repo, toolNam
 
 func isPrereleaseTag(tag string) bool {
 	lower := strings.ToLower(tag)
-	if strings.Contains(lower, "-rc") ||
+	return strings.Contains(lower, "-rc") ||
 		strings.Contains(lower, "-beta") ||
 		strings.Contains(lower, "-alpha") ||
 		strings.Contains(lower, "-dev") ||
 		strings.Contains(lower, "-preview") ||
-		strings.Contains(lower, "-prerelease") {
-		return true
-	}
-	parts := strings.SplitN(tag, "-", 2)
-	return len(parts) > 1
+		strings.Contains(lower, "-prerelease")
 }
 
 func (s *ReleaseService) fetchReleaseListURL(ctx context.Context, url, repo, toolName, token, cachedEtag string) (ToolRelease, string, bool, error) {
@@ -1095,10 +1131,23 @@ func (s *ReleaseService) SetCachedRelease(repo, version string, release ToolRele
 // ReleaseNotificationCallback is invoked when a new release is detected and profile updated.
 type ReleaseNotificationCallback func(profileName string, tool ProfileTool, oldVersion, newVersion string)
 
+func (s *ReleaseService) hasConfiguredToken() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.token != "" || len(s.credentials) > 0 {
+		return true
+	}
+	return os.Getenv("GITHUB_TOKEN") != "" || os.Getenv("GH_TOKEN") != ""
+}
+
 // StartBackgroundSync runs a background worker polling GitHub releases and auto-advancing tracking profiles.
 func (s *ReleaseService) StartBackgroundSync(ctx context.Context, e *Engine, interval time.Duration, onReleaseDetected ReleaseNotificationCallback) {
 	if interval <= 0 {
 		interval = 60 * time.Second
+	}
+	// Stretch unauthenticated interval to at least 5 minutes to stay within the 60 req/h limit (F-7)
+	if !s.hasConfiguredToken() && interval < 5*time.Minute {
+		interval = 5 * time.Minute
 	}
 	go func() {
 		// Initial sync after 2 seconds
