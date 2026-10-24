@@ -2195,13 +2195,24 @@ func TestHostHeartbeat_ToolServiceMetadata(t *testing.T) {
 }
 
 func TestSyncAllProfilesEndpoint_AndCacheControl(t *testing.T) {
+	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"mock-etag-492"`)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tag_name":     "0.0.492",
+			"html_url":     "https://github.com/viovy/autopilot-plugins-internal/releases/tag/0.0.492",
+			"published_at": time.Now().UTC().Format(time.RFC3339),
+		})
+	}))
+	defer mockGH.Close()
+
 	s := &Server{Engine: control.NewEngine(nil)}
 	handler := s.Handler()
 
 	_, err := s.Engine.UpsertProfile(control.DistributionProfile{
 		Name: "generic",
 		Tools: []control.ProfileTool{
-			{Name: "autopilot-fleet", Repository: "viovy/autopilot-plugins-internal", TargetVersion: "0.0.482"},
+			{Name: "autopilot-fleet", Repository: "viovy/autopilot-plugins-internal", TargetVersion: "0.0.482", TrackLatest: true},
 		},
 	})
 	if err != nil {
@@ -2209,13 +2220,8 @@ func TestSyncAllProfilesEndpoint_AndCacheControl(t *testing.T) {
 	}
 
 	relSvc := control.NewReleaseService()
-	relSvc.SetCachedRelease("viovy/autopilot-plugins-internal", "latest", control.ToolRelease{
-		Name:          "autopilot-fleet",
-		Repository:    "viovy/autopilot-plugins-internal",
-		LatestVersion: "0.0.492",
-		TagName:       "0.0.492",
-	}, 10*time.Minute)
-	s.Engine.Releases = relSvc
+	relSvc.SetBaseURL(mockGH.URL)
+	s.Engine.SetReleaseService(relSvc)
 
 	// 1. Check GET /v1/fleet/profiles has Cache-Control: no-store
 	reqGet := httptest.NewRequest(http.MethodGet, "/v1/fleet/profiles", nil)

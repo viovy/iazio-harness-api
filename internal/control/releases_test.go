@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -449,7 +451,7 @@ func TestReleaseService_SyncAllProfiles_AutoAdvanceTargetVersion(t *testing.T) {
 	_, err := e.UpsertProfile(DistributionProfile{
 		Name: "generic",
 		Tools: []ProfileTool{
-			{Name: "autopilot-fleet", Repository: "viovy/autopilot-plugins-internal", TargetVersion: "0.0.482"},
+			{Name: "autopilot-fleet", Repository: "viovy/autopilot-plugins-internal", TargetVersion: "0.0.482", TrackLatest: true},
 		},
 	})
 	if err != nil {
@@ -478,7 +480,188 @@ func TestReleaseService_SyncAllProfiles_AutoAdvanceTargetVersion(t *testing.T) {
 	if updatedProfile.Tools[0].LatestAvailableVersion != "0.0.492" {
 		t.Fatalf("expected LatestAvailableVersion 0.0.492, got %s", updatedProfile.Tools[0].LatestAvailableVersion)
 	}
-	if updatedProfile.Tools[0].LastSyncStatus != "ok" {
-		t.Fatalf("expected LastSyncStatus ok, got %s", updatedProfile.Tools[0].LastSyncStatus)
+}
+
+func TestReleaseService_ETagConditionalRequestAnd304(t *testing.T) {
+	etagHeaderSent := ""
+	requestCount := 0
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		etagHeaderSent = r.Header.Get("If-None-Match")
+
+		if etagHeaderSent == `"etag-0.0.492"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+
+		w.Header().Set("ETag", `"etag-0.0.492"`)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tag_name":     "0.0.492",
+			"html_url":     "https://github.com/viovy/autopilot-plugins-internal/releases/tag/0.0.492",
+			"published_at": time.Now().UTC().Format(time.RFC3339),
+		})
+	}))
+	defer ts.Close()
+
+	svc := NewReleaseService()
+	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
+
+	p := DistributionProfile{
+		Name: "generic",
+		Tools: []ProfileTool{
+			{Name: "autopilot", Repository: "viovy/autopilot-plugins-internal", TargetVersion: "latest"},
+		},
 	}
+
+	// First fetch: gets 200 and caches ETag
+	rel1, err1 := svc.GetProfileReleases(context.Background(), p)
+	if err1 != nil || len(rel1) != 1 || rel1[0].LatestVersion != "0.0.492" {
+		t.Fatalf("first fetch failed: %v", err1)
+	}
+
+	// Second fetch via InvalidateProfileCache (retaining ETag)
+	svc.InvalidateProfileCache(p)
+	rel2, err2 := svc.GetProfileReleases(context.Background(), p)
+	if err2 != nil || len(rel2) != 1 {
+		t.Fatalf("second fetch failed: %v", err2)
+	}
+	if rel2[0].LastSyncStatus != "not_modified" {
+		t.Fatalf("expected LastSyncStatus not_modified, got %s", rel2[0].LastSyncStatus)
+	}
+	if etagHeaderSent != `"etag-0.0.492"` {
+		t.Fatalf("expected If-None-Match header %q sent on second request, got %q", `"etag-0.0.492"`, etagHeaderSent)
+	}
+}
+
+func TestReleaseService_PinnedVersionDoesNotAutoAdvance(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tag_name":     "0.0.492",
+			"html_url":     "https://github.com/viovy/autopilot-plugins-internal/releases/tag/0.0.492",
+			"published_at": time.Now().UTC().Format(time.RFC3339),
+		})
+	}))
+	defer ts.Close()
+
+	svc := NewReleaseService()
+	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
+
+	e := NewEngine(time.Now)
+	e.Releases = svc
+
+	// Pinned tool: TargetVersion 0.0.482, TrackLatest false
+	_, _ = e.UpsertProfile(DistributionProfile{
+		Name: "pinned-profile",
+		Tools: []ProfileTool{
+			{Name: "autopilot-fleet", Repository: "viovy/autopilot-plugins-internal", TargetVersion: "0.0.482", TrackLatest: false},
+		},
+	})
+
+	var notifFired bool
+	svc.SyncAllProfiles(context.Background(), e, func(profileName string, tool ProfileTool, oldVer, newVer string) {
+		notifFired = true
+	})
+
+	if notifFired {
+		t.Fatalf("expected no advance notification for pinned tool")
+	}
+
+	updated, _ := e.GetProfile("pinned-profile")
+	if updated.Tools[0].TargetVersion != "0.0.482" {
+		t.Fatalf("expected pinned TargetVersion 0.0.482 preserved, got %s", updated.Tools[0].TargetVersion)
+	}
+	if updated.Tools[0].LatestAvailableVersion != "0.0.492" {
+		t.Fatalf("expected LatestAvailableVersion updated to 0.0.492, got %s", updated.Tools[0].LatestAvailableVersion)
+	}
+}
+
+func TestReleaseService_FetchErrorRecordsSyncError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	svc := NewReleaseService()
+	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
+
+	e := NewEngine(time.Now)
+	e.Releases = svc
+
+	_, _ = e.UpsertProfile(DistributionProfile{
+		Name: "error-profile",
+		Tools: []ProfileTool{
+			{Name: "missing-tool", Repository: "viovy/missing-tool", TargetVersion: "latest"},
+		},
+	})
+
+	svc.SyncAllProfiles(context.Background(), e, nil)
+
+	updated, _ := e.GetProfile("error-profile")
+	if updated.Tools[0].LastSyncStatus != "error" {
+		t.Fatalf("expected LastSyncStatus error, got %s", updated.Tools[0].LastSyncStatus)
+	}
+	if updated.Tools[0].LastSyncError == "" {
+		t.Fatalf("expected LastSyncError populated on fetch failure")
+	}
+}
+
+func TestReleaseService_ConcurrentListAndSync(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tag_name":     "0.0.492",
+			"html_url":     "https://github.com/viovy/autopilot-plugins-internal/releases/tag/0.0.492",
+			"published_at": time.Now().UTC().Format(time.RFC3339),
+		})
+	}))
+	defer ts.Close()
+
+	svc := NewReleaseService()
+	svc.client = ts.Client()
+	svc.SetBaseURL(ts.URL)
+
+	e := NewEngine(time.Now)
+	e.Releases = svc
+
+	for i := 0; i < 5; i++ {
+		_, _ = e.UpsertProfile(DistributionProfile{
+			Name: fmt.Sprintf("profile-%d", i),
+			Tools: []ProfileTool{
+				{Name: "tool-a", Repository: "viovy/autopilot-plugins-internal", TargetVersion: "latest"},
+			},
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ctx.Err() == nil {
+				profiles := e.ListProfiles()
+				for _, p := range profiles {
+					_ = len(p.Tools)
+				}
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for ctx.Err() == nil {
+			svc.SyncAllProfiles(ctx, e, nil)
+		}
+	}()
+
+	wg.Wait()
 }

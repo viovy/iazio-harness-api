@@ -1912,8 +1912,12 @@ func (s *Server) refreshProfileReleases(w http.ResponseWriter, r *http.Request) 
 				}
 				p.Tools[i].LatestAvailableVersion = rel.LatestVersion
 				p.Tools[i].LatestReleaseURL = rel.HTMLURL
-				p.Tools[i].LatestPublishedAt = rel.PublishedAt
-				p.Tools[i].LastCheckedAt = time.Now()
+				if !rel.PublishedAt.IsZero() {
+					pub := rel.PublishedAt
+					p.Tools[i].LatestPublishedAt = &pub
+				}
+				now := time.Now()
+				p.Tools[i].LastCheckedAt = &now
 				p.Tools[i].LastSyncStatus = "ok"
 				p.Tools[i].LastSyncError = ""
 				break
@@ -1953,88 +1957,37 @@ func (s *Server) syncAllProfiles(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Expires", "0")
 
-	if s.Engine.Releases == nil {
-		s.Engine.Releases = control.NewReleaseService()
+	if s.Engine == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "engine not initialized"})
+		return
+	}
+	relSvc := s.Engine.GetReleaseService()
+	if relSvc == nil {
+		relSvc = control.NewReleaseService()
+		s.Engine.SetReleaseService(relSvc)
 	}
 
-	profiles := s.Engine.ListProfiles()
-	if len(profiles) == 0 {
-		p, err := s.Engine.GetProfile("generic")
-		if err == nil && p != nil {
-			profiles = append(profiles, *p)
-		}
-	}
-
-	totalUpdated := 0
-	type syncResult struct {
-		Profile  string                `json:"profile"`
-		Releases []control.ToolRelease `json:"releases"`
-		Updated  bool                  `json:"updated"`
-	}
-	results := make([]syncResult, 0, len(profiles))
-
-	for _, p := range profiles {
-		releases, err := s.Engine.Releases.RefreshProfileReleases(r.Context(), p)
-		if err != nil && len(releases) == 0 {
-			continue
-		}
-		updated := false
-		for i := range p.Tools {
-			toolName := strings.ToLower(p.Tools[i].Name)
-			repoName := strings.ToLower(p.Tools[i].Repository)
-			for _, rel := range releases {
-				relTool := strings.ToLower(rel.Name)
-				relRepo := strings.ToLower(rel.Repository)
-				if (relTool == toolName || relRepo == repoName || strings.HasSuffix(relRepo, "/"+toolName)) &&
-					rel.LatestVersion != "" && rel.Error == "" {
-					oldTarget := p.Tools[i].TargetVersion
-					p.Tools[i].LatestAvailableVersion = rel.LatestVersion
-					p.Tools[i].LatestReleaseURL = rel.HTMLURL
-					p.Tools[i].LatestPublishedAt = rel.PublishedAt
-					p.Tools[i].LastCheckedAt = time.Now()
-					p.Tools[i].LastSyncStatus = "ok"
-					p.Tools[i].LastSyncError = ""
-
-					if oldTarget == "" || oldTarget == "latest" || control.CompareSemVer(rel.LatestVersion, oldTarget) > 0 {
-						p.Tools[i].TargetVersion = rel.LatestVersion
-						updated = true
-						totalUpdated++
-						s.RecordNotification(NotificationRecord{
-							Title:    "Release Detected",
-							Message:  fmt.Sprintf("New release detected for %s: %s (was %s). Profile '%s' updated.", p.Tools[i].Name, rel.LatestVersion, oldTarget, p.Name),
-							Category: "release",
-							Source:   "release-sync",
-							Metadata: map[string]any{
-								"event":        "release.detected",
-								"profile":      p.Name,
-								"tool":         p.Tools[i].Name,
-								"from_version": oldTarget,
-								"to_version":   rel.LatestVersion,
-								"url":          rel.HTMLURL,
-							},
-						})
-					}
-					break
-				}
-			}
-		}
-		if updated {
-			saved, uErr := s.Engine.UpsertProfile(p)
-			if uErr == nil && s.SaveProfile != nil && saved != nil {
-				s.SaveProfile(*saved)
-			}
-		}
-		results = append(results, syncResult{
-			Profile:  p.Name,
-			Releases: releases,
-			Updated:  updated,
+	totalUpdated := relSvc.SyncAllProfiles(r.Context(), s.Engine, func(profile string, tool control.ProfileTool, fromVersion, toVersion string) {
+		s.RecordNotification(NotificationRecord{
+			Title:    "Release Detected",
+			Message:  fmt.Sprintf("New release detected for %s: %s (was %s). Profile '%s' updated.", tool.Name, toVersion, fromVersion, profile),
+			Category: "release",
+			Source:   "release-sync",
+			Metadata: map[string]any{
+				"event":        "release.detected",
+				"profile":      profile,
+				"tool":         tool.Name,
+				"from_version": fromVersion,
+				"to_version":   toVersion,
+				"url":          tool.LatestReleaseURL,
+			},
 		})
-	}
+	})
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":        "ok",
-		"total_updated": totalUpdated,
-		"profiles":      results,
+		"tools_updated": totalUpdated,
+		"synced_at":     time.Now().UTC().Format(time.RFC3339),
 	})
 }
 

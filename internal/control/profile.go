@@ -52,10 +52,11 @@ type ProfileTool struct {
 	Description            string       `json:"description" yaml:"description"`
 	Tier                   string       `json:"tier" yaml:"tier"` // baseline | optional
 	TargetVersion          string       `json:"target_version,omitempty" yaml:"target_version,omitempty"`
+	TrackLatest            bool         `json:"track_latest,omitempty" yaml:"track_latest,omitempty"`
 	LatestAvailableVersion string       `json:"latest_available_version,omitempty" yaml:"latest_available_version,omitempty"`
 	LatestReleaseURL       string       `json:"latest_release_url,omitempty" yaml:"latest_release_url,omitempty"`
-	LatestPublishedAt      time.Time    `json:"latest_published_at,omitempty" yaml:"latest_published_at,omitempty"`
-	LastCheckedAt          time.Time    `json:"last_checked_at,omitempty" yaml:"last_checked_at,omitempty"`
+	LatestPublishedAt      *time.Time   `json:"latest_published_at,omitempty" yaml:"latest_published_at,omitempty"`
+	LastCheckedAt          *time.Time   `json:"last_checked_at,omitempty" yaml:"last_checked_at,omitempty"`
 	LastSyncStatus         string       `json:"last_sync_status,omitempty" yaml:"last_sync_status,omitempty"`
 	LastSyncError          string       `json:"last_sync_error,omitempty" yaml:"last_sync_error,omitempty"`
 	Service                *ToolService `json:"service,omitempty" yaml:"service,omitempty"`
@@ -88,13 +89,18 @@ type ManifestToolItem struct {
 	Service       *ToolService `json:"service,omitempty"`
 }
 
-// ListProfiles returns all distribution profiles sorted by name.
+// ListProfiles returns all distribution profiles sorted by name with deep-copied Tools.
 func (e *Engine) ListProfiles() []DistributionProfile {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	out := make([]DistributionProfile, 0, len(e.profiles))
 	for _, p := range e.profiles {
-		out = append(out, *p)
+		cp := *p
+		if len(p.Tools) > 0 {
+			cp.Tools = make([]ProfileTool, len(p.Tools))
+			copy(cp.Tools, p.Tools)
+		}
+		out = append(out, cp)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].IsDefault != out[j].IsDefault {
@@ -103,6 +109,20 @@ func (e *Engine) ListProfiles() []DistributionProfile {
 		return out[i].Name < out[j].Name
 	})
 	return out
+}
+
+// GetReleaseService returns the registered ReleaseService in a thread-safe manner.
+func (e *Engine) GetReleaseService() *ReleaseService {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.Releases
+}
+
+// SetReleaseService registers the ReleaseService in a thread-safe manner.
+func (e *Engine) SetReleaseService(r *ReleaseService) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.Releases = r
 }
 
 // GetProfile returns a distribution profile by name.

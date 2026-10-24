@@ -717,9 +717,12 @@ func (s *ReleaseService) GetProfileReleases(ctx context.Context, p DistributionP
 	return out, nil
 }
 
-// RefreshProfileReleases purges cached releases for all tools in a profile and fetches fresh releases.
-func (s *ReleaseService) RefreshProfileReleases(ctx context.Context, p DistributionProfile) ([]ToolRelease, error) {
+// InvalidateProfileCache expires the TTL of cached entries for tools in a profile,
+// while intentionally preserving their cached ETags so subsequent requests use conditional HTTP (If-None-Match).
+func (s *ReleaseService) InvalidateProfileCache(p DistributionProfile) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	expired := s.now().Add(-1 * time.Hour)
 	for _, t := range p.Tools {
 		repo := t.Repository
 		if repo == "" {
@@ -733,12 +736,23 @@ func (s *ReleaseService) RefreshProfileReleases(ctx context.Context, p Distribut
 			targetVersion = "latest"
 		}
 		bare := strings.TrimPrefix(targetVersion, "v")
-		delete(s.cache, repo+":"+targetVersion)
-		delete(s.cache, repo+":"+bare)
-		delete(s.cache, repo+":v"+bare)
-		delete(s.cache, repo+":latest")
+		for _, key := range []string{
+			repo + ":" + targetVersion,
+			repo + ":" + bare,
+			repo + ":v" + bare,
+			repo + ":latest",
+		} {
+			if entry, exists := s.cache[key]; exists {
+				entry.expiresAt = expired
+				s.cache[key] = entry
+			}
+		}
 	}
-	s.mu.Unlock()
+}
+
+// RefreshProfileReleases expires cached release TTLs (preserving ETags) and queries fresh releases.
+func (s *ReleaseService) RefreshProfileReleases(ctx context.Context, p DistributionProfile) ([]ToolRelease, error) {
+	s.InvalidateProfileCache(p)
 	return s.GetProfileReleases(ctx, p)
 }
 
@@ -754,13 +768,8 @@ func (s *ReleaseService) SetCachedRelease(repo, version string, release ToolRele
 	}
 	s.cache[repo+":"+version] = cachedRelease{
 		release:   release,
+		etag:      release.TagName,
 		expiresAt: s.now().Add(ttl),
-	}
-	if version != "latest" {
-		s.cache[repo+":latest"] = cachedRelease{
-			release:   release,
-			expiresAt: s.now().Add(ttl),
-		}
 	}
 }
 
@@ -795,47 +804,92 @@ func (s *ReleaseService) StartBackgroundSync(ctx context.Context, e *Engine, int
 }
 
 // SyncAllProfiles iterates all registered distribution profiles and updates tool release information.
-func (s *ReleaseService) SyncAllProfiles(ctx context.Context, e *Engine, onReleaseDetected ReleaseNotificationCallback) {
+// Returns the number of tools whose target version was advanced.
+func (s *ReleaseService) SyncAllProfiles(ctx context.Context, e *Engine, onReleaseDetected ReleaseNotificationCallback) int {
 	if e == nil {
-		return
+		return 0
 	}
 	profiles := e.ListProfiles()
+	totalAdvanced := 0
+
+	type notificationItem struct {
+		profile     string
+		tool        ProfileTool
+		fromVersion string
+		toVersion   string
+	}
+
 	for _, p := range profiles {
-		releases, err := s.RefreshProfileReleases(ctx, p)
+		// Invalidate cache TTL so fresh/conditional ETag requests are issued without discarding cached ETags
+		s.InvalidateProfileCache(p)
+		releases, err := s.GetProfileReleases(ctx, p)
 		if err != nil && len(releases) == 0 {
 			continue
 		}
-		updated := false
+
+		profileUpdated := false
+		var pendingNotifications []notificationItem
+
 		for i := range p.Tools {
 			toolName := strings.ToLower(p.Tools[i].Name)
 			repoName := strings.ToLower(p.Tools[i].Repository)
+			now := s.now()
+
 			for _, rel := range releases {
 				relTool := strings.ToLower(rel.Name)
 				relRepo := strings.ToLower(rel.Repository)
-				if (relTool == toolName || relRepo == repoName || strings.HasSuffix(relRepo, "/"+toolName)) &&
-					rel.LatestVersion != "" && rel.Error == "" {
-					oldTarget := p.Tools[i].TargetVersion
-					p.Tools[i].LatestAvailableVersion = rel.LatestVersion
-					p.Tools[i].LatestReleaseURL = rel.HTMLURL
-					p.Tools[i].LatestPublishedAt = rel.PublishedAt
-					p.Tools[i].LastCheckedAt = s.now()
-					p.Tools[i].LastSyncStatus = "ok"
-					p.Tools[i].LastSyncError = ""
+				if relTool == toolName || relRepo == repoName || strings.HasSuffix(relRepo, "/"+toolName) {
+					p.Tools[i].LastCheckedAt = &now
 
-					// Auto-advance target_version if target is empty, "latest", or older than latest release
-					if oldTarget == "" || oldTarget == "latest" || compareSemVer(rel.LatestVersion, oldTarget) > 0 {
-						p.Tools[i].TargetVersion = rel.LatestVersion
-						updated = true
-						if onReleaseDetected != nil {
-							onReleaseDetected(p.Name, p.Tools[i], oldTarget, rel.LatestVersion)
+					if rel.Error != "" {
+						p.Tools[i].LastSyncStatus = "error"
+						p.Tools[i].LastSyncError = rel.Error
+						profileUpdated = true
+						break
+					}
+
+					if rel.LatestVersion != "" {
+						p.Tools[i].LatestAvailableVersion = rel.LatestVersion
+						p.Tools[i].LatestReleaseURL = rel.HTMLURL
+						if !rel.PublishedAt.IsZero() {
+							pub := rel.PublishedAt
+							p.Tools[i].LatestPublishedAt = &pub
+						}
+						p.Tools[i].LastSyncStatus = "ok"
+						p.Tools[i].LastSyncError = ""
+						profileUpdated = true
+
+						oldTarget := p.Tools[i].TargetVersion
+						// Auto-advance target_version ONLY if tracking latest (empty, "latest", or TrackLatest=true)
+						isTrackingLatest := p.Tools[i].TrackLatest || oldTarget == "" || oldTarget == "latest"
+						if isTrackingLatest && (oldTarget == "" || oldTarget == "latest" || compareSemVer(rel.LatestVersion, oldTarget) > 0) {
+							p.Tools[i].TargetVersion = rel.LatestVersion
+							totalAdvanced++
+							pendingNotifications = append(pendingNotifications, notificationItem{
+								profile:     p.Name,
+								tool:        p.Tools[i],
+								fromVersion: oldTarget,
+								toVersion:   rel.LatestVersion,
+							})
 						}
 					}
 					break
 				}
 			}
 		}
-		if updated {
-			_, _ = e.UpsertProfile(p)
+
+		if profileUpdated {
+			if saved, uErr := e.UpsertProfile(p); uErr == nil && saved != nil {
+				if e.OnSaveProfile != nil {
+					e.OnSaveProfile(*saved)
+				}
+			}
+			if onReleaseDetected != nil {
+				for _, n := range pendingNotifications {
+					onReleaseDetected(n.profile, n.tool, n.fromVersion, n.toVersion)
+				}
+			}
 		}
 	}
+	return totalAdvanced
 }

@@ -565,6 +565,7 @@ type Engine struct {
 	pingWaiters     map[string]chan PingAck
 	repoWaiters     map[string]chan RepoRuntimeStatus
 	profiles        map[string]*DistributionProfile
+	OnSaveProfile   func(p DistributionProfile)
 	cloneLease      map[string]string
 	hubLease        string
 	runningRev      map[string]bool

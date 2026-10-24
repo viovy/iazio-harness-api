@@ -156,6 +156,7 @@ func run(ctx context.Context, args []string) error {
 		srv.SaveProfile = func(p control.DistributionProfile) {
 			_ = store.SaveProfile(context.Background(), p)
 		}
+		srv.Engine.OnSaveProfile = srv.SaveProfile
 		srv.DeleteProfile = func(name string) {
 			_ = store.DeleteProfile(context.Background(), name)
 		}
