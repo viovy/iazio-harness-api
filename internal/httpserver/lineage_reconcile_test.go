@@ -93,6 +93,14 @@ func TestServer_ReconcileLineage_Endpoint(t *testing.T) {
 	if jobResp.ParentJobID != "job-1311" {
 		t.Errorf("job-1313 ParentJobID = %q, want job-1311", jobResp.ParentJobID)
 	}
+
+	// Verify multi-segment worktree path routing (Finding M1)
+	multiReq := httptest.NewRequest(http.MethodGet, "/api/v1/agents/mac-mini/Users/romeo/work/meta-repo-03/jobs/job-1313", nil)
+	multiRR := httptest.NewRecorder()
+	s.Handler().ServeHTTP(multiRR, multiReq)
+	if multiRR.Code != http.StatusOK {
+		t.Fatalf("expected multi-segment job status 200, got %d: %s", multiRR.Code, multiRR.Body.String())
+	}
 }
 
 func TestServer_GetAgentTools_Payload(t *testing.T) {

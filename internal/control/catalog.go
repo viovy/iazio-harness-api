@@ -166,12 +166,8 @@ func (e *Engine) HeartbeatWithCapabilities(id, presence string, tools []Tool, fe
 	h.HarnessActive = len(activeJobs) > 0
 	if len(supportedCaps) > 0 {
 		h.SupportedCapabilities = append([]string(nil), supportedCaps...)
-	} else if len(h.SupportedCapabilities) == 0 {
-		h.SupportedCapabilities = []string{
-			"user_service_watchdog_v2",
-			"deterministic_resume_4tuple_v1",
-			"agy_conversation_pinning_v1",
-		}
+	} else {
+		h.SupportedCapabilities = []string{}
 	}
 	if version != "" {
 		h.Version = version

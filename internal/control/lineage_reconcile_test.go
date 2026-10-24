@@ -188,3 +188,127 @@ func TestEngine_PreDispatchGate_CapabilityRequirement(t *testing.T) {
 		t.Errorf("leased job InitialConversationID = %q, want conv-init-123", leasedJob.InitialConversationID)
 	}
 }
+
+func TestEngine_MultiHopSplitBrain_ASECheckpointConsolidation(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	e.SetHostCapabilities("mac-mini", "user_service_watchdog_v2", "deterministic_resume_4tuple_v1", "agy_conversation_pinning_v1")
+
+	repoPath := "/Users/romeo/work/meta-repo-03"
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	initialConv := "aad902c8-bda6-44c7-8a68-c468a1562399"
+	secConv1 := "1d446877-5bf9-44eb-9db5-e1c007a9fe31"
+	secConv2 := "14de9a1f-5679-4f11-a08f-f32bc7e47663"
+
+	// Seed job-1311
+	e.mu.Lock()
+	e.jobs["job-1311"] = &Job{
+		ID:                    "job-1311",
+		ScheduleID:            "sch-1311",
+		InitialConversationID: initialConv,
+		ActiveConversationID:  initialConv,
+		ConversationIDs:       []string{initialConv},
+		Status:                "FAILED",
+		InterruptedASEState: map[string]any{
+			"phase":      "PHASE_3_TDD",
+			"step":       2,
+			"git_commit": "commit-11-tdd",
+			"summary":    "TDD tests written",
+		},
+	}
+	e.schedules["sch-1311"] = &Schedule{
+		ID:           "sch-1311",
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Engine:       "agy",
+		StoryID:      "STORY-GOV-3682",
+		Status:       "FAILED",
+	}
+
+	// Seed job-1313 (split-brain intermediate attempt)
+	e.jobs["job-1313"] = &Job{
+		ID:                    "job-1313",
+		ScheduleID:            "sch-1313",
+		ParentJobID:           "job-1311",
+		InitialConversationID: secConv1,
+		ActiveConversationID:  secConv2,
+		ConversationIDs:       []string{secConv1, secConv2},
+		Status:                "FAILED",
+		InterruptedASEState: map[string]any{
+			"phase":      "PHASE_4_REVIEW",
+			"step":       4,
+			"git_commit": "commit-13-phase4",
+			"summary":    "Phase 4 review scheme started with unpinned secondary session",
+		},
+	}
+	e.schedules["sch-1313"] = &Schedule{
+		ID:           "sch-1313",
+		HostID:       "mac-mini",
+		WorktreePath: repoPath,
+		Engine:       "agy",
+		StoryID:      "STORY-GOV-3682",
+		Status:       "FAILED",
+	}
+	e.mu.Unlock()
+
+	// 1. Reconcile lineage
+	count, err := e.ReconcileHistoricalLineage()
+	if err != nil {
+		t.Fatalf("ReconcileHistoricalLineage error: %v", err)
+	}
+	if count < 1 {
+		t.Fatalf("expected at least 1 reconciled job, got %d", count)
+	}
+
+	// Verify job-1313 was re-anchored to root conversation aad902c8-...
+	e.mu.Lock()
+	j1313 := e.jobs["job-1313"]
+	e.mu.Unlock()
+	if j1313.InitialConversationID != initialConv {
+		t.Fatalf("job-1313 InitialConversationID = %s, want %s", j1313.InitialConversationID, initialConv)
+	}
+
+	// 2. Resume repo in place from job-1313
+	resumeSch, err := e.ResumeRepoInPlace("mac-mini", repoPath, ResumeOptions{
+		JobID:       "job-1313",
+		ParentJobID: "job-1313",
+		StoryID:     "STORY-GOV-3682",
+	})
+	if err != nil {
+		t.Fatalf("ResumeRepoInPlace failed: %v", err)
+	}
+
+	if resumeSch.ParentJobID != "job-1313" {
+		t.Errorf("resumeSch.ParentJobID = %q, want job-1313", resumeSch.ParentJobID)
+	}
+	if resumeSch.RootJobID != "job-1311" {
+		t.Errorf("resumeSch.RootJobID = %q, want job-1311", resumeSch.RootJobID)
+	}
+	if resumeSch.InitialConversationID != initialConv {
+		t.Errorf("resumeSch.InitialConversationID = %q, want %s", resumeSch.InitialConversationID, initialConv)
+	}
+
+	// 3. Poll host and verify consolidated ASE checkpoint
+	leasedJob, _, _, ok := e.PollHost("mac-mini")
+	if !ok {
+		t.Fatal("expected PollHost to lease resume job")
+	}
+	if leasedJob.InitialConversationID != initialConv {
+		t.Errorf("leasedJob.InitialConversationID = %q, want %s", leasedJob.InitialConversationID, initialConv)
+	}
+	if leasedJob.InterruptedASEState == nil {
+		t.Fatal("expected leasedJob to retain InterruptedASEState")
+	}
+	if phase, _ := leasedJob.InterruptedASEState["phase"].(string); phase != "PHASE_4_REVIEW" {
+		t.Errorf("leasedJob InterruptedASEState[phase] = %q, want PHASE_4_REVIEW", phase)
+	}
+	if gitCommit, _ := leasedJob.InterruptedASEState["git_commit"].(string); gitCommit != "commit-13-phase4" {
+		t.Errorf("leasedJob InterruptedASEState[git_commit] = %q, want commit-13-phase4", gitCommit)
+	}
+}

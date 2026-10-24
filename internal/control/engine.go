@@ -1010,6 +1010,15 @@ func (e *Engine) RegisterHost(id, kind string, profile ...string) Host {
 	return *h
 }
 
+// SetHostCapabilities explicitly configures supported capabilities for a host.
+func (e *Engine) SetHostCapabilities(id string, caps ...string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if h, ok := e.hosts[id]; ok {
+		h.SupportedCapabilities = append([]string(nil), caps...)
+	}
+}
+
 // LeaseOrdinary assigns one job per clone URL. Refinement does not take that lease.
 func (e *Engine) LeaseOrdinary(host, path, clone string) (Job, error) {
 	e.mu.Lock()

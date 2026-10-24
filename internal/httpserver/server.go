@@ -263,7 +263,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/hosts/{id}", s.hostDetail)
 	mux.HandleFunc("GET /api/v1/agents/{id}/tools", s.getAgentTools)
 	mux.HandleFunc("GET /v1/hosts/{id}/tools", s.getAgentTools)
+	mux.HandleFunc("GET /api/v1/agents/{host}/jobs/{id}", s.getJob)
 	mux.HandleFunc("GET /api/v1/agents/{host}/{repo}/jobs/{id}", s.getJob)
+	mux.HandleFunc("GET /api/v1/agents/{rest...}", s.getAgentRest)
 	mux.HandleFunc("POST /api/v1/admin/jobs/reconcile-lineage", s.reconcileLineage)
 	mux.HandleFunc("POST /v1/admin/jobs/reconcile-lineage", s.reconcileLineage)
 	mux.HandleFunc("POST /v1/hosts/{id}/heartbeat", s.heartbeat)
@@ -1347,6 +1349,18 @@ func (s *Server) listHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"history": out})
 }
 
+func (s *Server) getAgentRest(w http.ResponseWriter, r *http.Request) {
+	rest := r.PathValue("rest")
+	if strings.Contains(rest, "/jobs/") {
+		parts := strings.Split(rest, "/jobs/")
+		jobID := parts[len(parts)-1]
+		r.SetPathValue("id", jobID)
+		s.getJob(w, r)
+		return
+	}
+	http.NotFound(w, r)
+}
+
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	// 1. Active in-memory jobs take highest precedence
@@ -1638,12 +1652,8 @@ func (s *Server) getAgentTools(w http.ResponseWriter, r *http.Request) {
 		tools = append(tools, toolView(tool))
 	}
 	supportedCaps := detail.Host.SupportedCapabilities
-	if len(supportedCaps) == 0 {
-		supportedCaps = []string{
-			"user_service_watchdog_v2",
-			"deterministic_resume_4tuple_v1",
-			"agy_conversation_pinning_v1",
-		}
+	if supportedCaps == nil {
+		supportedCaps = []string{}
 	}
 	resp := map[string]any{
 		"host":                   hostID,
