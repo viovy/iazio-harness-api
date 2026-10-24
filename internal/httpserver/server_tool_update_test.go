@@ -519,6 +519,18 @@ func TestServer_ForceUpdateToolEndpoint(t *testing.T) {
 	if !strings.Contains(rec13.Body.String(), "failed to enqueue tool update job") {
 		t.Fatalf("expected error message to mention failed to enqueue, got: %s", rec13.Body.String())
 	}
+
+	// 14. Unknown tool in multi-tool body returns 404 (R4)
+	srv.Queue = nil // restore queue
+	rec14 := httptest.NewRecorder()
+	req14 := httptest.NewRequest("POST", "/v1/hosts/mac-mini/tools/update", bytes.NewReader([]byte(`{"tools":["autopilot-plugins-internal", "nonexistent-tool-2"]}`)))
+	handler.ServeHTTP(rec14, req14)
+	if rec14.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown tool in multi-tool body (R4), got %d: %s", rec14.Code, rec14.Body.String())
+	}
+	if !strings.Contains(rec14.Body.String(), "unknown tool") {
+		t.Fatalf("expected error message to mention unknown tool, got: %s", rec14.Body.String())
+	}
 }
 
 type failingMockQueue struct {

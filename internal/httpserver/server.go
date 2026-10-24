@@ -1678,6 +1678,45 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 		p, _ = s.Engine.GetProfile("generic")
 	}
 
+	// Validate tool existence across all requested tools (F6, N4-R, R4)
+	if p != nil && len(p.Tools) > 0 {
+		for _, toolName := range body.Tools {
+			found := false
+			for _, pt := range p.Tools {
+				if strings.EqualFold(pt.Name, toolName) || strings.EqualFold(pt.BinaryName, toolName) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				writeErr(w, http.StatusNotFound, fmt.Errorf("unknown tool: %s", toolName))
+				return
+			}
+		}
+	} else if toolParam != "" || body.TargetVersion != "" {
+		for _, toolName := range body.Tools {
+			var foundTool *control.ProfileTool
+			if p != nil {
+				for _, pt := range p.Tools {
+					if strings.EqualFold(pt.Name, toolName) || strings.EqualFold(pt.BinaryName, toolName) {
+						toolCopy := pt
+						foundTool = &toolCopy
+						break
+					}
+				}
+			}
+			if foundTool == nil {
+				writeErr(w, http.StatusNotFound, fmt.Errorf("unknown tool: %s", toolName))
+				return
+			}
+		}
+	}
+
+	if len(body.Tools) > 1 && body.TargetVersion != "" {
+		writeErr(w, http.StatusUnprocessableEntity, fmt.Errorf("target_version can only be specified when exactly one tool is targeted"))
+		return
+	}
+
 	if len(body.Tools) == 1 {
 		toolName := body.Tools[0]
 		var foundTool *control.ProfileTool
@@ -1689,11 +1728,6 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 			}
-		}
-		// Validate tool existence in profile when profile has defined tools or when explicitly targeted (F6, N4-R)
-		if (toolParam != "" || body.TargetVersion != "" || (p != nil && len(p.Tools) > 0)) && foundTool == nil {
-			writeErr(w, http.StatusNotFound, fmt.Errorf("unknown tool: %s", toolName))
-			return
 		}
 
 		// R2, N4: validate explicit target_version if supplied; return 422 if invalid or unknown
