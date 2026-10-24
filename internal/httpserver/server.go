@@ -537,6 +537,14 @@ func (s *Server) resumeJob(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&opts)
 	}
+	if opts.ConversationID != "" && !control.IsValidConversationID(opts.ConversationID) {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid conversation_id: contains illegal characters or path traversal"))
+		return
+	}
+	if opts.InitialConversationID != "" && !control.IsValidConversationID(opts.InitialConversationID) {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid initial_conversation_id: contains illegal characters or path traversal"))
+		return
+	}
 	sch, err := s.Engine.ResumeJob(jobID, opts)
 	if err != nil {
 		code := http.StatusConflict
@@ -832,6 +840,14 @@ func (s *Server) resumeRepoInPlace(w http.ResponseWriter, r *http.Request) {
 	initConvID := body.InitialConversationID
 	if initConvID == "" {
 		initConvID = body.ConversationID
+	}
+	if initConvID != "" && !control.IsValidConversationID(initConvID) {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid initial_conversation_id: contains illegal characters or path traversal"))
+		return
+	}
+	if body.ActiveConversationID != "" && !control.IsValidConversationID(body.ActiveConversationID) {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid active_conversation_id: contains illegal characters or path traversal"))
+		return
 	}
 	opts := control.ResumeOptions{
 		ConversationID:        body.ConversationID,
@@ -2435,6 +2451,10 @@ func (s *Server) addJobConversation(w http.ResponseWriter, r *http.Request) {
 	cid := strings.TrimSpace(raw.ConversationID)
 	if cid == "" {
 		writeErr(w, http.StatusBadRequest, errors.New("conversation_id is required"))
+		return
+	}
+	if !control.IsValidConversationID(cid) {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid conversation_id: contains illegal characters or path traversal"))
 		return
 	}
 	opt := control.ConversationAttachOptions{

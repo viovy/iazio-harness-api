@@ -153,6 +153,23 @@ type ConversationAttachOptions struct {
 	ASEPhase       string `json:"ase_phase,omitempty"`
 }
 
+// IsValidConversationID validates that a conversation ID is well-formed and safe against path traversal.
+func IsValidConversationID(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" || len(id) > 128 {
+		return false
+	}
+	if strings.Contains(id, "..") || strings.Contains(id, "/") || strings.Contains(id, "\\") {
+		return false
+	}
+	for _, r := range id {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.') {
+			return false
+		}
+	}
+	return true
+}
+
 // Schedule is one Execute click.
 type Schedule struct {
 	ID                   string
@@ -180,6 +197,9 @@ type Schedule struct {
 	TraceID              string
 	ParentJobID          string
 	RootJobID            string
+	AssociatedJobs       []string
+	ExecutionAttempt     int
+	ExecutionChain       []string
 	InitialConversationID string
 	ActiveConversationID string
 	ResumeMode           string
@@ -220,6 +240,9 @@ type JobDetail struct {
 	TraceID                     string                 `json:"trace_id,omitempty"`
 	ParentJobID                 string                 `json:"parent_job_id,omitempty"`
 	RootJobID                   string                 `json:"root_job_id,omitempty"`
+	AssociatedJobs              []string               `json:"associated_jobs,omitempty"`
+	ExecutionAttempt            int                    `json:"execution_attempt,omitempty"`
+	ExecutionChain              []string               `json:"execution_chain,omitempty"`
 	InitialConversationID       string                 `json:"initial_conversation_id,omitempty"`
 	ActiveConversationID        string                 `json:"active_conversation_id,omitempty"`
 	ResumeMode                  string                 `json:"resume_mode,omitempty"`
@@ -262,10 +285,13 @@ type Job struct {
 	TraceID               string
 	ParentJobID           string
 	RootJobID             string
+	ExecutionAttempt      int
+	ExecutionChain        []string
 	InitialConversationID string
 	ActiveConversationID  string
 	ResumeMode            string
 	ResumeFallbackReason  string
+	SameConversationConfirmed bool
 	InterruptedASEState   map[string]any
 	ConversationLineage   []ConversationLineage
 }
@@ -396,10 +422,13 @@ type HistoryRow struct {
 	CreatedAt             time.Time
 	ParentJobID           string
 	RootJobID             string
+	ExecutionAttempt      int
+	ExecutionChain        []string
 	InitialConversationID string
 	ActiveConversationID  string
 	ResumeMode            string
 	ResumeFallbackReason  string
+	SameConversationConfirmed bool
 	InterruptedASEState   map[string]any
 	ConversationLineage   []ConversationLineage
 }
@@ -425,10 +454,13 @@ type HistoryItem struct {
 	CreatedAt             time.Time
 	ParentJobID           string
 	RootJobID             string
+	ExecutionAttempt      int
+	ExecutionChain        []string
 	InitialConversationID string
 	ActiveConversationID  string
 	ResumeMode            string
 	ResumeFallbackReason  string
+	SameConversationConfirmed bool
 	InterruptedASEState   map[string]any
 	ConversationLineage   []ConversationLineage
 }
@@ -2027,6 +2059,28 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			resMode = "same_conversation"
 		}
 
+		execAttempt := sch.ExecutionAttempt
+		if execAttempt <= 0 {
+			if sch.ParentJobID != "" {
+				execAttempt = 2
+			} else {
+				execAttempt = 1
+			}
+		}
+		var execChain []string
+		if len(sch.ExecutionChain) > 0 {
+			execChain = append(append([]string(nil), sch.ExecutionChain...), id)
+		} else if sch.ParentJobID != "" {
+			if sch.RootJobID != "" && sch.RootJobID != sch.ParentJobID {
+				execChain = []string{sch.RootJobID, sch.ParentJobID, id}
+			} else {
+				execChain = []string{sch.ParentJobID, id}
+			}
+		} else {
+			execChain = []string{id}
+		}
+		sch.AssociatedJobs = append(sch.AssociatedJobs, id)
+
 		job := &Job{
 			ID:                    id,
 			ScheduleID:            sch.ID,
@@ -2042,6 +2096,8 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			TraceID:               traceID,
 			ParentJobID:           sch.ParentJobID,
 			RootJobID:             sch.RootJobID,
+			ExecutionAttempt:      execAttempt,
+			ExecutionChain:        execChain,
 			InitialConversationID: initConvID,
 			ActiveConversationID:  actConvID,
 			ResumeMode:            resMode,
@@ -2095,6 +2151,8 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			CreatedAt:             e.now(),
 			ParentJobID:           job.ParentJobID,
 			RootJobID:             job.RootJobID,
+			ExecutionAttempt:      job.ExecutionAttempt,
+			ExecutionChain:        append([]string(nil), job.ExecutionChain...),
 			InitialConversationID: job.InitialConversationID,
 			ActiveConversationID:  job.ActiveConversationID,
 			ResumeMode:            job.ResumeMode,
@@ -2181,8 +2239,23 @@ func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseC
 		}
 	}
 	title, engine, schID, traceID := "", "", "", ""
+	var pj, rj, initConv, actConv, resMode, resReason string
+	var attempt int
+	var chain []string
+	var intState map[string]any
+	var lineage []ConversationLineage
 	if j, ok := e.jobs[jobID]; ok {
 		traceID = j.TraceID
+		pj = j.ParentJobID
+		rj = j.RootJobID
+		attempt = j.ExecutionAttempt
+		chain = j.ExecutionChain
+		initConv = j.InitialConversationID
+		actConv = j.ActiveConversationID
+		resMode = j.ResumeMode
+		resReason = j.ResumeFallbackReason
+		intState = j.InterruptedASEState
+		lineage = j.ConversationLineage
 		if sch := e.schedules[j.ScheduleID]; sch != nil {
 			title = sch.PromptTitle
 			engine = sch.Engine
@@ -2195,6 +2268,9 @@ func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseC
 	row := HistoryRow{
 		JobID: jobID, ScheduleID: schID, PromptTitle: title, Engine: engine,
 		Status: status, Clean: clean, ASEComplete: aseComplete, TraceID: traceID, CreatedAt: e.now(),
+		ParentJobID: pj, RootJobID: rj, ExecutionAttempt: attempt, ExecutionChain: chain,
+		InitialConversationID: initConv, ActiveConversationID: actConv, ResumeMode: resMode,
+		ResumeFallbackReason: resReason, InterruptedASEState: intState, ConversationLineage: lineage,
 	}
 	e.history[key] = append(e.history[key], row)
 	e.notifyHistoryLocked(host, path, row)
@@ -2282,7 +2358,55 @@ func (e *Engine) SetSchedulePriority(scheduleID string, priority int) (Schedule,
 	return *sch, nil
 }
 
-// GetSchedule retrieves a schedule by ID.
+// GetAssociatedJobsForScheduleLocked finds all job IDs associated with a schedule's execution lineage.
+func (e *Engine) GetAssociatedJobsForScheduleLocked(schID string) []string {
+	sch, ok := e.schedules[schID]
+	if !ok {
+		return nil
+	}
+	jobSet := make(map[string]bool)
+	var ordered []string
+
+	addJob := func(id string) {
+		if id != "" && !jobSet[id] {
+			jobSet[id] = true
+			ordered = append(ordered, id)
+		}
+	}
+
+	for _, id := range sch.AssociatedJobs {
+		addJob(id)
+	}
+	if sch.RootJobID != "" {
+		addJob(sch.RootJobID)
+	}
+	if sch.ParentJobID != "" {
+		addJob(sch.ParentJobID)
+	}
+
+	for _, j := range e.jobs {
+		if j.ScheduleID == schID || (sch.RootJobID != "" && (j.RootJobID == sch.RootJobID || j.ID == sch.RootJobID)) || (sch.ParentJobID != "" && (j.ParentJobID == sch.ParentJobID || j.ID == sch.ParentJobID)) {
+			addJob(j.ID)
+		}
+	}
+	for _, rows := range e.history {
+		for _, r := range rows {
+			if r.ScheduleID == schID || (sch.RootJobID != "" && (r.RootJobID == sch.RootJobID || r.JobID == sch.RootJobID)) || (sch.ParentJobID != "" && (r.ParentJobID == sch.ParentJobID || r.JobID == sch.ParentJobID)) {
+				addJob(r.JobID)
+			}
+		}
+	}
+	return ordered
+}
+
+// GetAssociatedJobsForSchedule returns all job IDs associated with a schedule's execution lineage.
+func (e *Engine) GetAssociatedJobsForSchedule(schID string) []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.GetAssociatedJobsForScheduleLocked(schID)
+}
+
+// GetSchedule retrieves a schedule by ID with complete associated execution jobs.
 func (e *Engine) GetSchedule(scheduleID string) (Schedule, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -2290,7 +2414,9 @@ func (e *Engine) GetSchedule(scheduleID string) (Schedule, bool) {
 	if !ok {
 		return Schedule{}, false
 	}
-	return *sch, true
+	res := *sch
+	res.AssociatedJobs = e.GetAssociatedJobsForScheduleLocked(scheduleID)
+	return res, true
 }
 
 // CancelSchedule cancels a schedule by ID and aborts any active running job for it.
@@ -2527,6 +2653,9 @@ func (e *Engine) AddJobConversationWithOptions(jobID, convID string, opts ...Con
 	if convID == "" {
 		return errors.New("empty conversation id")
 	}
+	if !IsValidConversationID(convID) {
+		return fmt.Errorf("invalid conversation_id %q: illegal characters or path traversal", convID)
+	}
 
 	var opt ConversationAttachOptions
 	if len(opts) > 0 {
@@ -2552,6 +2681,23 @@ func (e *Engine) AddJobConversationWithOptions(jobID, convID string, opts ...Con
 	}
 
 	if opt.Fallback {
+		// Guard against duplicate fallback posts for the same fallback ID (F6)
+		if job.ActiveConversationID == convID && job.ResumeMode == "fallback_new_conversation" {
+			return nil
+		}
+		// Guard against multiple fallbacks: exactly one fallback allowed per job
+		if job.ActiveConversationID != "" && job.ActiveConversationID != job.InitialConversationID && convID != job.ActiveConversationID {
+			job.ConversationLineage = append(job.ConversationLineage, ConversationLineage{
+				ConversationID: convID,
+				Role:           "dropped_unpinned",
+				AttachedAt:     e.now(),
+				CLIArgs:        cliArgs,
+				ASEPhase:       opt.ASEPhase,
+				Reason:         fmt.Sprintf("rejected secondary fallback %s; active fallback %s already pinned", convID, job.ActiveConversationID),
+			})
+			return nil
+		}
+
 		// Explicit fallback from initial conversation failure
 		job.ActiveConversationID = convID
 		job.ResumeMode = "fallback_new_conversation"
@@ -2595,7 +2741,8 @@ func (e *Engine) AddJobConversationWithOptions(jobID, convID string, opts ...Con
 			job.ConversationIDs = append(job.ConversationIDs, convID)
 		} else if job.ActiveConversationID == convID || job.InitialConversationID == convID {
 			if job.InitialConversationID != "" && convID == job.InitialConversationID {
-				job.ResumeMode = "same_conversation_confirmed"
+				job.ResumeMode = "same_conversation"
+				job.SameConversationConfirmed = true
 			}
 			found := false
 			for _, c := range job.ConversationIDs {
@@ -2609,9 +2756,8 @@ func (e *Engine) AddJobConversationWithOptions(jobID, convID string, opts ...Con
 			}
 		} else {
 			// A different conversation ID arrived without explicit opt.Fallback.
-			// If we haven't confirmed initial conversation yet and not in fallback mode,
-			// record this single fallback transition so the job tracks the new active session.
-			if job.ActiveConversationID == job.InitialConversationID && job.ResumeMode != "same_conversation_confirmed" {
+			// Only allow implicit fallback if initial conversation was NEVER confirmed yet and not already in fallback mode!
+			if !job.SameConversationConfirmed && job.ResumeMode != "fallback_new_conversation" {
 				job.ActiveConversationID = convID
 				job.ResumeMode = "fallback_new_conversation"
 				reason := fmt.Sprintf("streamed session fallback from %s to %s", job.InitialConversationID, convID)
@@ -2628,7 +2774,15 @@ func (e *Engine) AddJobConversationWithOptions(jobID, convID string, opts ...Con
 				})
 				job.ConversationIDs = append(job.ConversationIDs, convID)
 			} else {
-				// Fragmented extra conversation ID! Ignore to prevent split-brain attachment.
+				// Fragmented extra conversation ID! Record dropped unpinned conversation for observability
+				job.ConversationLineage = append(job.ConversationLineage, ConversationLineage{
+					ConversationID: convID,
+					Role:           "dropped_unpinned",
+					AttachedAt:     e.now(),
+					CLIArgs:        cliArgs,
+					ASEPhase:       opt.ASEPhase,
+					Reason:         fmt.Sprintf("ignored unpinned tertiary conversation %s; active is %s", convID, job.ActiveConversationID),
+				})
 				return nil
 			}
 		}
@@ -3012,6 +3166,15 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		}
 	}
 
+	var associatedJobs []string
+	if rootJobID != "" && rootJobID != parentJobID {
+		associatedJobs = []string{rootJobID, parentJobID}
+	} else if parentJobID != "" {
+		associatedJobs = []string{parentJobID}
+	}
+	execAttempt := len(associatedJobs) + 1
+	execChain := append([]string(nil), associatedJobs...)
+
 	newSch := &Schedule{
 		ID:                    schID,
 		PromptID:              promptID,
@@ -3033,6 +3196,9 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		CustomPrompt:          customPrompt,
 		ParentJobID:           parentJobID,
 		RootJobID:             rootJobID,
+		AssociatedJobs:        associatedJobs,
+		ExecutionAttempt:      execAttempt,
+		ExecutionChain:        execChain,
 		InitialConversationID: initConvID,
 		ActiveConversationID:  initConvID,
 		ResumeMode:            "same_conversation",
@@ -3248,6 +3414,17 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 		}
 	}
 
+	var associatedJobs []string
+	if len(job.ExecutionChain) > 0 {
+		associatedJobs = append([]string(nil), job.ExecutionChain...)
+	} else if rootJobID != "" && rootJobID != parentJobID {
+		associatedJobs = []string{rootJobID, parentJobID}
+	} else if parentJobID != "" {
+		associatedJobs = []string{parentJobID}
+	}
+	execAttempt := len(associatedJobs) + 1
+	execChain := append([]string(nil), associatedJobs...)
+
 	// Create new schedule to resume execution with KindResume.
 	schID := e.next("sch-")
 	newSch := &Schedule{
@@ -3273,6 +3450,9 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 		CustomPrompt:          customPrompt,
 		ParentJobID:           parentJobID,
 		RootJobID:             rootJobID,
+		AssociatedJobs:        associatedJobs,
+		ExecutionAttempt:      execAttempt,
+		ExecutionChain:        execChain,
 		InitialConversationID: initConvID,
 		ActiveConversationID:  initConvID,
 		ResumeMode:            "same_conversation",

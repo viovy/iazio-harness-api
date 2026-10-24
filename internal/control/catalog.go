@@ -796,7 +796,9 @@ func (e *Engine) ListSchedules(hostID, repoPath, status string) []Schedule {
 		if status != "" && !strings.EqualFold(sch.Status, status) {
 			continue
 		}
-		out = append(out, *sch)
+		sCopy := *sch
+		sCopy.AssociatedJobs = e.GetAssociatedJobsForScheduleLocked(sch.ID)
+		out = append(out, sCopy)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Priority != out[j].Priority {
@@ -859,8 +861,18 @@ func (e *Engine) ListHistory(hostID, repoPath, status string, limit int) []Histo
 				DiagnosticCode:  row.DiagnosticCode,
 				Model:           row.Model,
 				Remediation:     row.Remediation,
-				TraceID:         row.TraceID,
-				CreatedAt:       row.CreatedAt,
+				TraceID:               row.TraceID,
+				CreatedAt:             row.CreatedAt,
+				ParentJobID:           row.ParentJobID,
+				RootJobID:             row.RootJobID,
+				ExecutionAttempt:      row.ExecutionAttempt,
+				ExecutionChain:        row.ExecutionChain,
+				InitialConversationID: row.InitialConversationID,
+				ActiveConversationID:  row.ActiveConversationID,
+				ResumeMode:            row.ResumeMode,
+				ResumeFallbackReason:  row.ResumeFallbackReason,
+				InterruptedASEState:   row.InterruptedASEState,
+				ConversationLineage:   row.ConversationLineage,
 			})
 		}
 	}
