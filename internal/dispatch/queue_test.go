@@ -82,8 +82,8 @@ func TestQueue_ClaimFilters(t *testing.T) {
 	if claimed.Type != JobTypeStoryCreate || claimed.TargetHost != "host-b" {
 		t.Fatalf("unexpected claimed job attributes: %+v", claimed)
 	}
-	if claimed.Status != JobStatusClaimed {
-		t.Fatalf("expected status claimed, got %s", claimed.Status)
+	if claimed.Status != JobStatusClaimed && claimed.Status != JobStatusLeased {
+		t.Fatalf("expected status claimed or leased, got %s", claimed.Status)
 	}
 }
 
@@ -369,8 +369,13 @@ func TestQueue_ClaimLeaseExpiry(t *testing.T) {
 	if err != nil || claimed == nil {
 		t.Fatalf("claim failed: %v", err)
 	}
-	if claimed.Status != JobStatusClaimed {
+	if claimed.Status != JobStatusClaimed && claimed.Status != JobStatusLeased {
 		t.Fatalf("expected claimed, got %s", claimed.Status)
+	}
+
+	// Ack lease to transition to running
+	if _, err := q.AckLease(ctx, claimed.ID, claimed.LeaseToken, 1234, ""); err != nil {
+		t.Fatalf("ack lease failed: %v", err)
 	}
 
 	// Advance time past claimTimeout (11 minutes)
@@ -699,7 +704,7 @@ func TestQueue_ReconcileGlobalQueueSlots_And_ForceDispatch(t *testing.T) {
 	if err != nil || claimed == nil {
 		t.Fatalf("claim error: %v", err)
 	}
-	if claimed.Status != JobStatusClaimed || claimed.ClaimedHost != "pc1-wsl" {
+	if (claimed.Status != JobStatusClaimed && claimed.Status != JobStatusLeased) || claimed.ClaimedHost != "pc1-wsl" {
 		t.Fatalf("expected claimed by pc1-wsl, got status=%s host=%s", claimed.Status, claimed.ClaimedHost)
 	}
 

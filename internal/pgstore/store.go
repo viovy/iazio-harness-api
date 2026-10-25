@@ -129,6 +129,53 @@ ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS execution_attempt integer N
 ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS execution_chain jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS same_conversation_confirmed boolean NOT NULL DEFAULT false;
 ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS attach_confirmation text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS lease_token text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS lease_ack_deadline_at timestamp with time zone;
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS failure_category text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS failure_stage text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS failure_reason_summary text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS retriable boolean NOT NULL DEFAULT false;
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS attempt_history jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS zipkin_trace_id text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS zipkin_trace_url text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS traceparent text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS infra_requeue_count integer NOT NULL DEFAULT 0;
+
+UPDATE harness_history
+SET failure_category = CASE
+  WHEN (reason ILIKE '%claim%' OR error_message ILIKE '%claim%' OR diagnostic_code ILIKE '%claim%' OR reason ILIKE '%startup_heartbeat%') THEN 'DISPATCH_CLAIM_TIMEOUT'
+  WHEN (reason ILIKE '%429%' OR error_message ILIKE '%429%' OR reason ILIKE '%quota%' OR error_message ILIKE '%quota%' OR reason ILIKE '%auth%' OR error_message ILIKE '%auth%') THEN 'TOOL_QUOTA_OR_AUTH'
+  WHEN (reason ILIKE '%worktree%' OR error_message ILIKE '%worktree%' OR reason ILIKE '%submodule%' OR error_message ILIKE '%submodule%' OR reason ILIKE '%lock%') THEN 'WORKSPACE_PREP_ERROR'
+  WHEN (reason ILIKE '%1h0m0s%' OR error_message ILIKE '%1h0m0s%' OR reason ILIKE '%background task%' OR error_message ILIKE '%background task%' OR status = 'LEASE_EXPIRED') THEN 'BACKGROUND_DRAIN_TIMEOUT'
+  WHEN (reason ILIKE '%circuit%' OR error_message ILIKE '%circuit%') THEN 'CIRCUIT_BREAKER_TRIPPED'
+  WHEN (reason ILIKE '%gate%' OR error_message ILIKE '%gate%' OR diagnostic_code ILIKE '%gate%') THEN 'ASE_GATE_INCOMPLETE'
+  ELSE 'TOOL_CRASH'
+END,
+failure_stage = CASE
+  WHEN (reason ILIKE '%claim%' OR error_message ILIKE '%claim%' OR diagnostic_code ILIKE '%claim%') THEN 'QUEUE_DISPATCH'
+  WHEN (reason ILIKE '%worktree%' OR error_message ILIKE '%worktree%' OR reason ILIKE '%submodule%' OR error_message ILIKE '%submodule%' OR reason ILIKE '%lock%') THEN 'WORKSPACE_PREP'
+  WHEN (reason ILIKE '%1h0m0s%' OR error_message ILIKE '%1h0m0s%' OR reason ILIKE '%background task%' OR error_message ILIKE '%background task%' OR status = 'LEASE_EXPIRED') THEN 'BACKGROUND_DRAIN'
+  ELSE 'TOOL_EXECUTION'
+END,
+failure_reason_summary = CASE
+  WHEN error_message <> '' THEN error_message
+  WHEN reason <> '' THEN reason
+  ELSE 'Historical failure backfill'
+END,
+retriable = CASE
+  WHEN (reason ILIKE '%gate%' OR error_message ILIKE '%gate%' OR diagnostic_code ILIKE '%gate%') THEN false
+  ELSE true
+END,
+zipkin_trace_id = CASE
+  WHEN zipkin_trace_id = '' AND trace_id <> '' THEN trace_id
+  ELSE zipkin_trace_id
+END,
+zipkin_trace_url = CASE
+  WHEN zipkin_trace_url = '' AND trace_id <> '' THEN 'https://tian.go.ro/zipkin/traces/' || trace_id
+  ELSE zipkin_trace_url
+END
+WHERE status IN ('FAILED', 'DECLINED', 'ABANDONED', 'LEASE_EXPIRED')
+  AND (failure_category = '' OR failure_category = 'NONE');
 
 UPDATE harness_history
 SET initial_conversation_id = 'aad902c8-bda6-44c7-8a68-c468a1562399',
@@ -672,6 +719,10 @@ func (s *Store) SaveHistory(ctx context.Context, hostID, worktreePath string, ro
 	if err != nil || len(row.ExecutionChain) == 0 {
 		chainBytes = []byte("[]")
 	}
+	attemptHistoryBytes, err := json.Marshal(row.AttemptHistory)
+	if err != nil || len(row.AttemptHistory) == 0 {
+		attemptHistoryBytes = []byte("[]")
+	}
 	attempt := row.ExecutionAttempt
 	if attempt <= 0 {
 		attempt = 1
@@ -682,9 +733,12 @@ INSERT INTO harness_history (
   ase_complete, conversation_ids, reason, error_message, diagnostic_code, model,
   remediation, trace_id, parent_job_id, root_job_id, initial_conversation_id,
   active_conversation_id, resume_mode, resume_fallback_reason, interrupted_ase_state,
-  conversation_lineage, execution_attempt, execution_chain, same_conversation_confirmed, attach_confirmation
+  conversation_lineage, execution_attempt, execution_chain, same_conversation_confirmed, attach_confirmation,
+  lease_token, lease_ack_deadline_at, failure_category, failure_stage,
+  failure_reason_summary, retriable, attempt_history, zipkin_trace_id,
+  zipkin_trace_url, traceparent, infra_requeue_count
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39)
 ON CONFLICT (job_id) DO UPDATE SET
   host_id = EXCLUDED.host_id,
   worktree_path = EXCLUDED.worktree_path,
@@ -712,8 +766,19 @@ ON CONFLICT (job_id) DO UPDATE SET
   execution_attempt = EXCLUDED.execution_attempt,
   execution_chain = EXCLUDED.execution_chain,
   same_conversation_confirmed = EXCLUDED.same_conversation_confirmed,
-  attach_confirmation = EXCLUDED.attach_confirmation
-`, row.JobID, hostID, worktreePath, row.ScheduleID, row.PromptTitle, row.Engine, row.Status, row.Clean, row.ASEComplete, string(convBytes), row.Reason, row.ErrorMessage, row.DiagnosticCode, row.Model, row.Remediation, row.TraceID, row.ParentJobID, row.RootJobID, row.InitialConversationID, row.ActiveConversationID, row.ResumeMode, row.ResumeFallbackReason, string(interruptedBytes), string(lineageBytes), attempt, string(chainBytes), row.SameConversationConfirmed, row.AttachConfirmation)
+  attach_confirmation = EXCLUDED.attach_confirmation,
+  lease_token = EXCLUDED.lease_token,
+  lease_ack_deadline_at = EXCLUDED.lease_ack_deadline_at,
+  failure_category = EXCLUDED.failure_category,
+  failure_stage = EXCLUDED.failure_stage,
+  failure_reason_summary = EXCLUDED.failure_reason_summary,
+  retriable = EXCLUDED.retriable,
+  attempt_history = EXCLUDED.attempt_history,
+  zipkin_trace_id = EXCLUDED.zipkin_trace_id,
+  zipkin_trace_url = EXCLUDED.zipkin_trace_url,
+  traceparent = EXCLUDED.traceparent,
+  infra_requeue_count = EXCLUDED.infra_requeue_count
+`, row.JobID, hostID, worktreePath, row.ScheduleID, row.PromptTitle, row.Engine, row.Status, row.Clean, row.ASEComplete, string(convBytes), row.Reason, row.ErrorMessage, row.DiagnosticCode, row.Model, row.Remediation, row.TraceID, row.ParentJobID, row.RootJobID, row.InitialConversationID, row.ActiveConversationID, row.ResumeMode, row.ResumeFallbackReason, string(interruptedBytes), string(lineageBytes), attempt, string(chainBytes), row.SameConversationConfirmed, row.AttachConfirmation, row.LeaseToken, row.LeaseAckDeadlineAt, row.FailureCategory, row.FailureStage, row.FailureReasonSummary, row.Retriable, string(attemptHistoryBytes), row.ZipkinTraceID, row.ZipkinTraceURL, row.Traceparent, row.InfraRequeueCount)
 	if err != nil {
 		return fmt.Errorf("save history: %w", err)
 	}
@@ -755,7 +820,9 @@ SELECT
   ase_complete, conversation_ids, reason, error_message, diagnostic_code, model,
   remediation, trace_id, created_at, parent_job_id, root_job_id, initial_conversation_id,
   active_conversation_id, resume_mode, resume_fallback_reason, interrupted_ase_state,
-  conversation_lineage, execution_attempt, execution_chain, same_conversation_confirmed, attach_confirmation
+  conversation_lineage, execution_attempt, execution_chain, same_conversation_confirmed, attach_confirmation,
+  lease_token, lease_ack_deadline_at, failure_category, failure_stage, failure_reason_summary,
+  retriable, attempt_history, zipkin_trace_id, zipkin_trace_url, traceparent, infra_requeue_count
 FROM harness_history ORDER BY created_at ASC
 `)
 	if err != nil {
@@ -768,6 +835,8 @@ FROM harness_history ORDER BY created_at ASC
 		var r control.HistoryRow
 		var hostID, worktreePath string
 		var convRaw, interruptedRaw, lineageRaw, chainRaw []byte
+		var attemptHistoryRaw []byte
+		var leaseAckDeadline sql.NullTime
 		if err := rows.Scan(
 			&r.JobID, &hostID, &worktreePath, &r.ScheduleID, &r.PromptTitle, &r.Engine,
 			&r.Status, &r.Clean, &r.ASEComplete, &convRaw, &r.Reason, &r.ErrorMessage,
@@ -775,8 +844,20 @@ FROM harness_history ORDER BY created_at ASC
 			&r.ParentJobID, &r.RootJobID, &r.InitialConversationID, &r.ActiveConversationID,
 			&r.ResumeMode, &r.ResumeFallbackReason, &interruptedRaw, &lineageRaw,
 			&r.ExecutionAttempt, &chainRaw, &r.SameConversationConfirmed, &r.AttachConfirmation,
+			&r.LeaseToken, &leaseAckDeadline, &r.FailureCategory, &r.FailureStage, &r.FailureReasonSummary,
+			&r.Retriable, &attemptHistoryRaw, &r.ZipkinTraceID, &r.ZipkinTraceURL, &r.Traceparent, &r.InfraRequeueCount,
 		); err != nil {
 			return nil, err
+		}
+		if leaseAckDeadline.Valid {
+			t := leaseAckDeadline.Time
+			r.LeaseAckDeadlineAt = &t
+		}
+		if len(attemptHistoryRaw) > 0 {
+			_ = json.Unmarshal(attemptHistoryRaw, &r.AttemptHistory)
+		}
+		if r.AttemptHistory == nil {
+			r.AttemptHistory = []control.AttemptFailure{}
 		}
 		if len(convRaw) > 0 {
 			_ = json.Unmarshal(convRaw, &r.ConversationIDs)

@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/viovy/iazio-harness-api/internal/dispatch"
 )
 
 // DefaultMinFreeBytes is the default free-space floor on the worktree mount (5 GiB).
@@ -126,6 +128,28 @@ type BackgroundTaskInfo struct {
 	IdleDurationSec   float64   `json:"idle_duration_sec,omitempty"`
 }
 
+// Failure taxonomy categories and stages aliases.
+const (
+	FailureCategoryNone                 = dispatch.FailureCategoryNone
+	FailureCategoryDispatchClaimTimeout = dispatch.FailureCategoryDispatchClaimTimeout
+	FailureCategoryToolQuotaOrAuth      = dispatch.FailureCategoryToolQuotaOrAuth
+	FailureCategoryToolCrash            = dispatch.FailureCategoryToolCrash
+	FailureCategoryWorkspacePrepError   = dispatch.FailureCategoryWorkspacePrepError
+	FailureCategoryBackgroundDrainTimeout = dispatch.FailureCategoryBackgroundDrainTimeout
+	FailureCategoryASEGateIncomplete    = dispatch.FailureCategoryASEGateIncomplete
+	FailureCategoryCircuitBreakerTripped = dispatch.FailureCategoryCircuitBreakerTripped
+
+	FailureStageIngress         = dispatch.FailureStageIngress
+	FailureStageQueueDispatch   = dispatch.FailureStageQueueDispatch
+	FailureStageWorkspacePrep   = dispatch.FailureStageWorkspacePrep
+	FailureStageToolExecution   = dispatch.FailureStageToolExecution
+	FailureStageBackgroundDrain = dispatch.FailureStageBackgroundDrain
+	FailureStageCompletionGate  = dispatch.FailureStageCompletionGate
+)
+
+// AttemptFailure models one failed dispatch or execution attempt.
+type AttemptFailure = dispatch.AttemptFailure
+
 // ExitOptions provides additional diagnostic and error context when a job finishes.
 type ExitOptions struct {
 	ExitCode                 int                  `json:"exit_code"`
@@ -142,7 +166,21 @@ type ExitOptions struct {
 	NonResumableReason       string               `json:"non_resumable_reason,omitempty"`
 	WorkspaceDirtyFiles      []string             `json:"workspace_dirty_files,omitempty"`
 	BackgroundTasks          []BackgroundTaskInfo `json:"background_tasks,omitempty"`
+	FailureCategory          string               `json:"failure_category,omitempty"`
+	FailureStage             string               `json:"failure_stage,omitempty"`
+	FailureReasonSummary     string               `json:"failure_reason_summary,omitempty"`
+	Retriable                *bool                `json:"retriable,omitempty"`
+	AttemptHistory           []AttemptFailure     `json:"attempt_history,omitempty"`
+	ZipkinTraceID            string               `json:"zipkin_trace_id,omitempty"`
+	ZipkinTraceURL           string               `json:"zipkin_trace_url,omitempty"`
+	Traceparent              string               `json:"traceparent,omitempty"`
 }
+
+// DefaultLeaseAckDeadline is the maximum duration an agent has to acknowledge a lease.
+const DefaultLeaseAckDeadline = dispatch.DefaultLeaseAckDeadline
+
+// ErrJobNotFound is returned when a job is not found.
+var ErrJobNotFound = errors.New("job not found")
 
 // ErrBadShareURL is returned when an import URL is not a Gemini share link.
 var ErrBadShareURL = errors.New("share url must be https://gemini.google.com/share/<id>")
