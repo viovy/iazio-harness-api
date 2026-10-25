@@ -429,8 +429,8 @@ func TestServer_AgentJobsClaim(t *testing.T) {
 	if claimed.ID != job.ID {
 		t.Errorf("expected claimed ID %s, got %s", job.ID, claimed.ID)
 	}
-	if claimed.Status != dispatch.JobStatusClaimed {
-		t.Errorf("expected status claimed, got %s", claimed.Status)
+	if claimed.Status != dispatch.JobStatusClaimed && claimed.Status != dispatch.JobStatusLeased {
+		t.Errorf("expected status claimed or leased, got %s", claimed.Status)
 	}
 }
 

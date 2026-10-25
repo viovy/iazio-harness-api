@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/viovy/iazio-harness-api/internal/telemetry"
 )
 
 // Standard job types.
@@ -29,12 +31,54 @@ const (
 // Standard job statuses.
 const (
 	JobStatusPending   = "pending"
+	JobStatusLeased    = "leased"
 	JobStatusClaimed   = "claimed"
+	JobStatusRunning   = "running"
+	JobStatusVerifying = "verifying"
 	JobStatusCompleted = "completed"
 	JobStatusFailed    = "failed"
 	JobStatusCanceled  = "canceled"
 	JobStatusStalled   = "stalled"
+	JobStatusRequeued  = "requeued"
 )
+
+// Canonical Failure Taxonomy
+const (
+	FailureCategoryNone                   = "NONE"
+	FailureCategoryDispatchClaimTimeout   = "DISPATCH_CLAIM_TIMEOUT"
+	FailureCategoryToolQuotaOrAuth        = "TOOL_QUOTA_OR_AUTH"
+	FailureCategoryToolCrash              = "TOOL_CRASH"
+	FailureCategoryWorkspacePrepError     = "WORKSPACE_PREP_ERROR"
+	FailureCategoryBackgroundDrainTimeout = "BACKGROUND_DRAIN_TIMEOUT"
+	FailureCategoryASEGateIncomplete      = "ASE_GATE_INCOMPLETE"
+	FailureCategoryCircuitBreakerTripped  = "CIRCUIT_BREAKER_TRIPPED"
+
+	FailureStageIngress         = "INGRESS"
+	FailureStageQueueDispatch   = "QUEUE_DISPATCH"
+	FailureStageWorkspacePrep   = "WORKSPACE_PREP"
+	FailureStageToolExecution   = "TOOL_EXECUTION"
+	FailureStageBackgroundDrain = "BACKGROUND_DRAIN"
+	FailureStageCompletionGate  = "COMPLETION_GATE"
+)
+
+const (
+	DefaultLeaseAckDeadline = 20 * time.Second
+)
+
+// AttemptFailure models one failed dispatch or execution attempt.
+type AttemptFailure struct {
+	AttemptNumber   int    `json:"attempt_number"`
+	Host            string `json:"host"`
+	Workspace       string `json:"workspace"`
+	Tool            string `json:"tool"`
+	FailureCategory string `json:"failure_category"`
+	FailureStage    string `json:"failure_stage,omitempty"`
+	Reason          string `json:"reason,omitempty"`
+	ExitCode        int    `json:"exit_code,omitempty"`
+	StderrTail      string `json:"stderr_tail,omitempty"`
+	ZipkinSpanID    string `json:"zipkin_span_id,omitempty"`
+	Timestamp       string `json:"timestamp,omitempty"`
+}
 
 const (
 	// DefaultClaimTimeout is the duration a claimed job can remain active before lease expiration.
@@ -117,6 +161,19 @@ type Job struct {
 	LeaseExpiresAt   *time.Time      `json:"lease_expires_at,omitempty"`
 	CompletedAt      *time.Time      `json:"completed_at,omitempty"`
 	DispatchDiagnostics *DispatchDiagnostics `json:"dispatch_diagnostics,omitempty"`
+	LeaseToken           string            `json:"lease_token,omitempty"`
+	LeaseAckDeadlineAt   *time.Time        `json:"lease_ack_deadline_at,omitempty"`
+	FailureCategory      string            `json:"failure_category,omitempty"`
+	FailureStage         string            `json:"failure_stage,omitempty"`
+	FailureReasonSummary string            `json:"failure_reason_summary,omitempty"`
+	Retriable            bool              `json:"retriable"`
+	AttemptHistory       []AttemptFailure  `json:"attempt_history,omitempty"`
+	ZipkinTraceID        string            `json:"zipkin_trace_id,omitempty"`
+	ZipkinTraceURL       string            `json:"zipkin_trace_url,omitempty"`
+	Traceparent          string            `json:"traceparent,omitempty"`
+	InfraRequeueCount    int               `json:"infra_requeue_count,omitempty"`
+	AgentPID             int               `json:"agent_pid,omitempty"`
+	ActiveConversationID string            `json:"active_conversation_id,omitempty"`
 
 	// doneCh signals when the job has been completed or failed.
 	doneCh chan struct{}
@@ -149,6 +206,9 @@ type Queue interface {
 	ReconcileGlobalQueueSlots(now time.Time, staleGrace time.Duration) []string
 	SetDispatchDiagnostics(jobID string, diag *DispatchDiagnostics) error
 	ForceDispatch(ctx context.Context, jobID string) (*Job, error)
+	AckLease(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID string) (*Job, error)
+	Failover(ctx context.Context, jobID string, req AttemptFailure) (*Job, error)
+	RetryRetriable(ctx context.Context) ([]*Job, error)
 }
 
 // JobAttributionResponse models the attribution of a job outcome to retrieval context.
@@ -228,7 +288,7 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 	var doneChannels []chan struct{}
 
 	for _, j := range q.jobs {
-		if j.Status != JobStatusPending && j.Status != JobStatusClaimed {
+		if j.Status != JobStatusPending && j.Status != JobStatusClaimed && j.Status != JobStatusLeased && j.Status != JobStatusRunning {
 			continue
 		}
 
@@ -246,8 +306,29 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 			continue
 		}
 
+		// 1b. Unacknowledged lease expiration (Two-Phase Lease Handshake):
+		if j.Status == JobStatusLeased {
+			if j.LeaseAckDeadlineAt != nil && !j.LeaseAckDeadlineAt.IsZero() && now.After(*j.LeaseAckDeadlineAt) {
+				// Revert to pending without consuming story retry budget
+				j.Status = JobStatusPending
+				j.InfraRequeueCount++
+				j.LeaseToken = ""
+				j.LeaseAckDeadlineAt = nil
+				j.ClaimedHost = ""
+				j.HostID = ""
+				j.ClaimedAt = nil
+				j.HeartbeatAt = nil
+				j.LeaseExpiresAt = nil
+				j.DispatchDiagnostics = &DispatchDiagnostics{
+					QueueState: "queued",
+				}
+				expiredIDs = append(expiredIDs, j.ID)
+				continue
+			}
+		}
+
 		// 2. Claim lease & heartbeat timeout:
-		if j.Status == JobStatusClaimed {
+		if j.Status == JobStatusClaimed || j.Status == JobStatusRunning {
 			if q.claimTimeout > 0 && j.ClaimedAt != nil && !j.ClaimedAt.IsZero() && now.Sub(*j.ClaimedAt) > q.claimTimeout {
 				j.Status = JobStatusFailed
 				j.Error = "LEASE_EXPIRED: execution lease expired without completion"
@@ -344,6 +425,17 @@ func (q *InMemoryQueue) Enqueue(ctx context.Context, job *Job) (*Job, error) {
 
 	// Store copy
 	q.jobs[job.ID] = job
+
+	var spanOpts []telemetry.SpanOption
+	spanOpts = append(spanOpts, telemetry.WithTag("job.id", job.ID))
+	if job.TraceID != "" {
+		spanOpts = append(spanOpts, telemetry.WithParentTrace(job.TraceID, ""))
+	}
+	_, span := telemetry.StartSpan(ctx, "global_queue.enqueue", spanOpts...)
+	if span != nil {
+		span.End()
+	}
+
 	return job, nil
 }
 
@@ -386,7 +478,13 @@ func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []str
 	q.fencingSeq++
 	oldest.FencingToken = q.fencingSeq
 	oldest.Attempts++
-	oldest.Status = JobStatusClaimed
+	oldest.Status = JobStatusLeased
+	oldest.LeaseToken = fmt.Sprintf("lt-%s-%d", oldest.ID, now.UnixNano())
+	ackDeadline := now.Add(DefaultLeaseAckDeadline)
+	oldest.LeaseAckDeadlineAt = &ackDeadline
+	if oldest.TraceID != "" && oldest.Traceparent == "" {
+		oldest.Traceparent = fmt.Sprintf("00-%s-%016x-01", oldest.TraceID, now.UnixNano())
+	}
 	if hostID != "" {
 		oldest.ClaimedHost = hostID
 		oldest.HostID = hostID
@@ -395,6 +493,17 @@ func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []str
 	oldest.HeartbeatAt = &now
 	expires := now.Add(DefaultHeartbeatTimeout)
 	oldest.LeaseExpiresAt = &expires
+
+	var claimSpanOpts []telemetry.SpanOption
+	claimSpanOpts = append(claimSpanOpts, telemetry.WithTag("job.id", oldest.ID), telemetry.WithTag("host.id", hostID))
+	if oldest.TraceID != "" {
+		claimSpanOpts = append(claimSpanOpts, telemetry.WithParentTrace(oldest.TraceID, ""))
+	}
+	_, claimSpan := telemetry.StartSpan(ctx, "global_queue.lease_and_dispatch", claimSpanOpts...)
+	if claimSpan != nil {
+		claimSpan.End()
+	}
+
 	return oldest, nil
 }
 
@@ -407,7 +516,7 @@ func (q *InMemoryQueue) Heartbeat(ctx context.Context, jobID string, fencingToke
 	if !exists {
 		return nil, ErrJobNotFound
 	}
-	if job.Status != JobStatusClaimed {
+	if job.Status != JobStatusClaimed && job.Status != JobStatusLeased && job.Status != JobStatusRunning {
 		return nil, fmt.Errorf("job %s is not currently claimed (status: %s)", jobID, job.Status)
 	}
 	if job.FencingToken > 0 && fencingToken != job.FencingToken {
@@ -678,6 +787,107 @@ func (q *InMemoryQueue) Retry(ctx context.Context, jobID string) (*Job, error) {
 	return newJob, nil
 }
 
+// AckLease completes Phase 2 of the two-phase lease handshake, transitioning the job to running.
+func (q *InMemoryQueue) AckLease(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID string) (*Job, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	job, exists := q.jobs[jobID]
+	if !exists {
+		return nil, ErrJobNotFound
+	}
+	if job.Status != JobStatusLeased && job.Status != JobStatusClaimed && job.Status != JobStatusRunning {
+		return nil, fmt.Errorf("job %s is not in leased state (status: %s)", jobID, job.Status)
+	}
+	if job.LeaseToken != "" && (leaseToken == "" || job.LeaseToken != leaseToken) {
+		return nil, errors.New("invalid or missing lease token")
+	}
+
+	job.Status = JobStatusRunning
+	job.LeaseAckDeadlineAt = nil
+	if agentPID > 0 {
+		job.AgentPID = agentPID
+	}
+	if activeConvID != "" {
+		job.ActiveConversationID = activeConvID
+	}
+	now := q.now()
+	job.HeartbeatAt = &now
+	expires := now.Add(DefaultHeartbeatTimeout)
+	job.LeaseExpiresAt = &expires
+	return job, nil
+}
+
+// Failover records an attempt failure and resets the job to pending for re-dispatch.
+func (q *InMemoryQueue) Failover(ctx context.Context, jobID string, req AttemptFailure) (*Job, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	job, exists := q.jobs[jobID]
+	if !exists {
+		return nil, ErrJobNotFound
+	}
+
+	if req.AttemptNumber <= 0 {
+		req.AttemptNumber = len(job.AttemptHistory) + 1
+	}
+	if req.Timestamp == "" {
+		req.Timestamp = q.now().UTC().Format(time.RFC3339)
+	}
+	job.AttemptHistory = append(job.AttemptHistory, req)
+	job.Status = JobStatusPending
+	job.ClaimedHost = ""
+	job.HostID = ""
+	job.ClaimedAt = nil
+	job.HeartbeatAt = nil
+	job.LeaseExpiresAt = nil
+	job.LeaseToken = ""
+	job.LeaseAckDeadlineAt = nil
+	job.FailureCategory = req.FailureCategory
+	job.FailureStage = FailureStageToolExecution
+	job.FailureReasonSummary = fmt.Sprintf("Tool %s on %s failed (exit %d): %s", req.Tool, req.Host, req.ExitCode, req.StderrTail)
+	job.Retriable = true
+
+	return job, nil
+}
+
+// RetryRetriable retries all failed jobs that are marked retriable.
+func (q *InMemoryQueue) RetryRetriable(ctx context.Context) ([]*Job, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	var retried []*Job
+	for _, job := range q.jobs {
+		if (job.Status == JobStatusFailed || job.Status == JobStatusCanceled) && job.Retriable {
+			job.Status = JobStatusRequeued
+			newJob := &Job{
+				ID:                      generateJobID(),
+				Type:                    job.Type,
+				Repo:                    job.Repo,
+				StoryID:                 job.StoryID,
+				StoryTitle:              job.StoryTitle,
+				StoryPath:               job.StoryPath,
+				StoryAllocationStatus:   job.StoryAllocationStatus,
+				AllocationSource:        job.AllocationSource,
+				PriorityRankSelected:    job.PriorityRankSelected,
+				SourceConversationTitle: job.SourceConversationTitle,
+				NormalizedPrompt:        job.NormalizedPrompt,
+				EffectiveAction:         job.EffectiveAction,
+				Payload:                 job.Payload,
+				Status:                  JobStatusPending,
+				CreatedAt:               q.now(),
+				TraceID:                 job.TraceID,
+				ParentID:                job.ID,
+				Retriable:               true,
+				doneCh:                  make(chan struct{}),
+			}
+			q.jobs[newJob.ID] = newJob
+			retried = append(retried, newJob)
+		}
+	}
+	return retried, nil
+}
+
 // BindStory binds a newly allocated story ID and metadata to a job.
 func (q *InMemoryQueue) BindStory(ctx context.Context, jobID, storyID, storyTitle, storyPath string) (*Job, error) {
 	q.mu.Lock()
@@ -720,6 +930,13 @@ func (q *InMemoryQueue) BindStory(ctx context.Context, jobID, storyID, storyTitl
 
 // Await blocks until the specified job completes, the context is cancelled, or the timeout expires.
 func (q *InMemoryQueue) Await(ctx context.Context, jobID string, timeout time.Duration) (*Job, error) {
+	var waitSpanOpts []telemetry.SpanOption
+	waitSpanOpts = append(waitSpanOpts, telemetry.WithTag("job.id", jobID))
+	_, waitSpan := telemetry.StartSpan(ctx, "global_queue.wait", waitSpanOpts...)
+	if waitSpan != nil {
+		defer waitSpan.End()
+	}
+
 	q.mu.Lock()
 	q.reapExpiredLocked(q.now())
 	job, exists := q.jobs[jobID]
@@ -804,7 +1021,7 @@ func (q *InMemoryQueue) ReconcileGlobalQueueSlots(now time.Time, staleGrace time
 		staleGrace = 45 * time.Second
 	}
 
-	var reclaimedIDs []string
+	reclaimedIDs := q.reapExpiredLocked(now)
 	for _, j := range q.jobs {
 		if j.Status == JobStatusClaimed {
 			stale := false

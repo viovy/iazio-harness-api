@@ -216,6 +216,17 @@ type Schedule struct {
 	WorkspaceStateManifest    map[string]any
 	ReapResult                map[string]any
 	RehydrationStatus         map[string]any
+	LeaseToken                string
+	LeaseAckDeadlineAt        *time.Time
+	FailureCategory           string
+	FailureStage              string
+	FailureReasonSummary      string
+	Retriable                 bool
+	AttemptHistory            []AttemptFailure
+	ZipkinTraceID             string
+	ZipkinTraceURL            string
+	Traceparent               string
+	InfraRequeueCount         int
 }
 
 // JobDetail carries the execution payload for iazio-harness.
@@ -289,6 +300,17 @@ type JobDetail struct {
 	NonResumableReason          string                `json:"non_resumable_reason,omitempty"`
 	WorkspaceDirtyFiles         []string              `json:"workspace_dirty_files,omitempty"`
 	BackgroundTasks             []BackgroundTaskInfo  `json:"background_tasks,omitempty"`
+	LeaseToken                  string                `json:"lease_token,omitempty"`
+	LeaseAckDeadlineAt          string                `json:"lease_ack_deadline_at,omitempty"`
+	FailureCategory             string                `json:"failure_category,omitempty"`
+	FailureStage                string                `json:"failure_stage,omitempty"`
+	FailureReasonSummary        string                `json:"failure_reason_summary,omitempty"`
+	Retriable                   bool                  `json:"retriable"`
+	AttemptHistory              []AttemptFailure      `json:"attempt_history,omitempty"`
+	ZipkinTraceID               string                `json:"zipkin_trace_id,omitempty"`
+	ZipkinTraceURL              string                `json:"zipkin_trace_url,omitempty"`
+	Traceparent                 string                `json:"traceparent,omitempty"`
+	InfraRequeueCount           int                   `json:"infra_requeue_count,omitempty"`
 }
 
 // ActiveJob describes an active job reported on heartbeat.
@@ -365,6 +387,17 @@ type Job struct {
 	NonResumableReason        string
 	WorkspaceDirtyFiles       []string
 	BackgroundTasks           []BackgroundTaskInfo
+	LeaseToken                string
+	LeaseAckDeadlineAt        *time.Time
+	FailureCategory           string
+	FailureStage              string
+	FailureReasonSummary      string
+	Retriable                 bool
+	AttemptHistory            []AttemptFailure
+	ZipkinTraceID             string
+	ZipkinTraceURL            string
+	Traceparent               string
+	InfraRequeueCount         int
 }
 
 // Repo is one registered checkout.
@@ -559,6 +592,17 @@ type HistoryRow struct {
 	BackgroundTasks           []BackgroundTaskInfo
 	HarnessPID                int
 	ToolPID                   int
+	LeaseToken                string
+	LeaseAckDeadlineAt        *time.Time
+	FailureCategory           string
+	FailureStage              string
+	FailureReasonSummary      string
+	Retriable                 bool
+	AttemptHistory            []AttemptFailure
+	ZipkinTraceID             string
+	ZipkinTraceURL            string
+	Traceparent               string
+	InfraRequeueCount         int
 }
 
 // HistoryItem is one execution record reported across repositories.
@@ -617,6 +661,17 @@ type HistoryItem struct {
 	BackgroundTasks           []BackgroundTaskInfo
 	HarnessPID                int
 	ToolPID                   int
+	LeaseToken                string
+	LeaseAckDeadlineAt        *time.Time
+	FailureCategory           string
+	FailureStage              string
+	FailureReasonSummary      string
+	Retriable                 bool
+	AttemptHistory            []AttemptFailure
+	ZipkinTraceID             string
+	ZipkinTraceURL            string
+	Traceparent               string
+	InfraRequeueCount         int
 }
 
 // LogChunk is one stripped output event.
@@ -787,6 +842,7 @@ type Engine struct {
 	subs            map[string][]chan LogChunk
 	Releases        *ReleaseService
 	toolPriority    []string
+	toolCooldowns   map[string]time.Time
 	OnRepoChange    func(Repo)
 	OnStoryChange   func(Story)
 	OnHistoryChange func(host, path string, row HistoryRow)
@@ -859,6 +915,7 @@ func NewEngine(now func() time.Time) *Engine {
 		subs:         map[string][]chan LogChunk{},
 		Releases:     NewReleaseService(),
 		toolPriority: []string{"agy", "agent", "copilot", "opencode"},
+		toolCooldowns: make(map[string]time.Time),
 	}
 }
 
@@ -1161,6 +1218,9 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 				continue
 			}
 			if reqHost != "" && h.ID != reqHost {
+				continue
+			}
+			if cd, ok := e.toolCooldowns[h.ID+":"+candidateToolLower]; ok && e.now().Before(cd) {
 				continue
 			}
 			hasTool := false
@@ -1717,6 +1777,268 @@ func (e *Engine) ClearHealingRepo(host, path string) error {
 	return nil
 }
 
+// ClassifyFailure maps reasons and error messages to canonical failure taxonomy.
+func ClassifyFailure(reason, errorMsg, diagCode string) (category, stage, summary string, retriable bool) {
+	combined := strings.ToLower(reason + " " + errorMsg + " " + diagCode)
+	switch {
+	case strings.Contains(combined, "claim") || strings.Contains(combined, "startup_heartbeat") || strings.Contains(combined, "unacknowledged lease"):
+		return FailureCategoryDispatchClaimTimeout, FailureStageQueueDispatch, "Agent lease claim timed out or lost before initial acknowledgement", true
+	case strings.Contains(combined, "429") || strings.Contains(combined, "resource_exhausted") || strings.Contains(combined, "quota") || strings.Contains(combined, "auth") || strings.Contains(combined, "token limit") || strings.Contains(combined, "unauthorized") || strings.Contains(combined, "preflight_or_early_tool_exit"):
+		return FailureCategoryToolQuotaOrAuth, FailureStageToolExecution, "Tool startup failed due to quota exhaustion, rate limit, or auth expiration", true
+	case strings.Contains(combined, "crash") || strings.Contains(combined, "exit status") || strings.Contains(combined, "sigsegv") || strings.Contains(combined, "binary"):
+		return FailureCategoryToolCrash, FailureStageToolExecution, "AI agent tool process crashed or exited non-zero during early execution", true
+	case strings.Contains(combined, "worktree") || strings.Contains(combined, "workspace_prep") || strings.Contains(combined, "lock") || strings.Contains(combined, "porcelain") || strings.Contains(combined, "submodule") || strings.Contains(combined, "dirty"):
+		return FailureCategoryWorkspacePrepError, FailureStageWorkspacePrep, "Workspace preparation conflict: dirty worktree or stale git locks", true
+	case strings.Contains(combined, "1h0m0s") || strings.Contains(combined, "background task") || strings.Contains(combined, "drain") || strings.Contains(combined, "lease_expired") || strings.Contains(combined, "execution_timeout"):
+		return FailureCategoryBackgroundDrainTimeout, FailureStageBackgroundDrain, "Post-turn background task drain timeout or heartbeat lease expiration", true
+	case strings.Contains(combined, "circuit") || strings.Contains(combined, "breaker"):
+		return FailureCategoryCircuitBreakerTripped, FailureStageQueueDispatch, "Circuit breaker tripped due to consecutive tool failures", true
+	case strings.Contains(combined, "gate") || strings.Contains(combined, "dod") || strings.Contains(combined, "incomplete") || strings.Contains(combined, "ase_gate"):
+		return FailureCategoryASEGateIncomplete, FailureStageCompletionGate, "Autonomous Story Execution DoD or review scheme validation incomplete", false
+	default:
+		return FailureCategoryToolCrash, FailureStageToolExecution, "Execution error: " + reason, true
+	}
+}
+
+// AckLease completes Phase 2 of the two-phase lease handshake, transitioning the job to RUNNING.
+func (e *Engine) AckLease(jobID, leaseToken string, agentPID int, activeConvID string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	job, ok := e.jobs[jobID]
+	if !ok {
+		return ErrJobNotFound
+	}
+	if job.Status != "LEASED" && job.Status != "RUNNING" {
+		return fmt.Errorf("job %s is not in leased state (status: %s)", jobID, job.Status)
+	}
+	if job.LeaseToken != "" && (leaseToken == "" || job.LeaseToken != leaseToken) {
+		return errors.New("invalid or missing lease token")
+	}
+
+	job.Status = "RUNNING"
+	job.LeaseAckDeadlineAt = nil
+	job.LeaseExpiry = e.now().Add(LeaseInterval)
+	if agentPID > 0 {
+		job.HarnessPID = agentPID
+	}
+	if activeConvID != "" {
+		job.ActiveConversationID = activeConvID
+		if len(job.ConversationIDs) == 0 {
+			job.ConversationIDs = []string{activeConvID}
+		}
+	}
+
+	sch := e.schedules[job.ScheduleID]
+	if sch != nil {
+		sch.Status = "RUNNING"
+		sch.LeaseAckDeadlineAt = nil
+		if activeConvID != "" {
+			sch.ActiveConversationID = activeConvID
+		}
+	}
+
+	for key, rows := range e.history {
+		for i := range rows {
+			if rows[i].JobID == jobID {
+				rows[i].Status = "RUNNING"
+				rows[i].LeaseAckDeadlineAt = nil
+				if agentPID > 0 {
+					rows[i].HarnessPID = agentPID
+				}
+				if activeConvID != "" {
+					rows[i].ActiveConversationID = activeConvID
+				}
+			}
+		}
+		e.history[key] = rows
+	}
+
+	return nil
+}
+
+// HeartbeatJob extends the lease of a running or leased job.
+func (e *Engine) HeartbeatJob(jobID, leaseToken string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	job, ok := e.jobs[jobID]
+	if !ok {
+		return ErrJobNotFound
+	}
+	if job.Status != "RUNNING" && job.Status != "LEASED" {
+		return fmt.Errorf("job %s is not currently running or leased (status: %s)", jobID, job.Status)
+	}
+	if job.LeaseToken != "" && (leaseToken == "" || job.LeaseToken != leaseToken) {
+		return errors.New("invalid or missing lease token")
+	}
+
+	now := e.now()
+	job.LastOutputAt = now
+	job.LastChunkAt = now
+	job.LeaseExpiry = now.Add(LeaseInterval)
+	return nil
+}
+
+// FailoverJob records an attempt failure, cools down the failing (host, tool) tuple,
+// and resets the schedule to QUEUED for dispatch to the next priority tool/host.
+func (e *Engine) FailoverJob(jobID string, req AttemptFailure) (*Schedule, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	job := e.jobs[jobID]
+	var sch *Schedule
+	if job != nil {
+		sch = e.schedules[job.ScheduleID]
+	} else {
+		for _, s := range e.schedules {
+			if s.ID == jobID {
+				sch = s
+				break
+			}
+		}
+	}
+	if sch == nil && job == nil {
+		return nil, ErrJobNotFound
+	}
+
+	// 1. Determine cooldown duration
+	cooldownDur := 2 * time.Minute
+	if req.FailureCategory == FailureCategoryToolQuotaOrAuth || strings.Contains(strings.ToLower(req.StderrTail), "429") || strings.Contains(strings.ToLower(req.StderrTail), "quota") {
+		cooldownDur = 5 * time.Minute
+	}
+	if req.Host != "" && req.Tool != "" {
+		if e.toolCooldowns == nil {
+			e.toolCooldowns = make(map[string]time.Time)
+		}
+		e.toolCooldowns[req.Host+":"+strings.ToLower(req.Tool)] = e.now().Add(cooldownDur)
+	}
+
+	// 2. Record AttemptFailure
+	if req.Timestamp == "" {
+		req.Timestamp = e.now().UTC().Format(time.RFC3339)
+	}
+	if req.AttemptNumber <= 0 {
+		if sch != nil {
+			req.AttemptNumber = len(sch.AttemptHistory) + 1
+		} else if job != nil {
+			req.AttemptNumber = len(job.AttemptHistory) + 1
+		}
+	}
+	if sch != nil {
+		sch.AttemptHistory = append(sch.AttemptHistory, req)
+	}
+	if job != nil {
+		job.AttemptHistory = append(job.AttemptHistory, req)
+		job.Status = "REQUEUED"
+		job.FailureCategory = req.FailureCategory
+		job.FailureStage = FailureStageToolExecution
+		job.FailureReasonSummary = fmt.Sprintf("Tool %s on %s failed (exit %d): %s", req.Tool, req.Host, req.ExitCode, req.StderrTail)
+		job.Retriable = true
+	}
+
+	// 3. Select next eligible tool from toolPriority
+	if sch != nil {
+		nextTool := ""
+		for _, candidateTool := range e.toolPriority {
+			candLower := strings.ToLower(candidateTool)
+			if candLower == strings.ToLower(req.Tool) {
+				continue
+			}
+			cd, hasCd := e.toolCooldowns[req.Host+":"+candLower]
+			if !hasCd || e.now().After(cd) {
+				nextTool = candLower
+				break
+			}
+		}
+		if nextTool == "" {
+			for _, candidateTool := range e.toolPriority {
+				candLower := strings.ToLower(candidateTool)
+				if candLower != strings.ToLower(req.Tool) {
+					nextTool = candLower
+					break
+				}
+			}
+		}
+		if nextTool != "" {
+			sch.Engine = nextTool
+		}
+		sch.Status = "QUEUED"
+		sch.HostID = "global"
+		sch.LeaseToken = ""
+		sch.LeaseAckDeadlineAt = nil
+		if sch.IterationsRemaining <= 0 {
+			sch.IterationsRemaining = 1
+		}
+		if sch.CloneURL != "" {
+			delete(e.cloneLease, sch.CloneURL)
+		}
+		if req.Host != "" && req.Workspace != "" {
+			if repo := e.repos[repoKey(req.Host, req.Workspace)]; repo != nil {
+				if repo.Lock == LockRunning {
+					repo.Lock = LockIdle
+				}
+				repo.RunningJobID = ""
+				e.notifyRepoLocked(repo)
+			}
+		}
+		return sch, nil
+	}
+
+	return nil, nil
+}
+
+// RetryRetriableJobs finds all failed or abandoned jobs that are marked retriable and re-enqueues them.
+func (e *Engine) RetryRetriableJobs() ([]Schedule, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	var retried []Schedule
+	for _, sch := range e.schedules {
+		if sch.Status == "FAILED" || sch.Status == "ABANDONED" || sch.Status == "CANCELLED" {
+			if sch.Retriable || sch.FailureCategory != FailureCategoryASEGateIncomplete {
+				sch.Status = "QUEUED"
+				sch.HostID = "global"
+				sch.IterationsRemaining = 1
+				sch.LeaseToken = ""
+				sch.LeaseAckDeadlineAt = nil
+				retried = append(retried, *sch)
+			}
+		}
+	}
+	return retried, nil
+}
+
+// ReconcileHistoricalFailureTaxonomy inspects all history rows across all repos,
+// populates canonical failure taxonomy, and returns the count of updated records.
+func (e *Engine) ReconcileHistoricalFailureTaxonomy() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	count := 0
+	for key, rows := range e.history {
+		for i := range rows {
+			isFailed := rows[i].Status == "FAILED" || rows[i].Status == "DECLINED" || rows[i].Status == "ABANDONED" || rows[i].Status == "LEASE_EXPIRED" || rows[i].Status == "EXECUTION_TIMEOUT"
+			if isFailed && (rows[i].FailureCategory == "" || rows[i].FailureCategory == FailureCategoryNone) {
+				cat, stage, summary, retriable := ClassifyFailure(rows[i].Reason, rows[i].ErrorMessage, rows[i].DiagnosticCode)
+				rows[i].FailureCategory = cat
+				rows[i].FailureStage = stage
+				rows[i].FailureReasonSummary = summary
+				rows[i].Retriable = retriable
+				if rows[i].ZipkinTraceID == "" && rows[i].TraceID != "" {
+					rows[i].ZipkinTraceID = rows[i].TraceID
+				}
+				if rows[i].ZipkinTraceURL == "" && rows[i].ZipkinTraceID != "" {
+					rows[i].ZipkinTraceURL = "/zipkin/traces/" + rows[i].ZipkinTraceID
+				}
+				count++
+			}
+		}
+		e.history[key] = rows
+	}
+	return count
+}
+
 // PostExit marks the child gone. Cancel after this is rejected.
 func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 	e.mu.Lock()
@@ -1821,8 +2143,30 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 			} else if opt.DiagnosticCode != "" {
 				job.Reason = opt.DiagnosticCode
 			}
+			if opt.FailureCategory != "" {
+				job.FailureCategory = opt.FailureCategory
+				job.FailureStage = opt.FailureStage
+				job.FailureReasonSummary = opt.FailureReasonSummary
+				if opt.Retriable != nil {
+					job.Retriable = *opt.Retriable
+				}
+			} else {
+				cat, stage, summary, retriable := ClassifyFailure(opt.Reason, opt.ErrorMessage, opt.DiagnosticCode)
+				job.FailureCategory = cat
+				job.FailureStage = stage
+				job.FailureReasonSummary = summary
+				job.Retriable = retriable
+			}
+			opt.FailureCategory = job.FailureCategory
+			opt.FailureStage = job.FailureStage
+			opt.FailureReasonSummary = job.FailureReasonSummary
+			opt.Retriable = &job.Retriable
 			isDirtyWorktreeAutoHeal := (opt.DiagnosticCode == "INCOMPLETE_DIRTY_WORKTREE" || opt.Reason == "INCOMPLETE_DIRTY_WORKTREE")
 			if sch, ok := e.schedules[job.ScheduleID]; ok {
+				sch.FailureCategory = job.FailureCategory
+				sch.FailureStage = job.FailureStage
+				sch.FailureReasonSummary = job.FailureReasonSummary
+				sch.Retriable = job.Retriable
 				if isDirtyWorktreeAutoHeal {
 					// Incomplete dirty worktree indicates interrupted in-flight ASE turn.
 					// Keep schedule in QUEUED for auto-resumption with KindResume and elevated priority.
@@ -2452,10 +2796,43 @@ func (e *Engine) GetRepo(host, path string) (Repo, bool) {
 func (e *Engine) reapExpiredLocked() {
 	now := e.now()
 	for _, job := range e.jobs {
-		if job.ExitPosted && job.Status != "RUNNING" && job.Status != "CANCEL_REQUESTED" {
+		if job.ExitPosted && job.Status != "RUNNING" && job.Status != "CANCEL_REQUESTED" && job.Status != "LEASED" {
 			continue
 		}
 		sch := e.schedules[job.ScheduleID]
+		if job.Status == "LEASED" {
+			if job.LeaseAckDeadlineAt != nil && !job.LeaseAckDeadlineAt.IsZero() && now.After(*job.LeaseAckDeadlineAt) {
+				// Unacknowledged lease expired: 2-phase handshake zero-penalty requeue
+				job.Status = "REQUEUED"
+				job.ExitPosted = true
+				job.InfraRequeueCount++
+				job.FailureCategory = FailureCategoryDispatchClaimTimeout
+				job.FailureStage = FailureStageQueueDispatch
+				job.FailureReasonSummary = fmt.Sprintf("Unacknowledged lease %s on %s expired (20s TTL); rolled back to queued (infra_requeue_count=%d)", job.ID, job.HostID, job.InfraRequeueCount)
+				job.Retriable = true
+				if sch != nil {
+					sch.Status = "QUEUED"
+					sch.LeaseToken = ""
+					sch.LeaseAckDeadlineAt = nil
+					sch.InfraRequeueCount++
+					sch.HostID = "global"
+					if sch.IterationsRemaining <= 0 {
+						sch.IterationsRemaining = 1
+					}
+					if sch.CloneURL != "" {
+						delete(e.cloneLease, sch.CloneURL)
+					}
+					if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
+						if repo.Lock == LockRunning {
+							repo.Lock = LockIdle
+						}
+						repo.RunningJobID = ""
+						e.notifyRepoLocked(repo)
+					}
+				}
+				continue
+			}
+		}
 		if job.Status == "CANCEL_REQUESTED" && !job.FrozenUntil.IsZero() && now.After(job.FrozenUntil) {
 			job.Status = "CANCELLED"
 			job.ExitPosted = true
@@ -2497,6 +2874,11 @@ func (e *Engine) reapExpiredLocked() {
 				}
 				job.TerminationReasonCode = reason
 				job.TerminationReasonMessage = fmt.Sprintf("Job terminated: %s", reason)
+				cat, stage, summary, retriable := ClassifyFailure(reason, job.TerminationReasonMessage, reason)
+				job.FailureCategory = cat
+				job.FailureStage = stage
+				job.FailureReasonSummary = summary
+				job.Retriable = retriable
 				hasStory := (sch != nil && sch.StoryID != "") || (job.InterruptedASEState != nil && job.InterruptedASEState["story_id"] != nil)
 				job.Resumable = (len(job.ConversationIDs) > 0 || job.ResumeConversationID != "" || job.InitialConversationID != "" || job.ActiveConversationID != "" || hasStory)
 				if !job.Resumable {
@@ -2861,13 +3243,44 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 		}
 		sch.IterationsCompleted++
 
-		sch.Status = "RUNNING"
 		id := e.next("job-")
 		targetHost := sch.HostID
 		if targetHost == "" || targetHost == "auto" {
 			targetHost = host
 		}
 		traceID := sch.TraceID
+		if traceID == "" {
+			rawID := strings.ReplaceAll(id, "-", "")
+			traceID = rawID
+			for len(traceID) < 32 {
+				traceID += "0"
+			}
+			if len(traceID) > 32 {
+				traceID = traceID[:32]
+			}
+			sch.TraceID = traceID
+		}
+		zipkinTraceID := sch.ZipkinTraceID
+		if zipkinTraceID == "" {
+			zipkinTraceID = traceID
+			sch.ZipkinTraceID = zipkinTraceID
+		}
+		zipkinTraceURL := sch.ZipkinTraceURL
+		if zipkinTraceURL == "" && zipkinTraceID != "" {
+			zipkinTraceURL = "/zipkin/traces/" + zipkinTraceID
+			sch.ZipkinTraceURL = zipkinTraceURL
+		}
+		traceparent := sch.Traceparent
+		if traceparent == "" && zipkinTraceID != "" {
+			traceparent = fmt.Sprintf("00-%s-0000000000000001-01", zipkinTraceID)
+			sch.Traceparent = traceparent
+		}
+
+		leaseToken := fmt.Sprintf("lt-%s-%d", id, e.now().UnixNano())
+		leaseDeadline := e.now().Add(DefaultLeaseAckDeadline)
+		sch.Status = "RUNNING"
+		sch.LeaseToken = leaseToken
+		sch.LeaseAckDeadlineAt = &leaseDeadline
 
 		initConvID := sch.InitialConversationID
 		if initConvID == "" {
@@ -2938,6 +3351,12 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			SameConversationConfirmed: sch.SameConversationConfirmed,
 			AttachConfirmation:        sch.AttachConfirmation,
 			InterruptedASEState:       sch.InterruptedASEState,
+			LeaseToken:                leaseToken,
+			LeaseAckDeadlineAt:        &leaseDeadline,
+			ZipkinTraceID:             zipkinTraceID,
+			ZipkinTraceURL:            zipkinTraceURL,
+			Traceparent:               traceparent,
+			InfraRequeueCount:         sch.InfraRequeueCount,
 		}
 		if actConvID != "" {
 			job.ConversationIDs = []string{actConvID}
@@ -3018,6 +3437,12 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			ConversationLineage:   append([]ConversationLineage(nil), job.ConversationLineage...),
 			HarnessPID:            job.HarnessPID,
 			ToolPID:               job.ToolPID,
+			LeaseToken:            leaseToken,
+			LeaseAckDeadlineAt:    &leaseDeadline,
+			ZipkinTraceID:         zipkinTraceID,
+			ZipkinTraceURL:        zipkinTraceURL,
+			Traceparent:           traceparent,
+			InfraRequeueCount:     sch.InfraRequeueCount,
 		}
 		e.history[repoKey(host, sch.WorktreePath)] = append(e.history[repoKey(host, sch.WorktreePath)], row)
 		e.notifyHistoryLocked(host, sch.WorktreePath, row)
@@ -3074,11 +3499,55 @@ func (e *Engine) updateHistoryStatusLocked(host, path, jobID, status string, opt
 				if len(opt.BackgroundTasks) > 0 {
 					rows[i].BackgroundTasks = append([]BackgroundTaskInfo(nil), opt.BackgroundTasks...)
 				}
+				if opt.FailureCategory != "" {
+					rows[i].FailureCategory = opt.FailureCategory
+					rows[i].FailureStage = opt.FailureStage
+					rows[i].FailureReasonSummary = opt.FailureReasonSummary
+					if opt.Retriable != nil {
+						rows[i].Retriable = *opt.Retriable
+					}
+				}
+				if len(opt.AttemptHistory) > 0 {
+					rows[i].AttemptHistory = append([]AttemptFailure(nil), opt.AttemptHistory...)
+				}
+				if opt.ZipkinTraceID != "" {
+					rows[i].ZipkinTraceID = opt.ZipkinTraceID
+				}
+				if opt.ZipkinTraceURL != "" {
+					rows[i].ZipkinTraceURL = opt.ZipkinTraceURL
+				}
+				if opt.Traceparent != "" {
+					rows[i].Traceparent = opt.Traceparent
+				}
 			}
 			if rows[i].Reason == "" && (status == "LEASE_EXPIRED" || status == "EXECUTION_TIMEOUT" || status == "HOST_OFFLINE" || status == "FAILED") {
 				rows[i].Reason = status
 			}
 			if j, ok := e.jobs[jobID]; ok {
+				if rows[i].LeaseToken == "" && j.LeaseToken != "" {
+					rows[i].LeaseToken = j.LeaseToken
+				}
+				if rows[i].FailureCategory == "" && j.FailureCategory != "" {
+					rows[i].FailureCategory = j.FailureCategory
+					rows[i].FailureStage = j.FailureStage
+					rows[i].FailureReasonSummary = j.FailureReasonSummary
+					rows[i].Retriable = j.Retriable
+				}
+				if len(rows[i].AttemptHistory) == 0 && len(j.AttemptHistory) > 0 {
+					rows[i].AttemptHistory = append([]AttemptFailure(nil), j.AttemptHistory...)
+				}
+				if rows[i].ZipkinTraceID == "" && j.ZipkinTraceID != "" {
+					rows[i].ZipkinTraceID = j.ZipkinTraceID
+				}
+				if rows[i].ZipkinTraceURL == "" && j.ZipkinTraceURL != "" {
+					rows[i].ZipkinTraceURL = j.ZipkinTraceURL
+				}
+				if rows[i].Traceparent == "" && j.Traceparent != "" {
+					rows[i].Traceparent = j.Traceparent
+				}
+				if rows[i].InfraRequeueCount == 0 && j.InfraRequeueCount > 0 {
+					rows[i].InfraRequeueCount = j.InfraRequeueCount
+				}
 				if rows[i].HarnessPID == 0 && j.HarnessPID > 0 {
 					rows[i].HarnessPID = j.HarnessPID
 				}
@@ -3124,6 +3593,19 @@ func (e *Engine) updateHistoryStatusLocked(host, path, jobID, status string, opt
 				if rows[i].TraceID == "" {
 					rows[i].TraceID = j.TraceID
 				}
+			}
+			if (rows[i].Status == "FAILED" || rows[i].Status == "LEASE_EXPIRED" || rows[i].Status == "EXECUTION_TIMEOUT") && (rows[i].FailureCategory == "" || rows[i].FailureCategory == FailureCategoryNone) {
+				cat, stage, summary, retriable := ClassifyFailure(rows[i].Reason, rows[i].ErrorMessage, rows[i].DiagnosticCode)
+				rows[i].FailureCategory = cat
+				rows[i].FailureStage = stage
+				rows[i].FailureReasonSummary = summary
+				rows[i].Retriable = retriable
+			}
+			if rows[i].ZipkinTraceID == "" && rows[i].TraceID != "" {
+				rows[i].ZipkinTraceID = rows[i].TraceID
+			}
+			if rows[i].ZipkinTraceURL == "" && rows[i].ZipkinTraceID != "" {
+				rows[i].ZipkinTraceURL = "/zipkin/traces/" + rows[i].ZipkinTraceID
 			}
 			e.notifyHistoryLocked(host, path, rows[i])
 			return
@@ -3770,6 +4252,19 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 			NonResumableReason:        r.NonResumableReason,
 			WorkspaceDirtyFiles:       append([]string(nil), r.WorkspaceDirtyFiles...),
 			BackgroundTasks:           append([]BackgroundTaskInfo(nil), r.BackgroundTasks...),
+			LeaseToken:                r.LeaseToken,
+			FailureCategory:           r.FailureCategory,
+			FailureStage:              r.FailureStage,
+			FailureReasonSummary:      r.FailureReasonSummary,
+			Retriable:                 r.Retriable,
+			AttemptHistory:            append([]AttemptFailure(nil), r.AttemptHistory...),
+			ZipkinTraceID:             r.ZipkinTraceID,
+			ZipkinTraceURL:            r.ZipkinTraceURL,
+			Traceparent:               r.Traceparent,
+			InfraRequeueCount:         r.InfraRequeueCount,
+		}
+		if r.LeaseAckDeadlineAt != nil {
+			detail.LeaseAckDeadlineAt = r.LeaseAckDeadlineAt.UTC().Format(time.RFC3339)
 		}
 		if !r.CreatedAt.IsZero() {
 			detail.StartedAt = r.CreatedAt.UTC().Format(time.RFC3339)
@@ -3827,6 +4322,19 @@ func (e *Engine) buildJobDetailLocked(job *Job) JobDetail {
 		ActiveChildTasks:          job.ActiveChildTasks,
 		ExecutionAttempt:          job.ExecutionAttempt,
 		AutoResumeCount:           job.AutoResumeCount,
+		LeaseToken:                job.LeaseToken,
+		FailureCategory:           job.FailureCategory,
+		FailureStage:              job.FailureStage,
+		FailureReasonSummary:      job.FailureReasonSummary,
+		Retriable:                 job.Retriable,
+		AttemptHistory:            append([]AttemptFailure(nil), job.AttemptHistory...),
+		ZipkinTraceID:             job.ZipkinTraceID,
+		ZipkinTraceURL:            job.ZipkinTraceURL,
+		Traceparent:               job.Traceparent,
+		InfraRequeueCount:         job.InfraRequeueCount,
+	}
+	if job.LeaseAckDeadlineAt != nil {
+		detail.LeaseAckDeadlineAt = job.LeaseAckDeadlineAt.UTC().Format(time.RFC3339)
 	}
 	if !job.StartedAt.IsZero() {
 		detail.StartedAt = job.StartedAt.UTC().Format(time.RFC3339)
@@ -3894,6 +4402,30 @@ func (e *Engine) buildJobDetailLocked(job *Job) JobDetail {
 		}
 		if detail.StoryID == "" && sch.StoryID != "" {
 			detail.StoryID = sch.StoryID
+		}
+		if detail.FailureCategory == "" {
+			detail.FailureCategory = sch.FailureCategory
+		}
+		if detail.FailureStage == "" {
+			detail.FailureStage = sch.FailureStage
+		}
+		if detail.FailureReasonSummary == "" {
+			detail.FailureReasonSummary = sch.FailureReasonSummary
+		}
+		if len(detail.AttemptHistory) == 0 && len(sch.AttemptHistory) > 0 {
+			detail.AttemptHistory = append([]AttemptFailure(nil), sch.AttemptHistory...)
+		}
+		if detail.ZipkinTraceID == "" {
+			detail.ZipkinTraceID = sch.ZipkinTraceID
+		}
+		if detail.ZipkinTraceURL == "" {
+			detail.ZipkinTraceURL = sch.ZipkinTraceURL
+		}
+		if detail.Traceparent == "" {
+			detail.Traceparent = sch.Traceparent
+		}
+		if detail.InfraRequeueCount == 0 {
+			detail.InfraRequeueCount = sch.InfraRequeueCount
 		}
 		if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
 			detail.DocsHubPath = repo.DocsHubPath

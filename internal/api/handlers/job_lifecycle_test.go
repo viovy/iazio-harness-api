@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -378,5 +379,115 @@ func TestJobLifecycleHandler_ExecuteStory_HarnessAllocated(t *testing.T) {
 	}
 	if detail.StoryTitle != "Gemini Web MCP Frictionless ASE" {
 		t.Errorf("expected story_title, got %q", detail.StoryTitle)
+	}
+}
+
+func TestJobLifecycleHandler_AckLease_Heartbeat_Failover(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	h := NewJobLifecycleHandler(q)
+
+	job, err := q.Enqueue(context.Background(), &dispatch.Job{
+		Type:        dispatch.JobTypePromptExecute,
+		Repo:        "iazio-mcp",
+		TargetAgent: "autopilot",
+	})
+	if err != nil {
+		t.Fatalf("failed to enqueue: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/jobs/{id}/ack-lease", h.AckLease)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/heartbeat", h.Heartbeat)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/failover", h.Failover)
+	mux.HandleFunc("POST /api/v1/global-queue/jobs/retry-retriable", h.RetryRetriable)
+
+	// Claim the job into leased status
+	claimed, err := q.Claim(context.Background(), "agent-1", []string{dispatch.JobTypePromptExecute})
+	if err != nil {
+		t.Fatalf("failed to claim: %v", err)
+	}
+
+	// 1. AckLease
+	ackBody := bytes.NewReader([]byte(fmt.Sprintf(`{"lease_token":%q,"agent_pid":1234,"active_conversation_id":"conv-1"}`, claimed.LeaseToken)))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/"+job.ID+"/ack-lease", ackBody)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for AckLease, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// 2. Heartbeat
+	hbBody := bytes.NewReader([]byte(fmt.Sprintf(`{"lease_token":%q,"fencing_token":%d}`, claimed.LeaseToken, claimed.FencingToken)))
+	hbReq := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/"+job.ID+"/heartbeat", hbBody)
+	hbRr := httptest.NewRecorder()
+	mux.ServeHTTP(hbRr, hbReq)
+
+	if hbRr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for Heartbeat, got %d: %s", hbRr.Code, hbRr.Body.String())
+	}
+
+	// 3. Failover
+	failBody := bytes.NewReader([]byte(`{"host":"pc1","tool":"agy","workspace":"/tmp/ws","failure_category":"rate_limit_exceeded","exit_code":429,"reason":"quota exhausted"}`))
+	failReq := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/"+job.ID+"/failover", failBody)
+	failRr := httptest.NewRecorder()
+	mux.ServeHTTP(failRr, failReq)
+
+	if failRr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for Failover, got %d: %s", failRr.Code, failRr.Body.String())
+	}
+
+	// 4. RetryRetriable
+	retryBody := bytes.NewReader([]byte(`{}`))
+	retryReq := httptest.NewRequest(http.MethodPost, "/api/v1/global-queue/jobs/retry-retriable", retryBody)
+	retryRr := httptest.NewRecorder()
+	mux.ServeHTTP(retryRr, retryReq)
+
+	if retryRr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for RetryRetriable, got %d: %s", retryRr.Code, retryRr.Body.String())
+	}
+}
+
+func TestJobLifecycleHandler_ForceDispatch_Cancel_Retry(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	h := NewJobLifecycleHandler(q)
+
+	job, err := q.Enqueue(context.Background(), &dispatch.Job{
+		Type:        dispatch.JobTypePromptExecute,
+		Repo:        "iazio-mcp",
+		TargetAgent: "autopilot",
+	})
+	if err != nil {
+		t.Fatalf("failed to enqueue: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/jobs/{id}/force-dispatch", h.ForceDispatchJob)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/cancel", h.CancelJob)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/retry", h.RetryJob)
+
+	// ForceDispatch
+	fdReq := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/"+job.ID+"/force-dispatch", nil)
+	fdRr := httptest.NewRecorder()
+	mux.ServeHTTP(fdRr, fdReq)
+	if fdRr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for ForceDispatch, got %d: %s", fdRr.Code, fdRr.Body.String())
+	}
+
+	// Cancel
+	cancelBody := bytes.NewReader([]byte(`{"reason":"user test"}`))
+	cReq := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/"+job.ID+"/cancel", cancelBody)
+	cRr := httptest.NewRecorder()
+	mux.ServeHTTP(cRr, cReq)
+	if cRr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for Cancel, got %d: %s", cRr.Code, cRr.Body.String())
+	}
+
+	// Retry
+	rReq := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/"+job.ID+"/retry", nil)
+	rRr := httptest.NewRecorder()
+	mux.ServeHTTP(rRr, rReq)
+	if rRr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for Retry, got %d: %s", rRr.Code, rRr.Body.String())
 	}
 }

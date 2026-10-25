@@ -176,6 +176,29 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/jobs", jobLifecycle.ListQueue)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/cancel", jobLifecycle.CancelJob)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/retry", jobLifecycle.RetryJob)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/ack-lease", jobLifecycle.AckLease)
+	mux.HandleFunc("POST /v1/jobs/{id}/ack-lease", jobLifecycle.AckLease)
+	mux.HandleFunc("POST /api/v1/global-queue/jobs/{id}/ack-lease", jobLifecycle.AckLease)
+	mux.HandleFunc("POST /v1/global-queue/jobs/{id}/ack-lease", jobLifecycle.AckLease)
+	mux.HandleFunc("POST /api/v1/agent/jobs/{id}/ack-lease", jobLifecycle.AckLease)
+	mux.HandleFunc("POST /v1/agent/jobs/{id}/ack-lease", jobLifecycle.AckLease)
+
+	mux.HandleFunc("POST /api/v1/jobs/{id}/heartbeat", jobLifecycle.Heartbeat)
+	mux.HandleFunc("POST /v1/jobs/{id}/heartbeat", jobLifecycle.Heartbeat)
+	mux.HandleFunc("POST /api/v1/global-queue/jobs/{id}/heartbeat", jobLifecycle.Heartbeat)
+	mux.HandleFunc("POST /v1/global-queue/jobs/{id}/heartbeat", jobLifecycle.Heartbeat)
+
+	mux.HandleFunc("POST /api/v1/jobs/{id}/failover", jobLifecycle.Failover)
+	mux.HandleFunc("POST /v1/jobs/{id}/failover", jobLifecycle.Failover)
+	mux.HandleFunc("POST /api/v1/global-queue/jobs/{id}/failover", jobLifecycle.Failover)
+	mux.HandleFunc("POST /v1/global-queue/jobs/{id}/failover", jobLifecycle.Failover)
+	mux.HandleFunc("POST /api/v1/agent/jobs/{id}/failover", jobLifecycle.Failover)
+	mux.HandleFunc("POST /v1/agent/jobs/{id}/failover", jobLifecycle.Failover)
+
+	mux.HandleFunc("POST /api/v1/global-queue/jobs/retry-retriable", jobLifecycle.RetryRetriable)
+	mux.HandleFunc("POST /v1/global-queue/jobs/retry-retriable", jobLifecycle.RetryRetriable)
+	mux.HandleFunc("POST /api/v1/jobs/retry-retriable", jobLifecycle.RetryRetriable)
+	mux.HandleFunc("POST /v1/jobs/retry-retriable", jobLifecycle.RetryRetriable)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/force-dispatch", jobLifecycle.ForceDispatchJob)
 	mux.HandleFunc("POST /v1/jobs/{id}/force-dispatch", jobLifecycle.ForceDispatchJob)
 	mux.HandleFunc("POST /api/v1/global-queue/jobs/{id}/force-dispatch", jobLifecycle.ForceDispatchJob)
@@ -1663,6 +1686,17 @@ func (s *Server) pollHost(w http.ResponseWriter, r *http.Request) {
 		"active_conversation_id":  activeConvID,
 		"resume_mode":             resumeMode,
 		"resume_fallback_reason":  fallbackReason,
+		"lease_token":             job.LeaseToken,
+		"lease_ack_deadline_at":   job.LeaseAckDeadlineAt,
+		"failure_category":        job.FailureCategory,
+		"failure_stage":           job.FailureStage,
+		"failure_reason_summary":  job.FailureReasonSummary,
+		"retriable":               job.Retriable,
+		"attempt_history":         job.AttemptHistory,
+		"zipkin_trace_id":         job.ZipkinTraceID,
+		"zipkin_trace_url":        job.ZipkinTraceURL,
+		"traceparent":             job.Traceparent,
+		"infra_requeue_count":     job.InfraRequeueCount,
 	}
 	if interruptedASE != nil {
 		resp["interrupted_ase_state"] = interruptedASE

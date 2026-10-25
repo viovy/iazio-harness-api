@@ -78,6 +78,17 @@ CREATE TABLE IF NOT EXISTS harness_history (
 
 CREATE INDEX IF NOT EXISTS idx_harness_history_repo ON harness_history (host_id, worktree_path, created_at ASC);
 ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS trace_id text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS lease_token text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS lease_ack_deadline_at timestamp with time zone;
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS failure_category text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS failure_stage text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS failure_reason_summary text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS retriable boolean NOT NULL DEFAULT false;
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS attempt_history jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS zipkin_trace_id text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS zipkin_trace_url text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS traceparent text NOT NULL DEFAULT '';
+ALTER TABLE harness_history ADD COLUMN IF NOT EXISTS infra_requeue_count integer NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS harness_git_credentials (
   id text PRIMARY KEY,

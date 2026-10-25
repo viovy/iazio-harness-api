@@ -753,3 +753,209 @@ func (h *JobLifecycleHandler) GetJobAttribution(w http.ResponseWriter, r *http.R
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(attr)
 }
+
+// AckLeaseRequest is the payload for Phase 2 lease handshake.
+type AckLeaseRequest struct {
+	LeaseToken           string `json:"lease_token"`
+	AgentPID             int    `json:"agent_pid"`
+	ActiveConversationID string `json:"active_conversation_id"`
+}
+
+// AckLease serves POST /api/v1/global-queue/jobs/{id}/ack-lease and POST /api/v1/jobs/{id}/ack-lease.
+func (h *JobLifecycleHandler) AckLease(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	jobID := strings.TrimSpace(r.PathValue("id"))
+	if jobID == "" {
+		writeJSONError(w, http.StatusBadRequest, "job id is required")
+		return
+	}
+
+	var req AckLeaseRequest
+	if r.Body != nil {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(r.Body, 1<<18))
+		if len(bodyBytes) > 0 {
+			_ = json.Unmarshal(bodyBytes, &req)
+		}
+	}
+
+	var errQueue error
+	if h.queue != nil {
+		_, errQueue = h.queue.AckLease(r.Context(), jobID, req.LeaseToken, req.AgentPID, req.ActiveConversationID)
+	}
+
+	var errEngine error
+	if h.engine != nil {
+		errEngine = h.engine.AckLease(jobID, req.LeaseToken, req.AgentPID, req.ActiveConversationID)
+	}
+
+	if errQueue != nil && errEngine != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("failed to acknowledge lease: %v", errQueue))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":  "acknowledged",
+		"job_id":  jobID,
+		"message": "Phase 2 lease handshake completed; job transitioned to running",
+	})
+}
+
+// Heartbeat serves POST /api/v1/global-queue/jobs/{id}/heartbeat and POST /api/v1/jobs/{id}/heartbeat.
+func (h *JobLifecycleHandler) Heartbeat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	jobID := strings.TrimSpace(r.PathValue("id"))
+	if jobID == "" {
+		writeJSONError(w, http.StatusBadRequest, "job id is required")
+		return
+	}
+
+	var req struct {
+		LeaseToken   string `json:"lease_token"`
+		FencingToken int64  `json:"fencing_token"`
+	}
+	if r.Body != nil {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(r.Body, 1<<18))
+		if len(bodyBytes) > 0 {
+			_ = json.Unmarshal(bodyBytes, &req)
+		}
+	}
+
+	var errQueue error
+	if h.queue != nil {
+		_, errQueue = h.queue.Heartbeat(r.Context(), jobID, req.FencingToken)
+	}
+
+	var errEngine error
+	if h.engine != nil {
+		errEngine = h.engine.HeartbeatJob(jobID, req.LeaseToken)
+	}
+
+	if errQueue != nil && errEngine != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("failed to heartbeat job: %v", errQueue))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status": "ok",
+		"job_id": jobID,
+	})
+}
+
+// FailoverRequest carries details when a tool startup or pre-progress check fails.
+type FailoverRequest struct {
+	Host            string `json:"host"`
+	Tool            string `json:"tool"`
+	Workspace       string `json:"workspace"`
+	ExitCode        int    `json:"exit_code"`
+	StderrTail      string `json:"stderr_tail"`
+	FailureCategory string `json:"failure_category"`
+	FailureStage    string `json:"failure_stage"`
+	Reason          string `json:"reason"`
+	Timestamp       string `json:"timestamp"`
+}
+
+// Failover serves POST /api/v1/global-queue/jobs/{id}/failover and POST /api/v1/jobs/{id}/failover.
+func (h *JobLifecycleHandler) Failover(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	jobID := strings.TrimSpace(r.PathValue("id"))
+	if jobID == "" {
+		writeJSONError(w, http.StatusBadRequest, "job id is required")
+		return
+	}
+
+	var req FailoverRequest
+	if r.Body != nil {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(r.Body, 1<<18))
+		if len(bodyBytes) > 0 {
+			_ = json.Unmarshal(bodyBytes, &req)
+		}
+	}
+
+	attempt := dispatch.AttemptFailure{
+		Host:            req.Host,
+		Tool:            req.Tool,
+		Workspace:       req.Workspace,
+		ExitCode:        req.ExitCode,
+		StderrTail:      req.StderrTail,
+		FailureCategory: req.FailureCategory,
+		FailureStage:    req.FailureStage,
+		Reason:          req.Reason,
+		Timestamp:       req.Timestamp,
+	}
+
+	var errQueue error
+	if h.queue != nil {
+		_, errQueue = h.queue.Failover(r.Context(), jobID, attempt)
+	}
+
+	var errEngine error
+	if h.engine != nil {
+		_, errEngine = h.engine.FailoverJob(jobID, attempt)
+	}
+
+	if errQueue != nil && errEngine != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("failed to failover job: %v", errQueue))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":  "failover_requeued",
+		"job_id":  jobID,
+		"message": "Tool failure recorded and cooled down; job requeued for next priority candidate",
+	})
+}
+
+// RetryRetriable serves POST /api/v1/global-queue/jobs/retry-retriable.
+func (h *JobLifecycleHandler) RetryRetriable(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var retriedQueueCount int
+	if h.queue != nil {
+		retried, err := h.queue.RetryRetriable(r.Context())
+		if err == nil {
+			retriedQueueCount = len(retried)
+		}
+	}
+
+	var retriedEngineCount int
+	if h.engine != nil {
+		retried, err := h.engine.RetryRetriableJobs()
+		if err == nil {
+			retriedEngineCount = len(retried)
+		}
+	}
+
+	total := retriedQueueCount
+	if retriedEngineCount > total {
+		total = retriedEngineCount
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":        "ok",
+		"retried_count": total,
+		"message":       fmt.Sprintf("Re-enqueued %d retriable failed jobs", total),
+	})
+}

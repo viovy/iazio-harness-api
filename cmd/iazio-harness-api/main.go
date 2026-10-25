@@ -106,6 +106,10 @@ func run(ctx context.Context, args []string) error {
 				srv.Engine.SetHistory(key, rows)
 			}
 			log.Printf("loaded %d repo history records from database", len(hist))
+			reconciled := srv.Engine.ReconcileHistoricalFailureTaxonomy()
+			if reconciled > 0 {
+				log.Printf("reconciled failure taxonomy for %d historical history records", reconciled)
+			}
 		}
 		if stories, err := store.LoadStories(ctx); err == nil {
 			for _, st := range stories {

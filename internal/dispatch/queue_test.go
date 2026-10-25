@@ -82,8 +82,8 @@ func TestQueue_ClaimFilters(t *testing.T) {
 	if claimed.Type != JobTypeStoryCreate || claimed.TargetHost != "host-b" {
 		t.Fatalf("unexpected claimed job attributes: %+v", claimed)
 	}
-	if claimed.Status != JobStatusClaimed {
-		t.Fatalf("expected status claimed, got %s", claimed.Status)
+	if claimed.Status != JobStatusClaimed && claimed.Status != JobStatusLeased {
+		t.Fatalf("expected status claimed or leased, got %s", claimed.Status)
 	}
 }
 
@@ -369,8 +369,13 @@ func TestQueue_ClaimLeaseExpiry(t *testing.T) {
 	if err != nil || claimed == nil {
 		t.Fatalf("claim failed: %v", err)
 	}
-	if claimed.Status != JobStatusClaimed {
+	if claimed.Status != JobStatusClaimed && claimed.Status != JobStatusLeased {
 		t.Fatalf("expected claimed, got %s", claimed.Status)
+	}
+
+	// Ack lease to transition to running
+	if _, err := q.AckLease(ctx, claimed.ID, claimed.LeaseToken, 1234, ""); err != nil {
+		t.Fatalf("ack lease failed: %v", err)
 	}
 
 	// Advance time past claimTimeout (11 minutes)
@@ -699,7 +704,7 @@ func TestQueue_ReconcileGlobalQueueSlots_And_ForceDispatch(t *testing.T) {
 	if err != nil || claimed == nil {
 		t.Fatalf("claim error: %v", err)
 	}
-	if claimed.Status != JobStatusClaimed || claimed.ClaimedHost != "pc1-wsl" {
+	if (claimed.Status != JobStatusClaimed && claimed.Status != JobStatusLeased) || claimed.ClaimedHost != "pc1-wsl" {
 		t.Fatalf("expected claimed by pc1-wsl, got status=%s host=%s", claimed.Status, claimed.ClaimedHost)
 	}
 
@@ -735,5 +740,69 @@ func TestQueue_ReconcileGlobalQueueSlots_And_ForceDispatch(t *testing.T) {
 	}
 	if forced.DispatchDiagnostics.QueueState != "dispatching" {
 		t.Fatalf("expected queue_state dispatching, got %s", forced.DispatchDiagnostics.QueueState)
+	}
+}
+
+func TestInMemoryQueue_Failover_RetryRetriable_BindStory_Attribution(t *testing.T) {
+	ctx := context.Background()
+	q := NewInMemoryQueue()
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type: JobTypePromptExecute,
+		Repo: "iazio-mcp",
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	// 1. Failover
+	attempt := AttemptFailure{
+		Host:            "host1",
+		Tool:            "agy",
+		Workspace:       "/tmp/w",
+		ExitCode:        1,
+		StderrTail:      "crash",
+		FailureCategory: "preflight_tool_exit",
+	}
+	foJob, err := q.Failover(ctx, job.ID, attempt)
+	if err != nil {
+		t.Fatalf("failover failed: %v", err)
+	}
+	if len(foJob.AttemptHistory) != 1 || foJob.Status != JobStatusPending || !foJob.Retriable {
+		t.Fatalf("unexpected failover job state: %+v", foJob)
+	}
+
+	// 2. RetryRetriable
+	foJob.Status = JobStatusFailed
+	retried, err := q.RetryRetriable(ctx)
+	if err != nil {
+		t.Fatalf("retry retriable failed: %v", err)
+	}
+	if len(retried) != 1 {
+		t.Fatalf("expected 1 retried job, got %d", len(retried))
+	}
+
+	// 3. BindStory
+	bound, err := q.BindStory(ctx, job.ID, "STORY-GOV-9999", "Test Title", "docs/test.story.md")
+	if err != nil {
+		t.Fatalf("bind story failed: %v", err)
+	}
+	if bound.StoryID != "STORY-GOV-9999" || bound.StoryAllocationStatus != "allocated" {
+		t.Fatalf("unexpected bound job state: %+v", bound)
+	}
+
+	// 4. SetDispatchDiagnostics & GetAttribution
+	diag := &DispatchDiagnostics{
+		QueueState: "queued",
+	}
+	if err := q.SetDispatchDiagnostics(job.ID, diag); err != nil {
+		t.Fatalf("set dispatch diagnostics failed: %v", err)
+	}
+	attr, err := q.GetAttribution(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("get attribution failed: %v", err)
+	}
+	if attr.JobID != job.ID {
+		t.Fatalf("expected jobID %s, got %s", job.ID, attr.JobID)
 	}
 }
