@@ -313,8 +313,8 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 			"conversation_lineage":        h.ConversationLineage,
 			"termination_reason_code":     h.TerminationReasonCode,
 			"termination_reason_message":  h.TerminationReasonMessage,
-			"resumable":                   h.Resumable,
-			"non_resumable_reason":        h.NonResumableReason,
+			"resumable":                   h.Resumable || h.ActiveConversationID != "" || len(ids) > 0,
+			"non_resumable_reason":        func() string { if h.Resumable || h.ActiveConversationID != "" || len(ids) > 0 { return "" }; return h.NonResumableReason }(),
 			"workspace_dirty_files":       h.WorkspaceDirtyFiles,
 			"background_tasks":            h.BackgroundTasks,
 		})
@@ -439,8 +439,8 @@ func jobDetailView(j control.JobDetail) map[string]any {
 		"liveness_pulse_seconds":        j.LivenessPulseSeconds,
 		"termination_reason_code":       j.TerminationReasonCode,
 		"termination_reason_message":    j.TerminationReasonMessage,
-		"resumable":                     j.Resumable,
-		"non_resumable_reason":          j.NonResumableReason,
+		"resumable":                     j.Resumable || j.ActiveConversationID != "" || j.ResumeConversationID != "" || j.InitialConversationID != "" || len(cids) > 0,
+		"non_resumable_reason":          func() string { if j.Resumable || j.ActiveConversationID != "" || j.ResumeConversationID != "" || j.InitialConversationID != "" || len(cids) > 0 { return "" }; return j.NonResumableReason }(),
 		"workspace_dirty_files":         j.WorkspaceDirtyFiles,
 		"background_tasks":              j.BackgroundTasks,
 	}
@@ -504,8 +504,8 @@ func historyJobDetailView(r control.HistoryRow, host, path string) map[string]an
 		"liveness_pulse_seconds":        r.LivenessPulseSeconds,
 		"termination_reason_code":       r.TerminationReasonCode,
 		"termination_reason_message":    r.TerminationReasonMessage,
-		"resumable":                     r.Resumable,
-		"non_resumable_reason":          r.NonResumableReason,
+		"resumable":                     r.Resumable || r.ActiveConversationID != "" || r.InitialConversationID != "" || len(cids) > 0,
+		"non_resumable_reason":          func() string { if r.Resumable || r.ActiveConversationID != "" || r.InitialConversationID != "" || len(cids) > 0 { return "" }; return r.NonResumableReason }(),
 		"workspace_dirty_files":         r.WorkspaceDirtyFiles,
 		"background_tasks":              r.BackgroundTasks,
 	}

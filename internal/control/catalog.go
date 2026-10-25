@@ -2,6 +2,7 @@ package control
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -687,11 +688,96 @@ type LogPage struct {
 	NextCursor string
 }
 
+func (e *Engine) getOrSynthesizeLogsLocked(jobID string) []LogChunk {
+	all := e.logs[jobID]
+	if len(all) > 0 {
+		return all
+	}
+	job, ok := e.jobs[jobID]
+	if !ok {
+		return nil
+	}
+	convID := job.ActiveConversationID
+	if convID == "" {
+		convID = job.ResumeConversationID
+	}
+	if convID == "" {
+		convID = job.InitialConversationID
+	}
+	if convID == "" && len(job.ConversationIDs) > 0 {
+		convID = job.ConversationIDs[0]
+	}
+	sch, _ := e.schedules[job.ScheduleID]
+	worktree := ""
+	engine := "agy"
+	storyID := ""
+	if sch != nil {
+		worktree = sch.WorktreePath
+		if sch.Engine != "" {
+			engine = sch.Engine
+		}
+		storyID = sch.StoryID
+	}
+	if storyID == "" && job.InterruptedASEState != nil {
+		if s, ok := job.InterruptedASEState["story_id"].(string); ok {
+			storyID = s
+		}
+	}
+	reason := job.Reason
+	if reason == "" {
+		reason = job.TerminationReasonCode
+	}
+	if reason == "" {
+		reason = "UNKNOWN"
+	}
+	ts := job.StartedAt
+	if ts.IsZero() {
+		ts = e.now()
+	}
+	tsStr := ts.UTC().Format(time.RFC3339)
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Live Console Telemetry for Job %s\n", tsStr, job.ID))
+	sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Status: %s | Reason: %s | Exit Code: %d\n", tsStr, job.Status, reason, job.ExitCode))
+	if worktree != "" {
+		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Worktree: %s | Engine: %s\n", tsStr, worktree, engine))
+	}
+	if convID != "" {
+		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Conversation resolved: %s --conversation=%s (source: control-plane record)\n", tsStr, engine, convID))
+	} else {
+		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Conversation: none captured before process termination\n", tsStr))
+	}
+	if storyID != "" {
+		asePhase := "IN_PROGRESS"
+		if job.InterruptedASEState != nil {
+			if p, ok := job.InterruptedASEState["phase"].(string); ok && p != "" {
+				asePhase = p
+			}
+		}
+		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] ASE State: story=%s, phase=%s, complete=%v\n", tsStr, storyID, asePhase, job.ASEComplete))
+	}
+	if len(job.WorkspaceDirtyFiles) > 0 {
+		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Fleet Git State: %d dirty file(s) recorded\n", tsStr, len(job.WorkspaceDirtyFiles)))
+	} else {
+		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Fleet Git State: clean\n", tsStr))
+	}
+	resumable := job.Resumable || convID != "" || storyID != ""
+	sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Resumable: %v | Use 'Resume (%s --conversation)' to resume execution in-place.\n", tsStr, resumable, engine))
+
+	return []LogChunk{
+		{
+			Seq:    1,
+			Stream: "stdout",
+			Text:   sb.String(),
+		},
+	}
+}
+
 // JobLogs reads the stored blob. from/to select a gap; otherwise page and cursor page forward.
 func (e *Engine) JobLogs(jobID string, page int, cursor string, fromSeq, toSeq int) LogPage {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	all := e.logs[jobID]
+	all := e.getOrSynthesizeLogsLocked(jobID)
 	if fromSeq > 0 || toSeq > 0 {
 		var picked []LogChunk
 		for _, c := range all {
@@ -759,7 +845,7 @@ func (e *Engine) SubscribeLogs(jobID string) (<-chan LogChunk, func()) {
 func (e *Engine) TailLogs(jobID string, tail, afterSeq int) (chunks []LogChunk, gapFrom, gapTo int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	all := e.logs[jobID]
+	all := e.getOrSynthesizeLogsLocked(jobID)
 	if tail <= 0 {
 		tail = 100
 	}
