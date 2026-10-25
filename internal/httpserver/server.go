@@ -245,6 +245,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/jobs/{id}/retry-correlation", s.retryCorrelation)
 	mux.HandleFunc("POST /v1/jobs/{id}/chunks", s.appendChunk)
 	mux.HandleFunc("POST /v1/jobs/{id}/conversations", s.addJobConversation)
+	mux.HandleFunc("POST /v1/jobs/{id}/readiness", s.postJobReadiness)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/readiness", s.postJobReadiness)
 	mux.HandleFunc("GET /api/v1/conversations/{id}/rehydration-bundle", s.getRehydrationBundle)
 	mux.HandleFunc("GET /v1/conversations/{id}/rehydration-bundle", s.getRehydrationBundle)
 	mux.HandleFunc("GET /v1/jobs/{id}/logs", s.jobLogs)
@@ -2790,12 +2792,13 @@ func (s *Server) appendChunk(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) addJobConversation(w http.ResponseWriter, r *http.Request) {
 	var raw struct {
-		ConversationID string `json:"conversation_id"`
-		Fallback       bool   `json:"fallback"`
-		FallbackReason string `json:"fallback_reason"`
-		Role           string `json:"role"`
-		CLIArgs        string `json:"cli_args"`
-		ASEPhase       string `json:"ase_phase"`
+		ConversationID    string         `json:"conversation_id"`
+		Fallback          bool           `json:"fallback"`
+		FallbackReason    string         `json:"fallback_reason"`
+		Role              string         `json:"role"`
+		CLIArgs           string         `json:"cli_args"`
+		ASEPhase          string         `json:"ase_phase"`
+		RehydrationStatus map[string]any `json:"rehydration_status"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -2811,17 +2814,36 @@ func (s *Server) addJobConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	opt := control.ConversationAttachOptions{
-		Fallback:       raw.Fallback,
-		FallbackReason: raw.FallbackReason,
-		Role:           raw.Role,
-		CLIArgs:        raw.CLIArgs,
-		ASEPhase:       raw.ASEPhase,
+		Fallback:          raw.Fallback,
+		FallbackReason:    raw.FallbackReason,
+		Role:              raw.Role,
+		CLIArgs:           raw.CLIArgs,
+		ASEPhase:          raw.ASEPhase,
+		RehydrationStatus: raw.RehydrationStatus,
 	}
 	if err := s.Engine.AddJobConversationWithOptions(r.PathValue("id"), cid, opt); err != nil {
 		writeErr(w, http.StatusNotFound, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "recorded", "conversation_id": cid})
+}
+
+func (s *Server) postJobReadiness(w http.ResponseWriter, r *http.Request) {
+	var raw struct {
+		ReapResult             map[string]any `json:"reap_result"`
+		WorkspaceStateManifest map[string]any `json:"workspace_state_manifest"`
+		RehydrationStatus      map[string]any `json:"rehydration_status"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	id := r.PathValue("id")
+	if err := s.Engine.SetJobReadiness(id, raw.ReapResult, raw.WorkspaceStateManifest, raw.RehydrationStatus); err != nil {
+		writeErr(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
 func (s *Server) getRehydrationBundle(w http.ResponseWriter, r *http.Request) {
