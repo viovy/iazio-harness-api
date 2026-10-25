@@ -694,7 +694,49 @@ func TestAppendChunk_TurnAutoContinued(t *testing.T) {
 	if detail.ActiveConversationID != "conv-12345" {
 		t.Fatalf("expected ActiveConversationID='conv-12345', got %q", detail.ActiveConversationID)
 	}
+
+	foundTurnNotif := false
+	for _, n := range s.notifications {
+		if n.Event == "job.turn.auto_continued" && n.JobID == job.ID {
+			foundTurnNotif = true
+			break
+		}
+	}
+	if !foundTurnNotif {
+		t.Fatal("expected notification job.turn.auto_continued to be recorded")
+	}
 	_ = sch
+}
+
+func TestPostExit_Notifications(t *testing.T) {
+	e := control.NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	_ = e.UpsertRepo(control.Repo{HostID: "host-1", WorktreePath: "/work/app"})
+	p := e.PutPrompt(control.Prompt{Title: "Task 1", Body: "do task 1", Status: "READY"})
+	_, _ = e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	job, _, _, _ := e.PollHost("host-1")
+
+	s := &Server{Engine: e}
+	handler := s.Handler()
+
+	exitReq := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/exit", bytes.NewBufferString(`{"exit_code":0,"termination_reason_code":"CLEAN"}`))
+	exitReq.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, exitReq)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+
+	foundCompleted := false
+	for _, n := range s.notifications {
+		if n.Event == "job.ase.completed" && n.JobID == job.ID {
+			foundCompleted = true
+			break
+		}
+	}
+	if !foundCompleted {
+		t.Fatal("expected notification job.ase.completed to be recorded")
+	}
 }
 
 func TestAppendChunk_FilterRootAgentIdle(t *testing.T) {

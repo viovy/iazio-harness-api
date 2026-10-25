@@ -753,6 +753,9 @@ func (e *Engine) AppendLog(jobID string, chunk LogChunk) {
 		if chunk.ElapsedSeconds > 0 {
 			job.ElapsedSeconds = chunk.ElapsedSeconds
 		}
+		if chunk.ActiveChildTasks != "" {
+			job.ActiveChildTasks = chunk.ActiveChildTasks
+		}
 		if chunk.Type == "TURN_AUTO_CONTINUED" {
 			if chunk.ContinuationTurn > 0 {
 				job.ExecutionAttempt = chunk.ContinuationTurn + 1
@@ -761,9 +764,6 @@ func (e *Engine) AppendLog(jobID string, chunk LogChunk) {
 			}
 			if chunk.ConversationID != "" && job.ActiveConversationID != chunk.ConversationID {
 				job.ActiveConversationID = chunk.ConversationID
-			}
-			if chunk.ActiveChildTasks != "" {
-				job.ActiveChildTasks = chunk.ActiveChildTasks
 			}
 		}
 	}

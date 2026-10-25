@@ -423,6 +423,41 @@ func TestQueue_MaxExecutionTimeout(t *testing.T) {
 	}
 }
 
+func TestQueue_StoryJobDoesNotTimeoutOnMaxExecution(t *testing.T) {
+	q := NewInMemoryQueue()
+	ctx := context.Background()
+
+	currTime := time.Date(2026, 10, 21, 10, 0, 0, 0, time.UTC)
+	q.SetNowFunc(func() time.Time { return currTime })
+	q.SetTimeouts(30*time.Minute, 60*time.Minute)
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type:    JobTypePromptExecute,
+		Repo:    "repo-story-exec",
+		StoryID: "STORY-GOV-3693",
+	})
+	if err != nil {
+		t.Fatalf("enqueue error: %v", err)
+	}
+
+	// Advance time past max execution timeout (75 minutes)
+	currTime = currTime.Add(75 * time.Minute)
+
+	list, err := q.List(ctx, JobFilter{})
+	if err != nil {
+		t.Fatalf("list error: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 job, got %d", len(list))
+	}
+	if list[0].ID != job.ID {
+		t.Fatalf("expected job %s, got %s", job.ID, list[0].ID)
+	}
+	if list[0].Status == JobStatusFailed {
+		t.Fatalf("expected story job NOT to fail on execution timeout, got status: %s", list[0].Status)
+	}
+}
+
 func TestQueue_StartReaperBackground(t *testing.T) {
 	q := NewInMemoryQueue()
 	ctx, cancel := context.WithCancel(context.Background())
