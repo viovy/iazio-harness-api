@@ -94,6 +94,10 @@ func hostView(h control.Host, paused int) map[string]any {
 		fleetChecked = h.FleetCheckedAt.UTC().Format(time.RFC3339)
 		fleetGitClean = h.FleetGitClean
 	}
+	var eagerReadiness any
+	if h.EagerReadiness != nil {
+		eagerReadiness = h.EagerReadiness
+	}
 	return map[string]any{
 		"id":                   h.ID,
 		"name":                 name,
@@ -108,6 +112,7 @@ func hostView(h control.Host, paused int) map[string]any {
 		"harness_active":       h.HarnessActive,
 		"fleet_checked_at":     fleetChecked,
 		"tools":                tools,
+		"eager_readiness":      eagerReadiness,
 	}
 }
 

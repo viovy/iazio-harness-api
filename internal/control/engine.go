@@ -644,6 +644,54 @@ type CommandEnvelope struct {
 	CreatedAt string `json:"created_at"`
 }
 
+// EagerUpdateState represents the status of eager auto-updating on an agent host.
+type EagerUpdateState string
+
+const (
+	StateUpToDate              EagerUpdateState = "UP_TO_DATE"
+	StateUpdating              EagerUpdateState = "UPDATING"
+	StateDeferredHarnessActive EagerUpdateState = "DEFERRED_HARNESS_ACTIVE"
+	StateDeferredGitDirty      EagerUpdateState = "DEFERRED_GIT_DIRTY"
+	StateBackoffAfterFailure   EagerUpdateState = "BACKOFF_AFTER_FAILURE"
+)
+
+// OutdatedToolInfo describes a tool that is behind the target release version.
+type OutdatedToolInfo struct {
+	ToolName         string `json:"tool_name"`
+	InstalledVersion string `json:"installed_version"`
+	TargetVersion    string `json:"target_version"`
+}
+
+// BlockingActiveJobInfo describes an active harness execution blocking tool updates.
+type BlockingActiveJobInfo struct {
+	RepoName  string    `json:"repo_name"`
+	JobID     string    `json:"job_id"`
+	PID       int       `json:"pid,omitempty"`
+	StartedAt time.Time `json:"started_at,omitempty"`
+	Source    string    `json:"source,omitempty"`
+}
+
+// BlockingDirtyRepoInfo describes a dirty repository or sub-repository blocking tool updates.
+type BlockingDirtyRepoInfo struct {
+	RepoName            string `json:"repo_name"`
+	SubRepoPath         string `json:"sub_repo_path,omitempty"`
+	DirtyFilesCount     int    `json:"dirty_files_count"`
+	UntrackedFilesCount int    `json:"untracked_files_count"`
+	Branch              string `json:"branch"`
+}
+
+// EagerUpdateReadinessReport provides comprehensive diagnostic visibility into eager update eligibility.
+type EagerUpdateReadinessReport struct {
+	HostID                    string                  `json:"host_id"`
+	EagerUpdateState          EagerUpdateState        `json:"eager_update_state"`
+	OutdatedTools             []OutdatedToolInfo      `json:"outdated_tools,omitempty"`
+	BlockingActiveJobs        []BlockingActiveJobInfo `json:"blocking_active_jobs,omitempty"`
+	BlockingDirtyRepos        []BlockingDirtyRepoInfo `json:"blocking_dirty_repos,omitempty"`
+	LastEvaluatedAt           time.Time               `json:"last_evaluated_at"`
+	NextScheduledEvaluationAt time.Time               `json:"next_scheduled_evaluation_at,omitempty"`
+	Details                   string                  `json:"details,omitempty"`
+}
+
 // Host is a registered supervisor.
 type Host struct {
 	ID                    string
@@ -663,6 +711,7 @@ type Host struct {
 	HarnessActive         bool
 	FleetCheckedAt        *time.Time
 	RepoStatuses          map[string]RepoRuntimeStatus
+	EagerReadiness        *EagerUpdateReadinessReport
 }
 
 // PingAck is a live acknowledgment from an agent responding to a PING command.

@@ -266,6 +266,70 @@ func (e *Engine) GetHostDetail(id string) (HostDetail, bool) {
 	return detail, true
 }
 
+// UpdateEagerReadiness updates or stores the eager update readiness report for a host.
+func (e *Engine) UpdateEagerReadiness(hostID string, report EagerUpdateReadinessReport) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	h, hasHost := e.hosts[hostID]
+	if !hasHost || h == nil {
+		return
+	}
+	reportCopy := report
+	if reportCopy.LastEvaluatedAt.IsZero() {
+		reportCopy.LastEvaluatedAt = e.now().UTC()
+	}
+	h.EagerReadiness = &reportCopy
+}
+
+// GetEagerReadiness retrieves the eager update readiness report for a host.
+func (e *Engine) GetEagerReadiness(hostID string) (EagerUpdateReadinessReport, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	h, hasHost := e.hosts[hostID]
+	if !hasHost || h == nil || h.EagerReadiness == nil {
+		return EagerUpdateReadinessReport{}, false
+	}
+	return *h.EagerReadiness, true
+}
+
+// EvaluateEagerUpdate requests the host to evaluate eager tool updates immediately.
+func (e *Engine) EvaluateEagerUpdate(hostID string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	h, ok := e.hosts[hostID]
+	if !ok || h == nil {
+		return ErrNotFound
+	}
+	cmdID := fmt.Sprintf("eval-eager-%d", e.now().UnixNano())
+	h.PendingCommands = append(h.PendingCommands, CommandEnvelope{
+		ID:        cmdID,
+		Type:      "EVALUATE_EAGER_UPDATE",
+		CreatedAt: e.now().UTC().Format(time.RFC3339),
+	})
+	return nil
+}
+
+// ForceEagerUpdate requests the host to force tool updates immediately.
+func (e *Engine) ForceEagerUpdate(hostID string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	h, ok := e.hosts[hostID]
+	if !ok || h == nil {
+		return ErrNotFound
+	}
+	cmdID := fmt.Sprintf("force-tool-%d", e.now().UnixNano())
+	h.PendingCommands = append(h.PendingCommands, CommandEnvelope{
+		ID:        cmdID,
+		Type:      "FORCE_TOOL_UPDATE",
+		CreatedAt: e.now().UTC().Format(time.RFC3339),
+	})
+	return nil
+}
+
 // RepoDetail is the queue page.
 type RepoDetail struct {
 	Repo                 Repo

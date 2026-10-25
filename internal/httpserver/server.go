@@ -351,6 +351,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/hosts/{host}/repos/clean-and-dispatch-next", s.cleanAndDispatchNext)
 	mux.HandleFunc("POST /api/v1/agents/{host}/repos/clean-and-dispatch-next", s.cleanAndDispatchNext)
 	mux.HandleFunc("POST /v1/hosts/{host}/repos/status", s.updateRepoRuntimeStatus)
+	mux.HandleFunc("POST /v1/hosts/{host}/eager-readiness", s.updateEagerReadiness)
+	mux.HandleFunc("POST /api/v1/agents/{host}/eager-readiness", s.updateEagerReadiness)
+	mux.HandleFunc("POST /api/agents/{host}/eager-readiness", s.updateEagerReadiness)
+	mux.HandleFunc("GET /v1/hosts/{host}/eager-readiness", s.getEagerReadiness)
+	mux.HandleFunc("GET /api/v1/agents/{host}/eager-readiness", s.getEagerReadiness)
+	mux.HandleFunc("GET /api/agents/{host}/eager-readiness", s.getEagerReadiness)
+	mux.HandleFunc("POST /v1/hosts/{host}/eager-update/evaluate", s.evaluateEagerUpdate)
+	mux.HandleFunc("POST /api/v1/agents/{host}/eager-update/evaluate", s.evaluateEagerUpdate)
+	mux.HandleFunc("POST /api/agents/{host}/eager-update/evaluate", s.evaluateEagerUpdate)
+	mux.HandleFunc("POST /v1/hosts/{host}/eager-update/force", s.forceEagerUpdate)
+	mux.HandleFunc("POST /api/v1/agents/{host}/eager-update/force", s.forceEagerUpdate)
+	mux.HandleFunc("POST /api/agents/{host}/eager-update/force", s.forceEagerUpdate)
 	mux.HandleFunc("GET /v1/fleet/tool-priority", s.getToolPriority)
 	mux.HandleFunc("PUT /v1/fleet/tool-priority", s.setToolPriority)
 	mux.HandleFunc("GET /api/v1/tool-priority", s.getToolPriority)
@@ -2410,6 +2422,90 @@ func (s *Server) updateRepoRuntimeStatus(w http.ResponseWriter, r *http.Request)
 	}
 	s.Engine.UpdateRepoRuntimeStatus(hostID, statuses)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func resolveHostID(r *http.Request) string {
+	hostID := r.PathValue("host")
+	if hostID == "" {
+		hostID = r.PathValue("id")
+	}
+	if hostID == "" {
+		p := strings.TrimPrefix(r.URL.Path, "/v1/hosts/")
+		p = strings.TrimPrefix(p, "/api/v1/agents/")
+		p = strings.TrimPrefix(p, "/api/agents/")
+		if idx := strings.Index(p, "/"); idx != -1 {
+			hostID = p[:idx]
+		} else {
+			hostID = p
+		}
+	}
+	return hostID
+}
+
+func (s *Server) updateEagerReadiness(w http.ResponseWriter, r *http.Request) {
+	hostID := resolveHostID(r)
+	if hostID == "" {
+		http.Error(w, "host is required", http.StatusBadRequest)
+		return
+	}
+	var report control.EagerUpdateReadinessReport
+	if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if report.HostID == "" {
+		report.HostID = hostID
+	}
+	s.Engine.UpdateEagerReadiness(hostID, report)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) getEagerReadiness(w http.ResponseWriter, r *http.Request) {
+	hostID := resolveHostID(r)
+	if hostID == "" {
+		http.Error(w, "host is required", http.StatusBadRequest)
+		return
+	}
+	report, ok := s.Engine.GetEagerReadiness(hostID)
+	if !ok {
+		writeErr(w, http.StatusNotFound, control.ErrNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+func (s *Server) evaluateEagerUpdate(w http.ResponseWriter, r *http.Request) {
+	hostID := resolveHostID(r)
+	if hostID == "" {
+		http.Error(w, "host is required", http.StatusBadRequest)
+		return
+	}
+	if err := s.Engine.EvaluateEagerUpdate(hostID); err != nil {
+		if errors.Is(err, control.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, err)
+		} else {
+			writeErr(w, http.StatusBadRequest, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "evaluation_dispatched"})
+}
+
+func (s *Server) forceEagerUpdate(w http.ResponseWriter, r *http.Request) {
+	hostID := resolveHostID(r)
+	if hostID == "" {
+		http.Error(w, "host is required", http.StatusBadRequest)
+		return
+	}
+	if err := s.Engine.ForceEagerUpdate(hostID); err != nil {
+		if errors.Is(err, control.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, err)
+		} else {
+			writeErr(w, http.StatusBadRequest, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "force_update_dispatched"})
 }
 
 func (s *Server) checkFleetStatus(w http.ResponseWriter, r *http.Request) {

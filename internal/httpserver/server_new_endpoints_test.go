@@ -712,3 +712,115 @@ func TestServer_HealingOperatorEndpoints(t *testing.T) {
 		t.Fatalf("expected repo queue to be OPEN after clear-healing, got %+v", repo)
 	}
 }
+
+func TestServer_EagerReadinessEndpoints(t *testing.T) {
+	e := control.NewEngine(time.Now)
+	srv := &Server{Engine: e}
+	handler := srv.Handler()
+
+	hostID := "host-eager-test"
+	_ = e.RegisterHost(hostID, "linux", "generic")
+
+	// 1. GET before report -> 404
+	reqGet404 := httptest.NewRequest("GET", "/v1/hosts/"+hostID+"/eager-readiness", nil)
+	wGet404 := httptest.NewRecorder()
+	handler.ServeHTTP(wGet404, reqGet404)
+	if wGet404.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for uninitialized readiness, got %d", wGet404.Code)
+	}
+
+	// 2. POST /v1/hosts/{host}/eager-readiness
+	reportPayload := control.EagerUpdateReadinessReport{
+		HostID:           hostID,
+		EagerUpdateState: control.StateDeferredGitDirty,
+		OutdatedTools: []control.OutdatedToolInfo{
+			{ToolName: "iazio-harness", InstalledVersion: "0.0.1", TargetVersion: "0.0.2"},
+		},
+		BlockingDirtyRepos: []control.BlockingDirtyRepoInfo{
+			{RepoName: "workspace-fleet", SubRepoPath: "iazio-web", DirtyFilesCount: 2, Branch: "feature/foo"},
+		},
+		Details: "1 registered workspace is git dirty",
+	}
+	rawPayload, _ := json.Marshal(reportPayload)
+	reqPost := httptest.NewRequest("POST", "/v1/hosts/"+hostID+"/eager-readiness", bytes.NewReader(rawPayload))
+	wPost := httptest.NewRecorder()
+	handler.ServeHTTP(wPost, reqPost)
+	if wPost.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for post eager readiness, got %d: %s", wPost.Code, wPost.Body.String())
+	}
+
+	// 3. GET /v1/hosts/{host}/eager-readiness
+	reqGet := httptest.NewRequest("GET", "/v1/hosts/"+hostID+"/eager-readiness", nil)
+	wGet := httptest.NewRecorder()
+	handler.ServeHTTP(wGet, reqGet)
+	if wGet.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for get eager readiness, got %d: %s", wGet.Code, wGet.Body.String())
+	}
+	var fetchedReport control.EagerUpdateReadinessReport
+	if err := json.Unmarshal(wGet.Body.Bytes(), &fetchedReport); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if fetchedReport.EagerUpdateState != control.StateDeferredGitDirty {
+		t.Fatalf("expected state DEFERRED_GIT_DIRTY, got %s", fetchedReport.EagerUpdateState)
+	}
+	if len(fetchedReport.OutdatedTools) != 1 || fetchedReport.OutdatedTools[0].ToolName != "iazio-harness" {
+		t.Fatalf("expected 1 outdated tool iazio-harness, got %+v", fetchedReport.OutdatedTools)
+	}
+
+	// 4. GET /api/v1/agents/{host}/eager-readiness alias
+	reqAlias := httptest.NewRequest("GET", "/api/v1/agents/"+hostID+"/eager-readiness", nil)
+	wAlias := httptest.NewRecorder()
+	handler.ServeHTTP(wAlias, reqAlias)
+	if wAlias.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for alias get, got %d", wAlias.Code)
+	}
+
+	// 5. Host Detail contains eager_readiness
+	reqDetail := httptest.NewRequest("GET", "/v1/hosts/"+hostID, nil)
+	wDetail := httptest.NewRecorder()
+	handler.ServeHTTP(wDetail, reqDetail)
+	if wDetail.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for host detail, got %d", wDetail.Code)
+	}
+	var detailMap map[string]any
+	if err := json.Unmarshal(wDetail.Body.Bytes(), &detailMap); err != nil {
+		t.Fatalf("unmarshal detail error: %v", err)
+	}
+	hostObj, ok := detailMap["host"].(map[string]any)
+	if !ok || hostObj["eager_readiness"] == nil {
+		t.Fatalf("expected eager_readiness in host detail, got %+v", detailMap)
+	}
+
+	// 6. POST /v1/hosts/{host}/eager-update/evaluate
+	reqEval := httptest.NewRequest("POST", "/v1/hosts/"+hostID+"/eager-update/evaluate", nil)
+	wEval := httptest.NewRecorder()
+	handler.ServeHTTP(wEval, reqEval)
+	if wEval.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for evaluate, got %d: %s", wEval.Code, wEval.Body.String())
+	}
+
+	// 7. POST /v1/hosts/{host}/eager-update/force
+	reqForce := httptest.NewRequest("POST", "/v1/hosts/"+hostID+"/eager-update/force", nil)
+	wForce := httptest.NewRecorder()
+	handler.ServeHTTP(wForce, reqForce)
+	if wForce.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for force, got %d: %s", wForce.Code, wForce.Body.String())
+	}
+
+	hostDet, ok := e.GetHostDetail(hostID)
+	if !ok {
+		t.Fatalf("host detail not found")
+	}
+	var hasEval, hasForce bool
+	for _, cmd := range hostDet.Host.PendingCommands {
+		if cmd.Type == "EVALUATE_EAGER_UPDATE" {
+			hasEval = true
+		}
+		if cmd.Type == "FORCE_TOOL_UPDATE" {
+			hasForce = true
+		}
+	}
+	if !hasEval || !hasForce {
+		t.Fatalf("expected EVALUATE_EAGER_UPDATE and FORCE_TOOL_UPDATE commands, got %+v", hostDet.Host.PendingCommands)
+	}
+}
