@@ -4098,3 +4098,141 @@ func TestEngine_AssociatedJobsAndHistoricalScheduleLineage(t *testing.T) {
 	}
 }
 
+func TestHealingLifecycleAndOperatorControls(t *testing.T) {
+	e := NewEngine(time.Now)
+	e.RegisterHost("host-test", "Host Test", "permanent")
+	err := e.UpsertRepo(Repo{
+		HostID:       "host-test",
+		WorktreePath: "/repos/healing-test",
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+	if err != nil {
+		t.Fatalf("UpsertRepo failed: %v", err)
+	}
+
+	// 1. Initial state is QueueOpen
+	repo, ok := e.GetRepo("host-test", "/repos/healing-test")
+	if !ok || repo.Queue != QueueOpen {
+		t.Fatalf("expected repo in QueueOpen, got %+v", repo)
+	}
+
+	// 2. Start a job, then finish with incomplete ASE -> transitions to QueueHealing
+	p := e.PutPrompt(Prompt{
+		ID:     "p-healing",
+		Title:  "Test Story",
+		Body:   "Implement stuff",
+		Engine: "agent",
+		Status: "READY",
+	})
+	sch, err := e.ExecutePrompt(p.ID, "host-test", "/repos/healing-test", 1, nil)
+	if err != nil {
+		t.Fatalf("ExecutePrompt failed: %v", err)
+	}
+	job, _, _, ok := e.PollHost("host-test")
+	if !ok {
+		t.Fatalf("PollHost failed to lease job")
+	}
+
+	// Finish incomplete
+	e.ApplyFinish("host-test", "/repos/healing-test", job.ID, FinishInput{
+		ASEComplete:   false,
+		WorkPorcelain: "",
+	})
+	repo, _ = e.GetRepo("host-test", "/repos/healing-test")
+	if repo.Queue != QueueHealing {
+		t.Fatalf("expected QueueHealing after incomplete finish, got %s", repo.Queue)
+	}
+	if repo.HealingReasonCode != HealingReasonPostRunFailed {
+		t.Fatalf("expected HealingReasonPostRunFailed, got %s", repo.HealingReasonCode)
+	}
+	if repo.HealingAttemptCount != 1 {
+		t.Fatalf("expected HealingAttemptCount 1, got %d", repo.HealingAttemptCount)
+	}
+
+	// 3. Simulate healer runs and fails with non-zero exit code multiple times to trip circuit breaker
+	repo.MaxHealingAttempts = 3
+	e.repos[repoKey("host-test", "/repos/healing-test")] = &repo
+
+	// Simulate 2 more failures to reach max attempts (total 3)
+	for i := 2; i <= 3; i++ {
+		hSch, err := e.ExecutePrompt(p.ID, "host-test", "/repos/healing-test", 1, nil)
+		if err != nil {
+			t.Fatalf("ExecutePrompt failed: %v", err)
+		}
+		_ = hSch
+		hJob, _, _, leased := e.PollHost("host-test")
+		if !leased {
+			t.Fatalf("PollHost failed to lease healer job on attempt %d", i)
+		}
+		_ = e.PostExit(hJob.ID, 10, ExitOptions{Reason: "git clean failed"})
+	}
+
+	repo, _ = e.GetRepo("host-test", "/repos/healing-test")
+	if repo.Queue != QueuePaused || repo.Reason != ReasonHealFailed {
+		t.Fatalf("expected circuit breaker to pause queue with ReasonHealFailed, got queue=%s, reason=%s", repo.Queue, repo.Reason)
+	}
+
+	// 4. Operator RetryHealRepo
+	err = e.RetryHealRepo("host-test", "/repos/healing-test")
+	if err != nil {
+		t.Fatalf("RetryHealRepo failed: %v", err)
+	}
+	repo, _ = e.GetRepo("host-test", "/repos/healing-test")
+	if repo.Queue != QueueHealing {
+		t.Fatalf("expected QueueHealing after retry, got %s", repo.Queue)
+	}
+
+	// Verify command queued
+	hostObj := e.hosts["host-test"]
+	if len(hostObj.PendingCommands) == 0 || hostObj.PendingCommands[len(hostObj.PendingCommands)-1].Type != "HEAL_GIT_REPO" {
+		t.Fatalf("expected HEAL_GIT_REPO pending command, got %+v", hostObj.PendingCommands)
+	}
+
+	// 5. UpdateRepoRuntimeStatus arrives from agent with clean git state -> Auto-recovers to QueueOpen!
+	cleanStatus := RepoRuntimeStatus{
+		RepoPath:       "/repos/healing-test",
+		IsClean:        true,
+		Branch:         "main",
+		Ahead:          0,
+		Behind:         0,
+		MetadataYmlRaw: "name: test-repo\nversion: 1.0.0\n",
+		MetadataYmlSHA: "abc123sha",
+	}
+	e.UpdateRepoRuntimeStatus("host-test", []RepoRuntimeStatus{cleanStatus})
+
+	repo, _ = e.GetRepo("host-test", "/repos/healing-test")
+	if repo.Queue != QueueOpen {
+		t.Fatalf("expected auto-recovery to QueueOpen when clean, got %s", repo.Queue)
+	}
+	if repo.Reason != "" || repo.HealingReasonCode != "" {
+		t.Fatalf("expected cleared reason and healing code, got reason=%s, code=%s", repo.Reason, repo.HealingReasonCode)
+	}
+	if repo.MetadataYmlRaw != cleanStatus.MetadataYmlRaw {
+		t.Fatalf("expected snapshot metadata.yml to be recorded on repo")
+	}
+
+	// 6. ForceCleanGitRepo queues FORCE_CLEAN_GIT command
+	err = e.ForceCleanGitRepo("host-test", "/repos/healing-test")
+	if err != nil {
+		t.Fatalf("ForceCleanGitRepo failed: %v", err)
+	}
+	lastCmd := hostObj.PendingCommands[len(hostObj.PendingCommands)-1]
+	if lastCmd.Type != "FORCE_CLEAN_GIT" {
+		t.Fatalf("expected FORCE_CLEAN_GIT command, got %s", lastCmd.Type)
+	}
+
+	// 7. ClearHealingRepo sets Queue back to QueueOpen
+	repo.Queue = QueueHealing
+	e.repos[repoKey("host-test", "/repos/healing-test")] = &repo
+	err = e.ClearHealingRepo("host-test", "/repos/healing-test")
+	if err != nil {
+		t.Fatalf("ClearHealingRepo failed: %v", err)
+	}
+	repo, _ = e.GetRepo("host-test", "/repos/healing-test")
+	if repo.Queue != QueueOpen {
+		t.Fatalf("expected QueueOpen after ClearHealingRepo, got %s", repo.Queue)
+	}
+	_ = sch
+}
+

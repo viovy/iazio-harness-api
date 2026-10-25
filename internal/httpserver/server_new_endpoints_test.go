@@ -670,3 +670,45 @@ func TestServer_CheckFleetStatus_DirtyFilesFormatting(t *testing.T) {
 		t.Errorf("summary missing untracked file: %s", envelope.Result.DiagnosticSummary)
 	}
 }
+
+func TestServer_HealingOperatorEndpoints(t *testing.T) {
+	e := control.NewEngine(time.Now)
+	srv := &Server{Engine: e}
+	handler := srv.Handler()
+
+	e.RegisterHost("pc1", "pc1-windows", "permanent")
+	_ = e.UpsertRepo(control.Repo{
+		HostID:       "pc1",
+		WorktreePath: "C:\\work\\meta-repo-03",
+		Queue:        control.QueueHealing,
+	})
+
+	// 1. POST /v1/hosts/pc1/repos/retry-heal
+	reqRetry := httptest.NewRequest("POST", "/v1/hosts/pc1/repos/retry-heal?path=C:\\work\\meta-repo-03", nil)
+	wRetry := httptest.NewRecorder()
+	handler.ServeHTTP(wRetry, reqRetry)
+	if wRetry.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for retry-heal, got %d: %s", wRetry.Code, wRetry.Body.String())
+	}
+
+	// 2. POST /v1/hosts/pc1/repos/force-clean-git
+	reqClean := httptest.NewRequest("POST", "/v1/hosts/pc1/repos/force-clean-git?path=C:\\work\\meta-repo-03", nil)
+	wClean := httptest.NewRecorder()
+	handler.ServeHTTP(wClean, reqClean)
+	if wClean.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for force-clean-git, got %d: %s", wClean.Code, wClean.Body.String())
+	}
+
+	// 3. POST /v1/hosts/pc1/repos/clear-healing
+	reqClear := httptest.NewRequest("POST", "/v1/hosts/pc1/repos/clear-healing?path=C:\\work\\meta-repo-03", nil)
+	wClear := httptest.NewRecorder()
+	handler.ServeHTTP(wClear, reqClear)
+	if wClear.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for clear-healing, got %d: %s", wClear.Code, wClear.Body.String())
+	}
+
+	repo, ok := e.GetRepo("pc1", "C:\\work\\meta-repo-03")
+	if !ok || repo.Queue != control.QueueOpen {
+		t.Fatalf("expected repo queue to be OPEN after clear-healing, got %+v", repo)
+	}
+}

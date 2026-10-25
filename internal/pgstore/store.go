@@ -56,6 +56,17 @@ CREATE TABLE IF NOT EXISTS harness_repos (
 );
 
 ALTER TABLE harness_repos ADD COLUMN IF NOT EXISTS repo_alias text NOT NULL DEFAULT '';
+ALTER TABLE harness_repos ADD COLUMN IF NOT EXISTS healing_reason_code text NOT NULL DEFAULT '';
+ALTER TABLE harness_repos ADD COLUMN IF NOT EXISTS healing_reason_message text NOT NULL DEFAULT '';
+ALTER TABLE harness_repos ADD COLUMN IF NOT EXISTS healing_started_at timestamp with time zone;
+ALTER TABLE harness_repos ADD COLUMN IF NOT EXISTS healing_attempt_count integer NOT NULL DEFAULT 0;
+ALTER TABLE harness_repos ADD COLUMN IF NOT EXISTS max_healing_attempts integer NOT NULL DEFAULT 0;
+ALTER TABLE harness_repos ADD COLUMN IF NOT EXISTS last_healing_error text NOT NULL DEFAULT '';
+ALTER TABLE harness_repos ADD COLUMN IF NOT EXISTS active_healer_run_id text NOT NULL DEFAULT '';
+ALTER TABLE harness_repos ADD COLUMN IF NOT EXISTS metadata_yml_raw text NOT NULL DEFAULT '';
+ALTER TABLE harness_repos ADD COLUMN IF NOT EXISTS metadata_yml_sha text NOT NULL DEFAULT '';
+ALTER TABLE harness_repos ADD COLUMN IF NOT EXISTS metadata_yml_mod_time text NOT NULL DEFAULT '';
+ALTER TABLE harness_repos ADD COLUMN IF NOT EXISTS git_version text NOT NULL DEFAULT '';
 CREATE UNIQUE INDEX IF NOT EXISTS harness_repos_host_alias_idx ON harness_repos (host_id, lower(repo_alias)) WHERE repo_alias <> '';
 
 CREATE TABLE IF NOT EXISTS harness_hosts (
@@ -376,9 +387,19 @@ func (s *Store) SaveRepo(ctx context.Context, r control.Repo) error {
 		return nil
 	}
 	alias := r.EffectiveAlias()
+	var healingStartedAt *time.Time
+	if !r.HealingStartedAt.IsZero() {
+		healingStartedAt = &r.HealingStartedAt
+	}
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO harness_repos (host_id, worktree_path, docs_hub_path, clone_url, default_branch, queue, lock, reason, healing_attempts, porcelain, discard_pending, repo_alias)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+INSERT INTO harness_repos (
+  host_id, worktree_path, docs_hub_path, clone_url, default_branch, queue, lock, reason,
+  healing_attempts, porcelain, discard_pending, repo_alias,
+  healing_reason_code, healing_reason_message, healing_started_at, healing_attempt_count,
+  max_healing_attempts, last_healing_error, active_healer_run_id,
+  metadata_yml_raw, metadata_yml_sha, metadata_yml_mod_time, git_version
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
 ON CONFLICT (host_id, worktree_path) DO UPDATE SET
   docs_hub_path = EXCLUDED.docs_hub_path,
   clone_url = EXCLUDED.clone_url,
@@ -389,8 +410,23 @@ ON CONFLICT (host_id, worktree_path) DO UPDATE SET
   healing_attempts = EXCLUDED.healing_attempts,
   porcelain = EXCLUDED.porcelain,
   discard_pending = EXCLUDED.discard_pending,
-  repo_alias = EXCLUDED.repo_alias
-`, r.HostID, r.WorktreePath, r.DocsHubPath, r.CloneURL, r.DefaultBranch, r.Queue, r.Lock, r.Reason, r.HealingAttempts, r.Porcelain, r.DiscardPending, alias)
+  repo_alias = EXCLUDED.repo_alias,
+  healing_reason_code = EXCLUDED.healing_reason_code,
+  healing_reason_message = EXCLUDED.healing_reason_message,
+  healing_started_at = EXCLUDED.healing_started_at,
+  healing_attempt_count = EXCLUDED.healing_attempt_count,
+  max_healing_attempts = EXCLUDED.max_healing_attempts,
+  last_healing_error = EXCLUDED.last_healing_error,
+  active_healer_run_id = EXCLUDED.active_healer_run_id,
+  metadata_yml_raw = EXCLUDED.metadata_yml_raw,
+  metadata_yml_sha = EXCLUDED.metadata_yml_sha,
+  metadata_yml_mod_time = EXCLUDED.metadata_yml_mod_time,
+  git_version = EXCLUDED.git_version
+`, r.HostID, r.WorktreePath, r.DocsHubPath, r.CloneURL, r.DefaultBranch, r.Queue, r.Lock, r.Reason,
+		r.HealingAttempts, r.Porcelain, r.DiscardPending, alias,
+		r.HealingReasonCode, r.HealingReasonMessage, healingStartedAt, r.HealingAttemptCount,
+		r.MaxHealingAttempts, r.LastHealingError, r.ActiveHealerRunID,
+		r.MetadataYmlRaw, r.MetadataYmlSHA, r.MetadataYmlModTime, r.GitVersion)
 	if err != nil {
 		return fmt.Errorf("save repo: %w", err)
 	}
@@ -415,7 +451,12 @@ func (s *Store) LoadRepos(ctx context.Context) ([]control.Repo, error) {
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT host_id, worktree_path, docs_hub_path, clone_url, default_branch, queue, lock, reason, healing_attempts, porcelain, discard_pending, repo_alias
+SELECT
+  host_id, worktree_path, docs_hub_path, clone_url, default_branch, queue, lock, reason,
+  healing_attempts, porcelain, discard_pending, repo_alias,
+  healing_reason_code, healing_reason_message, healing_started_at, healing_attempt_count,
+  max_healing_attempts, last_healing_error, active_healer_run_id,
+  metadata_yml_raw, metadata_yml_sha, metadata_yml_mod_time, git_version
 FROM harness_repos ORDER BY host_id, worktree_path
 `)
 	if err != nil {
@@ -426,8 +467,18 @@ FROM harness_repos ORDER BY host_id, worktree_path
 	var out []control.Repo
 	for rows.Next() {
 		var r control.Repo
-		if err := rows.Scan(&r.HostID, &r.WorktreePath, &r.DocsHubPath, &r.CloneURL, &r.DefaultBranch, &r.Queue, &r.Lock, &r.Reason, &r.HealingAttempts, &r.Porcelain, &r.DiscardPending, &r.RepoAlias); err != nil {
+		var healingStartedAt *time.Time
+		if err := rows.Scan(
+			&r.HostID, &r.WorktreePath, &r.DocsHubPath, &r.CloneURL, &r.DefaultBranch, &r.Queue, &r.Lock, &r.Reason,
+			&r.HealingAttempts, &r.Porcelain, &r.DiscardPending, &r.RepoAlias,
+			&r.HealingReasonCode, &r.HealingReasonMessage, &healingStartedAt, &r.HealingAttemptCount,
+			&r.MaxHealingAttempts, &r.LastHealingError, &r.ActiveHealerRunID,
+			&r.MetadataYmlRaw, &r.MetadataYmlSHA, &r.MetadataYmlModTime, &r.GitVersion,
+		); err != nil {
 			return nil, err
+		}
+		if healingStartedAt != nil {
+			r.HealingStartedAt = *healingStartedAt
 		}
 		out = append(out, r)
 	}

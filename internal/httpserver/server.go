@@ -314,6 +314,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/agents/{host}/repos/check-fleet-status", s.checkFleetStatus)
 	mux.HandleFunc("POST /v1/hosts/{host}/repos/heal-ase", s.healASERepo)
 	mux.HandleFunc("POST /api/v1/agents/{host}/repos/heal-ase", s.healASERepo)
+	mux.HandleFunc("POST /v1/hosts/{host}/repos/retry-heal", s.retryHealRepo)
+	mux.HandleFunc("POST /api/v1/agents/{host}/repos/retry-heal", s.retryHealRepo)
+	mux.HandleFunc("POST /v1/hosts/{host}/repos/force-clean-git", s.forceCleanGitRepo)
+	mux.HandleFunc("POST /api/v1/agents/{host}/repos/force-clean-git", s.forceCleanGitRepo)
+	mux.HandleFunc("POST /v1/hosts/{host}/repos/clear-healing", s.clearHealingRepo)
+	mux.HandleFunc("POST /api/v1/agents/{host}/repos/clear-healing", s.clearHealingRepo)
 	mux.HandleFunc("POST /v1/hosts/{host}/repos/status", s.updateRepoRuntimeStatus)
 	mux.HandleFunc("GET /v1/fleet/tool-priority", s.getToolPriority)
 	mux.HandleFunc("PUT /v1/fleet/tool-priority", s.setToolPriority)
@@ -3010,6 +3016,108 @@ func (s *Server) healASERepo(w http.ResponseWriter, r *http.Request) {
 		"locks_cleared": locksCleared,
 		"status":        "dispatched",
 		"healed_at":     time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+func (s *Server) retryHealRepo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	hostID := r.PathValue("host")
+	targetPath := strings.TrimSpace(r.URL.Query().Get("path"))
+	if targetPath == "" {
+		var req struct {
+			Path string `json:"path"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		targetPath = strings.TrimSpace(req.Path)
+	}
+	if err := s.Engine.RetryHealRepo(hostID, targetPath); err != nil {
+		if errors.Is(err, control.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, err)
+		} else {
+			writeErr(w, http.StatusBadRequest, err)
+		}
+		return
+	}
+	if s.SaveRepo != nil {
+		if repo, ok := s.Engine.GetRepo(hostID, targetPath); ok {
+			s.SaveRepo(repo)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"host_id":   hostID,
+		"repo_path": targetPath,
+		"status":    "healing_retried",
+	})
+}
+
+func (s *Server) forceCleanGitRepo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	hostID := r.PathValue("host")
+	targetPath := strings.TrimSpace(r.URL.Query().Get("path"))
+	if targetPath == "" {
+		var req struct {
+			Path string `json:"path"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		targetPath = strings.TrimSpace(req.Path)
+	}
+	if err := s.Engine.ForceCleanGitRepo(hostID, targetPath); err != nil {
+		if errors.Is(err, control.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, err)
+		} else {
+			writeErr(w, http.StatusBadRequest, err)
+		}
+		return
+	}
+	if s.SaveRepo != nil {
+		if repo, ok := s.Engine.GetRepo(hostID, targetPath); ok {
+			s.SaveRepo(repo)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"host_id":   hostID,
+		"repo_path": targetPath,
+		"status":    "force_clean_dispatched",
+	})
+}
+
+func (s *Server) clearHealingRepo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	hostID := r.PathValue("host")
+	targetPath := strings.TrimSpace(r.URL.Query().Get("path"))
+	if targetPath == "" {
+		var req struct {
+			Path string `json:"path"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		targetPath = strings.TrimSpace(req.Path)
+	}
+	if err := s.Engine.ClearHealingRepo(hostID, targetPath); err != nil {
+		if errors.Is(err, control.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, err)
+		} else {
+			writeErr(w, http.StatusBadRequest, err)
+		}
+		return
+	}
+	if s.SaveRepo != nil {
+		if repo, ok := s.Engine.GetRepo(hostID, targetPath); ok {
+			s.SaveRepo(repo)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"host_id":   hostID,
+		"repo_path": targetPath,
+		"status":    "healing_cleared",
 	})
 }
 

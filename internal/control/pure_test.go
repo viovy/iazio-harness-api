@@ -93,12 +93,12 @@ func TestDecidePreflight(t *testing.T) {
 func TestDecideFinish(t *testing.T) {
 	clean := FinishInput{Kind: KindOrdinary}
 	d := DecideFinish(clean)
-	if d.Queue != QueueHealing || !d.LeaseResume || d.HealingAttempts != 1 {
+	if d.Queue != QueueHealing || !d.LeaseResume || d.HealingAttempts != 1 || d.HealingReasonCode != HealingReasonPostRunFailed {
 		t.Fatalf("first heal: %+v", d)
 	}
 	clean.HealingAttempts = 1
 	d = DecideFinish(clean)
-	if d.Queue != QueuePaused || d.LeaseResume {
+	if d.Queue != QueuePaused || d.LeaseResume || d.Reason != ReasonHealFailed {
 		t.Fatalf("second: %+v", d)
 	}
 	done := FinishInput{Kind: KindOrdinary, ASEComplete: true}
