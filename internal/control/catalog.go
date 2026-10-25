@@ -87,6 +87,28 @@ func (e *Engine) ConsumePendingToolUpdate(hostID string) *PendingToolUpdate {
 	return res
 }
 
+// DeleteTool removes a tool from the host's tool list.
+func (e *Engine) DeleteTool(hostID, toolName string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	h, ok := e.hosts[hostID]
+	if !ok {
+		return ErrNotFound
+	}
+	idx := -1
+	for i, t := range h.Tools {
+		if strings.EqualFold(t.Name, toolName) {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return ErrNotFound
+	}
+	h.Tools = append(h.Tools[:idx], h.Tools[idx+1:]...)
+	return nil
+}
+
 // QueueCommand registers a command to be delivered to the host on its next check/heartbeat.
 func (e *Engine) QueueCommand(hostID string, cmd CommandEnvelope) error {
 	e.mu.Lock()

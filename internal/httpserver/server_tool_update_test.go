@@ -601,3 +601,81 @@ func TestServer_EagerUpdateTelemetry(t *testing.T) {
 		t.Fatalf("expected eager_update_enabled true in host tools, got false")
 	}
 }
+
+
+func TestServer_DeleteAgentTool(t *testing.T) {
+	e := control.NewEngine(time.Now)
+	savedHosts := 0
+	srv := &Server{
+		Engine: e,
+		SaveHost: func(h control.Host) {
+			savedHosts++
+		},
+	}
+	handler := srv.Handler()
+
+	_ = e.RegisterHost("pc1", "workstation")
+	hbBody := `{"presence":"ONLINE","tools":[{"name":"tool1","version":"1.0.0","status":"OK"},{"name":"tool2","version":"2.0.0","status":"OK"}]}`
+	recHB := httptest.NewRecorder()
+	handler.ServeHTTP(recHB, httptest.NewRequest("POST", "/v1/hosts/pc1/heartbeat", bytes.NewReader([]byte(hbBody))))
+	if recHB.Code != http.StatusOK {
+		t.Fatalf("expected 200 on heartbeat, got %d: %s", recHB.Code, recHB.Body.String())
+	}
+
+	// 1. DELETE /api/v1/agents/pc1/tools/tool1
+	recDel := httptest.NewRecorder()
+	handler.ServeHTTP(recDel, httptest.NewRequest("DELETE", "/api/v1/agents/pc1/tools/tool1", nil))
+	if recDel.Code != http.StatusOK {
+		t.Fatalf("expected 200 on delete tool1, got %d: %s", recDel.Code, recDel.Body.String())
+	}
+	if savedHosts == 0 {
+		t.Fatalf("expected SaveHost to be invoked on tool deletion")
+	}
+
+	// 2. Query /api/v1/agents/pc1/tools -> tool1 is gone, tool2 remains
+	recTools := httptest.NewRecorder()
+	handler.ServeHTTP(recTools, httptest.NewRequest("GET", "/api/v1/agents/pc1/tools", nil))
+	if recTools.Code != http.StatusOK {
+		t.Fatalf("expected 200 on get tools, got %d", recTools.Code)
+	}
+	var toolsResp struct {
+		Tools []struct {
+			Name string `json:"name"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(recTools.Body.Bytes(), &toolsResp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(toolsResp.Tools) != 1 || toolsResp.Tools[0].Name != "tool2" {
+		t.Fatalf("expected 1 remaining tool named tool2, got %+v", toolsResp.Tools)
+	}
+
+	// 3. DELETE /v1/hosts/pc1/tools/tool2
+	recDel2 := httptest.NewRecorder()
+	handler.ServeHTTP(recDel2, httptest.NewRequest("DELETE", "/v1/hosts/pc1/tools/tool2", nil))
+	if recDel2.Code != http.StatusOK {
+		t.Fatalf("expected 200 on delete tool2, got %d: %s", recDel2.Code, recDel2.Body.String())
+	}
+
+	// 4. Query again -> 0 tools
+	recTools2 := httptest.NewRecorder()
+	handler.ServeHTTP(recTools2, httptest.NewRequest("GET", "/api/v1/agents/pc1/tools", nil))
+	_ = json.Unmarshal(recTools2.Body.Bytes(), &toolsResp)
+	if len(toolsResp.Tools) != 0 {
+		t.Fatalf("expected 0 tools, got %+v", toolsResp.Tools)
+	}
+
+	// 5. DELETE non-existent tool -> 404
+	recDel3 := httptest.NewRecorder()
+	handler.ServeHTTP(recDel3, httptest.NewRequest("DELETE", "/api/v1/agents/pc1/tools/nonexistent", nil))
+	if recDel3.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 on nonexistent tool, got %d", recDel3.Code)
+	}
+
+	// 6. DELETE on nonexistent host -> 404
+	recDel4 := httptest.NewRecorder()
+	handler.ServeHTTP(recDel4, httptest.NewRequest("DELETE", "/api/v1/agents/unknown-host/tools/tool1", nil))
+	if recDel4.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 on nonexistent host, got %d", recDel4.Code)
+	}
+}

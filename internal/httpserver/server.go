@@ -302,6 +302,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/hosts/{id}", s.hostDetail)
 	mux.HandleFunc("GET /api/v1/agents/{id}/tools", s.getAgentTools)
 	mux.HandleFunc("GET /v1/hosts/{id}/tools", s.getAgentTools)
+	mux.HandleFunc("DELETE /v1/hosts/{id}/tools/{tool}", s.deleteAgentTool)
+	mux.HandleFunc("DELETE /api/v1/agents/{id}/tools/{tool}", s.deleteAgentTool)
+	mux.HandleFunc("DELETE /api/agents/{id}/tools/{tool}", s.deleteAgentTool)
 	mux.HandleFunc("GET /api/v1/agents/{host}/jobs/{id}", s.getJob)
 	mux.HandleFunc("GET /api/v1/agents/{host}/{repo}/jobs/{id}", s.getJob)
 	mux.HandleFunc("GET /api/v1/agents/{rest...}", s.getAgentRest)
@@ -1786,6 +1789,37 @@ func (s *Server) getAgentTools(w http.ResponseWriter, r *http.Request) {
 		resp["last_eager_update_at"] = detail.Host.LastEagerUpdateAt.Format(time.RFC3339)
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) deleteAgentTool(w http.ResponseWriter, r *http.Request) {
+	hostID := r.PathValue("id")
+	if hostID == "" {
+		hostID = r.PathValue("host")
+	}
+	toolName := r.PathValue("tool")
+	if hostID == "" || toolName == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("host and tool name are required"))
+		return
+	}
+	if err := s.Engine.DeleteTool(hostID, toolName); err != nil {
+		code := http.StatusConflict
+		if errors.Is(err, control.ErrNotFound) {
+			code = http.StatusNotFound
+		}
+		writeErr(w, code, err)
+		return
+	}
+	if s.SaveHost != nil {
+		if detail, ok := s.Engine.GetHostDetail(hostID); ok {
+			s.SaveHost(detail.Host)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "deleted",
+		"host":    hostID,
+		"tool":    toolName,
+		"message": fmt.Sprintf("tool %s removed from host %s", toolName, hostID),
+	})
 }
 
 func (s *Server) reconcileLineage(w http.ResponseWriter, r *http.Request) {
