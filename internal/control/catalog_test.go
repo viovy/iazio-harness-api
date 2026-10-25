@@ -1,6 +1,7 @@
 package control
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -372,3 +373,102 @@ func TestCatalogAdditionalCoverage(t *testing.T) {
 		t.Errorf("expected success for idle repo discard hub, got %v", err)
 	}
 }
+
+func TestCatalog_SynthesizeLogsAndCoverage(t *testing.T) {
+	e := NewEngine(nil)
+
+	// 1. GetPrompt
+	e.PutPrompt(Prompt{ID: "p-test", Title: "Title 1", Body: "Body 1"})
+	p, ok := e.GetPrompt("p-test")
+	if !ok || p.ID != "p-test" {
+		t.Errorf("GetPrompt p-test failed: %v, %v", p, ok)
+	}
+	_, ok = e.GetPrompt("nonexistent-p")
+	if ok {
+		t.Errorf("expected false for missing prompt, got true")
+	}
+
+	// 2. RepoCounts & ActiveJobsCount
+	_ = e.UpsertRepo(Repo{HostID: "h1", WorktreePath: "/work/r1", Lock: LockIdle})
+	_ = e.UpsertRepo(Repo{HostID: "h1", WorktreePath: "/work/r2", Lock: LockRunning})
+	idle, running, paused := e.RepoCounts()
+	if idle+running+paused != 2 {
+		t.Errorf("unexpected RepoCounts sum: %d, %d, %d", idle, running, paused)
+	}
+
+	ajc := e.ActiveJobsCount()
+	if ajc != 0 {
+		t.Errorf("expected 0 active jobs initially, got %d", ajc)
+	}
+
+	// 3. JobLogs when raw logs exist
+	e.AppendLog("j-raw", LogChunk{Seq: 1, Stream: "stdout", Text: "raw log"})
+	rawLogs := e.JobLogs("j-raw", 1, "", 0, 0)
+	if len(rawLogs.Chunks) != 1 || rawLogs.Chunks[0].Text != "raw log" {
+		t.Errorf("expected raw log, got %+v", rawLogs)
+	}
+
+	// 4. JobLogs synthesized from active job in e.jobs
+	e.schedules["sch-active"] = &Schedule{
+		ID:           "sch-active",
+		WorktreePath: "/work/r1",
+		Engine:       "agy",
+		StoryID:      "STORY-111",
+		PromptTitle:  "Run story 111",
+	}
+	e.jobs["j-active"] = &Job{
+		ID:                   "j-active",
+		ScheduleID:           "sch-active",
+		ActiveConversationID: "conv-123",
+		Status:               "RUNNING",
+		TargetHost:           "h1",
+		Kind:                 "resume",
+		ParentJobID:          "j-parent",
+		RootJobID:            "j-root",
+		HarnessPID:           101,
+		ToolPID:              102,
+		ElapsedSeconds:       45,
+		ResumeCount:          1,
+		WorkspaceDirtyFiles:  []string{"file1.go"},
+		InterruptedASEState:  map[string]any{"phase": "TDD", "story_id": "STORY-111"},
+	}
+	activeSynth := e.JobLogs("j-active", 1, "", 0, 0)
+	if len(activeSynth.Chunks) != 1 || !strings.Contains(activeSynth.Chunks[0].Text, "[ASE-SUPERVISOR]") {
+		t.Errorf("expected synthesized supervisor log for active job, got %+v", activeSynth)
+	}
+
+	// 5. JobLogs synthesized from history row
+	historyKey := "h1\x00/work/r1"
+	e.history[historyKey] = []HistoryRow{
+		{
+			JobID:                 "j-hist-auto",
+			ParentJobID:           "j-parent-001",
+			RootJobID:             "j-root-001",
+			ActiveConversationID:  "conv-hist-456",
+			Status:                "FAILED",
+			Reason:                "watchdog_timeout",
+			TerminationReasonCode: "TIMEOUT",
+			ExitCode:              1,
+			PromptTitle:           "Historic story prompt",
+			CreatedAt:             time.Now(),
+			AutoResumeCount:       2,
+			HarnessPID:            201,
+			ToolPID:               202,
+			WorkspaceDirtyFiles:   []string{"dirty.go"},
+			InterruptedASEState:   map[string]any{"phase": "REVIEW", "story_id": "STORY-HIST"},
+			Engine:                "agy",
+			Resumable:             true,
+		},
+	}
+	histSynth := e.JobLogs("j-hist-auto", 1, "", 0, 0)
+	if len(histSynth.Chunks) != 1 || !strings.Contains(histSynth.Chunks[0].Text, "Automatic Resume") {
+		t.Errorf("expected synthesized auto-resume supervisor log for history job, got %+v", histSynth)
+	}
+
+	// 6. JobLogs for completely nonexistent job
+	noneSynth := e.JobLogs("j-completely-unknown", 1, "", 0, 0)
+	if len(noneSynth.Chunks) != 0 {
+		t.Errorf("expected empty logs for unknown job, got %+v", noneSynth)
+	}
+}
+
