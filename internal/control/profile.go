@@ -1,8 +1,12 @@
 package control
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -450,34 +454,93 @@ func (e *Engine) ScanRepoProfile(hostID, repoPath, profileName string) (*Distrib
 	}
 	repo, ok := e.repos[repoKey(hostID, repoPath)]
 	if !ok || repo == nil {
+		for _, candidate := range e.repos {
+			if candidate.HostID == hostID && (candidate.EffectiveAlias() == repoPath || candidate.WorktreePath == repoPath || filepath.Base(candidate.WorktreePath) == repoPath) {
+				repo = candidate
+				repoPath = candidate.WorktreePath
+				ok = true
+				break
+			}
+		}
+	}
+	if !ok || repo == nil {
 		e.mu.Unlock()
 		return nil, fmt.Errorf("requirement criteria not met: repository %q is not configured for host %q", repoPath, hostID)
 	}
 	existingProfile := repo.DistributionProfile
+	repoCopy := *repo
 	e.mu.Unlock()
 
-	// Read metadata.yml from repo
+	var raw []byte
+	var version string
+	var scanSource string
+
+	// Tier 1: Local Filesystem Check
 	metaFile := filepath.Join(repoPath, "metadata.yml")
-	raw, err := os.ReadFile(metaFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("requirement criteria not met: metadata.yml not found in %s (host %q may be remote): %w", repoPath, hostID, err)
+	if b, err := os.ReadFile(metaFile); err == nil && len(b) > 0 {
+		raw = b
+		scanSource = fmt.Sprintf("local:%s", repoPath)
+		cmd := exec.Command("git", "describe", "--tags", "--always")
+		cmd.Dir = repoPath
+		if out, err := cmd.Output(); err == nil && len(out) > 0 {
+			version = strings.TrimSpace(string(out))
 		}
-		return nil, fmt.Errorf("requirement criteria not met: metadata.yml not found in %s: %w", repoPath, err)
+	}
+
+	// Tier 2: Agent Repo Snapshot Sync (cached or live RPC fetch)
+	if len(raw) == 0 && repoCopy.MetadataYmlRaw != "" {
+		raw = []byte(repoCopy.MetadataYmlRaw)
+		version = repoCopy.GitVersion
+		scanSource = fmt.Sprintf("agent-snapshot:%s:%s", hostID, filepath.Base(repoPath))
+	}
+
+	if len(raw) == 0 {
+		e.mu.Lock()
+		h := e.hosts[hostID]
+		isOnline := h != nil && strings.HasPrefix(h.Presence, "ONLINE")
+		e.mu.Unlock()
+
+		if isOnline {
+			probeID := fmt.Sprintf("fetch-meta-%d", time.Now().UnixNano())
+			waiterKey, waiterCh := e.RegisterRepoStatusWaiter(hostID, repoCopy.WorktreePath)
+			defer e.DeregisterRepoStatusWaiter(waiterKey)
+
+			_ = e.QueueCommand(hostID, CommandEnvelope{
+				ID:        probeID,
+				Type:      "FETCH_METADATA_YML",
+				Payload:   repoCopy.WorktreePath,
+				CreatedAt: time.Now().UTC().Format(time.RFC3339),
+			})
+
+			select {
+			case st := <-waiterCh:
+				if st.MetadataYmlRaw != "" {
+					raw = []byte(st.MetadataYmlRaw)
+					version = st.GitVersion
+					scanSource = fmt.Sprintf("agent-live:%s:%s", hostID, filepath.Base(repoPath))
+				}
+			case <-time.After(3 * time.Second):
+			}
+		}
+	}
+
+	// Tier 3: Upstream Git / GitHub API Fallback
+	if len(raw) == 0 && strings.TrimSpace(repoCopy.CloneURL) != "" {
+		cloneURL := strings.TrimSpace(repoCopy.CloneURL)
+		if b, ver, err := fetchGitHubMetadataYml(context.Background(), cloneURL, e.Releases); err == nil && len(b) > 0 {
+			raw = b
+			version = ver
+			scanSource = fmt.Sprintf("github-upstream:%s", cloneURL)
+		}
+	}
+
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("requirement criteria not met: metadata.yml not found in %s (host %q may be remote and agent snapshot not yet received): ensure iazio-agent is online and has scanned repo", repoPath, hostID)
 	}
 
 	profile, err := parseFleetDistribution(raw)
 	if err != nil {
 		return nil, fmt.Errorf("requirement criteria not met: %w", err)
-	}
-
-	// Autodetect version via Git Flow (git describe --tags --always)
-	cmd := exec.Command("git", "describe", "--tags", "--always")
-	cmd.Dir = repoPath
-	out, err := cmd.Output()
-	version := strings.TrimSpace(string(out))
-	if err != nil || version == "" {
-		version = "unknown"
 	}
 
 	pName := strings.TrimSpace(profileName)
@@ -488,11 +551,15 @@ func (e *Engine) ScanRepoProfile(hostID, repoPath, profileName string) (*Distrib
 		pName = "generic"
 	}
 
+	if version == "" {
+		version = "unknown"
+	}
+
 	profile.Name = pName
 	profile.Version = version
 	profile.SourceRepo = repoPath
 	profile.SourceHost = hostID
-	profile.Description = fmt.Sprintf("Scanned from %s on host %s (git flow: %s)", filepath.Base(repoPath), hostID, version)
+	profile.Description = fmt.Sprintf("Scanned from %s on host %s (%s, git flow: %s)", filepath.Base(repoPath), hostID, scanSource, version)
 	profile.IsDefault = (pName == "generic")
 
 	upserted, err := e.UpsertProfile(*profile)
@@ -507,7 +574,103 @@ func (e *Engine) ScanRepoProfile(hostID, repoPath, profileName string) (*Distrib
 	}
 	e.mu.Unlock()
 
+	// Trigger release reconciliation asynchronously if release service is available
+	if e.Releases != nil {
+		go func() {
+			_, _ = e.Releases.SyncProfile(context.Background(), e, pName, nil)
+		}()
+	}
+
 	return upserted, nil
+}
+
+func fetchGitHubMetadataYml(ctx context.Context, cloneURL string, relService *ReleaseService) ([]byte, string, error) {
+	clean := strings.TrimSpace(cloneURL)
+	if clean == "" {
+		clean = "https://github.com/viovy/meta-repo"
+	}
+	repo := extractGitHubRepo(clean)
+	if repo == "" {
+		repo = "viovy/meta-repo"
+	}
+
+	client := &http.Client{Timeout: 6 * time.Second}
+	var token string
+	if relService != nil {
+		token = relService.tokenForRepo(repo)
+	}
+	if token == "" {
+		token = os.Getenv("GITHUB_TOKEN")
+		if token == "" {
+			token = os.Getenv("GH_TOKEN")
+		}
+	}
+
+	for _, branch := range []string{"main", "master"} {
+		rawURL := fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/metadata.yml", repo, branch)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if err != nil {
+			continue
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				body, rerr := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+				if rerr == nil && len(body) > 0 {
+					version := fetchGitHubLatestVersion(ctx, client, repo, token)
+					return body, version, nil
+				}
+			}
+		}
+	}
+	return nil, "", errors.New("metadata.yml not accessible via upstream GitHub")
+}
+
+func fetchGitHubLatestVersion(ctx context.Context, client *http.Client, repo, token string) string {
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err == nil {
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		req.Header.Set("Accept", "application/vnd.github.v3+json")
+		if resp, err := client.Do(req); err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				var r struct {
+					TagName string `json:"tag_name"`
+				}
+				if json.NewDecoder(resp.Body).Decode(&r) == nil && r.TagName != "" {
+					return r.TagName
+				}
+			}
+		}
+	}
+	return "upstream"
+}
+
+func extractGitHubRepo(rawURL string) string {
+	u := strings.TrimSpace(rawURL)
+	u = strings.TrimSuffix(u, ".git")
+	if strings.Contains(u, "github.com/") {
+		parts := strings.Split(u, "github.com/")
+		if len(parts) >= 2 {
+			return strings.Trim(parts[1], "/")
+		}
+	} else if strings.Contains(u, "github.com:") {
+		parts := strings.Split(u, "github.com:")
+		if len(parts) >= 2 {
+			return strings.Trim(parts[1], "/")
+		}
+	}
+	if strings.Count(u, "/") == 1 && !strings.Contains(u, ":") {
+		return u
+	}
+	return ""
 }
 
 // GetManifest produces a machine-targeted manifest for a profile.

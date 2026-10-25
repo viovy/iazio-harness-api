@@ -35,6 +35,17 @@ CREATE TABLE IF NOT EXISTS harness_repos (
   porcelain text NOT NULL DEFAULT '',
   discard_pending boolean NOT NULL DEFAULT false,
   repo_alias text NOT NULL DEFAULT '',
+  healing_reason_code text NOT NULL DEFAULT '',
+  healing_reason_message text NOT NULL DEFAULT '',
+  healing_started_at timestamp with time zone,
+  healing_attempt_count integer NOT NULL DEFAULT 0,
+  max_healing_attempts integer NOT NULL DEFAULT 0,
+  last_healing_error text NOT NULL DEFAULT '',
+  active_healer_run_id text NOT NULL DEFAULT '',
+  metadata_yml_raw text NOT NULL DEFAULT '',
+  metadata_yml_sha text NOT NULL DEFAULT '',
+  metadata_yml_mod_time text NOT NULL DEFAULT '',
+  git_version text NOT NULL DEFAULT '',
   PRIMARY KEY (host_id, worktree_path)
 );
 

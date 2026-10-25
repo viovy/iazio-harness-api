@@ -304,6 +304,10 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 	if !d.Repo.LockExpiresAt.IsZero() {
 		lockExpiresAt = d.Repo.LockExpiresAt.UTC().Format(time.RFC3339)
 	}
+	var healingStartedAt any
+	if !d.Repo.HealingStartedAt.IsZero() {
+		healingStartedAt = d.Repo.HealingStartedAt.UTC().Format(time.RFC3339)
+	}
 
 	return map[string]any{
 		"host_id":                         d.Repo.HostID,
@@ -326,6 +330,13 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 		"dirty_review_file":               d.Repo.DirtyReviewFile,
 		"detected_conversation_id":        d.Repo.DetectedConversationID,
 		"detected_verdict":                d.Repo.DetectedVerdict,
+		"healing_reason_code":             d.Repo.HealingReasonCode,
+		"healing_reason_message":          d.Repo.HealingReasonMessage,
+		"healing_started_at":              healingStartedAt,
+		"healing_attempt_count":           d.Repo.HealingAttemptCount,
+		"max_healing_attempts":            d.Repo.MaxHealingAttempts,
+		"last_healing_error":              d.Repo.LastHealingError,
+		"active_healer_run_id":            d.Repo.ActiveHealerRunID,
 		"running_job":                     running,
 		"schedules":                       schedules,
 		"global_schedules":                globalSchedules,
