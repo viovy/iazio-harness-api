@@ -333,6 +333,78 @@ func TestRepoResumeAndHistory(t *testing.T) {
 		t.Fatalf("expected running_job conversation_ids to include conv-test-123, got: %v", running["conversation_ids"])
 	}
 
+	// Verify GET /api/v1/conversations/:id/rehydration-bundle
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/conversations/conv-test-123/rehydration-bundle", nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /api/v1/conversations/conv-test-123/rehydration-bundle, got: %d", rr.Code)
+	}
+	var bundle map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &bundle); err != nil {
+		t.Fatalf("failed to unmarshal rehydration bundle: %v", err)
+	}
+	if bundle["conversation_id"] != "conv-test-123" {
+		t.Errorf("expected conversation_id conv-test-123, got: %v", bundle["conversation_id"])
+	}
+	if bundle["bootstrap_prompt"] == "" {
+		t.Errorf("expected non-empty bootstrap_prompt in rehydration bundle")
+	}
+
+	// Also verify /v1/conversations/:id/rehydration-bundle
+	req = httptest.NewRequest(http.MethodGet, "/v1/conversations/conv-test-123/rehydration-bundle", nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /v1/conversations/conv-test-123/rehydration-bundle, got: %d", rr.Code)
+	}
+
+	// Verify POST /v1/jobs/:id/readiness
+	readinessPayload, _ := json.Marshal(map[string]any{
+		"reap_result": map[string]any{
+			"orphans_reaped": 2,
+			"locks_released": 1,
+		},
+		"workspace_state_manifest": map[string]any{
+			"clean_locks":           true,
+			"preserved_files_count": 3,
+			"modified_submodules":   []string{"iazio-agent"},
+		},
+		"rehydration_status": map[string]any{
+			"hydrated":               true,
+			"source_conversation_id": "conv-test-123",
+			"turns_count":            15,
+			"ase_phase":              "IMPLEMENTATION",
+		},
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/readiness", bytes.NewReader(readinessPayload))
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /v1/jobs/%s/readiness, got: %d (%s)", job.ID, rr.Code, rr.Body.String())
+	}
+
+	// Verify GET /v1/jobs/:id includes populated workspace_state_manifest, reap_result, and rehydration_status
+	req = httptest.NewRequest(http.MethodGet, "/v1/jobs/"+job.ID, nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /v1/jobs/%s, got: %d", job.ID, rr.Code)
+	}
+	var jobView map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &jobView); err != nil {
+		t.Fatalf("failed to unmarshal job view: %v", err)
+	}
+	if ws, ok := jobView["workspace_state_manifest"].(map[string]any); !ok || ws["clean_locks"] != true {
+		t.Errorf("expected clean_locks=true in job view workspace_state_manifest, got: %v", jobView["workspace_state_manifest"])
+	}
+	if rrMap, ok := jobView["reap_result"].(map[string]any); !ok || rrMap["orphans_reaped"] != float64(2) {
+		t.Errorf("expected orphans_reaped=2 in job view reap_result, got: %v", jobView["reap_result"])
+	}
+	if rhMap, ok := jobView["rehydration_status"].(map[string]any); !ok || rhMap["hydrated"] != true {
+		t.Errorf("expected hydrated=true in job view rehydration_status, got: %v", jobView["rehydration_status"])
+	}
+
 	history, ok := detail["history"].([]any)
 	if !ok || len(history) != 1 {
 		t.Fatalf("expected 1 history item, got: %v", detail["history"])

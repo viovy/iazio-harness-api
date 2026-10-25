@@ -983,6 +983,9 @@ func (e *Engine) ListHistory(hostID, repoPath, status string, limit int) []Histo
 				SameConversationConfirmed: row.SameConversationConfirmed,
 				AttachConfirmation:        row.AttachConfirmation,
 				InterruptedASEState:       row.InterruptedASEState,
+				WorkspaceStateManifest:    row.WorkspaceStateManifest,
+				ReapResult:                row.ReapResult,
+				RehydrationStatus:         row.RehydrationStatus,
 				ConversationLineage:       row.ConversationLineage,
 			})
 		}

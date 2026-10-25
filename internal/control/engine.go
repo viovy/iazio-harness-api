@@ -146,11 +146,12 @@ type ConversationLineage struct {
 
 // ConversationAttachOptions configures conversation attachment and fallback metadata.
 type ConversationAttachOptions struct {
-	Fallback       bool   `json:"fallback,omitempty"`
-	FallbackReason string `json:"fallback_reason,omitempty"`
-	Role           string `json:"role,omitempty"`
-	CLIArgs        string `json:"cli_args,omitempty"`
-	ASEPhase       string `json:"ase_phase,omitempty"`
+	Fallback          bool           `json:"fallback,omitempty"`
+	FallbackReason    string         `json:"fallback_reason,omitempty"`
+	Role              string         `json:"role,omitempty"`
+	CLIArgs           string         `json:"cli_args,omitempty"`
+	ASEPhase          string         `json:"ase_phase,omitempty"`
+	RehydrationStatus map[string]any `json:"rehydration_status,omitempty"`
 }
 
 // IsValidConversationID validates that a conversation ID is well-formed and safe against path traversal.
@@ -207,6 +208,9 @@ type Schedule struct {
 	SameConversationConfirmed bool
 	AttachConfirmation        string
 	InterruptedASEState       map[string]any
+	WorkspaceStateManifest    map[string]any
+	ReapResult                map[string]any
+	RehydrationStatus         map[string]any
 }
 
 // JobDetail carries the execution payload for iazio-harness.
@@ -252,6 +256,9 @@ type JobDetail struct {
 	SameConversationConfirmed   bool                  `json:"same_conversation_confirmed,omitempty"`
 	AttachConfirmation          string                `json:"attach_confirmation,omitempty"`
 	InterruptedASEState         map[string]any        `json:"interrupted_ase_state,omitempty"`
+	WorkspaceStateManifest      map[string]any        `json:"workspace_state_manifest,omitempty"`
+	ReapResult                  map[string]any        `json:"reap_result,omitempty"`
+	RehydrationStatus           map[string]any        `json:"rehydration_status,omitempty"`
 	ConversationLineage         []ConversationLineage `json:"conversation_lineage,omitempty"`
 	AutoResumePolicy            *AutoResumePolicy     `json:"auto_resume_policy,omitempty"`
 	AutoResumeCount             int                   `json:"auto_resume_count,omitempty"`
@@ -311,6 +318,9 @@ type Job struct {
 	SameConversationConfirmed bool
 	AttachConfirmation        string
 	InterruptedASEState       map[string]any
+	WorkspaceStateManifest    map[string]any
+	ReapResult                map[string]any
+	RehydrationStatus         map[string]any
 	ConversationLineage       []ConversationLineage
 	AutoResumePolicy          *AutoResumePolicy
 	AutoResumeCount           int
@@ -493,6 +503,9 @@ type HistoryRow struct {
 	SameConversationConfirmed bool
 	AttachConfirmation        string
 	InterruptedASEState       map[string]any
+	WorkspaceStateManifest    map[string]any
+	ReapResult                map[string]any
+	RehydrationStatus         map[string]any
 	ConversationLineage       []ConversationLineage
 	AutoResumePolicy          *AutoResumePolicy
 	AutoResumeCount           int
@@ -539,6 +552,9 @@ type HistoryItem struct {
 	SameConversationConfirmed bool
 	AttachConfirmation        string
 	InterruptedASEState       map[string]any
+	WorkspaceStateManifest    map[string]any
+	ReapResult                map[string]any
+	RehydrationStatus         map[string]any
 	ConversationLineage       []ConversationLineage
 	AutoResumePolicy          *AutoResumePolicy
 	AutoResumeCount           int
@@ -2713,6 +2729,9 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			ResumeMode:            job.ResumeMode,
 			ResumeFallbackReason:  job.ResumeFallbackReason,
 			InterruptedASEState:   job.InterruptedASEState,
+			WorkspaceStateManifest: job.WorkspaceStateManifest,
+			ReapResult:             job.ReapResult,
+			RehydrationStatus:      job.RehydrationStatus,
 			ConversationLineage:   append([]ConversationLineage(nil), job.ConversationLineage...),
 		}
 		e.history[repoKey(host, sch.WorktreePath)] = append(e.history[repoKey(host, sch.WorktreePath)], row)
@@ -2808,6 +2827,9 @@ func (e *Engine) updateHistoryStatusLocked(host, path, jobID, status string, opt
 				rows[i].AttachConfirmation = j.AttachConfirmation
 				rows[i].ActiveConversationID = j.ActiveConversationID
 				rows[i].ConversationLineage = j.ConversationLineage
+				rows[i].WorkspaceStateManifest = j.WorkspaceStateManifest
+				rows[i].ReapResult = j.ReapResult
+				rows[i].RehydrationStatus = j.RehydrationStatus
 				if rows[i].TraceID == "" {
 					rows[i].TraceID = j.TraceID
 				}
@@ -2847,6 +2869,9 @@ func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseC
 				rows[i].AttachConfirmation = j.AttachConfirmation
 				rows[i].ActiveConversationID = j.ActiveConversationID
 				rows[i].ConversationLineage = j.ConversationLineage
+				rows[i].WorkspaceStateManifest = j.WorkspaceStateManifest
+				rows[i].ReapResult = j.ReapResult
+				rows[i].RehydrationStatus = j.RehydrationStatus
 			}
 			e.notifyHistoryLocked(host, path, rows[i])
 			return
@@ -2857,7 +2882,7 @@ func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseC
 	var sameConvConf bool
 	var attempt int
 	var chain []string
-	var intState map[string]any
+	var intState, wsManifest, reapRes, rehydStatus map[string]any
 	var lineage []ConversationLineage
 	if j, ok := e.jobs[jobID]; ok {
 		traceID = j.TraceID
@@ -2872,6 +2897,9 @@ func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseC
 		sameConvConf = j.SameConversationConfirmed
 		attachConf = j.AttachConfirmation
 		intState = j.InterruptedASEState
+		wsManifest = j.WorkspaceStateManifest
+		reapRes = j.ReapResult
+		rehydStatus = j.RehydrationStatus
 		lineage = j.ConversationLineage
 		if sch := e.schedules[j.ScheduleID]; sch != nil {
 			title = sch.PromptTitle
@@ -2889,6 +2917,7 @@ func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseC
 		InitialConversationID: initConv, ActiveConversationID: actConv, ResumeMode: resMode,
 		ResumeFallbackReason: resReason, InterruptedASEState: intState, ConversationLineage: lineage,
 		SameConversationConfirmed: sameConvConf, AttachConfirmation: attachConf,
+		WorkspaceStateManifest: wsManifest, ReapResult: reapRes, RehydrationStatus: rehydStatus,
 	}
 	e.history[key] = append(e.history[key], row)
 	e.notifyHistoryLocked(host, path, row)
@@ -3432,6 +3461,9 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 			SameConversationConfirmed: r.SameConversationConfirmed || r.ResumeMode == "same_conversation",
 			AttachConfirmation:        r.AttachConfirmation,
 			InterruptedASEState:       r.InterruptedASEState,
+			WorkspaceStateManifest:    r.WorkspaceStateManifest,
+			ReapResult:                r.ReapResult,
+			RehydrationStatus:         r.RehydrationStatus,
 			ConversationLineage:       append([]ConversationLineage(nil), r.ConversationLineage...),
 			TerminationReasonCode:     r.TerminationReasonCode,
 			TerminationReasonMessage:  r.TerminationReasonMessage,
@@ -3472,6 +3504,9 @@ func (e *Engine) buildJobDetailLocked(job *Job) JobDetail {
 		SameConversationConfirmed: job.SameConversationConfirmed,
 		AttachConfirmation:        job.AttachConfirmation,
 		InterruptedASEState:       job.InterruptedASEState,
+		WorkspaceStateManifest:    job.WorkspaceStateManifest,
+		ReapResult:                job.ReapResult,
+		RehydrationStatus:         job.RehydrationStatus,
 		ConversationLineage:       append([]ConversationLineage(nil), job.ConversationLineage...),
 		TerminationReasonCode:     job.TerminationReasonCode,
 		TerminationReasonMessage:  job.TerminationReasonMessage,
@@ -3817,7 +3852,14 @@ func (e *Engine) AddJobConversationWithOptions(jobID, convID string, opts ...Con
 		}
 	}
 
+	if opt.RehydrationStatus != nil {
+		job.RehydrationStatus = opt.RehydrationStatus
+	}
+
 	sch, okSch := e.schedules[job.ScheduleID]
+	if okSch && sch != nil && opt.RehydrationStatus != nil {
+		sch.RehydrationStatus = opt.RehydrationStatus
+	}
 	if okSch {
 		key := repoKey(sch.HostID, sch.WorktreePath)
 		rows := e.history[key]
@@ -3831,6 +3873,63 @@ func (e *Engine) AddJobConversationWithOptions(jobID, convID string, opts ...Con
 				rows[i].AttachConfirmation = job.AttachConfirmation
 				rows[i].ConversationLineage = append([]ConversationLineage(nil), job.ConversationLineage...)
 				rows[i].ConversationIDs = append([]string(nil), job.ConversationIDs...)
+				if job.RehydrationStatus != nil {
+					rows[i].RehydrationStatus = job.RehydrationStatus
+				}
+				if job.WorkspaceStateManifest != nil {
+					rows[i].WorkspaceStateManifest = job.WorkspaceStateManifest
+				}
+				if job.ReapResult != nil {
+					rows[i].ReapResult = job.ReapResult
+				}
+				e.notifyHistoryLocked(sch.HostID, sch.WorktreePath, rows[i])
+				break
+			}
+		}
+	}
+	return nil
+}
+
+// SetJobReadiness updates workspace sanitization manifest, reap result, and rehydration status for an active job.
+func (e *Engine) SetJobReadiness(jobID string, reapResult, manifest, rehydrationStatus map[string]any) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	j, ok := e.jobs[jobID]
+	if !ok {
+		return fmt.Errorf("job %s not found", jobID)
+	}
+	if reapResult != nil {
+		j.ReapResult = reapResult
+	}
+	if manifest != nil {
+		j.WorkspaceStateManifest = manifest
+	}
+	if rehydrationStatus != nil {
+		j.RehydrationStatus = rehydrationStatus
+	}
+	if sch := e.schedules[j.ScheduleID]; sch != nil {
+		if reapResult != nil {
+			sch.ReapResult = reapResult
+		}
+		if manifest != nil {
+			sch.WorkspaceStateManifest = manifest
+		}
+		if rehydrationStatus != nil {
+			sch.RehydrationStatus = rehydrationStatus
+		}
+		key := repoKey(sch.HostID, sch.WorktreePath)
+		rows := e.history[key]
+		for i := len(rows) - 1; i >= 0; i-- {
+			if rows[i].JobID == jobID {
+				if reapResult != nil {
+					rows[i].ReapResult = reapResult
+				}
+				if manifest != nil {
+					rows[i].WorkspaceStateManifest = manifest
+				}
+				if rehydrationStatus != nil {
+					rows[i].RehydrationStatus = rehydrationStatus
+				}
 				e.notifyHistoryLocked(sch.HostID, sch.WorktreePath, rows[i])
 				break
 			}
