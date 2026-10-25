@@ -254,6 +254,12 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 			"same_conversation_confirmed": d.Running.SameConversationConfirmed || d.Running.ResumeMode == "same_conversation",
 			"attach_confirmation":         d.Running.AttachConfirmation,
 			"conversation_lineage":        d.Running.ConversationLineage,
+			"termination_reason_code":     d.Running.TerminationReasonCode,
+			"termination_reason_message":  d.Running.TerminationReasonMessage,
+			"resumable":                   d.Running.Resumable,
+			"non_resumable_reason":        d.Running.NonResumableReason,
+			"workspace_dirty_files":       d.Running.WorkspaceDirtyFiles,
+			"background_tasks":            d.Running.BackgroundTasks,
 		}
 	}
 	schedules := make([]map[string]any, 0, len(d.Schedules))
@@ -298,6 +304,12 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 			"attach_confirmation":         h.AttachConfirmation,
 			"interrupted_ase_state":       h.InterruptedASEState,
 			"conversation_lineage":        h.ConversationLineage,
+			"termination_reason_code":     h.TerminationReasonCode,
+			"termination_reason_message":  h.TerminationReasonMessage,
+			"resumable":                   h.Resumable,
+			"non_resumable_reason":        h.NonResumableReason,
+			"workspace_dirty_files":       h.WorkspaceDirtyFiles,
+			"background_tasks":            h.BackgroundTasks,
 		})
 	}
 	var lockExpiresAt any
@@ -348,6 +360,11 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 		"active_tool":                     d.Repo.ActiveTool,
 		"tool_liveness":                   d.Repo.ToolLiveness,
 		"execution_provenance":            d.Repo.ExecutionProvenance,
+		"dispatch_status":                 d.Repo.DispatchStatus,
+		"dispatch_blocked_code":           d.Repo.DispatchBlockedCode,
+		"dispatch_blocked_message":        d.Repo.DispatchBlockedMessage,
+		"blocking_job_id":                 d.Repo.BlockingJobID,
+		"last_dispatch_attempt_at":        d.Repo.LastDispatchAttemptAt,
 	}
 }
 
@@ -410,6 +427,12 @@ func jobDetailView(j control.JobDetail) map[string]any {
 		"ase_gate_status":               j.ASEGateStatus,
 		"stall_timeout_sec":             j.StallTimeoutSec,
 		"liveness_pulse_seconds":        j.LivenessPulseSeconds,
+		"termination_reason_code":       j.TerminationReasonCode,
+		"termination_reason_message":    j.TerminationReasonMessage,
+		"resumable":                     j.Resumable,
+		"non_resumable_reason":          j.NonResumableReason,
+		"workspace_dirty_files":         j.WorkspaceDirtyFiles,
+		"background_tasks":              j.BackgroundTasks,
 	}
 }
 
@@ -466,6 +489,12 @@ func historyJobDetailView(r control.HistoryRow, host, path string) map[string]an
 		"ase_gate_status":               r.ASEGateStatus,
 		"stall_timeout_sec":             0,
 		"liveness_pulse_seconds":        r.LivenessPulseSeconds,
+		"termination_reason_code":       r.TerminationReasonCode,
+		"termination_reason_message":    r.TerminationReasonMessage,
+		"resumable":                     r.Resumable,
+		"non_resumable_reason":          r.NonResumableReason,
+		"workspace_dirty_files":         r.WorkspaceDirtyFiles,
+		"background_tasks":              r.BackgroundTasks,
 	}
 }
 
@@ -510,6 +539,12 @@ func historyItemView(h control.HistoryItem) map[string]any {
 		"circuit_breaker_tripped":     h.CircuitBreakerTripped,
 		"ase_gate_status":             h.ASEGateStatus,
 		"liveness_pulse_seconds":      h.LivenessPulseSeconds,
+		"termination_reason_code":     h.TerminationReasonCode,
+		"termination_reason_message":  h.TerminationReasonMessage,
+		"resumable":                   h.Resumable,
+		"non_resumable_reason":        h.NonResumableReason,
+		"workspace_dirty_files":       h.WorkspaceDirtyFiles,
+		"background_tasks":            h.BackgroundTasks,
 	}
 }
 

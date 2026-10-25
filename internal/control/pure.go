@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // DefaultMinFreeBytes is the default free-space floor on the worktree mount (5 GiB).
@@ -114,16 +115,33 @@ type ResumeOptions struct {
 	CustomPrompt          string         `json:"custom_prompt,omitempty"`
 }
 
+// BackgroundTaskInfo describes an active or reaped child/background process.
+type BackgroundTaskInfo struct {
+	TaskID            string    `json:"task_id,omitempty"`
+	PID               int       `json:"pid"`
+	Command           string    `json:"command"`
+	StartedAt         time.Time `json:"started_at,omitempty"`
+	LastOutputAt      time.Time `json:"last_output_at,omitempty"`
+	LastOutputSnippet string    `json:"last_output_snippet,omitempty"`
+	IdleDurationSec   float64   `json:"idle_duration_sec,omitempty"`
+}
+
 // ExitOptions provides additional diagnostic and error context when a job finishes.
 type ExitOptions struct {
-	ExitCode       int    `json:"exit_code"`
-	Reason         string `json:"reason,omitempty"`
-	ErrorMessage   string `json:"error_message,omitempty"`
-	DiagnosticCode string `json:"diagnostic_code,omitempty"`
-	Engine         string `json:"engine,omitempty"`
-	Model          string `json:"model,omitempty"`
-	Remediation    string `json:"remediation,omitempty"`
-	ASEComplete    bool   `json:"ase_complete,omitempty"`
+	ExitCode                 int                  `json:"exit_code"`
+	Reason                   string               `json:"reason,omitempty"`
+	ErrorMessage             string               `json:"error_message,omitempty"`
+	DiagnosticCode           string               `json:"diagnostic_code,omitempty"`
+	Engine                   string               `json:"engine,omitempty"`
+	Model                    string               `json:"model,omitempty"`
+	Remediation              string               `json:"remediation,omitempty"`
+	ASEComplete              bool                 `json:"ase_complete,omitempty"`
+	TerminationReasonCode    string               `json:"termination_reason_code,omitempty"`
+	TerminationReasonMessage string               `json:"termination_reason_message,omitempty"`
+	Resumable                bool                 `json:"resumable"`
+	NonResumableReason       string               `json:"non_resumable_reason,omitempty"`
+	WorkspaceDirtyFiles      []string             `json:"workspace_dirty_files,omitempty"`
+	BackgroundTasks          []BackgroundTaskInfo `json:"background_tasks,omitempty"`
 }
 
 // ErrBadShareURL is returned when an import URL is not a Gemini share link.

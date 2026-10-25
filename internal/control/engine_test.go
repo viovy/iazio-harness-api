@@ -4235,3 +4235,108 @@ func TestHealingLifecycleAndOperatorControls(t *testing.T) {
 	}
 	_ = sch
 }
+
+func TestQueueReconciler_And_WorkspaceRecoveryModes(t *testing.T) {
+	curr := time.Date(2026, 10, 25, 5, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return curr }
+	e := NewEngine(clock)
+	e.RegisterHost("host-1", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "host-1",
+		WorktreePath: "/work/app",
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	// 1. Initially with no queued schedules, dispatch status is idle
+	e.ReconcileQueues()
+	r, _ := e.GetRepo("host-1", "/work/app")
+	if r.DispatchStatus != "idle" {
+		t.Fatalf("expected idle dispatch status, got: %s", r.DispatchStatus)
+	}
+
+	// 2. Queue an ordinary schedule, but repo is dirty -> dispatch status blocked (DIRTY_WORKSPACE)
+	p := e.PutPrompt(Prompt{Title: "Task 1", Body: "do something", Status: "READY"})
+	sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.mu.Lock()
+	rPtr := e.repos[repoKey("host-1", "/work/app")]
+	rPtr.Porcelain = "M dirty_file.go\n"
+	rPtr.DirtyStoryID = "STORY-123"
+	e.mu.Unlock()
+
+	e.ReconcileQueues()
+	r, _ = e.GetRepo("host-1", "/work/app")
+	if r.DispatchStatus != "blocked" || r.DispatchBlockedCode != "DIRTY_WORKSPACE" {
+		t.Fatalf("expected blocked due to DIRTY_WORKSPACE, got status=%s code=%s", r.DispatchStatus, r.DispatchBlockedCode)
+	}
+
+	// 3. CleanAndDispatchNext clears dirty state and reconciles queue to ready
+	if err := e.CleanAndDispatchNext("host-1", "/work/app"); err != nil {
+		t.Fatalf("CleanAndDispatchNext failed: %v", err)
+	}
+	r, _ = e.GetRepo("host-1", "/work/app")
+	if r.DispatchStatus != "ready" {
+		t.Fatalf("expected dispatch status ready after CleanAndDispatchNext, got: %s", r.DispatchStatus)
+	}
+
+	// 4. PollHost leases the job -> dispatch status running
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("expected job to be leased")
+	}
+	r, _ = e.GetRepo("host-1", "/work/app")
+	if r.DispatchStatus != "running" {
+		t.Fatalf("expected dispatch status running while job is running, got: %s", r.DispatchStatus)
+	}
+
+	// 5. PostExit with background tasks and dirty files
+	exitOpts := ExitOptions{
+		ExitCode:                 1,
+		TerminationReasonCode:    "BACKGROUND_TASK_HANG",
+		TerminationReasonMessage: "Background task hung during root agent idle wait",
+		Resumable:                true,
+		WorkspaceDirtyFiles:      []string{"modified.txt"},
+		BackgroundTasks: []BackgroundTaskInfo{
+			{PID: 1234, Command: "test-runner --watch"},
+		},
+	}
+	if err := e.PostExit(job.ID, 1, exitOpts); err != nil {
+		t.Fatalf("PostExit failed: %v", err)
+	}
+
+	jobDetail, ok := e.GetJob(job.ID)
+	if !ok {
+		t.Fatal("expected job to be found")
+	}
+	if jobDetail.TerminationReasonCode != "BACKGROUND_TASK_HANG" {
+		t.Fatalf("expected termination reason code BACKGROUND_TASK_HANG, got: %s", jobDetail.TerminationReasonCode)
+	}
+	if !jobDetail.Resumable {
+		t.Fatal("expected job to be marked Resumable = true")
+	}
+	if len(jobDetail.BackgroundTasks) != 1 || jobDetail.BackgroundTasks[0].PID != 1234 {
+		t.Fatalf("expected background task info, got: %+v", jobDetail.BackgroundTasks)
+	}
+
+	// 6. KillBackgroundTasks clears background task list
+	if err := e.KillBackgroundTasks(job.ID); err != nil {
+		t.Fatalf("KillBackgroundTasks failed: %v", err)
+	}
+	jobDetail, _ = e.GetJob(job.ID)
+	if len(jobDetail.BackgroundTasks) != 0 {
+		t.Fatalf("expected empty background tasks after kill, got: %+v", jobDetail.BackgroundTasks)
+	}
+
+	// 7. StashCleanRestart resets workspace and enqueues clean restart schedule
+	restartSch, err := e.StashCleanRestart(job.ID)
+	if err != nil {
+		t.Fatalf("StashCleanRestart failed: %v", err)
+	}
+	if restartSch.Status != "QUEUED" || restartSch.Kind != KindOrdinary {
+		t.Fatalf("expected restart schedule QUEUED with KindOrdinary, got: %+v", restartSch)
+	}
+	_ = sch
+}
