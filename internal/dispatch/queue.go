@@ -39,13 +39,29 @@ const (
 const (
 	// DefaultClaimTimeout is the duration a claimed job can remain active before lease expiration.
 	DefaultClaimTimeout = 30 * time.Minute
-	// DefaultHeartbeatTimeout is the maximum duration between runner heartbeats before considering a runner stalled.
-	DefaultHeartbeatTimeout = 2 * time.Minute
-	// DefaultJobTimeout is the maximum total duration of a job before execution timeout.
-	DefaultJobTimeout = 60 * time.Minute
+	// DefaultHeartbeatTimeout is the maximum duration between runner heartbeats before considering a runner stalled (45s).
+	DefaultHeartbeatTimeout = 45 * time.Second
+	// DefaultJobTimeout is the maximum total duration of a job before execution timeout (7 days default).
+	DefaultJobTimeout = 7 * 24 * time.Hour
 	// DefaultMaxAttempts is the maximum number of times a stalled job may be reclaimed.
 	DefaultMaxAttempts = 3
 )
+
+// EligibleHost describes an agent/workspace candidate evaluated for job dispatch.
+type EligibleHost struct {
+	Host      string `json:"host"`
+	Workspace string `json:"workspace"`
+	Tool      string `json:"tool"`
+	Status    string `json:"status,omitempty"`
+}
+
+// DispatchDiagnostics contains real-time dispatch eligibility and blockage diagnostics for a queue job.
+type DispatchDiagnostics struct {
+	QueueState               string            `json:"queue_state"` // queued, dispatching, running, completed, failed
+	EligibleHosts            []EligibleHost    `json:"eligible_hosts"`
+	LastDispatchEvaluationAt string            `json:"last_dispatch_evaluation_at,omitempty"`
+	BlockedReasonsByHost     map[string]string `json:"blocked_reasons_by_host,omitempty"`
+}
 
 var (
 	// ErrJobNotFound indicates the requested job ID was not found.
@@ -100,6 +116,7 @@ type Job struct {
 	HeartbeatAt      *time.Time      `json:"heartbeat_at,omitempty"`
 	LeaseExpiresAt   *time.Time      `json:"lease_expires_at,omitempty"`
 	CompletedAt      *time.Time      `json:"completed_at,omitempty"`
+	DispatchDiagnostics *DispatchDiagnostics `json:"dispatch_diagnostics,omitempty"`
 
 	// doneCh signals when the job has been completed or failed.
 	doneCh chan struct{}
@@ -129,6 +146,9 @@ type Queue interface {
 	GetAttribution(ctx context.Context, jobID string) (JobAttributionResponse, error)
 	ReapExpired(now time.Time) []string
 	StartReaper(ctx context.Context, interval time.Duration)
+	ReconcileGlobalQueueSlots(now time.Time, staleGrace time.Duration) []string
+	SetDispatchDiagnostics(jobID string, diag *DispatchDiagnostics) error
+	ForceDispatch(ctx context.Context, jobID string) (*Job, error)
 }
 
 // JobAttributionResponse models the attribution of a job outcome to retrieval context.
@@ -726,6 +746,111 @@ func (q *InMemoryQueue) Await(ctx context.Context, jobID string, timeout time.Du
 		defer q.mu.Unlock()
 		return q.jobs[jobID], nil
 	}
+}
+
+// SetDispatchDiagnostics updates the dispatch diagnostics on a specific job.
+func (q *InMemoryQueue) SetDispatchDiagnostics(jobID string, diag *DispatchDiagnostics) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	job, exists := q.jobs[jobID]
+	if !exists {
+		return ErrJobNotFound
+	}
+	job.DispatchDiagnostics = diag
+	return nil
+}
+
+// ForceDispatch breaks any hung or stale claim on a job, re-queues it, and marks it ready for immediate allocation.
+func (q *InMemoryQueue) ForceDispatch(ctx context.Context, jobID string) (*Job, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	job, exists := q.jobs[jobID]
+	if !exists {
+		return nil, ErrJobNotFound
+	}
+	if job.Status == JobStatusCompleted || job.Status == JobStatusFailed || job.Status == JobStatusCanceled {
+		return nil, ErrJobAlreadyCompleted
+	}
+
+	now := q.now()
+	job.Status = JobStatusPending
+	job.ClaimedHost = ""
+	job.HostID = ""
+	job.ClaimedAt = nil
+	job.HeartbeatAt = nil
+	job.LeaseExpiresAt = nil
+	job.FencingToken = 0
+	if job.DispatchDiagnostics == nil {
+		job.DispatchDiagnostics = &DispatchDiagnostics{}
+	}
+	job.DispatchDiagnostics.QueueState = "dispatching"
+	job.DispatchDiagnostics.LastDispatchEvaluationAt = now.Format(time.RFC3339)
+
+	return job, nil
+}
+
+// ReconcileGlobalQueueSlots detects and reclaims stale leases (> staleGrace) across all claimed jobs.
+func (q *InMemoryQueue) ReconcileGlobalQueueSlots(now time.Time, staleGrace time.Duration) []string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if now.IsZero() {
+		now = q.now()
+	}
+	if staleGrace <= 0 {
+		staleGrace = 45 * time.Second
+	}
+
+	var reclaimedIDs []string
+	for _, j := range q.jobs {
+		if j.Status == JobStatusClaimed {
+			stale := false
+			if j.HeartbeatAt != nil && now.Sub(*j.HeartbeatAt) > staleGrace {
+				stale = true
+			}
+			if j.LeaseExpiresAt != nil && now.After(*j.LeaseExpiresAt) {
+				stale = true
+			}
+			if stale {
+				if j.Attempts < DefaultMaxAttempts {
+					j.Status = JobStatusPending
+					j.ClaimedHost = ""
+					j.HostID = ""
+					j.ClaimedAt = nil
+					j.HeartbeatAt = nil
+					j.LeaseExpiresAt = nil
+					j.FencingToken = 0
+					if j.DispatchDiagnostics == nil {
+						j.DispatchDiagnostics = &DispatchDiagnostics{}
+					}
+					j.DispatchDiagnostics.QueueState = "queued"
+					j.DispatchDiagnostics.LastDispatchEvaluationAt = now.Format(time.RFC3339)
+					if j.DispatchDiagnostics.BlockedReasonsByHost == nil {
+						j.DispatchDiagnostics.BlockedReasonsByHost = make(map[string]string)
+					}
+					j.DispatchDiagnostics.BlockedReasonsByHost["lease"] = fmt.Sprintf("reclaimed from %s after heartbeat timeout > %v", j.ClaimedHost, staleGrace)
+					reclaimedIDs = append(reclaimedIDs, j.ID)
+				} else {
+					j.Status = JobStatusFailed
+					j.Error = "HEARTBEAT_TIMEOUT: runner heartbeat stopped, max retry attempts exceeded"
+					completedAt := now
+					j.CompletedAt = &completedAt
+					reclaimedIDs = append(reclaimedIDs, j.ID)
+					if j.doneCh != nil {
+						select {
+						case <-j.doneCh:
+						default:
+							close(j.doneCh)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return reclaimedIDs
 }
 
 // GetAttribution returns attribution details linking a completed job to its retrieval context.

@@ -461,8 +461,8 @@ func TestReapExpiredTimeoutAndOrphanLock(t *testing.T) {
 		t.Fatalf("expected running job and LockRunning: %+v", detail)
 	}
 
-	// Fast forward past DefaultMaxExec (60 min)
-	fakeNow = fakeNow.Add(65 * time.Minute)
+	// Fast forward past DefaultMaxExec (7 days)
+	fakeNow = fakeNow.Add(DefaultMaxExec + 5*time.Minute)
 
 	// GetRepoDetail should trigger reapExpiredLocked
 	detail, ok = e.GetRepoDetail("host-1", "/work/app")
@@ -4339,4 +4339,97 @@ func TestQueueReconciler_And_WorkspaceRecoveryModes(t *testing.T) {
 		t.Fatalf("expected restart schedule QUEUED with KindOrdinary, got: %+v", restartSch)
 	}
 	_ = sch
+}
+
+func TestReconcileStaleWorkspaceSlots_And_DispatchDiagnostics(t *testing.T) {
+	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	e := NewEngine(clock)
+
+	e.RegisterHost("pc1", "permanent")
+	e.RegisterHost("mac-mini", "permanent")
+
+	// Set tools on pc1
+	pc1Tools := []Tool{
+		{Name: "agy", Installed: true, Status: "READY"},
+		{Name: "opencode", Installed: true, Status: "READY"},
+	}
+	_ = e.HeartbeatWithCapabilities("pc1", "ONLINE", pc1Tools, false, nil, "1.0", "")
+
+	// Set tools on mac-mini
+	macTools := []Tool{
+		{Name: "agy", Installed: true, Status: "READY"},
+	}
+	_ = e.HeartbeatWithCapabilities("mac-mini", "ONLINE", macTools, false, nil, "1.0", "")
+
+	// Upsert repos: pc1/meta-repo locked in LockASE by a stale job
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "pc1",
+		WorktreePath:                 "/work/meta-repo",
+		Queue:                        QueueOpen,
+		Lock:                         LockASE,
+		RunningJobID:                 "job-stale-1",
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	// Upsert pc1/meta-repo-03 locked in LockRunning with active job at now
+	e.jobs["job-finished-1"] = &Job{
+		ID:           "job-finished-1",
+		Status:       "RUNNING",
+		StartedAt:    now,
+		LastOutputAt: now,
+	}
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "pc1",
+		WorktreePath:                 "/work/meta-repo-03",
+		Queue:                        QueueOpen,
+		Lock:                         LockRunning,
+		RunningJobID:                 "job-finished-1",
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	// Upsert mac-mini/meta-repo-03 idle
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "mac-mini",
+		WorktreePath:                 "/work/meta-repo-03",
+		Queue:                        QueueOpen,
+		Lock:                         LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	// Before reconciliation: pc1 slots are locked
+	detail1, _ := e.GetRepoDetail("pc1", "/work/meta-repo")
+	if detail1.Repo.Lock == LockIdle {
+		t.Fatalf("expected pc1/meta-repo locked initially")
+	}
+
+	// Advance time past 45s stale grace
+	now = now.Add(50 * time.Second)
+
+	// Run ReconcileStaleWorkspaceSlots
+	reclaimed := e.ReconcileStaleWorkspaceSlots(now, 45*time.Second)
+	if len(reclaimed) != 2 {
+		t.Fatalf("expected 2 stale slots reclaimed on pc1, got %d: %v", len(reclaimed), reclaimed)
+	}
+
+	// Verify pc1 slots are now LockIdle
+	detail1After, _ := e.GetRepoDetail("pc1", "/work/meta-repo")
+	if detail1After.Repo.Lock != LockIdle {
+		t.Fatalf("expected pc1/meta-repo LockIdle after reconciliation, got %s", detail1After.Repo.Lock)
+	}
+	detail2After, _ := e.GetRepoDetail("pc1", "/work/meta-repo-03")
+	if detail2After.Repo.Lock != LockIdle {
+		t.Fatalf("expected pc1/meta-repo-03 LockIdle after reconciliation, got %s", detail2After.Repo.Lock)
+	}
+
+	// Evaluate dispatch diagnostics for a pending job after fresh heartbeats
+	_ = e.HeartbeatWithCapabilities("pc1", "ONLINE", pc1Tools, false, nil, "1.0", "")
+	_ = e.HeartbeatWithCapabilities("mac-mini", "ONLINE", macTools, false, nil, "1.0", "")
+	diag := e.EvaluateDispatchDiagnostics("", "")
+	if diag.QueueState != "dispatching" {
+		t.Fatalf("expected queue_state dispatching, got %s", diag.QueueState)
+	}
+	if len(diag.EligibleHosts) < 2 {
+		t.Fatalf("expected at least 2 eligible host slots, got %d: %+v", len(diag.EligibleHosts), diag.EligibleHosts)
+	}
 }

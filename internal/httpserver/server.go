@@ -175,6 +175,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/jobs", jobLifecycle.ListQueue)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/cancel", jobLifecycle.CancelJob)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/retry", jobLifecycle.RetryJob)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/force-dispatch", jobLifecycle.ForceDispatchJob)
+	mux.HandleFunc("POST /v1/jobs/{id}/force-dispatch", jobLifecycle.ForceDispatchJob)
+	mux.HandleFunc("POST /api/v1/global-queue/jobs/{id}/force-dispatch", jobLifecycle.ForceDispatchJob)
+	mux.HandleFunc("POST /v1/global-queue/jobs/{id}/force-dispatch", jobLifecycle.ForceDispatchJob)
 	mux.HandleFunc("POST /api/v1/stories/{id}/execute", jobLifecycle.ExecuteStory)
 	mux.HandleFunc("POST /api/v1/stories/execute", jobLifecycle.ExecuteStory)
 	mux.HandleFunc("POST /v1/stories/{id}/execute", jobLifecycle.ExecuteStory)
@@ -197,6 +201,21 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/notifications", s.createNotification)
 	mux.HandleFunc("POST /v1/fleet/tools/update-all", s.queueAllToolsUpdate)
 	mux.HandleFunc("POST /v1/hosts/all/tools/update", s.queueAllToolsUpdate)
+
+	// Periodic 15s Global Queue Slot & Lease Reconciler (STORY-GOV-3690)
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now().UTC()
+			if s.Engine != nil {
+				_ = s.Engine.ReconcileStaleWorkspaceSlots(now, 45*time.Second)
+			}
+			if queue != nil {
+				_ = queue.ReconcileGlobalQueueSlots(now, 45*time.Second)
+			}
+		}
+	}()
 
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{

@@ -643,3 +643,62 @@ func TestQueue_AgentAffinity(t *testing.T) {
 		t.Fatal("expected dedicated host to claim job")
 	}
 }
+
+func TestQueue_ReconcileGlobalQueueSlots_And_ForceDispatch(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+
+	_, err := q.Enqueue(ctx, &Job{
+		ID:   "job_18aefb5b4b68bb72",
+		Type: JobTypePromptExecute,
+		Repo: "meta-repo",
+	})
+	if err != nil {
+		t.Fatalf("enqueue error: %v", err)
+	}
+
+	// Claim job by pc1-wsl
+	claimed, err := q.Claim(ctx, "pc1-wsl", []string{JobTypePromptExecute})
+	if err != nil || claimed == nil {
+		t.Fatalf("claim error: %v", err)
+	}
+	if claimed.Status != JobStatusClaimed || claimed.ClaimedHost != "pc1-wsl" {
+		t.Fatalf("expected claimed by pc1-wsl, got status=%s host=%s", claimed.Status, claimed.ClaimedHost)
+	}
+
+	// Advance clock by 50s (exceeding 45s stale grace)
+	now = now.Add(50 * time.Second)
+	reclaimed := q.ReconcileGlobalQueueSlots(now, 45*time.Second)
+	if len(reclaimed) != 1 || reclaimed[0] != "job_18aefb5b4b68bb72" {
+		t.Fatalf("expected job_18aefb5b4b68bb72 reclaimed, got %v", reclaimed)
+	}
+
+	// Verify job is back in pending with diagnostics
+	jAfter, ok := q.Get("job_18aefb5b4b68bb72")
+	if !ok || jAfter.Status != JobStatusPending {
+		t.Fatalf("expected job reverted to pending, got %s", jAfter.Status)
+	}
+	if jAfter.DispatchDiagnostics == nil || jAfter.DispatchDiagnostics.QueueState != "queued" {
+		t.Fatalf("expected queue_state queued, got %+v", jAfter.DispatchDiagnostics)
+	}
+
+	// Re-claim on pc1 native
+	claimed2, err := q.Claim(ctx, "pc1", []string{JobTypePromptExecute})
+	if err != nil || claimed2 == nil {
+		t.Fatalf("second claim failed: %v", err)
+	}
+
+	// Test ForceDispatch to break claim and re-enqueue immediately
+	forced, err := q.ForceDispatch(ctx, "job_18aefb5b4b68bb72")
+	if err != nil {
+		t.Fatalf("force dispatch failed: %v", err)
+	}
+	if forced.Status != JobStatusPending || forced.ClaimedHost != "" {
+		t.Fatalf("expected reset to pending without claimed host, got %+v", forced)
+	}
+	if forced.DispatchDiagnostics.QueueState != "dispatching" {
+		t.Fatalf("expected queue_state dispatching, got %s", forced.DispatchDiagnostics.QueueState)
+	}
+}
