@@ -319,3 +319,64 @@ func TestJobLifecycleHandler_GetJob_HistoryFallback(t *testing.T) {
 		t.Fatalf("unexpected detail: %+v", detail)
 	}
 }
+
+func TestJobLifecycleHandler_ExecuteStory_HarnessAllocated(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	h := NewJobLifecycleHandler(q)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/stories/execute", h.ExecuteStory)
+	mux.HandleFunc("PATCH /api/v1/jobs/{id}/story-binding", h.BindStory)
+
+	// Minimal Gemini Web payload without story_id or agent
+	body := bytes.NewReader([]byte(`{"request":"Refactor auth middleware to zero trust","source_conversation_title":"Fleet Codebase Architecture Review"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/stories/execute", body)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var execResp ExecuteStoryResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &execResp); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+
+	if execResp.StoryID != "" {
+		t.Errorf("expected empty story_id, got %q", execResp.StoryID)
+	}
+	if execResp.StoryAllocationStatus != "pending_harness_creation" {
+		t.Errorf("expected pending_harness_creation, got %q", execResp.StoryAllocationStatus)
+	}
+	if execResp.EffectiveAction != "/autonomous-story-execution" {
+		t.Errorf("expected default action /autonomous-story-execution, got %q", execResp.EffectiveAction)
+	}
+	if !strings.HasPrefix(execResp.NormalizedPrompt, "/autonomous-story-execution Refactor auth middleware") {
+		t.Errorf("expected normalized prompt with prefix, got %q", execResp.NormalizedPrompt)
+	}
+
+	// Now simulate harness binding story ID
+	bindBody := bytes.NewReader([]byte(`{"story_id":"STORY-GOV-3688","story_title":"Gemini Web MCP Frictionless ASE","story_path":"docs/stories/2026-10-25-gov-3688.story.md"}`))
+	bindReq := httptest.NewRequest(http.MethodPatch, "/api/v1/jobs/"+execResp.JobID+"/story-binding", bindBody)
+	bindRr := httptest.NewRecorder()
+	mux.ServeHTTP(bindRr, bindReq)
+
+	if bindRr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for bind, got %d: %s", bindRr.Code, bindRr.Body.String())
+	}
+
+	var detail JobDetailResponse
+	if err := json.Unmarshal(bindRr.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("failed to unmarshal bind response: %v", err)
+	}
+	if detail.StoryID != "STORY-GOV-3688" {
+		t.Errorf("expected story_id STORY-GOV-3688, got %q", detail.StoryID)
+	}
+	if detail.StoryAllocationStatus != "allocated" {
+		t.Errorf("expected story_allocation_status allocated, got %q", detail.StoryAllocationStatus)
+	}
+	if detail.StoryTitle != "Gemini Web MCP Frictionless ASE" {
+		t.Errorf("expected story_title, got %q", detail.StoryTitle)
+	}
+}

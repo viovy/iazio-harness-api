@@ -73,8 +73,17 @@ type Job struct {
 	TargetHost       string          `json:"target_host,omitempty"`
 	ClaimedHost      string          `json:"claimed_host,omitempty"`
 	HostID           string          `json:"host_id,omitempty"`
-	TargetAgent      string          `json:"target_agent,omitempty"`
-	AgentAffinity    *AgentAffinity  `json:"agent_affinity,omitempty"`
+	TargetAgent             string          `json:"target_agent,omitempty"`
+	StoryID                 string          `json:"story_id,omitempty"`
+	StoryTitle              string          `json:"story_title,omitempty"`
+	StoryPath               string          `json:"story_path,omitempty"`
+	StoryAllocationStatus   string          `json:"story_allocation_status,omitempty"`
+	AllocationSource        string          `json:"allocation_source,omitempty"`
+	PriorityRankSelected    int             `json:"priority_rank_selected,omitempty"`
+	SourceConversationTitle string          `json:"source_conversation_title,omitempty"`
+	NormalizedPrompt        string          `json:"normalized_prompt,omitempty"`
+	EffectiveAction         string          `json:"effective_action,omitempty"`
+	AgentAffinity           *AgentAffinity  `json:"agent_affinity,omitempty"`
 	Payload          json.RawMessage `json:"payload"`
 	Status           string          `json:"status"`
 	Result           json.RawMessage `json:"result,omitempty"`
@@ -115,6 +124,7 @@ type Queue interface {
 	List(ctx context.Context, filter JobFilter) ([]*Job, error)
 	Cancel(ctx context.Context, jobID string, reason string) (*Job, error)
 	Retry(ctx context.Context, jobID string) (*Job, error)
+	BindStory(ctx context.Context, jobID, storyID, storyTitle, storyPath string) (*Job, error)
 	Await(ctx context.Context, jobID string, timeout time.Duration) (*Job, error)
 	GetAttribution(ctx context.Context, jobID string) (JobAttributionResponse, error)
 	ReapExpired(now time.Time) []string
@@ -645,6 +655,46 @@ func (q *InMemoryQueue) Retry(ctx context.Context, jobID string) (*Job, error) {
 	q.mu.Unlock()
 
 	return newJob, nil
+}
+
+// BindStory binds a newly allocated story ID and metadata to a job.
+func (q *InMemoryQueue) BindStory(ctx context.Context, jobID, storyID, storyTitle, storyPath string) (*Job, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	job, exists := q.jobs[jobID]
+	if !exists {
+		return nil, ErrJobNotFound
+	}
+
+	cleanStoryID := strings.TrimSpace(storyID)
+	if cleanStoryID == "" {
+		return nil, errors.New("story_id is required")
+	}
+
+	job.StoryID = cleanStoryID
+	if storyTitle != "" {
+		job.StoryTitle = storyTitle
+	}
+	if storyPath != "" {
+		job.StoryPath = storyPath
+	}
+	job.StoryAllocationStatus = "allocated"
+
+	if len(job.Payload) > 0 {
+		var payloadMap map[string]any
+		if err := json.Unmarshal(job.Payload, &payloadMap); err == nil {
+			payloadMap["story_id"] = cleanStoryID
+			if storyTitle != "" {
+				payloadMap["title"] = fmt.Sprintf("Execute story %s: %s", cleanStoryID, storyTitle)
+			}
+			if updated, err := json.Marshal(payloadMap); err == nil {
+				job.Payload = updated
+			}
+		}
+	}
+
+	return job, nil
 }
 
 // Await blocks until the specified job completes, the context is cancelled, or the timeout expires.

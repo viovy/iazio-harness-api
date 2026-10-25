@@ -222,6 +222,15 @@ type JobDetail struct {
 	Engine                      string                `json:"engine"`
 	Prompt                      string                `json:"prompt"`
 	StoryID                     string                `json:"story_id"`
+	StoryTitle                  string                `json:"story_title,omitempty"`
+	StoryPath                   string                `json:"story_path,omitempty"`
+	StoryAllocationStatus       string                `json:"story_allocation_status,omitempty"`
+	AllocationSource            string                `json:"allocation_source,omitempty"`
+	PriorityRankSelected        int                   `json:"priority_rank_selected,omitempty"`
+	NormalizedPrompt            string                `json:"normalized_prompt,omitempty"`
+	EffectiveAction             string                `json:"effective_action,omitempty"`
+	SourceConversationTitle     string                `json:"source_conversation_title,omitempty"`
+	LiveURL                     string                `json:"live_url,omitempty"`
 	SourceIdeaID                string                `json:"source_idea_id"`
 	Transcript                  string                `json:"transcript,omitempty"`
 	WorktreePath                string                `json:"worktree_path"`
@@ -290,6 +299,16 @@ type Job struct {
 	Status                    string
 	HostID                    string
 	TargetHost                string
+	StoryID                   string
+	StoryTitle                string
+	StoryPath                 string
+	StoryAllocationStatus     string
+	AllocationSource          string
+	PriorityRankSelected      int
+	NormalizedPrompt          string
+	EffectiveAction           string
+	SourceConversationTitle   string
+	LiveURL                   string
 	LeaseHolder               string
 	LeaseExpiry               time.Time
 	FrozenUntil               time.Time
@@ -481,6 +500,10 @@ type Tool struct {
 type HistoryRow struct {
 	JobID                     string
 	ScheduleID                string
+	StoryID                   string
+	StoryAllocationStatus     string
+	AllocationSource          string
+	PriorityRankSelected      int
 	PromptTitle               string
 	Engine                    string
 	Status                    string
@@ -533,6 +556,10 @@ type HistoryItem struct {
 	WorktreePath              string
 	JobID                     string
 	ScheduleID                string
+	StoryID                   string
+	StoryAllocationStatus     string
+	AllocationSource          string
+	PriorityRankSelected      int
 	PromptTitle               string
 	Engine                    string
 	Status                    string
@@ -996,12 +1023,171 @@ func (e *Engine) SetRepoQueueAllocation(hostID, worktreePath string, enabled boo
 	return nil
 }
 
+// NormalizeASEPrompt normalizes prompt text with an idempotent action command prefix (default: /autonomous-story-execution).
+func NormalizeASEPrompt(prompt, action string) string {
+	trimmedPrompt := strings.TrimSpace(prompt)
+	effectiveAction := strings.TrimSpace(action)
+	if effectiveAction == "" {
+		effectiveAction = "/autonomous-story-execution"
+	}
+	if !strings.HasPrefix(effectiveAction, "/") {
+		effectiveAction = "/" + effectiveAction
+	}
+	if trimmedPrompt == "" {
+		return effectiveAction
+	}
+	if strings.HasPrefix(trimmedPrompt, effectiveAction) {
+		return trimmedPrompt
+	}
+	return effectiveAction + " " + trimmedPrompt
+}
+
+// ToolPriorityAllocation represents the resolved target agent, host, and workspace slot.
+type ToolPriorityAllocation struct {
+	TargetAgent          string
+	TargetHost           string
+	TargetRepo           string
+	PriorityRankSelected int
+	AllocationSource     string
+	ImmediateClaimable   bool
+}
+
+// ResolveToolPriorityAllocation resolves the target agent, host, and workspace repo according to Global Queue Tool Priority.
+func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, requestedRepo string) ToolPriorityAllocation {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	reqAgent := strings.ToLower(strings.TrimSpace(requestedAgent))
+	reqHost := strings.TrimSpace(requestedHost)
+	reqRepo := strings.TrimSpace(requestedRepo)
+	if reqRepo == "" || reqRepo == "." {
+		reqRepo = "root"
+	}
+
+	if reqAgent != "" && reqAgent != "auto" {
+		return ToolPriorityAllocation{
+			TargetAgent:          reqAgent,
+			TargetHost:           reqHost,
+			TargetRepo:           reqRepo,
+			PriorityRankSelected: 0,
+			AllocationSource:     "explicit_override",
+			ImmediateClaimable:   true,
+		}
+	}
+
+	toolPriority := e.toolPriority
+	if len(toolPriority) == 0 {
+		toolPriority = []string{"agy", "opencode", "claude", "cursor"}
+	}
+
+	for i, candidateTool := range toolPriority {
+		candidateToolLower := strings.ToLower(candidateTool)
+		for _, h := range e.hosts {
+			if h.Presence != "online" && h.Presence != "idle" && time.Since(h.LastSeen) > 5*time.Minute {
+				continue
+			}
+			if reqHost != "" && h.ID != reqHost {
+				continue
+			}
+			hasTool := false
+			for _, t := range h.Tools {
+				if strings.EqualFold(t.Name, candidateToolLower) && (t.Status == "HEALTHY" || t.Status == "OK" || t.Status == "INSTALLED" || t.Status == "") {
+					hasTool = true
+					break
+				}
+			}
+			if !hasTool && len(h.Tools) > 0 {
+				continue
+			}
+
+			// Check for idle workspace slot
+			for _, r := range e.repos {
+				if r.HostID == h.ID && (r.GlobalQueueAllocationEnabled || r.WorktreePath == reqRepo || strings.Contains(r.WorktreePath, reqRepo)) {
+					if r.RunningJobID == "" && r.LockHolder == "" {
+						return ToolPriorityAllocation{
+							TargetAgent:          candidateToolLower,
+							TargetHost:           h.ID,
+							TargetRepo:           r.WorktreePath,
+							PriorityRankSelected: i + 1,
+							AllocationSource:     "global_queue_tool_priority",
+							ImmediateClaimable:   true,
+						}
+					}
+				}
+			}
+
+			return ToolPriorityAllocation{
+				TargetAgent:          candidateToolLower,
+				TargetHost:           h.ID,
+				TargetRepo:           reqRepo,
+				PriorityRankSelected: i + 1,
+				AllocationSource:     "global_queue_tool_priority",
+				ImmediateClaimable:   false,
+			}
+		}
+	}
+
+	topTool := "agy"
+	if len(toolPriority) > 0 {
+		topTool = toolPriority[0]
+	}
+	return ToolPriorityAllocation{
+		TargetAgent:          topTool,
+		TargetHost:           reqHost,
+		TargetRepo:           reqRepo,
+		PriorityRankSelected: 1,
+		AllocationSource:     "global_queue_tool_priority",
+		ImmediateClaimable:   false,
+	}
+}
+
+// BindStoryToJob updates the story ID and metadata on an active job, schedule, and history record.
+func (e *Engine) BindStoryToJob(jobID, storyID, storyTitle, storyPath string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	cleanStoryID := strings.TrimSpace(storyID)
+	if cleanStoryID == "" {
+		return errors.New("story_id is required")
+	}
+
+	if job, ok := e.jobs[jobID]; ok {
+		job.StoryID = cleanStoryID
+		job.StoryTitle = storyTitle
+		job.StoryPath = storyPath
+		job.StoryAllocationStatus = "allocated"
+		if job.ScheduleID != "" {
+			if sch, sOk := e.schedules[job.ScheduleID]; sOk {
+				sch.StoryID = cleanStoryID
+				if storyTitle != "" {
+					sch.PromptTitle = fmt.Sprintf("Execute story %s: %s", cleanStoryID, storyTitle)
+				}
+			}
+		}
+	}
+
+	for k, rows := range e.history {
+		for i := range rows {
+			if rows[i].JobID == jobID {
+				rows[i].StoryID = cleanStoryID
+				rows[i].StoryAllocationStatus = "allocated"
+				if storyTitle != "" {
+					rows[i].PromptTitle = fmt.Sprintf("Execute story %s: %s", cleanStoryID, storyTitle)
+				}
+			}
+		}
+		e.history[k] = rows
+	}
+
+	return nil
+}
+
 // GetToolPriority returns an ordered slice of preferred execution tool engines.
 func (e *Engine) GetToolPriority() []string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if len(e.toolPriority) == 0 {
-		return []string{"agy", "agent", "copilot", "opencode"}
+		return []string{"agy", "opencode", "claude", "cursor"}
 	}
 	cp := make([]string, len(e.toolPriority))
 	copy(cp, e.toolPriority)
@@ -1035,8 +1221,9 @@ func (e *Engine) SetToolPriority(tools []string) error {
 func (e *Engine) EnqueueGlobalStorySchedule(storyID, submodule, targetAgent, promptText string) (Schedule, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if strings.TrimSpace(storyID) == "" {
-		return Schedule{}, errors.New("story_id is required")
+	cleanStoryID := strings.TrimSpace(storyID)
+	if cleanStoryID == "" {
+		cleanStoryID = "pending_harness_creation"
 	}
 	if strings.TrimSpace(submodule) == "" {
 		submodule = "."
@@ -1046,25 +1233,25 @@ func (e *Engine) EnqueueGlobalStorySchedule(storyID, submodule, targetAgent, pro
 		targetAgent = "auto"
 	}
 	if strings.TrimSpace(promptText) == "" {
-		promptText = fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", storyID, storyID, submodule)
+		promptText = fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", cleanStoryID, cleanStoryID, submodule)
 	}
 
 	id := e.next("sch-")
 	promptID := e.next("prompt-")
 	e.prompts[promptID] = &Prompt{
 		ID:      promptID,
-		Title:   fmt.Sprintf("Execute story %s", storyID),
+		Title:   fmt.Sprintf("Execute story %s", cleanStoryID),
 		Body:    promptText,
 		Engine:  targetAgent,
-		StoryID: storyID,
+		StoryID: cleanStoryID,
 		Status:  "ACTIVE",
 	}
 	s := &Schedule{
 		ID:                  id,
 		PromptID:            promptID,
-		StoryID:             storyID,
+		StoryID:             cleanStoryID,
 		WorktreePath:        submodule,
-		PromptTitle:         fmt.Sprintf("Execute story %s", storyID),
+		PromptTitle:         fmt.Sprintf("Execute story %s", cleanStoryID),
 		Engine:              targetAgent,
 		Kind:                "story_execution",
 		Status:              "QUEUED",
@@ -3483,7 +3670,10 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 			Status:                    r.Status,
 			Engine:                    r.Engine,
 			Prompt:                    r.PromptTitle,
-			StoryID:                   "",
+			StoryID:                   r.StoryID,
+			StoryAllocationStatus:     r.StoryAllocationStatus,
+			AllocationSource:          r.AllocationSource,
+			PriorityRankSelected:      r.PriorityRankSelected,
 			WorktreePath:              path,
 			HostID:                    host,
 			TargetHost:                host,
@@ -3525,6 +3715,16 @@ func (e *Engine) buildJobDetailLocked(job *Job) JobDetail {
 		ScheduleID:                job.ScheduleID,
 		Kind:                      job.Kind,
 		Status:                    job.Status,
+		StoryID:                   job.StoryID,
+		StoryTitle:                job.StoryTitle,
+		StoryPath:                 job.StoryPath,
+		StoryAllocationStatus:     job.StoryAllocationStatus,
+		AllocationSource:          job.AllocationSource,
+		PriorityRankSelected:      job.PriorityRankSelected,
+		NormalizedPrompt:          job.NormalizedPrompt,
+		EffectiveAction:           job.EffectiveAction,
+		SourceConversationTitle:   job.SourceConversationTitle,
+		LiveURL:                   job.LiveURL,
 		ResumeConversationID:      job.ResumeConversationID,
 		ConversationIDs:           append([]string(nil), job.ConversationIDs...),
 		Reason:                    job.Reason,
