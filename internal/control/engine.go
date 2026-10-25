@@ -965,7 +965,7 @@ func (e *Engine) newJobLocked(host, path, clone, kind string) *Job {
 	e.schedules[sid] = &Schedule{
 		ID: sid, HostID: host, WorktreePath: path, CloneURL: clone, Kind: kind,
 		IterationsTotal: 1, IterationsRemaining: 1,
-		MaxExecutionDuration: DefaultMaxExec, Status: "RUNNING",
+		MaxExecutionDuration: 0, Status: "RUNNING",
 	}
 	job := &Job{
 		ID: id, ScheduleID: sid, Kind: kind, Status: "RUNNING",
@@ -2479,20 +2479,8 @@ func (e *Engine) reapExpiredLocked() {
 			continue
 		}
 		if job.Status == "RUNNING" {
-			maxDur := DefaultMaxExec
-			if sch != nil && sch.MaxExecutionDuration > 0 {
-				maxDur = sch.MaxExecutionDuration
-			}
-			started := job.StartedAt
-			if started.IsZero() {
-				started = job.LeaseExpiry.Add(-LeaseInterval)
-			}
-			isStory := job.StoryID != "" || (sch != nil && sch.StoryID != "") || (sch != nil && (sch.Kind == "story" || sch.Kind == KindRefinement))
-			isUnbounded := (sch != nil && sch.MaxExecutionDuration <= 0) || isStory
+			// No execution timeout on running jobs in iazio* components
 			timedOut := false
-			if !isUnbounded && !started.IsZero() && maxDur > 0 {
-				timedOut = now.Sub(started) > maxDur
-			}
 			hostOffline := false
 			if sch != nil {
 				if h, ok := e.hosts[sch.HostID]; ok && h.Presence == "OFFLINE" && now.Sub(h.LastSeen) > EphemeralGrace {
@@ -2503,11 +2491,9 @@ func (e *Engine) reapExpiredLocked() {
 			if timedOut || hostOffline || leaseExpired {
 				job.Status = "FAILED"
 				job.ExitPosted = true
-				reason := "EXECUTION_TIMEOUT"
+				reason := "LEASE_EXPIRED"
 				if hostOffline {
 					reason = "HOST_OFFLINE"
-				} else if leaseExpired && !timedOut {
-					reason = "LEASE_EXPIRED"
 				}
 				job.TerminationReasonCode = reason
 				job.TerminationReasonMessage = fmt.Sprintf("Job terminated: %s", reason)
@@ -3920,12 +3906,8 @@ func (e *Engine) buildJobDetailLocked(job *Job) JobDetail {
 	if detail.Engine == "" {
 		detail.Engine = "agent"
 	}
-	isStory := detail.StoryID != "" || (sch != nil && (sch.StoryID != "" || sch.Kind == "story" || sch.Kind == KindRefinement))
-	if isStory {
-		detail.MaxExecutionDurationSeconds = 0
-	} else if detail.MaxExecutionDurationSeconds == 0 {
-		detail.MaxExecutionDurationSeconds = int(DefaultMaxExec.Seconds())
-	}
+	// No execution timeout on jobs in iazio* components
+	detail.MaxExecutionDurationSeconds = 0
 	if detail.Kind == KindRefinement {
 		for _, it := range e.ideas {
 			if it.Status == IdeaRefining || (detail.SourceIdeaID != "" && it.ID == detail.SourceIdeaID) {

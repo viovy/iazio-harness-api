@@ -2936,6 +2936,20 @@ func (s *Server) appendChunk(w http.ResponseWriter, r *http.Request) {
 		raw.Text = fmt.Sprintf("[iazio-harness] Turn auto-continued (turn %d) on conversation %s (unmet gates: %v; active: %s)\n",
 			raw.ContinuationTurn, raw.ConversationID, raw.UnmetGates, raw.ActiveChildTasks)
 	}
+	if strings.Contains(raw.Text, "root agent idle; waiting up to") {
+		lines := strings.Split(raw.Text, "\n")
+		var kept []string
+		for _, line := range lines {
+			if !strings.Contains(line, "root agent idle; waiting up to") {
+				kept = append(kept, line)
+			}
+		}
+		raw.Text = strings.Join(kept, "\n")
+	}
+	if raw.Type == "OUTPUT_CHUNK" && raw.Text == "" {
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": "filtered"})
+		return
+	}
 	s.Engine.AppendLog(r.PathValue("id"), control.LogChunk{
 		Type:             raw.Type,
 		Stream:           raw.Stream,

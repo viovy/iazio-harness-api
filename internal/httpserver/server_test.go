@@ -697,6 +697,45 @@ func TestAppendChunk_TurnAutoContinued(t *testing.T) {
 	_ = sch
 }
 
+func TestAppendChunk_FilterRootAgentIdle(t *testing.T) {
+	e := control.NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	_ = e.UpsertRepo(control.Repo{HostID: "host-1", WorktreePath: "/work/app"})
+	p := e.PutPrompt(control.Prompt{Title: "Task 1", Body: "do task 1", Status: "READY"})
+	_, _ = e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	job, _, _, _ := e.PollHost("host-1")
+
+	s := &Server{Engine: e}
+	handler := s.Handler()
+
+	// Chunk containing only the misleading timeout message should be filtered completely
+	payload1 := `{"type":"OUTPUT_CHUNK","stream":"stderr","text":"root agent idle; waiting up to 1h0m0s for 1 background task(s)\n"}`
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/chunks", bytes.NewBufferString(payload1))
+	req1.Header.Set("Content-Type", "application/json")
+	rr1 := httptest.NewRecorder()
+	handler.ServeHTTP(rr1, req1)
+	if rr1.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d", rr1.Code)
+	}
+
+	// Chunk with mixed lines should have the idle line removed
+	payload2 := `{"type":"OUTPUT_CHUNK","stream":"stdout","text":"starting task\nroot agent idle; waiting up to 1h0m0s for 1 background task(s)\ntask finished\n"}`
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/chunks", bytes.NewBufferString(payload2))
+	req2.Header.Set("Content-Type", "application/json")
+	rr2 := httptest.NewRecorder()
+	handler.ServeHTTP(rr2, req2)
+	if rr2.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d", rr2.Code)
+	}
+
+	page := e.JobLogs(job.ID, 0, "", 0, 0)
+	for _, c := range page.Chunks {
+		if strings.Contains(c.Text, "root agent idle; waiting up to") {
+			t.Fatalf("expected idle line to be filtered from chunk, got: %q", c.Text)
+		}
+	}
+}
+
 
 func TestAbandonResumeAndRemediateEndpoints(t *testing.T) {
 	s := &Server{Engine: control.NewEngine(nil)}

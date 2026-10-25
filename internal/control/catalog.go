@@ -506,7 +506,7 @@ func (e *Engine) ExecutePromptWithResume(promptID, host, path string, iterations
 	sch := &Schedule{
 		ID: sid, PromptID: promptID, Revision: p.Revision, HostID: host, WorktreePath: path,
 		Kind: KindOrdinary, IterationsTotal: iterations, IterationsRemaining: iterations,
-		MaxExecutionDuration: DefaultMaxExec, EnvKeys: envKeys, EnvVars: envCopy,
+		MaxExecutionDuration: 0, EnvKeys: envKeys, EnvVars: envCopy,
 		Status: "QUEUED", PromptTitle: p.Title, Engine: p.Engine, CloneURL: repo.CloneURL,
 		ResumeConversationID: strings.TrimSpace(resumeConvID),
 		StoryID:              p.StoryID,
@@ -531,7 +531,7 @@ func (e *Engine) ScheduleIntervention(host, path, promptID string) (Schedule, er
 	sch := &Schedule{
 		ID: sid, PromptID: promptID, Revision: p.Revision, HostID: host, WorktreePath: path,
 		Kind: KindIntervention, IterationsTotal: 1, IterationsRemaining: 1,
-		MaxExecutionDuration: DefaultMaxExec, Status: "QUEUED",
+		MaxExecutionDuration: 0, Status: "QUEUED",
 		PromptTitle: p.Title, Engine: p.Engine, CloneURL: repo.CloneURL,
 	}
 	e.schedules[sid] = sch
