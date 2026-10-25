@@ -775,8 +775,8 @@ func (q *InMemoryQueue) AckLease(ctx context.Context, jobID, leaseToken string, 
 	if job.Status != JobStatusLeased && job.Status != JobStatusClaimed && job.Status != JobStatusRunning {
 		return nil, fmt.Errorf("job %s is not in leased state (status: %s)", jobID, job.Status)
 	}
-	if job.LeaseToken != "" && leaseToken != "" && job.LeaseToken != leaseToken {
-		return nil, errors.New("lease token mismatch")
+	if job.LeaseToken != "" && (leaseToken == "" || job.LeaseToken != leaseToken) {
+		return nil, errors.New("invalid or missing lease token")
 	}
 
 	job.Status = JobStatusRunning

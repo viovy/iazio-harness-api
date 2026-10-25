@@ -1812,8 +1812,8 @@ func (e *Engine) AckLease(jobID, leaseToken string, agentPID int, activeConvID s
 	if job.Status != "LEASED" && job.Status != "RUNNING" {
 		return fmt.Errorf("job %s is not in leased state (status: %s)", jobID, job.Status)
 	}
-	if job.LeaseToken != "" && leaseToken != "" && job.LeaseToken != leaseToken {
-		return errors.New("lease token mismatch")
+	if job.LeaseToken != "" && (leaseToken == "" || job.LeaseToken != leaseToken) {
+		return errors.New("invalid or missing lease token")
 	}
 
 	job.Status = "RUNNING"
@@ -1869,8 +1869,8 @@ func (e *Engine) HeartbeatJob(jobID, leaseToken string) error {
 	if job.Status != "RUNNING" && job.Status != "LEASED" {
 		return fmt.Errorf("job %s is not currently running or leased (status: %s)", jobID, job.Status)
 	}
-	if job.LeaseToken != "" && leaseToken != "" && job.LeaseToken != leaseToken {
-		return errors.New("lease token mismatch")
+	if job.LeaseToken != "" && (leaseToken == "" || job.LeaseToken != leaseToken) {
+		return errors.New("invalid or missing lease token")
 	}
 
 	now := e.now()
