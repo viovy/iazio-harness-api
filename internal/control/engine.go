@@ -207,6 +207,7 @@ type Schedule struct {
 	SameConversationConfirmed bool
 	AttachConfirmation        string
 	InterruptedASEState       map[string]any
+	WorkspaceStateManifest    map[string]any
 }
 
 // JobDetail carries the execution payload for iazio-harness.
@@ -252,6 +253,7 @@ type JobDetail struct {
 	SameConversationConfirmed   bool                  `json:"same_conversation_confirmed,omitempty"`
 	AttachConfirmation          string                `json:"attach_confirmation,omitempty"`
 	InterruptedASEState         map[string]any        `json:"interrupted_ase_state,omitempty"`
+	WorkspaceStateManifest      map[string]any        `json:"workspace_state_manifest,omitempty"`
 	ConversationLineage         []ConversationLineage `json:"conversation_lineage,omitempty"`
 	AutoResumePolicy            *AutoResumePolicy     `json:"auto_resume_policy,omitempty"`
 	AutoResumeCount             int                   `json:"auto_resume_count,omitempty"`
@@ -311,6 +313,7 @@ type Job struct {
 	SameConversationConfirmed bool
 	AttachConfirmation        string
 	InterruptedASEState       map[string]any
+	WorkspaceStateManifest    map[string]any
 	ConversationLineage       []ConversationLineage
 	AutoResumePolicy          *AutoResumePolicy
 	AutoResumeCount           int
@@ -493,6 +496,7 @@ type HistoryRow struct {
 	SameConversationConfirmed bool
 	AttachConfirmation        string
 	InterruptedASEState       map[string]any
+	WorkspaceStateManifest    map[string]any
 	ConversationLineage       []ConversationLineage
 	AutoResumePolicy          *AutoResumePolicy
 	AutoResumeCount           int
@@ -539,6 +543,7 @@ type HistoryItem struct {
 	SameConversationConfirmed bool
 	AttachConfirmation        string
 	InterruptedASEState       map[string]any
+	WorkspaceStateManifest    map[string]any
 	ConversationLineage       []ConversationLineage
 	AutoResumePolicy          *AutoResumePolicy
 	AutoResumeCount           int
@@ -3432,6 +3437,7 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 			SameConversationConfirmed: r.SameConversationConfirmed || r.ResumeMode == "same_conversation",
 			AttachConfirmation:        r.AttachConfirmation,
 			InterruptedASEState:       r.InterruptedASEState,
+			WorkspaceStateManifest:    r.WorkspaceStateManifest,
 			ConversationLineage:       append([]ConversationLineage(nil), r.ConversationLineage...),
 			TerminationReasonCode:     r.TerminationReasonCode,
 			TerminationReasonMessage:  r.TerminationReasonMessage,
@@ -3472,6 +3478,7 @@ func (e *Engine) buildJobDetailLocked(job *Job) JobDetail {
 		SameConversationConfirmed: job.SameConversationConfirmed,
 		AttachConfirmation:        job.AttachConfirmation,
 		InterruptedASEState:       job.InterruptedASEState,
+		WorkspaceStateManifest:    job.WorkspaceStateManifest,
 		ConversationLineage:       append([]ConversationLineage(nil), job.ConversationLineage...),
 		TerminationReasonCode:     job.TerminationReasonCode,
 		TerminationReasonMessage:  job.TerminationReasonMessage,

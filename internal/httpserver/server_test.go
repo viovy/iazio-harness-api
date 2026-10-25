@@ -333,6 +333,32 @@ func TestRepoResumeAndHistory(t *testing.T) {
 		t.Fatalf("expected running_job conversation_ids to include conv-test-123, got: %v", running["conversation_ids"])
 	}
 
+	// Verify GET /api/v1/conversations/:id/rehydration-bundle
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/conversations/conv-test-123/rehydration-bundle", nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /api/v1/conversations/conv-test-123/rehydration-bundle, got: %d", rr.Code)
+	}
+	var bundle map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &bundle); err != nil {
+		t.Fatalf("failed to unmarshal rehydration bundle: %v", err)
+	}
+	if bundle["conversation_id"] != "conv-test-123" {
+		t.Errorf("expected conversation_id conv-test-123, got: %v", bundle["conversation_id"])
+	}
+	if bundle["bootstrap_prompt"] == "" {
+		t.Errorf("expected non-empty bootstrap_prompt in rehydration bundle")
+	}
+
+	// Also verify /v1/conversations/:id/rehydration-bundle
+	req = httptest.NewRequest(http.MethodGet, "/v1/conversations/conv-test-123/rehydration-bundle", nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /v1/conversations/conv-test-123/rehydration-bundle, got: %d", rr.Code)
+	}
+
 	history, ok := detail["history"].([]any)
 	if !ok || len(history) != 1 {
 		t.Fatalf("expected 1 history item, got: %v", detail["history"])

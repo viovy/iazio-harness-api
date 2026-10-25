@@ -245,6 +245,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/jobs/{id}/retry-correlation", s.retryCorrelation)
 	mux.HandleFunc("POST /v1/jobs/{id}/chunks", s.appendChunk)
 	mux.HandleFunc("POST /v1/jobs/{id}/conversations", s.addJobConversation)
+	mux.HandleFunc("GET /api/v1/conversations/{id}/rehydration-bundle", s.getRehydrationBundle)
+	mux.HandleFunc("GET /v1/conversations/{id}/rehydration-bundle", s.getRehydrationBundle)
 	mux.HandleFunc("GET /v1/jobs/{id}/logs", s.jobLogs)
 	mux.HandleFunc("GET /v1/jobs/{id}/stream", s.jobStream)
 	mux.HandleFunc("GET /v1/jobs/{id}/events", func(w http.ResponseWriter, r *http.Request) {
@@ -2820,6 +2822,20 @@ func (s *Server) addJobConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "recorded", "conversation_id": cid})
+}
+
+func (s *Server) getRehydrationBundle(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !control.IsValidConversationID(id) {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid conversation_id: contains illegal characters or path traversal"))
+		return
+	}
+	bundle, err := s.Engine.GetRehydrationBundle(id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, bundle)
 }
 
 func (s *Server) jobLogs(w http.ResponseWriter, r *http.Request) {
