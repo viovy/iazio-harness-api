@@ -4530,7 +4530,7 @@ func (e *Engine) UpdateStorySyncState(id, syncState string) error {
 }
 
 // ReconcileHistoricalLineage performs an idempotent repair of historical split-brain job lineages,
-// specifically reconciling job-1311 and job-1313 on mac-mini/meta-repo-03 and propagating canonical
+// specifically reconciling job-1311 and job-1313 on mac-mini/target-workspace-03 and propagating canonical
 // root initial conversation IDs and classifying legacy unpinned secondary sessions.
 func (e *Engine) ReconcileHistoricalLineage() (int, error) {
 	e.mu.Lock()

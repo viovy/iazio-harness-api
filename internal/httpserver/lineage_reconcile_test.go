@@ -14,7 +14,7 @@ import (
 func TestServer_ReconcileLineage_Endpoint(t *testing.T) {
 	s := &Server{Engine: control.NewEngine(nil)}
 	s.Engine.RegisterHost("mac-mini", "permanent")
-	repoPath := "/Users/romeo/work/meta-repo-03"
+	repoPath := "/Users/romeo/work/repo-03"
 	_ = s.Engine.UpsertRepo(control.Repo{
 		HostID:       "mac-mini",
 		WorktreePath: repoPath,
@@ -70,8 +70,8 @@ func TestServer_ReconcileLineage_Endpoint(t *testing.T) {
 		t.Fatalf("unexpected response: %+v", resp)
 	}
 
-	// Also verify via GET /api/v1/agents/mac-mini/meta-repo-03/jobs/job-1313
-	jobReq := httptest.NewRequest(http.MethodGet, "/api/v1/agents/mac-mini/meta-repo-03/jobs/job-1313", nil)
+	// Also verify via GET /api/v1/agents/mac-mini/repo-03/jobs/job-1313
+	jobReq := httptest.NewRequest(http.MethodGet, "/api/v1/agents/mac-mini/repo-03/jobs/job-1313", nil)
 	jobRR := httptest.NewRecorder()
 	s.Handler().ServeHTTP(jobRR, jobReq)
 
@@ -95,7 +95,7 @@ func TestServer_ReconcileLineage_Endpoint(t *testing.T) {
 	}
 
 	// Verify multi-segment worktree path routing (Finding M1)
-	multiReq := httptest.NewRequest(http.MethodGet, "/api/v1/agents/mac-mini/Users/romeo/work/meta-repo-03/jobs/job-1313", nil)
+	multiReq := httptest.NewRequest(http.MethodGet, "/api/v1/agents/mac-mini/Users/romeo/work/repo-03/jobs/job-1313", nil)
 	multiRR := httptest.NewRecorder()
 	s.Handler().ServeHTTP(multiRR, multiReq)
 	if multiRR.Code != http.StatusOK {

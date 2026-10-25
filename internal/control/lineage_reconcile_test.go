@@ -8,7 +8,7 @@ import (
 func TestEngine_ReconcileHistoricalLineage_Job1311_1313(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("mac-mini", "permanent")
-	repoPath := "/Users/romeo/work/meta-repo-03"
+	repoPath := "/Users/romeo/work/repo-03"
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",
 		WorktreePath: repoPath,
@@ -194,7 +194,7 @@ func TestEngine_MultiHopSplitBrain_ASECheckpointConsolidation(t *testing.T) {
 	e.RegisterHost("mac-mini", "permanent")
 	e.SetHostCapabilities("mac-mini", "user_service_watchdog_v2", "deterministic_resume_4tuple_v1", "agy_conversation_pinning_v1")
 
-	repoPath := "/Users/romeo/work/meta-repo-03"
+	repoPath := "/Users/romeo/work/repo-03"
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",
 		WorktreePath: repoPath,

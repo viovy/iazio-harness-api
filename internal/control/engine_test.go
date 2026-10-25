@@ -2850,7 +2850,7 @@ func TestReapExpired_ReconcilesIdleRepoRunningJobID(t *testing.T) {
 func TestEngine_DeterministicResumeConversationPinning_SameConversation(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("mac-mini", "permanent")
-	repoPath := "/Users/romeo/work/meta-repo-03"
+	repoPath := "/Users/romeo/work/repo-03"
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",
 		WorktreePath: repoPath,
@@ -2953,7 +2953,7 @@ func TestEngine_DeterministicResumeConversationPinning_SameConversation(t *testi
 func TestEngine_DeterministicResumeConversationPinning_ControlledFallback(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("mac-mini", "permanent")
-	repoPath := "/Users/romeo/work/meta-repo-03"
+	repoPath := "/Users/romeo/work/repo-03"
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",
 		WorktreePath: repoPath,
@@ -3029,7 +3029,7 @@ func TestEngine_DeterministicResumeConversationPinning_ControlledFallback(t *tes
 func TestEngine_MultiHopChainResume_LineageAndAttempt(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("mac-mini", "permanent")
-	repoPath := "/Users/romeo/work/meta-repo-03"
+	repoPath := "/Users/romeo/work/repo-03"
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",
 		WorktreePath: repoPath,
@@ -3117,7 +3117,7 @@ func TestEngine_MultiHopChainResume_LineageAndAttempt(t *testing.T) {
 func TestEngine_DroppedUnpinnedLineageOnly_NoMutation(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("mac-mini", "permanent")
-	repoPath := "/Users/romeo/work/meta-repo-03"
+	repoPath := "/Users/romeo/work/repo-03"
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",
 		WorktreePath: repoPath,
@@ -3166,7 +3166,7 @@ func TestEngine_DroppedUnpinnedLineageOnly_NoMutation(t *testing.T) {
 func TestEngine_CrossEngineResume_MismatchFallback(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("mac-mini", "permanent")
-	repoPath := "/Users/romeo/work/meta-repo-03"
+	repoPath := "/Users/romeo/work/repo-03"
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",
 		WorktreePath: repoPath,
@@ -3218,7 +3218,7 @@ func TestEngine_CrossEngineResume_MismatchFallback(t *testing.T) {
 func TestEngine_PendingResumeMode_UntilAttachmentConfirmed(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("mac-mini", "permanent")
-	repoPath := "/Users/romeo/work/meta-repo-03"
+	repoPath := "/Users/romeo/work/repo-03"
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",
 		WorktreePath: repoPath,
@@ -3279,7 +3279,7 @@ func TestEngine_PendingResumeMode_UntilAttachmentConfirmed(t *testing.T) {
 
 func TestEngine_PendingToImplicitSameConversation_OnExit(t *testing.T) {
 	e := NewEngine(nil)
-	repoPath := "/home/romeo/work/meta-repo"
+	repoPath := "/home/romeo/work/repo"
 	e.RegisterHost("mac-mini", "permanent")
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",
@@ -3342,7 +3342,7 @@ func TestEngine_PendingToImplicitSameConversation_OnExit(t *testing.T) {
 
 func TestEngine_CrossEngineResume_QuotaOrRewriteFallback(t *testing.T) {
 	e := NewEngine(nil)
-	repoPath := "/home/romeo/work/meta-repo"
+	repoPath := "/home/romeo/work/repo"
 	e.RegisterHost("mac-mini", "permanent")
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",
@@ -3385,7 +3385,7 @@ func TestEngine_CrossEngineResume_QuotaOrRewriteFallback(t *testing.T) {
 
 func TestEngine_ResumeMode_BodyOverrideIgnored(t *testing.T) {
 	e := NewEngine(nil)
-	repoPath := "/home/romeo/work/meta-repo"
+	repoPath := "/home/romeo/work/repo"
 	e.RegisterHost("mac-mini", "permanent")
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",
@@ -3419,7 +3419,7 @@ func TestEngine_ResumeMode_BodyOverrideIgnored(t *testing.T) {
 
 func TestEngine_FallbackTerminal_RePostActiveID_StaysFallback(t *testing.T) {
 	e := NewEngine(nil)
-	repoPath := "/home/romeo/work/meta-repo"
+	repoPath := "/home/romeo/work/repo"
 	e.RegisterHost("mac-mini", "permanent")
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",
@@ -3471,7 +3471,7 @@ func TestEngine_FallbackTerminal_RePostActiveID_StaysFallback(t *testing.T) {
 
 func TestEngine_PendingToExitNonZero_NotConfirmedSameConversation(t *testing.T) {
 	e := NewEngine(nil)
-	repoPath := "/home/romeo/work/meta-repo"
+	repoPath := "/home/romeo/work/repo"
 	e.RegisterHost("mac-mini", "permanent")
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",
@@ -3537,7 +3537,7 @@ func TestEngine_PendingToExitNonZero_NotConfirmedSameConversation(t *testing.T) 
 
 func TestEngine_ResumeJob_SharedResolver_ParentHarnessAlias(t *testing.T) {
 	e := NewEngine(nil)
-	repoPath := "/home/romeo/work/meta-repo"
+	repoPath := "/home/romeo/work/repo"
 	e.RegisterHost("mac-mini", "permanent")
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",
@@ -3576,7 +3576,7 @@ func TestEngine_ResumeJob_SharedResolver_ParentHarnessAlias(t *testing.T) {
 
 func TestEngine_ResumeJob_QuotaExhausted_SharedResolverFallback(t *testing.T) {
 	e := NewEngine(nil)
-	repoPath := "/home/romeo/work/meta-repo"
+	repoPath := "/home/romeo/work/repo"
 	e.RegisterHost("mac-mini", "permanent")
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",
@@ -3614,7 +3614,7 @@ func TestEngine_ResumeJob_QuotaExhausted_SharedResolverFallback(t *testing.T) {
 
 func TestEngine_ResumeJob_BodyOverrideIgnored(t *testing.T) {
 	e := NewEngine(nil)
-	repoPath := "/home/romeo/work/meta-repo"
+	repoPath := "/home/romeo/work/repo"
 	e.RegisterHost("mac-mini", "permanent")
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",
@@ -3657,7 +3657,7 @@ func TestEngine_ResumeJob_BodyOverrideIgnored(t *testing.T) {
 
 func TestEngine_ResumeJob_HistoryFallbackPinsActiveInitialConversation(t *testing.T) {
 	e := NewEngine(nil)
-	repoPath := "/home/romeo/work/meta-repo"
+	repoPath := "/home/romeo/work/repo"
 	e.RegisterHost("mac-mini", "permanent")
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",
@@ -3715,7 +3715,7 @@ func TestEngine_ResumeJob_HistoryFallbackPinsActiveInitialConversation(t *testin
 
 func TestEngine_AddJobConversationWithOptions_EmptyParentDoesNotConfirmSameConversation(t *testing.T) {
 	e := NewEngine(nil)
-	repoPath := "/home/romeo/work/meta-repo"
+	repoPath := "/home/romeo/work/repo"
 	e.RegisterHost("mac-mini", "permanent")
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",
@@ -3760,7 +3760,7 @@ func TestEngine_AddJobConversationWithOptions_EmptyParentDoesNotConfirmSameConve
 
 func TestEngine_AddJobConversationWithOptions_DifferingNonFallbackDoesNotConfirmSameConversation(t *testing.T) {
 	e := NewEngine(nil)
-	repoPath := "/home/romeo/work/meta-repo"
+	repoPath := "/home/romeo/work/repo"
 	e.RegisterHost("mac-mini", "permanent")
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",
@@ -3811,7 +3811,7 @@ func TestEngine_AddJobConversationWithOptions_DifferingNonFallbackDoesNotConfirm
 
 func TestEngine_PostExit_PendingWithoutMarker_MapsToUnverified(t *testing.T) {
 	e := NewEngine(nil)
-	repoPath := "/home/romeo/work/meta-repo"
+	repoPath := "/home/romeo/work/repo"
 	e.RegisterHost("mac-mini", "permanent")
 	_ = e.UpsertRepo(Repo{
 		HostID:       "mac-mini",

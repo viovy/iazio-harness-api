@@ -19,7 +19,7 @@ func TestE2E_ResumeExecutionLineage_AndScheduleAssociation(t *testing.T) {
 
 	// 1. Seed host and repo in engine
 	eng.RegisterHost("mac-mini", "permanent")
-	repoPath := "/Users/romeo/work/meta-repo-03"
+	repoPath := "/Users/romeo/work/repo-03"
 	_ = eng.UpsertRepo(control.Repo{
 		HostID:       "mac-mini",
 		WorktreePath: repoPath,
@@ -153,7 +153,7 @@ func TestE2E_ResumeControlledFallback_AndMetrics(t *testing.T) {
 	defer ts.Close()
 
 	eng.RegisterHost("mac-mini", "permanent")
-	repoPath := "/Users/romeo/work/meta-repo-03"
+	repoPath := "/Users/romeo/work/repo-03"
 	_ = eng.UpsertRepo(control.Repo{
 		HostID:       "mac-mini",
 		WorktreePath: repoPath,
@@ -237,7 +237,7 @@ func TestE2E_ResumeJob_HistoryOnly_BindsParentAndActiveConversation(t *testing.T
 	defer ts.Close()
 
 	eng.RegisterHost("mac-mini", "permanent")
-	repoPath := "/Users/romeo/work/meta-repo-03"
+	repoPath := "/Users/romeo/work/repo-03"
 	_ = eng.UpsertRepo(control.Repo{
 		HostID:       "mac-mini",
 		WorktreePath: repoPath,
