@@ -737,7 +737,7 @@ func TestServer_EagerReadinessEndpoints(t *testing.T) {
 			{ToolName: "iazio-harness", InstalledVersion: "0.0.1", TargetVersion: "0.0.2"},
 		},
 		BlockingDirtyRepos: []control.BlockingDirtyRepoInfo{
-			{RepoName: "meta-repo-03", SubRepoPath: "iazio-web", DirtyFilesCount: 2, Branch: "feature/foo"},
+			{RepoName: "workspace-fleet", SubRepoPath: "iazio-web", DirtyFilesCount: 2, Branch: "feature/foo"},
 		},
 		Details: "1 registered workspace is git dirty",
 	}
