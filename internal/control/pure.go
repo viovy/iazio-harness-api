@@ -60,6 +60,26 @@ const (
 	ReasonCorrTimeout = "CORRELATION_TIMEOUT"
 )
 
+// AutoResumePolicy defines bounded auto-resume and circuit breaker rules.
+type AutoResumePolicy struct {
+	Enabled                bool `json:"enabled"`
+	MaxAutoResumes         int  `json:"max_auto_resumes"`
+	BackoffInitialSec      int  `json:"backoff_initial_sec"`
+	BackoffMaxSec          int  `json:"backoff_max_sec"`
+	RequireForwardProgress bool `json:"require_forward_progress"`
+}
+
+// DefaultAutoResumePolicy returns default values for autonomous jobs.
+func DefaultAutoResumePolicy() AutoResumePolicy {
+	return AutoResumePolicy{
+		Enabled:                true,
+		MaxAutoResumes:         5,
+		BackoffInitialSec:      10,
+		BackoffMaxSec:          120,
+		RequireForwardProgress: true,
+	}
+}
+
 // ResumeOptions specifies parameters when resuming a stalled or abandoned execution.
 type ResumeOptions struct {
 	ConversationID        string         `json:"conversation_id,omitempty"`
@@ -71,6 +91,7 @@ type ResumeOptions struct {
 	ResumeFallbackReason  string         `json:"resume_fallback_reason,omitempty"`
 	InterruptedASEState   map[string]any `json:"interrupted_ase_state,omitempty"`
 	AllowDirty            bool           `json:"allow_dirty,omitempty"`
+	Force                 bool           `json:"force,omitempty"`
 	StoryID               string         `json:"story_id,omitempty"`
 	JobID                 string         `json:"job_id,omitempty"`
 	PromptID              string         `json:"prompt_id,omitempty"`
