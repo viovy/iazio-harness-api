@@ -26,7 +26,7 @@ func TestE2E_GlobalQueue_TwoPhaseLeaseAndAck(t *testing.T) {
 	// 1. Submit a job into global queue
 	job, err := queue.Enqueue(context.Background(), &dispatch.Job{
 		ID:          "job-test-lease-1",
-		Repo:        "/work/meta-repo",
+		Repo:        "/work/sample-repo",
 		Type:        "ase",
 		Payload:     []byte(`{"title":"Test 2-Phase Lease"}`),
 		TargetAgent: "agy",
@@ -82,7 +82,7 @@ func TestE2E_GlobalQueue_UnacknowledgedLeaseRequeues(t *testing.T) {
 
 	job, err := queue.Enqueue(context.Background(), &dispatch.Job{
 		ID:          "job-test-timeout-1",
-		Repo:        "/work/meta-repo",
+		Repo:        "/work/sample-repo",
 		Type:        "ase",
 		Payload:     []byte(`{"title":"Test Timeout Lease"}`),
 		TargetAgent: "agy",
@@ -124,7 +124,7 @@ func TestE2E_GlobalQueue_ToolFailoverAndCircuitBreaker(t *testing.T) {
 
 	job, err := queue.Enqueue(context.Background(), &dispatch.Job{
 		ID:          "job-failover-1",
-		Repo:        "/work/meta-repo",
+		Repo:        "/work/sample-repo",
 		Type:        "ase",
 		Payload:     []byte(`{"title":"Test Tool Failover"}`),
 		TargetAgent: "agy",
@@ -142,7 +142,7 @@ func TestE2E_GlobalQueue_ToolFailoverAndCircuitBreaker(t *testing.T) {
 	failoverPayload, _ := json.Marshal(map[string]any{
 		"host":             "host-1",
 		"tool":             "agy",
-		"workspace":        "/work/meta-repo",
+		"workspace":        "/work/sample-repo",
 		"exit_code":        1,
 		"stderr_tail":      "HTTP 429: ResourceExhausted: rate limit exceeded",
 		"failure_category": control.FailureCategoryToolQuotaOrAuth,
@@ -241,7 +241,7 @@ func TestE2E_GlobalQueue_RetryRetriable(t *testing.T) {
 	// Seed retriable and non-retriable jobs
 	_, _ = queue.Enqueue(context.Background(), &dispatch.Job{
 		ID:              "job-retriable-1",
-		Repo:            "/work/meta-repo",
+		Repo:            "/work/sample-repo",
 		Type:            "ase",
 		Status:          dispatch.JobStatusFailed,
 		FailureCategory: control.FailureCategoryToolQuotaOrAuth,
@@ -249,7 +249,7 @@ func TestE2E_GlobalQueue_RetryRetriable(t *testing.T) {
 	})
 	_, _ = queue.Enqueue(context.Background(), &dispatch.Job{
 		ID:              "job-non-retriable-2",
-		Repo:            "/work/meta-repo",
+		Repo:            "/work/sample-repo",
 		Type:            "ase",
 		Status:          dispatch.JobStatusFailed,
 		FailureCategory: control.FailureCategoryASEGateIncomplete,

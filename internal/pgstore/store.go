@@ -171,7 +171,7 @@ zipkin_trace_id = CASE
   ELSE zipkin_trace_id
 END,
 zipkin_trace_url = CASE
-  WHEN zipkin_trace_url = '' AND trace_id <> '' THEN 'https://tian.go.ro/zipkin/traces/' || trace_id
+  WHEN zipkin_trace_url = '' AND trace_id <> '' THEN '/zipkin/traces/' || trace_id
   ELSE zipkin_trace_url
 END
 WHERE status IN ('FAILED', 'DECLINED', 'ABANDONED', 'LEASE_EXPIRED')

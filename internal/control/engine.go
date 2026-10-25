@@ -2029,7 +2029,7 @@ func (e *Engine) ReconcileHistoricalFailureTaxonomy() int {
 					rows[i].ZipkinTraceID = rows[i].TraceID
 				}
 				if rows[i].ZipkinTraceURL == "" && rows[i].ZipkinTraceID != "" {
-					rows[i].ZipkinTraceURL = "https://tian.go.ro/zipkin/traces/" + rows[i].ZipkinTraceID
+					rows[i].ZipkinTraceURL = "/zipkin/traces/" + rows[i].ZipkinTraceID
 				}
 				count++
 			}
@@ -3267,7 +3267,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 		}
 		zipkinTraceURL := sch.ZipkinTraceURL
 		if zipkinTraceURL == "" && zipkinTraceID != "" {
-			zipkinTraceURL = "https://tian.go.ro/zipkin/traces/" + zipkinTraceID
+			zipkinTraceURL = "/zipkin/traces/" + zipkinTraceID
 			sch.ZipkinTraceURL = zipkinTraceURL
 		}
 		traceparent := sch.Traceparent
@@ -3605,7 +3605,7 @@ func (e *Engine) updateHistoryStatusLocked(host, path, jobID, status string, opt
 				rows[i].ZipkinTraceID = rows[i].TraceID
 			}
 			if rows[i].ZipkinTraceURL == "" && rows[i].ZipkinTraceID != "" {
-				rows[i].ZipkinTraceURL = "https://tian.go.ro/zipkin/traces/" + rows[i].ZipkinTraceID
+				rows[i].ZipkinTraceURL = "/zipkin/traces/" + rows[i].ZipkinTraceID
 			}
 			e.notifyHistoryLocked(host, path, rows[i])
 			return
