@@ -509,6 +509,7 @@ func (e *Engine) ExecutePromptWithResume(promptID, host, path string, iterations
 		MaxExecutionDuration: DefaultMaxExec, EnvKeys: envKeys, EnvVars: envCopy,
 		Status: "QUEUED", PromptTitle: p.Title, Engine: p.Engine, CloneURL: repo.CloneURL,
 		ResumeConversationID: strings.TrimSpace(resumeConvID),
+		StoryID:              p.StoryID,
 	}
 	e.schedules[sid] = sch
 	return *sch, nil

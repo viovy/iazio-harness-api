@@ -483,6 +483,50 @@ func TestReapExpiredTimeoutAndOrphanLock(t *testing.T) {
 	}
 }
 
+func TestReapExpired_StoryJobDoesNotTimeoutOnWallClock(t *testing.T) {
+	fakeNow := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return fakeNow }
+	e := NewEngine(clock)
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/app", CloneURL: "https://example.test/app.git"}); err != nil {
+		t.Fatal(err)
+	}
+	p := e.PutPrompt(Prompt{Title: "Task 1", Body: "do task 1", Status: "READY", StoryID: "STORY-GOV-9999"})
+	sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok || job.ScheduleID != sch.ID {
+		t.Fatalf("failed to lease job")
+	}
+
+	// Verify JobDetail returns MaxExecutionDurationSeconds = 0 for stories
+	jobDetail, ok := e.GetJob(job.ID)
+	if !ok || jobDetail.MaxExecutionDurationSeconds != 0 {
+		t.Fatalf("expected MaxExecutionDurationSeconds == 0 for story job, got: %d", jobDetail.MaxExecutionDurationSeconds)
+	}
+
+	// Fast forward past DefaultMaxExec (75 min)
+	fakeNow = fakeNow.Add(75 * time.Minute)
+
+	// Keep lease fresh (agent heartbeat)
+	e.mu.Lock()
+	if j, ok := e.jobs[job.ID]; ok {
+		j.LeaseExpiry = fakeNow.Add(10 * time.Minute)
+	}
+	e.reapExpiredLocked()
+	e.mu.Unlock()
+
+	// Verify job is STILL RUNNING and not timed out
+	jobDetail, ok = e.GetJob(job.ID)
+	if !ok || jobDetail.Status != "RUNNING" {
+		t.Fatalf("expected story job to remain RUNNING past 60m with active lease, got: %s", jobDetail.Status)
+	}
+}
+
+
 func TestForcePauseClearsActiveJobAndSchedule(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("host-1", "permanent")

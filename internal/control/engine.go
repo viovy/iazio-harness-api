@@ -2475,7 +2475,12 @@ func (e *Engine) reapExpiredLocked() {
 			if started.IsZero() {
 				started = job.LeaseExpiry.Add(-LeaseInterval)
 			}
-			timedOut := !started.IsZero() && now.Sub(started) > maxDur
+			isStory := job.StoryID != "" || (sch != nil && sch.StoryID != "") || (sch != nil && (sch.Kind == "story" || sch.Kind == KindRefinement))
+			isUnbounded := (sch != nil && sch.MaxExecutionDuration <= 0) || isStory
+			timedOut := false
+			if !isUnbounded && !started.IsZero() && maxDur > 0 {
+				timedOut = now.Sub(started) > maxDur
+			}
 			hostOffline := false
 			if sch != nil {
 				if h, ok := e.hosts[sch.HostID]; ok && h.Presence == "OFFLINE" && now.Sub(h.LastSeen) > EphemeralGrace {
@@ -2641,8 +2646,6 @@ func (e *Engine) reapExpiredLocked() {
 				if !hasLiveJob {
 					isStale = true
 				} else if repo != nil && repo.Lock == LockIdle && repo.RunningJobID != rows[i].JobID {
-					isStale = true
-				} else if !rows[i].CreatedAt.IsZero() && now.Sub(rows[i].CreatedAt) > DefaultMaxExec*2 {
 					isStale = true
 				}
 				if isStale {
@@ -3901,7 +3904,10 @@ func (e *Engine) buildJobDetailLocked(job *Job) JobDetail {
 	if detail.Engine == "" {
 		detail.Engine = "agent"
 	}
-	if detail.MaxExecutionDurationSeconds == 0 {
+	isStory := detail.StoryID != "" || (sch != nil && (sch.StoryID != "" || sch.Kind == "story" || sch.Kind == KindRefinement))
+	if isStory {
+		detail.MaxExecutionDurationSeconds = 0
+	} else if detail.MaxExecutionDurationSeconds == 0 {
 		detail.MaxExecutionDurationSeconds = int(DefaultMaxExec.Seconds())
 	}
 	if detail.Kind == KindRefinement {
@@ -5754,6 +5760,7 @@ func (e *Engine) EnqueueGlobalSchedule(promptID string, iterations int, envVars 
 		IsGlobal: true, Kind: KindOrdinary, IterationsTotal: iterations, IterationsRemaining: iterations,
 		MaxExecutionDuration: DefaultMaxExec, EnvKeys: envKeys, EnvVars: envCopy,
 		Status: "QUEUED", PromptTitle: p.Title, Engine: p.Engine,
+		StoryID: p.StoryID,
 	}
 	e.schedules[sid] = sch
 	return *sch, nil
