@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1848,7 +1849,20 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 
 		// R2, N4: validate explicit target_version if supplied; return 422 if invalid or unknown
 		if body.TargetVersion != "" {
-			cleanTV := strings.TrimPrefix(strings.TrimSpace(body.TargetVersion), "v")
+			rawTV := strings.TrimSpace(body.TargetVersion)
+			cleanTV := strings.TrimPrefix(rawTV, "v")
+			if match := regexp.MustCompile(`([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?(?:\+[a-zA-Z0-9.]+)?)|([0-9]+\.[0-9]+\.[0-9]+)`).FindString(rawTV); match != "" {
+				cleanTV = match
+				body.TargetVersion = match
+			} else if strings.Contains(strings.ToLower(rawTV), "dev") || strings.EqualFold(cleanTV, "latest") {
+				if foundTool != nil && foundTool.LatestAvailableVersion != "" {
+					body.TargetVersion = foundTool.LatestAvailableVersion
+					cleanTV = strings.TrimPrefix(strings.TrimSpace(body.TargetVersion), "v")
+				} else if foundTool != nil && foundTool.TargetVersion != "" && foundTool.TargetVersion != "latest" {
+					body.TargetVersion = foundTool.TargetVersion
+					cleanTV = strings.TrimPrefix(strings.TrimSpace(body.TargetVersion), "v")
+				}
+			}
 			if cleanTV == "" || strings.Contains(cleanTV, " ") {
 				writeErr(w, http.StatusUnprocessableEntity, fmt.Errorf("invalid target_version: %s", body.TargetVersion))
 				return
@@ -1860,7 +1874,8 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 
 				isKnown := false
 				if (knownLatest != "" && normClean == knownLatest) ||
-					(knownTarget != "" && knownTarget != "latest" && normClean == knownTarget) {
+					(knownTarget != "" && knownTarget != "latest" && normClean == knownTarget) ||
+					(body.Force && (strings.Contains(strings.ToLower(rawTV), "dev") || strings.EqualFold(rawTV, "latest"))) {
 					isKnown = true
 				}
 				if !isKnown && s.Engine != nil && s.Engine.Releases != nil && foundTool.Repository != "" {

@@ -694,53 +694,154 @@ func (e *Engine) getOrSynthesizeLogsLocked(jobID string) []LogChunk {
 		return all
 	}
 	job, ok := e.jobs[jobID]
-	if !ok {
-		return nil
-	}
-	convID := job.ActiveConversationID
-	if convID == "" {
-		convID = job.ResumeConversationID
-	}
-	if convID == "" {
-		convID = job.InitialConversationID
-	}
-	if convID == "" && len(job.ConversationIDs) > 0 {
-		convID = job.ConversationIDs[0]
-	}
-	sch, _ := e.schedules[job.ScheduleID]
-	worktree := ""
-	engine := "agy"
-	storyID := ""
-	if sch != nil {
-		worktree = sch.WorktreePath
-		if sch.Engine != "" {
-			engine = sch.Engine
-		}
-		storyID = sch.StoryID
-	}
-	if storyID == "" && job.InterruptedASEState != nil {
-		if s, ok := job.InterruptedASEState["story_id"].(string); ok {
-			storyID = s
-		}
-	}
-	reason := job.Reason
-	if reason == "" {
-		reason = job.TerminationReasonCode
-	}
-	if reason == "" {
-		reason = "UNKNOWN"
-	}
-	ts := job.StartedAt
-	if ts.IsZero() {
-		ts = e.now()
-	}
-	tsStr := ts.UTC().Format(time.RFC3339)
+	var (
+		convID, worktree, engine, storyID, reason, promptText, status, hostID string
+		harnessPID, toolPID, exitCode, resumeCount int
+		elapsedSec int64
+		asePhase string
+		aseComplete, resumable bool
+		dirtyFilesCount int
+		ts time.Time
+		kind, parentJobID, rootJobID string
+	)
+	engine = "agy"
 
+	if ok {
+		convID = job.ActiveConversationID
+		if convID == "" {
+			convID = job.ResumeConversationID
+		}
+		if convID == "" {
+			convID = job.InitialConversationID
+		}
+		if convID == "" && len(job.ConversationIDs) > 0 {
+			convID = job.ConversationIDs[0]
+		}
+		sch, _ := e.schedules[job.ScheduleID]
+		if sch != nil {
+			worktree = sch.WorktreePath
+			if sch.Engine != "" {
+				engine = sch.Engine
+			}
+			storyID = sch.StoryID
+		}
+		if storyID == "" && job.InterruptedASEState != nil {
+			if s, ok := job.InterruptedASEState["story_id"].(string); ok {
+				storyID = s
+			}
+		}
+		reason = job.Reason
+		if reason == "" {
+			reason = job.TerminationReasonCode
+		}
+		if reason == "" {
+			reason = "UNKNOWN"
+		}
+		ts = job.StartedAt
+		if ts.IsZero() {
+			ts = e.now()
+		}
+		status = job.Status
+		exitCode = job.ExitCode
+		if sch != nil {
+			promptText = sch.PromptTitle
+		}
+		hostID = job.LeaseHolder
+		if hostID == "" {
+			hostID = job.TargetHost
+		}
+		kind = job.Kind
+		parentJobID = job.ParentJobID
+		rootJobID = job.RootJobID
+		harnessPID = job.HarnessPID
+		toolPID = job.ToolPID
+		elapsedSec = job.ElapsedSeconds
+		resumeCount = job.ResumeCount
+		aseComplete = job.ASEComplete
+		dirtyFilesCount = len(job.WorkspaceDirtyFiles)
+		resumable = job.Resumable || convID != "" || storyID != ""
+		if job.InterruptedASEState != nil {
+			if p, ok := job.InterruptedASEState["phase"].(string); ok && p != "" {
+				asePhase = p
+			}
+		}
+	} else {
+		var found bool
+		for key, rows := range e.history {
+			for _, row := range rows {
+				if row.JobID == jobID {
+					found = true
+					convID = row.ActiveConversationID
+					if convID == "" {
+						convID = row.InitialConversationID
+					}
+					if convID == "" && len(row.ConversationIDs) > 0 {
+						convID = row.ConversationIDs[0]
+					}
+					if idx := strings.Index(key, "\x00"); idx >= 0 {
+						hostID, worktree = key[:idx], key[idx+1:]
+					}
+					if row.Engine != "" {
+						engine = row.Engine
+					}
+					status = row.Status
+					reason = row.Reason
+					if reason == "" {
+						reason = row.TerminationReasonCode
+					}
+					if reason == "" {
+						reason = "COMPLETED"
+					}
+					exitCode = row.ExitCode
+					promptText = row.PromptTitle
+					ts = row.CreatedAt
+					aseComplete = row.ASEComplete
+					dirtyFilesCount = len(row.WorkspaceDirtyFiles)
+					harnessPID = row.HarnessPID
+					toolPID = row.ToolPID
+					parentJobID = row.ParentJobID
+					rootJobID = row.RootJobID
+					resumeCount = row.AutoResumeCount
+					resumable = row.Resumable || convID != ""
+					if row.InterruptedASEState != nil {
+						if s, ok := row.InterruptedASEState["story_id"].(string); ok {
+							storyID = s
+						}
+						if p, ok := row.InterruptedASEState["phase"].(string); ok {
+							asePhase = p
+						}
+					}
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			return nil
+		}
+	}
+
+	tsStr := ts.UTC().Format(time.RFC3339)
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Live Console Telemetry for Job %s\n", tsStr, job.ID))
-	sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Status: %s | Reason: %s | Exit Code: %d\n", tsStr, job.Status, reason, job.ExitCode))
+	sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Live Console Telemetry for Job %s\n", tsStr, jobID))
+	sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Status: %s | Reason: %s | Exit Code: %d\n", tsStr, status, reason, exitCode))
+	if promptText != "" {
+		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Executed Prompt: %s\n", tsStr, promptText))
+	}
+	if kind == "resume" || parentJobID != "" {
+		actionType := "Manual Resume"
+		if kind == "auto-resume" || strings.Contains(reason, "auto_resume") || strings.Contains(reason, "watchdog") || strings.Contains(reason, "interrupted") || strings.Contains(reason, "timeout") {
+			actionType = "Automatic Resume"
+		}
+		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Action Mode: %s (Kind: %s, Parent Job: %s, Root Job: %s)\n", tsStr, actionType, kind, parentJobID, rootJobID))
+	}
+	if harnessPID > 0 || toolPID > 0 {
+		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Process Telemetry: HarnessPID=%d, ToolPID=%d, ElapsedSeconds=%d, ResumeCount=%d\n", tsStr, harnessPID, toolPID, elapsedSec, resumeCount))
+	}
 	if worktree != "" {
-		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Worktree: %s | Engine: %s\n", tsStr, worktree, engine))
+		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Worktree: %s | Engine: %s | Host: %s\n", tsStr, worktree, engine, hostID))
 	}
 	if convID != "" {
 		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Conversation resolved: %s --conversation=%s (source: control-plane record)\n", tsStr, engine, convID))
@@ -748,20 +849,16 @@ func (e *Engine) getOrSynthesizeLogsLocked(jobID string) []LogChunk {
 		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Conversation: none captured before process termination\n", tsStr))
 	}
 	if storyID != "" {
-		asePhase := "IN_PROGRESS"
-		if job.InterruptedASEState != nil {
-			if p, ok := job.InterruptedASEState["phase"].(string); ok && p != "" {
-				asePhase = p
-			}
+		if asePhase == "" {
+			asePhase = "IN_PROGRESS"
 		}
-		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] ASE State: story=%s, phase=%s, complete=%v\n", tsStr, storyID, asePhase, job.ASEComplete))
+		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] ASE State: story=%s, phase=%s, complete=%v\n", tsStr, storyID, asePhase, aseComplete))
 	}
-	if len(job.WorkspaceDirtyFiles) > 0 {
-		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Fleet Git State: %d dirty file(s) recorded\n", tsStr, len(job.WorkspaceDirtyFiles)))
+	if dirtyFilesCount > 0 {
+		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Fleet Git State: %d dirty file(s) recorded\n", tsStr, dirtyFilesCount))
 	} else {
 		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Fleet Git State: clean\n", tsStr))
 	}
-	resumable := job.Resumable || convID != "" || storyID != ""
 	sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Resumable: %v | Use 'Resume (%s --conversation)' to resume execution in-place.\n", tsStr, resumable, engine))
 
 	return []LogChunk{

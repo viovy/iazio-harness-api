@@ -480,6 +480,8 @@ func historyJobDetailView(r control.HistoryRow, host, path string) map[string]an
 		"trace_id":                       r.TraceID,
 		"host_id":                        host,
 		"target_host":                    host,
+		"harness_pid":                    r.HarnessPID,
+		"tool_pid":                       r.ToolPID,
 		"parent_job_id":                  r.ParentJobID,
 		"root_job_id":                    r.RootJobID,
 		"execution_attempt":              r.ExecutionAttempt,

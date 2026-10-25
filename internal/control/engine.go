@@ -523,6 +523,8 @@ type HistoryRow struct {
 	NonResumableReason        string
 	WorkspaceDirtyFiles       []string
 	BackgroundTasks           []BackgroundTaskInfo
+	HarnessPID                int
+	ToolPID                   int
 }
 
 // HistoryItem is one execution record reported across repositories.
@@ -573,6 +575,8 @@ type HistoryItem struct {
 	NonResumableReason        string
 	WorkspaceDirtyFiles       []string
 	BackgroundTasks           []BackgroundTaskInfo
+	HarnessPID                int
+	ToolPID                   int
 }
 
 // LogChunk is one stripped output event.
@@ -2755,6 +2759,8 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			ReapResult:             job.ReapResult,
 			RehydrationStatus:      job.RehydrationStatus,
 			ConversationLineage:   append([]ConversationLineage(nil), job.ConversationLineage...),
+			HarnessPID:            job.HarnessPID,
+			ToolPID:               job.ToolPID,
 		}
 		e.history[repoKey(host, sch.WorktreePath)] = append(e.history[repoKey(host, sch.WorktreePath)], row)
 		e.notifyHistoryLocked(host, sch.WorktreePath, row)
@@ -2816,6 +2822,12 @@ func (e *Engine) updateHistoryStatusLocked(host, path, jobID, status string, opt
 				rows[i].Reason = status
 			}
 			if j, ok := e.jobs[jobID]; ok {
+				if rows[i].HarnessPID == 0 && j.HarnessPID > 0 {
+					rows[i].HarnessPID = j.HarnessPID
+				}
+				if rows[i].ToolPID == 0 && j.ToolPID > 0 {
+					rows[i].ToolPID = j.ToolPID
+				}
 				if rows[i].TerminationReasonCode == "" && j.TerminationReasonCode != "" {
 					rows[i].TerminationReasonCode = j.TerminationReasonCode
 				}
@@ -2906,6 +2918,7 @@ func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseC
 	var chain []string
 	var intState, wsManifest, reapRes, rehydStatus map[string]any
 	var lineage []ConversationLineage
+	var harnessPID, toolPID int
 	if j, ok := e.jobs[jobID]; ok {
 		traceID = j.TraceID
 		pj = j.ParentJobID
@@ -2923,6 +2936,8 @@ func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseC
 		reapRes = j.ReapResult
 		rehydStatus = j.RehydrationStatus
 		lineage = j.ConversationLineage
+		harnessPID = j.HarnessPID
+		toolPID = j.ToolPID
 		if sch := e.schedules[j.ScheduleID]; sch != nil {
 			title = sch.PromptTitle
 			engine = sch.Engine
@@ -2940,6 +2955,8 @@ func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseC
 		ResumeFallbackReason: resReason, InterruptedASEState: intState, ConversationLineage: lineage,
 		SameConversationConfirmed: sameConvConf, AttachConfirmation: attachConf,
 		WorkspaceStateManifest: wsManifest, ReapResult: reapRes, RehydrationStatus: rehydStatus,
+		HarnessPID: harnessPID,
+		ToolPID:    toolPID,
 	}
 	e.history[key] = append(e.history[key], row)
 	e.notifyHistoryLocked(host, path, row)
