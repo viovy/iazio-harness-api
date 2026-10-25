@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/viovy/iazio-harness-api/internal/telemetry"
 )
 
 // Standard job types.
@@ -423,6 +425,17 @@ func (q *InMemoryQueue) Enqueue(ctx context.Context, job *Job) (*Job, error) {
 
 	// Store copy
 	q.jobs[job.ID] = job
+
+	var spanOpts []telemetry.SpanOption
+	spanOpts = append(spanOpts, telemetry.WithTag("job.id", job.ID))
+	if job.TraceID != "" {
+		spanOpts = append(spanOpts, telemetry.WithParentTrace(job.TraceID, ""))
+	}
+	_, span := telemetry.StartSpan(ctx, "global_queue.enqueue", spanOpts...)
+	if span != nil {
+		span.End()
+	}
+
 	return job, nil
 }
 
@@ -480,6 +493,17 @@ func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []str
 	oldest.HeartbeatAt = &now
 	expires := now.Add(DefaultHeartbeatTimeout)
 	oldest.LeaseExpiresAt = &expires
+
+	var claimSpanOpts []telemetry.SpanOption
+	claimSpanOpts = append(claimSpanOpts, telemetry.WithTag("job.id", oldest.ID), telemetry.WithTag("host.id", hostID))
+	if oldest.TraceID != "" {
+		claimSpanOpts = append(claimSpanOpts, telemetry.WithParentTrace(oldest.TraceID, ""))
+	}
+	_, claimSpan := telemetry.StartSpan(ctx, "global_queue.lease_and_dispatch", claimSpanOpts...)
+	if claimSpan != nil {
+		claimSpan.End()
+	}
+
 	return oldest, nil
 }
 
@@ -906,6 +930,13 @@ func (q *InMemoryQueue) BindStory(ctx context.Context, jobID, storyID, storyTitl
 
 // Await blocks until the specified job completes, the context is cancelled, or the timeout expires.
 func (q *InMemoryQueue) Await(ctx context.Context, jobID string, timeout time.Duration) (*Job, error) {
+	var waitSpanOpts []telemetry.SpanOption
+	waitSpanOpts = append(waitSpanOpts, telemetry.WithTag("job.id", jobID))
+	_, waitSpan := telemetry.StartSpan(ctx, "global_queue.wait", waitSpanOpts...)
+	if waitSpan != nil {
+		defer waitSpan.End()
+	}
+
 	q.mu.Lock()
 	q.reapExpiredLocked(q.now())
 	job, exists := q.jobs[jobID]

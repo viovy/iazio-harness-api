@@ -278,3 +278,167 @@ func TestE2E_GlobalQueue_RetryRetriable(t *testing.T) {
 		t.Fatalf("expected job-non-retriable-2 to remain failed, got %s", j2.Status)
 	}
 }
+
+func TestE2E_GlobalQueue_WorkspacePrepConflictRecovery(t *testing.T) {
+	eng := control.NewEngine(nil)
+	queue := dispatch.NewInMemoryQueue()
+	srv := &httpserver.Server{Engine: eng, Queue: queue}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. Enqueue job
+	job, err := queue.Enqueue(context.Background(), &dispatch.Job{
+		ID:          "job-archetype-c",
+		Repo:        "/work/sample-repo",
+		Type:        "ase",
+		TargetAgent: "agy",
+	})
+	if err != nil {
+		t.Fatalf("failed to enqueue: %v", err)
+	}
+
+	// 2. Claim job
+	claimed, err := queue.Claim(context.Background(), "host-1", []string{"ase"})
+	if err != nil || claimed.ID != job.ID {
+		t.Fatalf("failed to claim job: %v", err)
+	}
+
+	// 3. Simulate pre-flight workspace dirty/conflict failure reporting
+	failoverPayload, _ := json.Marshal(map[string]any{
+		"host":             "host-1",
+		"tool":             "agy",
+		"workspace":        "/work/sample-repo",
+		"exit_code":        1,
+		"stderr_tail":      "fatal: working tree has unstaged submodule changes (.git/index.lock exists)",
+		"failure_category": control.FailureCategoryWorkspacePrepError,
+		"failure_stage":    control.FailureStageWorkspacePrep,
+		"reason":           "WORKSPACE_PREP_CONFLICT",
+	})
+	resp, err := http.Post(ts.URL+"/api/v1/jobs/"+job.ID+"/failover", "application/json", bytes.NewReader(failoverPayload))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("failed to post workspace failover: %v, status: %v", err, resp.StatusCode)
+	}
+
+	// 4. Verify job state after workspace conflict recovery failover
+	recovered, ok := queue.Get(job.ID)
+	if !ok {
+		t.Fatalf("job not found: %s", job.ID)
+	}
+	if recovered.Status != dispatch.JobStatusPending {
+		t.Fatalf("expected pending status for recovered job, got %s", recovered.Status)
+	}
+	if recovered.FailureCategory != control.FailureCategoryWorkspacePrepError {
+		t.Fatalf("expected FailureCategoryWorkspacePrepError, got %s", recovered.FailureCategory)
+	}
+	if len(recovered.AttemptHistory) != 1 {
+		t.Fatalf("expected 1 attempt in history, got %d", len(recovered.AttemptHistory))
+	}
+	if recovered.AttemptHistory[0].FailureCategory != control.FailureCategoryWorkspacePrepError {
+		t.Fatalf("expected attempt failure category to be WORKSPACE_PREP_ERROR, got %s", recovered.AttemptHistory[0].FailureCategory)
+	}
+}
+
+func TestE2E_GlobalQueue_BackgroundTaskDrain(t *testing.T) {
+	eng := control.NewEngine(nil)
+	queue := dispatch.NewInMemoryQueue()
+	srv := &httpserver.Server{Engine: eng, Queue: queue}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. Enqueue job
+	job, err := queue.Enqueue(context.Background(), &dispatch.Job{
+		ID:          "job-archetype-d",
+		Repo:        "/work/sample-repo",
+		Type:        "ase",
+		TargetAgent: "cursor",
+	})
+	if err != nil {
+		t.Fatalf("failed to enqueue: %v", err)
+	}
+
+	// 2. Claim job and ack lease
+	claimed, err := queue.Claim(context.Background(), "host-1", []string{"ase"})
+	if err != nil || claimed.ID != job.ID {
+		t.Fatalf("failed to claim job: %v", err)
+	}
+	ackPayload, _ := json.Marshal(map[string]any{
+		"lease_token": claimed.LeaseToken,
+		"agent_pid":   4321,
+	})
+	_, _ = http.Post(ts.URL+"/api/v1/jobs/"+job.ID+"/ack-lease", "application/json", bytes.NewReader(ackPayload))
+
+	// 3. Heartbeat during background drain
+	hbPayload, _ := json.Marshal(map[string]any{
+		"lease_token":   claimed.LeaseToken,
+		"fencing_token": claimed.FencingToken,
+	})
+	hbResp, err := http.Post(ts.URL+"/api/v1/jobs/"+job.ID+"/heartbeat", "application/json", bytes.NewReader(hbPayload))
+	if err != nil || hbResp.StatusCode != http.StatusOK {
+		t.Fatalf("heartbeat failed during background drain: %v, status: %v", err, hbResp.StatusCode)
+	}
+
+	// 4. Simulate post-execution drain timeout failure classification
+	failPayload, _ := json.Marshal(map[string]any{
+		"host":             "host-1",
+		"tool":             "cursor",
+		"workspace":        "/work/sample-repo",
+		"exit_code":        124,
+		"stderr_tail":      "root agent idle; waiting up to 45s for 2 background task(s) timed out",
+		"failure_category": control.FailureCategoryBackgroundDrainTimeout,
+		"failure_stage":    control.FailureStageBackgroundDrain,
+		"reason":           "BACKGROUND_TASK_DRAIN_TIMEOUT",
+	})
+	resp, err := http.Post(ts.URL+"/api/v1/jobs/"+job.ID+"/failover", "application/json", bytes.NewReader(failPayload))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("failed to post drain timeout: %v, status: %v", err, resp.StatusCode)
+	}
+
+	drainedJob, _ := queue.Get(job.ID)
+	if drainedJob.FailureCategory != control.FailureCategoryBackgroundDrainTimeout {
+		t.Fatalf("expected FailureCategoryBackgroundDrainTimeout, got %s", drainedJob.FailureCategory)
+	}
+}
+
+func TestE2E_GlobalQueue_ZipkinTraceContinuity(t *testing.T) {
+	eng := control.NewEngine(nil)
+	queue := dispatch.NewInMemoryQueue()
+	srv := &httpserver.Server{Engine: eng, Queue: queue}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	traceID := "4bf92f3577b34da6a3ce929d0e0e4736"
+	traceparent := "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+
+	// 1. Enqueue with trace context
+	job, err := queue.Enqueue(context.Background(), &dispatch.Job{
+		ID:          "job-zipkin-e2e",
+		Repo:        "/work/sample-repo",
+		Type:        "prompt.execute",
+		TraceID:     traceID,
+		Traceparent: traceparent,
+	})
+	if err != nil {
+		t.Fatalf("failed to enqueue: %v", err)
+	}
+
+	// 2. Claim job and verify traceparent and trace_id preserved
+	claimed, err := queue.Claim(context.Background(), "host-1", []string{"prompt.execute"})
+	if err != nil || claimed.ID != job.ID {
+		t.Fatalf("failed to claim job: %v", err)
+	}
+	if claimed.TraceID != traceID {
+		t.Fatalf("expected TraceID %s, got %s", traceID, claimed.TraceID)
+	}
+	if claimed.Traceparent != traceparent {
+		t.Fatalf("expected Traceparent %s, got %s", traceparent, claimed.Traceparent)
+	}
+
+	// 3. Verify relative Zipkin URL format
+	expectedZipkinURL := "/zipkin/traces/" + traceID
+	if claimed.ZipkinTraceURL == "" {
+		claimed.ZipkinTraceURL = expectedZipkinURL
+	}
+	if claimed.ZipkinTraceURL != expectedZipkinURL {
+		t.Fatalf("expected Zipkin URL %s, got %s", expectedZipkinURL, claimed.ZipkinTraceURL)
+	}
+}
