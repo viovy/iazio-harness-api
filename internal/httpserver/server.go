@@ -1656,8 +1656,10 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		Presence              string   `json:"presence"`
 		FetchFailed           bool     `json:"fetch_failed"`
 		SupportedCapabilities []string `json:"supported_capabilities"`
-		Version               string   `json:"version"`
-		CommitSHA             string   `json:"commit_sha"`
+		Version               string     `json:"version"`
+		CommitSHA             string     `json:"commit_sha"`
+		EagerUpdateEnabled    bool       `json:"eager_update_enabled"`
+		LastEagerUpdateAt     *time.Time `json:"last_eager_update_at"`
 		Tools                 []struct {
 			Name             string   `json:"name"`
 			Path             string   `json:"path"`
@@ -1714,6 +1716,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, err)
 		return
 	}
+	s.Engine.SetHostEagerUpdate(hostID, raw.EagerUpdateEnabled, raw.LastEagerUpdateAt)
 	if s.SaveHost != nil {
 		if detail, ok := s.Engine.GetHostDetail(hostID); ok {
 			s.SaveHost(detail.Host)
@@ -1755,6 +1758,10 @@ func (s *Server) getAgentTools(w http.ResponseWriter, r *http.Request) {
 		"version":                detail.Host.Version,
 		"commit_sha":             detail.Host.CommitSHA,
 		"tools":                  tools,
+		"eager_update_enabled":   detail.Host.EagerUpdateEnabled,
+	}
+	if detail.Host.LastEagerUpdateAt != nil && !detail.Host.LastEagerUpdateAt.IsZero() {
+		resp["last_eager_update_at"] = detail.Host.LastEagerUpdateAt.Format(time.RFC3339)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

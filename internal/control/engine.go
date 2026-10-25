@@ -717,6 +717,8 @@ type Host struct {
 	FleetCheckedAt        *time.Time
 	RepoStatuses          map[string]RepoRuntimeStatus
 	EagerReadiness        *EagerUpdateReadinessReport
+	EagerUpdateEnabled    bool
+	LastEagerUpdateAt     *time.Time
 }
 
 // PingAck is a live acknowledgment from an agent responding to a PING command.
@@ -5596,12 +5598,9 @@ func (e *Engine) reconcileStaleWorkspaceSlotsLocked(now time.Time, staleGrace ti
 				if job.ExitPosted || job.Status == "COMPLETED" || job.Status == "FAILED" || job.Status == "CANCELLED" || job.Status == "ABANDONED" {
 					shouldReclaim = true
 					reclaimReason = fmt.Sprintf("active job %s has completed/exited (status: %s)", repo.RunningJobID, job.Status)
-				} else if !job.LastOutputAt.IsZero() && now.Sub(job.LastOutputAt) > staleGrace {
+				} else if !job.LeaseExpiry.IsZero() && now.After(job.LeaseExpiry) {
 					shouldReclaim = true
-					reclaimReason = fmt.Sprintf("active job %s progress stalled for %v", repo.RunningJobID, now.Sub(job.LastOutputAt).Round(time.Second))
-				} else if job.LastOutputAt.IsZero() && !job.StartedAt.IsZero() && now.Sub(job.StartedAt) > staleGrace {
-					shouldReclaim = true
-					reclaimReason = fmt.Sprintf("active job %s inactive since start (%v)", repo.RunningJobID, now.Sub(job.StartedAt).Round(time.Second))
+					reclaimReason = fmt.Sprintf("active job %s lease expired at %s", repo.RunningJobID, job.LeaseExpiry.Format(time.RFC3339))
 				}
 			} else {
 				// No known job in memory matches RunningJobID: only reclaim if slot has been unchanged longer than staleGrace

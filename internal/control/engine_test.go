@@ -4378,6 +4378,7 @@ func TestReconcileStaleWorkspaceSlots_And_DispatchDiagnostics(t *testing.T) {
 		Status:       "RUNNING",
 		StartedAt:    now,
 		LastOutputAt: now,
+		LeaseExpiry:  now.Add(30 * time.Second),
 	}
 	_ = e.UpsertRepo(Repo{
 		HostID:                       "pc1",

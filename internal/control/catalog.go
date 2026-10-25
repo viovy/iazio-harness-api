@@ -210,6 +210,21 @@ func (e *Engine) Heartbeat(id string, tools []Tool, fetchFailed bool, activeJobs
 	return e.HeartbeatDetailed(id, "ONLINE", tools, fetchFailed, activeJobs...)
 }
 
+// SetHostEagerUpdate updates the eager update telemetry reported by the agent.
+func (e *Engine) SetHostEagerUpdate(id string, enabled bool, lastUpdate *time.Time) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	h, ok := e.hosts[id]
+	if !ok {
+		return
+	}
+	h.EagerUpdateEnabled = enabled
+	if lastUpdate != nil && !lastUpdate.IsZero() {
+		t := *lastUpdate
+		h.LastEagerUpdateAt = &t
+	}
+}
+
 // HostSummary is the fleet-list row.
 type HostSummary struct {
 	Host        Host

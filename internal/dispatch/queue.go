@@ -39,8 +39,8 @@ const (
 const (
 	// DefaultClaimTimeout is the duration a claimed job can remain active before lease expiration.
 	DefaultClaimTimeout = 30 * time.Minute
-	// DefaultHeartbeatTimeout is the maximum duration between runner heartbeats before considering a runner stalled (45s).
-	DefaultHeartbeatTimeout = 45 * time.Second
+	// DefaultHeartbeatTimeout is the maximum duration between runner heartbeats before considering a runner stalled (90s, allowing >=6 retry margins).
+	DefaultHeartbeatTimeout = 90 * time.Second
 	// DefaultJobTimeout is the maximum total duration of a job before execution timeout (7 days default).
 	DefaultJobTimeout = 7 * 24 * time.Hour
 	// DefaultMaxAttempts is the maximum number of times a stalled job may be reclaimed.

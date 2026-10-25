@@ -546,3 +546,58 @@ type failingMockQueue struct {
 func (f *failingMockQueue) Enqueue(ctx context.Context, job *dispatch.Job) (*dispatch.Job, error) {
 	return nil, f.err
 }
+
+func TestServer_EagerUpdateTelemetry(t *testing.T) {
+	e := control.NewEngine(time.Now)
+	srv := &Server{Engine: e}
+	handler := srv.Handler()
+
+	_ = e.RegisterHost("pc1", "workstation")
+
+	// Post heartbeat with eager update telemetry
+	hbBody := `{"presence":"ONLINE","eager_update_enabled":true,"last_eager_update_at":"2026-10-25T14:00:00Z","tools":[{"name":"autopilot","version":"0.1.0","status":"OK"}]}`
+	recHB := httptest.NewRecorder()
+	handler.ServeHTTP(recHB, httptest.NewRequest("POST", "/v1/hosts/pc1/heartbeat", bytes.NewReader([]byte(hbBody))))
+	if recHB.Code != http.StatusOK {
+		t.Fatalf("expected 200 on heartbeat, got %d: %s", recHB.Code, recHB.Body.String())
+	}
+
+	// Query /api/v1/agents/pc1/tools
+	recTools := httptest.NewRecorder()
+	handler.ServeHTTP(recTools, httptest.NewRequest("GET", "/api/v1/agents/pc1/tools", nil))
+	if recTools.Code != http.StatusOK {
+		t.Fatalf("expected 200 on /api/v1/agents/pc1/tools, got %d: %s", recTools.Code, recTools.Body.String())
+	}
+
+	var toolsResp struct {
+		Host               string `json:"host"`
+		EagerUpdateEnabled bool   `json:"eager_update_enabled"`
+		LastEagerUpdateAt  string `json:"last_eager_update_at"`
+	}
+	if err := json.Unmarshal(recTools.Body.Bytes(), &toolsResp); err != nil {
+		t.Fatalf("unmarshal tools response: %v", err)
+	}
+	if !toolsResp.EagerUpdateEnabled {
+		t.Fatalf("expected eager_update_enabled true, got false")
+	}
+	if toolsResp.LastEagerUpdateAt != "2026-10-25T14:00:00Z" {
+		t.Fatalf("expected last_eager_update_at 2026-10-25T14:00:00Z, got %s", toolsResp.LastEagerUpdateAt)
+	}
+
+	// Query /v1/hosts/pc1/tools
+	recHostTools := httptest.NewRecorder()
+	handler.ServeHTTP(recHostTools, httptest.NewRequest("GET", "/v1/hosts/pc1/tools", nil))
+	if recHostTools.Code != http.StatusOK {
+		t.Fatalf("expected 200 on /v1/hosts/pc1/tools, got %d: %s", recHostTools.Code, recHostTools.Body.String())
+	}
+	var hostToolsResp struct {
+		EagerUpdateEnabled bool   `json:"eager_update_enabled"`
+		LastEagerUpdateAt  string `json:"last_eager_update_at"`
+	}
+	if err := json.Unmarshal(recHostTools.Body.Bytes(), &hostToolsResp); err != nil {
+		t.Fatalf("unmarshal host tools response: %v", err)
+	}
+	if !hostToolsResp.EagerUpdateEnabled {
+		t.Fatalf("expected eager_update_enabled true in host tools, got false")
+	}
+}
