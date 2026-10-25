@@ -655,6 +655,130 @@ func TestJobStreamKeepaliveAndOutputTick(t *testing.T) {
 	_ = sch
 }
 
+func TestAppendChunk_TurnAutoContinued(t *testing.T) {
+	e := control.NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	_ = e.UpsertRepo(control.Repo{HostID: "host-1", WorktreePath: "/work/app"})
+	p := e.PutPrompt(control.Prompt{Title: "Task 1", Body: "do task 1", Status: "READY"})
+	sch, _ := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	job, _, _, _ := e.PollHost("host-1")
+
+	s := &Server{Engine: e}
+	handler := s.Handler()
+
+	payload := `{"type":"TURN_AUTO_CONTINUED","continuation_turn":2,"conversation_id":"conv-12345","unmet_gates":["clean_working_tree"],"active_child_tasks":"make run-review-scheme"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/chunks", bytes.NewBufferString(payload))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d", rr.Code)
+	}
+
+	detail, ok := e.GetJob(job.ID)
+	if !ok {
+		t.Fatal("expected job found")
+	}
+	if detail.ExecutionAttempt != 3 {
+		t.Fatalf("expected ExecutionAttempt=3, got %d", detail.ExecutionAttempt)
+	}
+	if detail.AutoResumeCount != 2 {
+		t.Fatalf("expected AutoResumeCount=2, got %d", detail.AutoResumeCount)
+	}
+	if detail.ContinuationTurn != 2 {
+		t.Fatalf("expected ContinuationTurn=2, got %d", detail.ContinuationTurn)
+	}
+	if detail.ActiveChildTasks != "make run-review-scheme" {
+		t.Fatalf("expected ActiveChildTasks='make run-review-scheme', got %q", detail.ActiveChildTasks)
+	}
+	if detail.ActiveConversationID != "conv-12345" {
+		t.Fatalf("expected ActiveConversationID='conv-12345', got %q", detail.ActiveConversationID)
+	}
+
+	foundTurnNotif := false
+	for _, n := range s.notifications {
+		if n.Event == "job.turn.auto_continued" && n.JobID == job.ID {
+			foundTurnNotif = true
+			break
+		}
+	}
+	if !foundTurnNotif {
+		t.Fatal("expected notification job.turn.auto_continued to be recorded")
+	}
+	_ = sch
+}
+
+func TestPostExit_Notifications(t *testing.T) {
+	e := control.NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	_ = e.UpsertRepo(control.Repo{HostID: "host-1", WorktreePath: "/work/app"})
+	p := e.PutPrompt(control.Prompt{Title: "Task 1", Body: "do task 1", Status: "READY"})
+	_, _ = e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	job, _, _, _ := e.PollHost("host-1")
+
+	s := &Server{Engine: e}
+	handler := s.Handler()
+
+	exitReq := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/exit", bytes.NewBufferString(`{"exit_code":0,"termination_reason_code":"CLEAN"}`))
+	exitReq.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, exitReq)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+
+	foundCompleted := false
+	for _, n := range s.notifications {
+		if n.Event == "job.ase.completed" && n.JobID == job.ID {
+			foundCompleted = true
+			break
+		}
+	}
+	if !foundCompleted {
+		t.Fatal("expected notification job.ase.completed to be recorded")
+	}
+}
+
+func TestAppendChunk_FilterRootAgentIdle(t *testing.T) {
+	e := control.NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	_ = e.UpsertRepo(control.Repo{HostID: "host-1", WorktreePath: "/work/app"})
+	p := e.PutPrompt(control.Prompt{Title: "Task 1", Body: "do task 1", Status: "READY"})
+	_, _ = e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	job, _, _, _ := e.PollHost("host-1")
+
+	s := &Server{Engine: e}
+	handler := s.Handler()
+
+	// Chunk containing only the misleading timeout message should be filtered completely
+	payload1 := `{"type":"OUTPUT_CHUNK","stream":"stderr","text":"root agent idle; waiting up to 1h0m0s for 1 background task(s)\n"}`
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/chunks", bytes.NewBufferString(payload1))
+	req1.Header.Set("Content-Type", "application/json")
+	rr1 := httptest.NewRecorder()
+	handler.ServeHTTP(rr1, req1)
+	if rr1.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d", rr1.Code)
+	}
+
+	// Chunk with mixed lines should have the idle line removed
+	payload2 := `{"type":"OUTPUT_CHUNK","stream":"stdout","text":"starting task\nroot agent idle; waiting up to 1h0m0s for 1 background task(s)\ntask finished\n"}`
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/chunks", bytes.NewBufferString(payload2))
+	req2.Header.Set("Content-Type", "application/json")
+	rr2 := httptest.NewRecorder()
+	handler.ServeHTTP(rr2, req2)
+	if rr2.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d", rr2.Code)
+	}
+
+	page := e.JobLogs(job.ID, 0, "", 0, 0)
+	for _, c := range page.Chunks {
+		if strings.Contains(c.Text, "root agent idle; waiting up to") {
+			t.Fatalf("expected idle line to be filtered from chunk, got: %q", c.Text)
+		}
+	}
+}
+
+
 func TestAbandonResumeAndRemediateEndpoints(t *testing.T) {
 	s := &Server{Engine: control.NewEngine(nil)}
 	handler := s.Handler()

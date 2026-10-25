@@ -41,8 +41,8 @@ const (
 	DefaultClaimTimeout = 30 * time.Minute
 	// DefaultHeartbeatTimeout is the maximum duration between runner heartbeats before considering a runner stalled (90s, allowing >=6 retry margins).
 	DefaultHeartbeatTimeout = 90 * time.Second
-	// DefaultJobTimeout is the maximum total duration of a job before execution timeout (7 days default).
-	DefaultJobTimeout = 7 * 24 * time.Hour
+	// DefaultJobTimeout is the maximum total duration of a job before execution timeout (0 = unbounded).
+	DefaultJobTimeout = 0
 	// DefaultMaxAttempts is the maximum number of times a stalled job may be reclaimed.
 	DefaultMaxAttempts = 3
 )
@@ -232,8 +232,9 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 			continue
 		}
 
-		// 1. Max execution timeout: from CreatedAt
-		if q.jobTimeout > 0 && !j.CreatedAt.IsZero() && now.Sub(j.CreatedAt) > q.jobTimeout {
+		// 1. Max execution timeout: from CreatedAt (0 = unbounded, stories immune)
+		isStory := j.StoryID != "" || j.Type == "story" || j.Type == "refinement"
+		if !isStory && q.jobTimeout > 0 && !j.CreatedAt.IsZero() && now.Sub(j.CreatedAt) > q.jobTimeout {
 			j.Status = JobStatusFailed
 			j.Error = "EXECUTION_TIMEOUT: job exceeded max execution duration"
 			completedAt := now

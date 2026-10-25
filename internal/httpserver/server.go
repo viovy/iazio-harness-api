@@ -77,6 +77,7 @@ type NotificationRecord struct {
 	Title     string         `json:"title"`
 	Message   string         `json:"message"`
 	Category  string         `json:"category"` // "info", "success", "warning", "error", "userAction"
+	Event     string         `json:"event,omitempty"`
 	Timestamp time.Time      `json:"timestamp"`
 	Source    string         `json:"source,omitempty"`
 	JobID     string         `json:"job_id,omitempty"`
@@ -1495,6 +1496,27 @@ func (s *Server) postExit(w http.ResponseWriter, r *http.Request) {
 	if err := s.Engine.PostExit(jobID, body.ExitCode, body); err != nil {
 		writeErr(w, http.StatusConflict, err)
 		return
+	}
+	if body.ExitCode == 0 && (body.TerminationReasonCode == "" || body.TerminationReasonCode == "CLEAN") {
+		s.RecordNotification(NotificationRecord{
+			Timestamp: time.Now().UTC(),
+			Category:  "info",
+			Title:     "job.ase.completed",
+			Source:    "harness",
+			Event:     "job.ase.completed",
+			JobID:     jobID,
+			Message:   fmt.Sprintf("ASE job %s completed successfully", jobID),
+		})
+	} else {
+		s.RecordNotification(NotificationRecord{
+			Timestamp: time.Now().UTC(),
+			Category:  "warning",
+			Title:     "job.ase.intervention_required",
+			Source:    "harness",
+			Event:     "job.ase.intervention_required",
+			JobID:     jobID,
+			Message:   fmt.Sprintf("ASE job %s intervention required (exit: %d, reason: %s)", jobID, body.ExitCode, body.TerminationReasonCode),
+		})
 	}
 	if s.SaveRepo != nil {
 		if repo, ok := s.Engine.GetRepoForJob(jobID); ok {
@@ -2915,26 +2937,64 @@ func (s *Server) retryCorrelation(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) appendChunk(w http.ResponseWriter, r *http.Request) {
 	var raw struct {
-		Type           string `json:"type"`
-		Stream         string `json:"stream"`
-		Text           string `json:"text"`
-		SilentForMs    int    `json:"silent_for_ms"`
-		HarnessPID     int    `json:"harness_pid"`
-		ToolPID        int    `json:"tool_pid"`
-		ElapsedSeconds int64  `json:"elapsed_seconds"`
+		Type             string   `json:"type"`
+		Stream           string   `json:"stream"`
+		Text             string   `json:"text"`
+		SilentForMs      int      `json:"silent_for_ms"`
+		HarnessPID       int      `json:"harness_pid"`
+		ToolPID          int      `json:"tool_pid"`
+		ElapsedSeconds   int64    `json:"elapsed_seconds"`
+		ContinuationTurn int      `json:"continuation_turn"`
+		ConversationID   string   `json:"conversation_id"`
+		UnmetGates       []string `json:"unmet_gates"`
+		ActiveChildTasks string   `json:"active_child_tasks"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	if raw.Type == "TURN_AUTO_CONTINUED" {
+		if raw.Text == "" {
+			raw.Stream = "stdout"
+			raw.Text = fmt.Sprintf("[iazio-harness] Turn auto-continued (turn %d) on conversation %s (unmet gates: %v; active: %s)\n",
+				raw.ContinuationTurn, raw.ConversationID, raw.UnmetGates, raw.ActiveChildTasks)
+		}
+		s.RecordNotification(NotificationRecord{
+			Timestamp: time.Now().UTC(),
+			Category:  "info",
+			Title:     "job.turn.auto_continued",
+			Source:    "harness",
+			Event:     "job.turn.auto_continued",
+			JobID:     r.PathValue("id"),
+			Message:   fmt.Sprintf("Turn auto-continued (turn %d) on job %s: conversation %s (unmet gates: %v)", raw.ContinuationTurn, r.PathValue("id"), raw.ConversationID, raw.UnmetGates),
+		})
+	}
+	if strings.Contains(raw.Text, "root agent idle; waiting up to") {
+		lines := strings.Split(raw.Text, "\n")
+		var kept []string
+		for _, line := range lines {
+			if !strings.Contains(line, "root agent idle; waiting up to") {
+				kept = append(kept, line)
+			}
+		}
+		raw.Text = strings.Join(kept, "\n")
+	}
+	if raw.Type == "OUTPUT_CHUNK" && raw.Text == "" {
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": "filtered"})
+		return
+	}
 	s.Engine.AppendLog(r.PathValue("id"), control.LogChunk{
-		Type:           raw.Type,
-		Stream:         raw.Stream,
-		Text:           raw.Text,
-		SilentForMs:    raw.SilentForMs,
-		HarnessPID:     raw.HarnessPID,
-		ToolPID:        raw.ToolPID,
-		ElapsedSeconds: raw.ElapsedSeconds,
+		Type:             raw.Type,
+		Stream:           raw.Stream,
+		Text:             raw.Text,
+		SilentForMs:      raw.SilentForMs,
+		HarnessPID:       raw.HarnessPID,
+		ToolPID:          raw.ToolPID,
+		ElapsedSeconds:   raw.ElapsedSeconds,
+		ContinuationTurn: raw.ContinuationTurn,
+		ConversationID:   raw.ConversationID,
+		UnmetGates:       raw.UnmetGates,
+		ActiveChildTasks: raw.ActiveChildTasks,
 	})
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "stored"})
 }

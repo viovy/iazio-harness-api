@@ -278,6 +278,8 @@ type JobDetail struct {
 	AutoResumeCount             int                   `json:"auto_resume_count,omitempty"`
 	LastProgressFingerprint     string                `json:"last_progress_fingerprint,omitempty"`
 	CircuitBreakerTripped       bool                  `json:"circuit_breaker_tripped,omitempty"`
+	ContinuationTurn            int                   `json:"continuation_turn,omitempty"`
+	ActiveChildTasks            string                `json:"active_child_tasks,omitempty"`
 	ASEGateStatus               map[string]any        `json:"ase_gate_status,omitempty"`
 	StallTimeoutSec             int                   `json:"stall_timeout_sec,omitempty"`
 	LivenessPulseSeconds        int                   `json:"liveness_pulse_seconds,omitempty"`
@@ -346,6 +348,8 @@ type Job struct {
 	ReapResult                map[string]any
 	RehydrationStatus         map[string]any
 	ConversationLineage       []ConversationLineage
+	ContinuationTurn          int
+	ActiveChildTasks          string
 	AutoResumePolicy          *AutoResumePolicy
 	AutoResumeCount           int
 	LastProgressFingerprint   string
@@ -537,6 +541,8 @@ type HistoryRow struct {
 	ReapResult                map[string]any
 	RehydrationStatus         map[string]any
 	ConversationLineage       []ConversationLineage
+	ContinuationTurn          int
+	ActiveChildTasks          string
 	AutoResumePolicy          *AutoResumePolicy
 	AutoResumeCount           int
 	LastProgressFingerprint   string
@@ -593,6 +599,8 @@ type HistoryItem struct {
 	ReapResult                map[string]any
 	RehydrationStatus         map[string]any
 	ConversationLineage       []ConversationLineage
+	ContinuationTurn          int
+	ActiveChildTasks          string
 	AutoResumePolicy          *AutoResumePolicy
 	AutoResumeCount           int
 	LastProgressFingerprint   string
@@ -613,17 +621,21 @@ type HistoryItem struct {
 
 // LogChunk is one stripped output event.
 type LogChunk struct {
-	Seq            int
-	Type           string
-	Stream         string
-	Text           string
-	Head           string
-	Tail           string
-	DroppedBytes   int
-	SilentForMs    int
-	HarnessPID     int
-	ToolPID        int
-	ElapsedSeconds int64
+	Seq              int
+	Type             string
+	Stream           string
+	Text             string
+	Head             string
+	Tail             string
+	DroppedBytes     int
+	SilentForMs      int
+	HarnessPID       int
+	ToolPID          int
+	ElapsedSeconds   int64
+	ContinuationTurn int
+	ConversationID   string
+	UnmetGates       []string
+	ActiveChildTasks string
 }
 
 // RepoRequest is a checkout the browser asked the agent to register.
@@ -953,7 +965,7 @@ func (e *Engine) newJobLocked(host, path, clone, kind string) *Job {
 	e.schedules[sid] = &Schedule{
 		ID: sid, HostID: host, WorktreePath: path, CloneURL: clone, Kind: kind,
 		IterationsTotal: 1, IterationsRemaining: 1,
-		MaxExecutionDuration: DefaultMaxExec, Status: "RUNNING",
+		MaxExecutionDuration: 0, Status: "RUNNING",
 	}
 	job := &Job{
 		ID: id, ScheduleID: sid, Kind: kind, Status: "RUNNING",
@@ -2467,15 +2479,8 @@ func (e *Engine) reapExpiredLocked() {
 			continue
 		}
 		if job.Status == "RUNNING" {
-			maxDur := DefaultMaxExec
-			if sch != nil && sch.MaxExecutionDuration > 0 {
-				maxDur = sch.MaxExecutionDuration
-			}
-			started := job.StartedAt
-			if started.IsZero() {
-				started = job.LeaseExpiry.Add(-LeaseInterval)
-			}
-			timedOut := !started.IsZero() && now.Sub(started) > maxDur
+			// No execution timeout on running jobs in iazio* components
+			timedOut := false
 			hostOffline := false
 			if sch != nil {
 				if h, ok := e.hosts[sch.HostID]; ok && h.Presence == "OFFLINE" && now.Sub(h.LastSeen) > EphemeralGrace {
@@ -2486,11 +2491,9 @@ func (e *Engine) reapExpiredLocked() {
 			if timedOut || hostOffline || leaseExpired {
 				job.Status = "FAILED"
 				job.ExitPosted = true
-				reason := "EXECUTION_TIMEOUT"
+				reason := "LEASE_EXPIRED"
 				if hostOffline {
 					reason = "HOST_OFFLINE"
-				} else if leaseExpired && !timedOut {
-					reason = "LEASE_EXPIRED"
 				}
 				job.TerminationReasonCode = reason
 				job.TerminationReasonMessage = fmt.Sprintf("Job terminated: %s", reason)
@@ -2641,8 +2644,6 @@ func (e *Engine) reapExpiredLocked() {
 				if !hasLiveJob {
 					isStale = true
 				} else if repo != nil && repo.Lock == LockIdle && repo.RunningJobID != rows[i].JobID {
-					isStale = true
-				} else if !rows[i].CreatedAt.IsZero() && now.Sub(rows[i].CreatedAt) > DefaultMaxExec*2 {
 					isStale = true
 				}
 				if isStale {
@@ -3822,6 +3823,10 @@ func (e *Engine) buildJobDetailLocked(job *Job) JobDetail {
 		NonResumableReason:        job.NonResumableReason,
 		WorkspaceDirtyFiles:       append([]string(nil), job.WorkspaceDirtyFiles...),
 		BackgroundTasks:           append([]BackgroundTaskInfo(nil), job.BackgroundTasks...),
+		ContinuationTurn:          job.ContinuationTurn,
+		ActiveChildTasks:          job.ActiveChildTasks,
+		ExecutionAttempt:          job.ExecutionAttempt,
+		AutoResumeCount:           job.AutoResumeCount,
 	}
 	if !job.StartedAt.IsZero() {
 		detail.StartedAt = job.StartedAt.UTC().Format(time.RFC3339)
@@ -3901,9 +3906,8 @@ func (e *Engine) buildJobDetailLocked(job *Job) JobDetail {
 	if detail.Engine == "" {
 		detail.Engine = "agent"
 	}
-	if detail.MaxExecutionDurationSeconds == 0 {
-		detail.MaxExecutionDurationSeconds = int(DefaultMaxExec.Seconds())
-	}
+	// No execution timeout on jobs in iazio* components
+	detail.MaxExecutionDurationSeconds = 0
 	if detail.Kind == KindRefinement {
 		for _, it := range e.ideas {
 			if it.Status == IdeaRefining || (detail.SourceIdeaID != "" && it.ID == detail.SourceIdeaID) {
@@ -5754,6 +5758,7 @@ func (e *Engine) EnqueueGlobalSchedule(promptID string, iterations int, envVars 
 		IsGlobal: true, Kind: KindOrdinary, IterationsTotal: iterations, IterationsRemaining: iterations,
 		MaxExecutionDuration: DefaultMaxExec, EnvKeys: envKeys, EnvVars: envCopy,
 		Status: "QUEUED", PromptTitle: p.Title, Engine: p.Engine,
+		StoryID: p.StoryID,
 	}
 	e.schedules[sid] = sch
 	return *sch, nil
