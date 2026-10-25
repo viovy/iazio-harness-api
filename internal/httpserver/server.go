@@ -162,6 +162,7 @@ func (s *Server) Handler() http.Handler {
 
 	jobLifecycle := handlers.NewJobLifecycleHandler(queue, codebaseStore)
 	if s.Engine != nil {
+		jobLifecycle.SetEngine(s.Engine)
 		jobLifecycle.SetScheduler(s.Engine)
 		jobLifecycle.SetHistoryFinder(s.Engine)
 	}
@@ -175,6 +176,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/jobs/{id}/cancel", jobLifecycle.CancelJob)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/retry", jobLifecycle.RetryJob)
 	mux.HandleFunc("POST /api/v1/stories/{id}/execute", jobLifecycle.ExecuteStory)
+	mux.HandleFunc("POST /api/v1/stories/execute", jobLifecycle.ExecuteStory)
+	mux.HandleFunc("POST /v1/stories/{id}/execute", jobLifecycle.ExecuteStory)
+	mux.HandleFunc("POST /v1/stories/execute", jobLifecycle.ExecuteStory)
+	mux.HandleFunc("PATCH /api/v1/jobs/{id}/story-binding", jobLifecycle.BindStory)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/story-binding", jobLifecycle.BindStory)
+	mux.HandleFunc("PATCH /v1/jobs/{id}/story-binding", jobLifecycle.BindStory)
+	mux.HandleFunc("POST /v1/jobs/{id}/story-binding", jobLifecycle.BindStory)
 
 	agentJobsHandler := handlers.NewAgentJobsHandler(queue)
 	mux.HandleFunc("POST /api/v1/agent/jobs/claim", agentJobsHandler.ClaimHandler)
@@ -347,6 +355,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /v1/fleet/tool-priority", s.setToolPriority)
 	mux.HandleFunc("GET /api/v1/tool-priority", s.getToolPriority)
 	mux.HandleFunc("PUT /api/v1/tool-priority", s.setToolPriority)
+	mux.HandleFunc("GET /v1/global-queue/tool-priority", s.getToolPriority)
+	mux.HandleFunc("PUT /v1/global-queue/tool-priority", s.setToolPriority)
+	mux.HandleFunc("GET /api/v1/global-queue/tool-priority", s.getToolPriority)
+	mux.HandleFunc("PUT /api/v1/global-queue/tool-priority", s.setToolPriority)
 	return withTracing(withCORS(withAuth(mux, s.AuthToken)))
 }
 

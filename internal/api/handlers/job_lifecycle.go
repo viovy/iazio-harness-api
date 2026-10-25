@@ -35,6 +35,7 @@ type JobLifecycleHandler struct {
 	scheduler      GlobalScheduler
 	historyFinder  HistoryFinder
 	storyValidator StoryValidator
+	engine         *control.Engine
 }
 
 // NewJobLifecycleHandler constructs a new JobLifecycleHandler.
@@ -47,6 +48,11 @@ func NewJobLifecycleHandler(queue dispatch.Queue, store ...codebase.Store) *JobL
 		queue: queue,
 		store: s,
 	}
+}
+
+// SetEngine sets the control engine for dynamic tool priority allocation and story binding.
+func (h *JobLifecycleHandler) SetEngine(engine *control.Engine) {
+	h.engine = engine
 }
 
 // SetScheduler sets the global scheduler.
@@ -105,27 +111,37 @@ func (h *JobLifecycleHandler) isStoryAvailable(storyID, submodule string) bool {
 
 // JobDetailResponse is the detailed JSON representation of a dispatch job.
 type JobDetailResponse struct {
-	ID               string                  `json:"id"`
-	Type             string                  `json:"type"`
-	Repo             string                  `json:"repo"`
-	TargetHost       string                  `json:"target_host,omitempty"`
-	TargetAgent      string                  `json:"target_agent,omitempty"`
-	Status           string                  `json:"status"`
-	Result           json.RawMessage         `json:"result,omitempty"`
-	Error            string                  `json:"error,omitempty"`
-	TraceID          string                  `json:"trace_id,omitempty"`
-	SearchID         string                  `json:"search_id,omitempty"`
-	RelevanceEmitted bool                    `json:"relevance_emitted"`
-	PromotedMemories []string                `json:"promoted_memories,omitempty"`
-	FencingToken     int64                   `json:"fencing_token,omitempty"`
-	Attempts         int                     `json:"attempts,omitempty"`
-	HeartbeatAt      string                  `json:"heartbeat_at,omitempty"`
-	LeaseExpiresAt   string                  `json:"lease_expires_at,omitempty"`
-	AgentAffinity    *dispatch.AgentAffinity `json:"agent_affinity,omitempty"`
-	CreatedAt        string                  `json:"created_at"`
-	ClaimedAt        string                  `json:"claimed_at,omitempty"`
-	CompletedAt      string                  `json:"completed_at,omitempty"`
-	DurationMs       int64                   `json:"duration_ms,omitempty"`
+	ID                      string                  `json:"id"`
+	Type                    string                  `json:"type"`
+	Repo                    string                  `json:"repo"`
+	TargetHost              string                  `json:"target_host,omitempty"`
+	TargetAgent             string                  `json:"target_agent,omitempty"`
+	StoryID                 string                  `json:"story_id,omitempty"`
+	StoryTitle              string                  `json:"story_title,omitempty"`
+	StoryPath               string                  `json:"story_path,omitempty"`
+	StoryAllocationStatus   string                  `json:"story_allocation_status,omitempty"`
+	AllocationSource        string                  `json:"allocation_source,omitempty"`
+	PriorityRankSelected    int                     `json:"priority_rank_selected,omitempty"`
+	NormalizedPrompt        string                  `json:"normalized_prompt,omitempty"`
+	EffectiveAction         string                  `json:"effective_action,omitempty"`
+	SourceConversationTitle string                  `json:"source_conversation_title,omitempty"`
+	LiveURL                 string                  `json:"live_url,omitempty"`
+	Status                  string                  `json:"status"`
+	Result                  json.RawMessage         `json:"result,omitempty"`
+	Error                   string                  `json:"error,omitempty"`
+	TraceID                 string                  `json:"trace_id,omitempty"`
+	SearchID                string                  `json:"search_id,omitempty"`
+	RelevanceEmitted        bool                    `json:"relevance_emitted"`
+	PromotedMemories        []string                `json:"promoted_memories,omitempty"`
+	FencingToken            int64                   `json:"fencing_token,omitempty"`
+	Attempts                int                     `json:"attempts,omitempty"`
+	HeartbeatAt             string                  `json:"heartbeat_at,omitempty"`
+	LeaseExpiresAt          string                  `json:"lease_expires_at,omitempty"`
+	AgentAffinity           *dispatch.AgentAffinity `json:"agent_affinity,omitempty"`
+	CreatedAt               string                  `json:"created_at"`
+	ClaimedAt               string                  `json:"claimed_at,omitempty"`
+	CompletedAt             string                  `json:"completed_at,omitempty"`
+	DurationMs              int64                   `json:"duration_ms,omitempty"`
 }
 
 // ListQueueResponse contains the list of jobs matching a filter.
@@ -139,23 +155,47 @@ type CancelJobRequest struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-// ExecuteStoryRequest specifies parameters for executing an existing story.
+// ExecuteStoryRequest specifies parameters for executing an existing or newly allocated story.
 type ExecuteStoryRequest struct {
-	Submodule   string `json:"submodule,omitempty"`
-	TargetAgent string `json:"target_agent,omitempty"`
-	Prompt      string `json:"prompt,omitempty"`
-	TraceID     string `json:"trace_id,omitempty"`
-	SearchID    string `json:"search_id,omitempty"`
+	Submodule               string `json:"submodule,omitempty"`
+	Repo                    string `json:"repo,omitempty"`
+	StoryID                 string `json:"story_id,omitempty"`
+	TargetAgent             string `json:"target_agent,omitempty"`
+	Host                    string `json:"host,omitempty"`
+	Prompt                  string `json:"prompt,omitempty"`
+	Request                 string `json:"request,omitempty"`
+	Specification           string `json:"specification,omitempty"`
+	Description             string `json:"description,omitempty"`
+	Action                  string `json:"action,omitempty"`
+	SourceConversationTitle string `json:"source_conversation_title,omitempty"`
+	SourceContext           string `json:"source_context,omitempty"`
+	TraceID                 string `json:"trace_id,omitempty"`
+	SearchID                string `json:"search_id,omitempty"`
 }
 
 // ExecuteStoryResponse is returned after queuing a story for execution.
 type ExecuteStoryResponse struct {
-	JobID       string `json:"job_id"`
-	StoryID     string `json:"story_id"`
-	Submodule   string `json:"submodule"`
-	TargetAgent string `json:"target_agent"`
-	Status      string `json:"status"`
-	CreatedAt   string `json:"created_at"`
+	JobID                 string `json:"job_id"`
+	StoryID               string `json:"story_id,omitempty"`
+	Submodule             string `json:"submodule"`
+	TargetAgent           string `json:"target_agent"`
+	TargetHost            string `json:"target_host,omitempty"`
+	TargetRepo            string `json:"target_repo,omitempty"`
+	Status                string `json:"status"`
+	StoryAllocationStatus string `json:"story_allocation_status,omitempty"`
+	AllocationSource      string `json:"allocation_source,omitempty"`
+	PriorityRankSelected  int    `json:"priority_rank_selected,omitempty"`
+	NormalizedPrompt      string `json:"normalized_prompt,omitempty"`
+	EffectiveAction       string `json:"effective_action,omitempty"`
+	LiveURL               string `json:"live_url,omitempty"`
+	CreatedAt             string `json:"created_at"`
+}
+
+// BindStoryRequest is the payload for PATCH /api/v1/jobs/{id}/story-binding.
+type BindStoryRequest struct {
+	StoryID    string `json:"story_id"`
+	StoryTitle string `json:"story_title,omitempty"`
+	StoryPath  string `json:"story_path,omitempty"`
 }
 
 // GetJob serves GET /api/v1/jobs/{id}.
@@ -311,7 +351,7 @@ func (h *JobLifecycleHandler) RetryJob(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// ExecuteStory serves POST /api/v1/stories/{id}/execute.
+// ExecuteStory serves POST /api/v1/stories/{id}/execute or POST /api/v1/stories/execute.
 func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Request) {
 	traceID, parentID := telemetry.ExtractHTTP(r.Header)
 	var spanOpts []telemetry.SpanOption
@@ -328,12 +368,6 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	storyID := strings.TrimSpace(r.PathValue("id"))
-	if storyID == "" {
-		writeJSONError(w, http.StatusBadRequest, "story id is required")
-		return
-	}
-
 	var req ExecuteStoryRequest
 	if r.Body != nil {
 		bodyBytes, _ := io.ReadAll(io.LimitReader(r.Body, 1<<18))
@@ -342,24 +376,66 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
+	storyID := strings.TrimSpace(r.PathValue("id"))
+	if storyID == "" {
+		storyID = strings.TrimSpace(req.StoryID)
+	}
+
 	submodule := strings.TrimSpace(req.Submodule)
+	if submodule == "" {
+		submodule = strings.TrimSpace(req.Repo)
+	}
 	if submodule == "" {
 		submodule = "."
 	}
 
-	if !h.isStoryAvailable(storyID, submodule) {
-		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("story %q not found in backlog: cannot execute nonexistent story. Create it first using create_story or verify it exists in docs/stories/.", storyID))
-		return
-	}
-
-	targetAgent := strings.TrimSpace(req.TargetAgent)
-	if targetAgent == "" {
-		targetAgent = "autopilot"
+	storyAllocationStatus := "allocated"
+	if storyID == "" {
+		storyAllocationStatus = "pending_harness_creation"
+	} else {
+		if !h.isStoryAvailable(storyID, submodule) {
+			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("story %q not found in backlog: cannot execute nonexistent story. Create it first using create_story or verify it exists in docs/stories/.", storyID))
+			return
+		}
 	}
 
 	promptText := strings.TrimSpace(req.Prompt)
 	if promptText == "" {
-		promptText = fmt.Sprintf("# Execute Story %s\n\nExecute autonomous story flow for %s in %s.", storyID, storyID, submodule)
+		promptText = strings.TrimSpace(req.Request)
+	}
+	if promptText == "" {
+		promptText = strings.TrimSpace(req.Specification)
+	}
+	if promptText == "" {
+		promptText = strings.TrimSpace(req.Description)
+	}
+	if promptText == "" {
+		if storyID != "" {
+			promptText = fmt.Sprintf("Execute autonomous story flow for %s in %s.", storyID, submodule)
+		} else {
+			promptText = fmt.Sprintf("Execute autonomous story flow in %s.", submodule)
+		}
+	}
+
+	action := strings.TrimSpace(req.Action)
+	if action == "" {
+		action = "/autonomous-story-execution"
+	}
+	normalizedPrompt := control.NormalizeASEPrompt(promptText, action)
+
+	targetAgent := strings.TrimSpace(req.TargetAgent)
+	targetHost := strings.TrimSpace(req.Host)
+	allocationSource := "explicit_target"
+	priorityRankSelected := 0
+
+	if h.engine != nil {
+		alloc := h.engine.ResolveToolPriorityAllocation(targetAgent, targetHost, submodule)
+		targetAgent = alloc.TargetAgent
+		targetHost = alloc.TargetHost
+		allocationSource = alloc.AllocationSource
+		priorityRankSelected = alloc.PriorityRankSelected
+	} else if targetAgent == "" {
+		targetAgent = "agy"
 	}
 
 	if t := strings.TrimSpace(req.TraceID); t != "" {
@@ -370,14 +446,28 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 	}
 
 	promptID := fmt.Sprintf("prompt_%s_%d", storyID, time.Now().Unix())
+	if storyID == "" {
+		promptID = fmt.Sprintf("prompt_ase_%d", time.Now().Unix())
+	}
+	execTitle := fmt.Sprintf("Execute story %s", storyID)
+	if storyID == "" {
+		execTitle = "Autonomous Story Execution"
+	}
+
 	execPayload, err := json.Marshal(map[string]any{
-		"prompt_id":    promptID,
-		"repo":         submodule,
-		"story_id":     storyID,
-		"title":        fmt.Sprintf("Execute story %s", storyID),
-		"prompt":       promptText,
-		"target_agent": targetAgent,
-		"trace_id":     traceID,
+		"prompt_id":                 promptID,
+		"repo":                      submodule,
+		"story_id":                  storyID,
+		"story_allocation_status":   storyAllocationStatus,
+		"allocation_source":         allocationSource,
+		"priority_rank_selected":    priorityRankSelected,
+		"source_conversation_title": req.SourceConversationTitle,
+		"title":                     execTitle,
+		"prompt":                    normalizedPrompt,
+		"effective_action":          action,
+		"target_agent":              targetAgent,
+		"target_host":               targetHost,
+		"trace_id":                  traceID,
 	})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to marshal execution payload: %v", err))
@@ -385,13 +475,21 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 	}
 
 	job, err := h.queue.Enqueue(r.Context(), &dispatch.Job{
-		Type:        dispatch.JobTypePromptExecute,
-		Repo:        submodule,
-		TargetAgent: targetAgent,
-		TraceID:     traceID,
-		ParentID:    span.ID,
-		SearchID:    strings.TrimSpace(req.SearchID),
-		Payload:     execPayload,
+		Type:                    dispatch.JobTypePromptExecute,
+		Repo:                    submodule,
+		TargetHost:              targetHost,
+		TargetAgent:             targetAgent,
+		StoryID:                 storyID,
+		StoryAllocationStatus:   storyAllocationStatus,
+		AllocationSource:        allocationSource,
+		PriorityRankSelected:    priorityRankSelected,
+		SourceConversationTitle: req.SourceConversationTitle,
+		NormalizedPrompt:        normalizedPrompt,
+		EffectiveAction:         action,
+		TraceID:                 traceID,
+		ParentID:                span.ID,
+		SearchID:                strings.TrimSpace(req.SearchID),
+		Payload:                 execPayload,
 	})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to enqueue story execution: %v", err))
@@ -399,16 +497,37 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 	}
 
 	if h.scheduler != nil {
-		_, _ = h.scheduler.EnqueueGlobalStorySchedule(storyID, submodule, targetAgent, promptText)
+		_, _ = h.scheduler.EnqueueGlobalStorySchedule(storyID, submodule, targetAgent, normalizedPrompt)
+	}
+
+	liveURL := ""
+	if targetHost != "" {
+		liveRepo := submodule
+		if liveRepo == "" || liveRepo == "." {
+			liveRepo = "root"
+		}
+		webBase := os.Getenv("IAZIO_WEB_BASE_URL")
+		if webBase == "" {
+			webBase = "https://example.com/iazio-web"
+		}
+		liveURL = fmt.Sprintf("%s/agents/%s/%s/live?job=%s", strings.TrimRight(webBase, "/"), targetHost, liveRepo, job.ID)
 	}
 
 	resp := ExecuteStoryResponse{
-		JobID:       job.ID,
-		StoryID:     storyID,
-		Submodule:   submodule,
-		TargetAgent: targetAgent,
-		Status:      job.Status,
-		CreatedAt:   job.CreatedAt.Format(time.RFC3339),
+		JobID:                 job.ID,
+		StoryID:               storyID,
+		Submodule:             submodule,
+		TargetAgent:           targetAgent,
+		TargetHost:            targetHost,
+		TargetRepo:            submodule,
+		Status:                job.Status,
+		StoryAllocationStatus: storyAllocationStatus,
+		AllocationSource:      allocationSource,
+		PriorityRankSelected:  priorityRankSelected,
+		NormalizedPrompt:      normalizedPrompt,
+		EffectiveAction:       action,
+		LiveURL:               liveURL,
+		CreatedAt:             job.CreatedAt.Format(time.RFC3339),
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -416,17 +535,67 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+// BindStory serves PATCH /api/v1/jobs/{id}/story-binding and POST /api/v1/jobs/{id}/story-binding.
+func (h *JobLifecycleHandler) BindStory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPatch && r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	jobID := strings.TrimSpace(r.PathValue("id"))
+	if jobID == "" {
+		writeJSONError(w, http.StatusBadRequest, "job id is required")
+		return
+	}
+
+	var req BindStoryRequest
+	if r.Body != nil {
+		bodyBytes, _ := io.ReadAll(io.LimitReader(r.Body, 1<<18))
+		if len(bodyBytes) > 0 {
+			_ = json.Unmarshal(bodyBytes, &req)
+		}
+	}
+
+	storyID := strings.TrimSpace(req.StoryID)
+	if storyID == "" {
+		writeJSONError(w, http.StatusBadRequest, "story_id is required")
+		return
+	}
+
+	job, err := h.queue.BindStory(r.Context(), jobID, storyID, req.StoryTitle, req.StoryPath)
+	if err != nil {
+		if errors.Is(err, dispatch.ErrJobNotFound) {
+			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("job %q not found", jobID))
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if h.engine != nil {
+		_ = h.engine.BindStoryToJob(jobID, storyID, req.StoryTitle, req.StoryPath)
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(formatJobDetail(job))
+}
+
 func formatHistoryRowToJobDetail(row control.HistoryRow, host, path string) JobDetailResponse {
 	return JobDetailResponse{
-		ID:               row.JobID,
-		Type:             "story_execution",
-		Repo:             path,
-		TargetHost:       host,
-		TargetAgent:      row.Engine,
-		Status:           row.Status,
-		Error:            row.ErrorMessage,
-		CreatedAt:        row.CreatedAt.Format(time.RFC3339),
-		PromotedMemories: []string{},
+		ID:                    row.JobID,
+		Type:                  "story_execution",
+		Repo:                  path,
+		TargetHost:            host,
+		TargetAgent:           row.Engine,
+		StoryID:               row.StoryID,
+		StoryAllocationStatus: row.StoryAllocationStatus,
+		AllocationSource:      row.AllocationSource,
+		PriorityRankSelected:  row.PriorityRankSelected,
+		Status:                row.Status,
+		Error:                 row.ErrorMessage,
+		CreatedAt:             row.CreatedAt.Format(time.RFC3339),
+		PromotedMemories:      []string{},
 	}
 }
 
@@ -441,22 +610,43 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 	}
 
 	resp := JobDetailResponse{
-		ID:               j.ID,
-		Type:             j.Type,
-		Repo:             j.Repo,
-		TargetHost:       j.TargetHost,
-		TargetAgent:      j.TargetAgent,
-		Status:           j.Status,
-		Result:           j.Result,
-		Error:            j.Error,
-		TraceID:          j.TraceID,
-		SearchID:         j.SearchID,
-		RelevanceEmitted: j.RelevanceEmitted,
-		PromotedMemories: promoted,
-		FencingToken:     j.FencingToken,
-		Attempts:         j.Attempts,
-		AgentAffinity:    j.AgentAffinity,
-		CreatedAt:        j.CreatedAt.Format(time.RFC3339),
+		ID:                      j.ID,
+		Type:                    j.Type,
+		Repo:                    j.Repo,
+		TargetHost:              j.TargetHost,
+		TargetAgent:             j.TargetAgent,
+		StoryID:                 j.StoryID,
+		StoryTitle:              j.StoryTitle,
+		StoryPath:               j.StoryPath,
+		StoryAllocationStatus:   j.StoryAllocationStatus,
+		AllocationSource:        j.AllocationSource,
+		PriorityRankSelected:    j.PriorityRankSelected,
+		NormalizedPrompt:        j.NormalizedPrompt,
+		EffectiveAction:         j.EffectiveAction,
+		SourceConversationTitle: j.SourceConversationTitle,
+		Status:                  j.Status,
+		Result:                  j.Result,
+		Error:                   j.Error,
+		TraceID:                 j.TraceID,
+		SearchID:                j.SearchID,
+		RelevanceEmitted:        j.RelevanceEmitted,
+		PromotedMemories:        promoted,
+		FencingToken:            j.FencingToken,
+		Attempts:                j.Attempts,
+		AgentAffinity:           j.AgentAffinity,
+		CreatedAt:               j.CreatedAt.Format(time.RFC3339),
+	}
+
+	if j.TargetHost != "" {
+		liveRepo := j.Repo
+		if liveRepo == "" || liveRepo == "." {
+			liveRepo = "root"
+		}
+		webBase := os.Getenv("IAZIO_WEB_BASE_URL")
+		if webBase == "" {
+			webBase = "https://example.com/iazio-web"
+		}
+		resp.LiveURL = fmt.Sprintf("%s/agents/%s/%s/live?job=%s", strings.TrimRight(webBase, "/"), j.TargetHost, liveRepo, j.ID)
 	}
 
 	if j.HeartbeatAt != nil {
