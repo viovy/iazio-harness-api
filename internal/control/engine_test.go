@@ -4362,17 +4362,17 @@ func TestReconcileStaleWorkspaceSlots_And_DispatchDiagnostics(t *testing.T) {
 	}
 	_ = e.HeartbeatWithCapabilities("mac-mini", "ONLINE", macTools, false, nil, "1.0", "")
 
-	// Upsert repos: pc1/meta-repo locked in LockASE by a stale job
+	// Upsert repos: pc1/workspace-main locked in LockASE by a stale job
 	_ = e.UpsertRepo(Repo{
 		HostID:                       "pc1",
-		WorktreePath:                 "/work/meta-repo",
+		WorktreePath:                 "/work/workspace-main",
 		Queue:                        QueueOpen,
 		Lock:                         LockASE,
 		RunningJobID:                 "job-stale-1",
 		GlobalQueueAllocationEnabled: true,
 	})
 
-	// Upsert pc1/meta-repo-03 locked in LockRunning with active job at now
+	// Upsert pc1/workspace-03 locked in LockRunning with active job at now
 	e.jobs["job-finished-1"] = &Job{
 		ID:           "job-finished-1",
 		Status:       "RUNNING",
@@ -4382,26 +4382,26 @@ func TestReconcileStaleWorkspaceSlots_And_DispatchDiagnostics(t *testing.T) {
 	}
 	_ = e.UpsertRepo(Repo{
 		HostID:                       "pc1",
-		WorktreePath:                 "/work/meta-repo-03",
+		WorktreePath:                 "/work/workspace-03",
 		Queue:                        QueueOpen,
 		Lock:                         LockRunning,
 		RunningJobID:                 "job-finished-1",
 		GlobalQueueAllocationEnabled: true,
 	})
 
-	// Upsert mac-mini/meta-repo-03 idle
+	// Upsert mac-mini/workspace-03 idle
 	_ = e.UpsertRepo(Repo{
 		HostID:                       "mac-mini",
-		WorktreePath:                 "/work/meta-repo-03",
+		WorktreePath:                 "/work/workspace-03",
 		Queue:                        QueueOpen,
 		Lock:                         LockIdle,
 		GlobalQueueAllocationEnabled: true,
 	})
 
 	// Before reconciliation: pc1 slots are locked
-	detail1, _ := e.GetRepoDetail("pc1", "/work/meta-repo")
+	detail1, _ := e.GetRepoDetail("pc1", "/work/workspace-main")
 	if detail1.Repo.Lock == LockIdle {
-		t.Fatalf("expected pc1/meta-repo locked initially")
+		t.Fatalf("expected pc1/workspace-main locked initially")
 	}
 
 	// Advance time past 45s stale grace
@@ -4414,13 +4414,13 @@ func TestReconcileStaleWorkspaceSlots_And_DispatchDiagnostics(t *testing.T) {
 	}
 
 	// Verify pc1 slots are now LockIdle
-	detail1After, _ := e.GetRepoDetail("pc1", "/work/meta-repo")
+	detail1After, _ := e.GetRepoDetail("pc1", "/work/workspace-main")
 	if detail1After.Repo.Lock != LockIdle {
-		t.Fatalf("expected pc1/meta-repo LockIdle after reconciliation, got %s", detail1After.Repo.Lock)
+		t.Fatalf("expected pc1/workspace-main LockIdle after reconciliation, got %s", detail1After.Repo.Lock)
 	}
-	detail2After, _ := e.GetRepoDetail("pc1", "/work/meta-repo-03")
+	detail2After, _ := e.GetRepoDetail("pc1", "/work/workspace-03")
 	if detail2After.Repo.Lock != LockIdle {
-		t.Fatalf("expected pc1/meta-repo-03 LockIdle after reconciliation, got %s", detail2After.Repo.Lock)
+		t.Fatalf("expected pc1/workspace-03 LockIdle after reconciliation, got %s", detail2After.Repo.Lock)
 	}
 
 	// Evaluate dispatch diagnostics for a pending job after fresh heartbeats

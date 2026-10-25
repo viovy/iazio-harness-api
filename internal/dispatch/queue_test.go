@@ -653,7 +653,7 @@ func TestQueue_ReconcileGlobalQueueSlots_And_ForceDispatch(t *testing.T) {
 	_, err := q.Enqueue(ctx, &Job{
 		ID:   "job_18aefb5b4b68bb72",
 		Type: JobTypePromptExecute,
-		Repo: "meta-repo",
+		Repo: "workspace-repo",
 	})
 	if err != nil {
 		t.Fatalf("enqueue error: %v", err)
