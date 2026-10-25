@@ -586,12 +586,9 @@ func (e *Engine) ScanRepoProfile(hostID, repoPath, profileName string) (*Distrib
 
 func fetchGitHubMetadataYml(ctx context.Context, cloneURL string, relService *ReleaseService) ([]byte, string, error) {
 	clean := strings.TrimSpace(cloneURL)
-	if clean == "" {
-		clean = "https://github.com/viovy/meta-repo"
-	}
 	repo := extractGitHubRepo(clean)
 	if repo == "" {
-		repo = "viovy/meta-repo"
+		return nil, "", fmt.Errorf("unable to determine repository from clone url %q", cloneURL)
 	}
 
 	client := &http.Client{Timeout: 6 * time.Second}

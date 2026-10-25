@@ -188,7 +188,7 @@ func TestScanRepoProfile_Validation(t *testing.T) {
 func TestScanRepoProfile_AgentSnapshot(t *testing.T) {
 	e := NewEngine(time.Now)
 	e.RegisterHost("h-remote", "Host Remote", "permanent")
-	rawYAML := `name: meta-repo
+	rawYAML := `name: test-repo
 fleet_distribution:
   tools:
     - name: agy
@@ -197,12 +197,12 @@ fleet_distribution:
 `
 	_ = e.UpsertRepo(Repo{
 		HostID:         "h-remote",
-		WorktreePath:   "/remote/work/meta-repo",
+		WorktreePath:   "/remote/work/test-repo",
 		MetadataYmlRaw: rawYAML,
 		GitVersion:     "v1.2.3",
 	})
 
-	prof, err := e.ScanRepoProfile("h-remote", "/remote/work/meta-repo", "remote-prof")
+	prof, err := e.ScanRepoProfile("h-remote", "/remote/work/test-repo", "remote-prof")
 	if err != nil {
 		t.Fatalf("expected ScanRepoProfile to succeed via agent snapshot, got: %v", err)
 	}
