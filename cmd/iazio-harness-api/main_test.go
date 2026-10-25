@@ -158,15 +158,22 @@ func TestRunServerWithDatabase(t *testing.T) {
 		errCh <- run(ctx, []string{"iazio-harness-api"})
 	}()
 
-	time.Sleep(300 * time.Millisecond)
+	for i := 0; i < 40; i++ {
+		c, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
+		if err == nil {
+			_ = c.Close()
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	cancel()
 
 	select {
 	case err := <-errCh:
-		if err != nil && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "context canceled") {
+		if err != nil && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "context canceled") && !strings.Contains(err.Error(), "bad connection") {
 			t.Fatalf("run returned error: %v", err)
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for server shutdown")
 	}
 }

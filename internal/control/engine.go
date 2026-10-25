@@ -347,6 +347,17 @@ type Repo struct {
 	ToolLiveness                 string
 	ExecutionProvenance          string
 	LastRuntimeCheck             time.Time
+	HealingReasonCode            string
+	HealingReasonMessage         string
+	HealingStartedAt             time.Time
+	HealingAttemptCount          int
+	MaxHealingAttempts           int
+	LastHealingError             string
+	ActiveHealerRunID            string
+	MetadataYmlRaw               string
+	MetadataYmlSHA               string
+	MetadataYmlModTime           string
+	GitVersion                   string
 }
 
 // RepoRuntimeStatus contains near real-time git and ASE telemetry for a repository.
@@ -371,6 +382,10 @@ type RepoRuntimeStatus struct {
 	ToolLiveness         string    `json:"tool_liveness,omitempty"`
 	ExecutionProvenance  string    `json:"execution_provenance,omitempty"`
 	ActiveConversationID string    `json:"active_conversation_id,omitempty"`
+	MetadataYmlRaw       string    `json:"metadata_yml_raw,omitempty"`
+	MetadataYmlSHA       string    `json:"metadata_yml_sha,omitempty"`
+	MetadataYmlModTime   string    `json:"metadata_yml_mod_time,omitempty"`
+	GitVersion           string    `json:"git_version,omitempty"`
 	LastCheckedAt        time.Time `json:"last_checked_at"`
 }
 
@@ -1210,7 +1225,7 @@ func (e *Engine) ApplyPreflight(host, path string, p Preflight) Halt {
 		repo.DetectedConversationID = ""
 		repo.DetectedVerdict = ""
 		repo.Porcelain = ""
-		if repo.Queue == QueuePaused && repo.Reason == ReasonDirty {
+		if repo.Queue == QueuePaused && (repo.Reason == ReasonDirty || repo.Reason == ReasonHealFailed) {
 			repo.Queue = QueueOpen
 			repo.Reason = ""
 		}
@@ -1220,10 +1235,18 @@ func (e *Engine) ApplyPreflight(host, path string, p Preflight) Halt {
 		if repo.Reason == ReasonDisk {
 			repo.Reason = ""
 		}
-		if clean && repo.Queue == QueuePaused && repo.Reason == ReasonDirty {
-			repo.Queue = QueueOpen
-			repo.Reason = ""
-			repo.Porcelain = ""
+		if clean {
+			if repo.Queue == QueueHealing || (repo.Queue == QueuePaused && (repo.Reason == ReasonDirty || repo.Reason == ReasonHealFailed)) {
+				repo.Queue = QueueOpen
+				repo.Reason = ""
+				repo.Porcelain = ""
+				repo.HealingAttempts = 0
+				repo.HealingAttemptCount = 0
+				repo.HealingReasonCode = ""
+				repo.HealingReasonMessage = ""
+				repo.LastHealingError = ""
+				repo.ActiveHealerRunID = ""
+			}
 		}
 		hasActive := false
 		for _, other := range e.jobs {
@@ -1267,6 +1290,115 @@ func (e *Engine) ResumeRepo(host, path string) error {
 	repo.Reason = ""
 	repo.Porcelain = ""
 	repo.DiscardPending = false
+	repo.HealingAttempts = 0
+	repo.HealingAttemptCount = 0
+	repo.HealingReasonCode = ""
+	repo.HealingReasonMessage = ""
+	repo.HealingStartedAt = time.Time{}
+	repo.LastHealingError = ""
+	repo.ActiveHealerRunID = ""
+	e.notifyRepoLocked(repo)
+	return nil
+}
+
+// RetryHealRepo re-triggers auto-healing for a repo stuck in HEAL_FAILED or HEALING.
+func (e *Engine) RetryHealRepo(host, path string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	repo := e.repos[repoKey(host, path)]
+	if repo == nil {
+		for _, candidate := range e.repos {
+			if candidate.HostID == host && (candidate.EffectiveAlias() == path || candidate.WorktreePath == path) {
+				repo = candidate
+				break
+			}
+		}
+	}
+	if repo == nil {
+		return ErrNotFound
+	}
+	repo.Queue = QueueHealing
+	repo.Reason = ""
+	repo.HealingAttempts = 1
+	repo.HealingAttemptCount = 1
+	repo.HealingStartedAt = e.now().UTC()
+	repo.LastHealingError = ""
+	repo.HealingReasonCode = HealingReasonPostRunFailed
+	repo.HealingReasonMessage = "Operator requested auto-healing retry."
+	e.notifyRepoLocked(repo)
+
+	// Dispatch HEAL_GIT_REPO command to agent
+	cmdID := fmt.Sprintf("heal-cmd-%d", e.now().UnixNano())
+	if h, ok := e.hosts[host]; ok && h != nil {
+		h.PendingCommands = append(h.PendingCommands, CommandEnvelope{
+			ID:        cmdID,
+			Type:      "HEAL_GIT_REPO",
+			Payload:   repo.WorktreePath,
+			CreatedAt: e.now().UTC().Format(time.RFC3339),
+		})
+	}
+	return nil
+}
+
+// ForceCleanGitRepo instructs the agent to force reset and clean git working tree and locks.
+func (e *Engine) ForceCleanGitRepo(host, path string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	repo := e.repos[repoKey(host, path)]
+	if repo == nil {
+		for _, candidate := range e.repos {
+			if candidate.HostID == host && (candidate.EffectiveAlias() == path || candidate.WorktreePath == path) {
+				repo = candidate
+				break
+			}
+		}
+	}
+	if repo == nil {
+		return ErrNotFound
+	}
+	repo.Porcelain = ""
+	repo.DirtyStoryID = ""
+	repo.DirtyReviewFile = ""
+	e.notifyRepoLocked(repo)
+
+	// Dispatch FORCE_CLEAN_GIT command to agent
+	cmdID := fmt.Sprintf("clean-git-%d", e.now().UnixNano())
+	if h, ok := e.hosts[host]; ok && h != nil {
+		h.PendingCommands = append(h.PendingCommands, CommandEnvelope{
+			ID:        cmdID,
+			Type:      "FORCE_CLEAN_GIT",
+			Payload:   repo.WorktreePath,
+			CreatedAt: e.now().UTC().Format(time.RFC3339),
+		})
+	}
+	return nil
+}
+
+// ClearHealingRepo clears all healing state and resets the queue to OPEN.
+func (e *Engine) ClearHealingRepo(host, path string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	repo := e.repos[repoKey(host, path)]
+	if repo == nil {
+		for _, candidate := range e.repos {
+			if candidate.HostID == host && (candidate.EffectiveAlias() == path || candidate.WorktreePath == path) {
+				repo = candidate
+				break
+			}
+		}
+	}
+	if repo == nil {
+		return ErrNotFound
+	}
+	repo.Queue = QueueOpen
+	repo.Reason = ""
+	repo.HealingAttempts = 0
+	repo.HealingAttemptCount = 0
+	repo.HealingReasonCode = ""
+	repo.HealingReasonMessage = ""
+	repo.HealingStartedAt = time.Time{}
+	repo.LastHealingError = ""
+	repo.ActiveHealerRunID = ""
 	e.notifyRepoLocked(repo)
 	return nil
 }
@@ -1364,15 +1496,35 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 						repo.Queue = QueueOpen
 						repo.Reason = "INCOMPLETE_DIRTY_WORKTREE"
 					} else {
-						if repo.Queue == QueueOpen {
-							repo.Queue = QueuePaused
-						}
 						if opt.DiagnosticCode != "" {
 							repo.Reason = opt.DiagnosticCode
 						} else if opt.Reason != "" {
 							repo.Reason = opt.Reason
 						} else {
 							repo.Reason = "NON_ZERO_EXIT"
+						}
+
+						if repo.Queue == QueueHealing {
+							if repo.MaxHealingAttempts <= 0 {
+								repo.MaxHealingAttempts = 3
+							}
+							repo.HealingAttemptCount++
+							errDetail := opt.ErrorMessage
+							if errDetail == "" {
+								errDetail = opt.Reason
+							}
+							repo.LastHealingError = errDetail
+							repo.HealingReasonCode = HealingReasonNonZeroExit
+							repo.HealingReasonMessage = fmt.Sprintf("Execution failed: %s", repo.Reason)
+							if repo.HealingAttemptCount >= repo.MaxHealingAttempts {
+								repo.Queue = QueuePaused
+								repo.Reason = ReasonHealFailed
+								repo.HealingReasonMessage = fmt.Sprintf("Circuit breaker tripped: exceeded maximum healing attempts (%d). Requires operator intervention.", repo.MaxHealingAttempts)
+							} else {
+								repo.Reason = ""
+							}
+						} else if repo.Queue == QueueOpen {
+							repo.Queue = QueuePaused
 						}
 					}
 					changedRepo = repo
@@ -1534,6 +1686,23 @@ func (e *Engine) ApplyFinish(host, path string, jobID string, in FinishInput) Fi
 		repo.Queue = d.Queue
 		repo.Reason = d.Reason
 		repo.HealingAttempts = d.HealingAttempts
+		repo.HealingAttemptCount = d.HealingAttempts
+		if repo.MaxHealingAttempts <= 0 {
+			repo.MaxHealingAttempts = 3
+		}
+		if d.Queue == QueueHealing {
+			repo.HealingReasonCode = d.HealingReasonCode
+			repo.HealingReasonMessage = d.HealingReasonMessage
+			if repo.HealingStartedAt.IsZero() {
+				repo.HealingStartedAt = e.now().UTC()
+			}
+		} else if d.Queue == QueueOpen {
+			repo.HealingReasonCode = ""
+			repo.HealingReasonMessage = ""
+			repo.HealingStartedAt = time.Time{}
+			repo.LastHealingError = ""
+			repo.ActiveHealerRunID = ""
+		}
 		repo.Lock = LockIdle
 		if strings.TrimSpace(in.WorkPorcelain) != "" {
 			repo.Porcelain = in.WorkPorcelain
@@ -1856,6 +2025,46 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 				r.ToolLiveness = st.ToolLiveness
 				r.ExecutionProvenance = st.ExecutionProvenance
 				r.LastRuntimeCheck = st.LastCheckedAt
+
+				if st.MetadataYmlRaw != "" {
+					r.MetadataYmlRaw = st.MetadataYmlRaw
+					r.MetadataYmlSHA = st.MetadataYmlSHA
+					r.MetadataYmlModTime = st.MetadataYmlModTime
+				}
+				if st.GitVersion != "" {
+					r.GitVersion = st.GitVersion
+				}
+
+				// Auto-recovery: if repo was HEALING or PAUSED(ReasonDirty/ReasonHealFailed),
+				// and git status is now verified clean with no active running harness job:
+				if st.IsClean && r.Lock == LockIdle {
+					if r.Queue == QueueHealing || (r.Queue == QueuePaused && (r.Reason == ReasonDirty || r.Reason == ReasonHealFailed)) {
+						r.Queue = QueueOpen
+						r.Reason = ""
+						r.Porcelain = ""
+						r.HealingAttempts = 0
+						r.HealingAttemptCount = 0
+						r.HealingReasonCode = ""
+						r.HealingReasonMessage = ""
+						r.LastHealingError = ""
+						r.ActiveHealerRunID = ""
+						e.notifyRepoLocked(r)
+					}
+				} else if r.Queue == QueueHealing && !st.IsClean {
+					if st.HasActiveGitLock {
+						r.HealingReasonCode = HealingReasonGitLock
+						r.HealingReasonMessage = "Active or stale .git/index.lock detected in repository."
+					} else if len(st.DirtySubmodules) > 0 {
+						r.HealingReasonCode = HealingReasonDirty
+						r.HealingReasonMessage = fmt.Sprintf("Dirty submodules detected: %s", strings.Join(st.DirtySubmodules, ", "))
+					} else if st.DirtyFilesCount > 0 || st.UntrackedFilesCount > 0 {
+						r.HealingReasonCode = HealingReasonDirty
+						r.HealingReasonMessage = fmt.Sprintf("Working tree has %d modified and %d untracked files.", st.DirtyFilesCount, st.UntrackedFilesCount)
+					} else if st.Branch != "main" && st.Branch != "master" && st.Branch != "" {
+						r.HealingReasonCode = HealingReasonDetachedHead
+						r.HealingReasonMessage = fmt.Sprintf("Repository is on non-standard branch %q.", st.Branch)
+					}
+				}
 			}
 		}
 	}
@@ -2185,7 +2394,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 					continue
 				}
 			}
-			if repo.Reason != "" && repo.Reason != "REMEDIATED" {
+			if repo.Reason != "" && repo.Reason != "REMEDIATED" && repo.Queue != QueueHealing {
 				if repo.Reason == ReasonDisk {
 					continue
 				}

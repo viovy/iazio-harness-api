@@ -35,6 +35,7 @@ const (
 
 	QueueOpen     = "OPEN"
 	QueueHealing  = "HEALING"
+	QueueHealFailed = "HEAL_FAILED"
 	QueuePaused   = "PAUSED"
 	QueueBlocked  = "BLOCKED_AWAITING_CORRELATION"
 	QueueCleaning = "CLEANING_HUB"
@@ -58,6 +59,16 @@ const (
 	ReasonNoDocsHub   = "HALTED_NO_DOCS_HUB"
 	ReasonGitAuth     = "HALTED_GIT_AUTH"
 	ReasonCorrTimeout = "CORRELATION_TIMEOUT"
+	ReasonHealFailed  = "HEAL_FAILED"
+
+	HealingReasonDirty             = "DIRTY_WORKTREE"
+	HealingReasonGitLock           = "GIT_LOCK_PRESENT"
+	HealingReasonBranchDiverged    = "BRANCH_DIVERGED"
+	HealingReasonDetachedHead      = "DETACHED_HEAD"
+	HealingReasonMergeRebase       = "MERGE_OR_REBASE_IN_PROGRESS"
+	HealingReasonPostRunFailed     = "POST_RUN_CHECK_FAILED"
+	HealingReasonOrphanedExecution = "ORPHANED_EXECUTION"
+	HealingReasonNonZeroExit       = "NON_ZERO_EXIT"
 )
 
 // AutoResumePolicy defines bounded auto-resume and circuit breaker rules.
@@ -239,11 +250,13 @@ type FinishInput struct {
 
 // FinishDecision is what the API applies to the repo queue.
 type FinishDecision struct {
-	Queue           string
-	Reason          string
-	HealingAttempts int
-	LeaseResume     bool
-	Decrement       bool
+	Queue                string
+	Reason               string
+	HealingAttempts      int
+	LeaseResume          bool
+	Decrement            bool
+	HealingReasonCode    string
+	HealingReasonMessage string
 }
 
 // ValidateShareURL accepts only https://gemini.google.com/share/<id>.
@@ -326,21 +339,51 @@ func DecideFinish(in FinishInput) FinishDecision {
 	if in.Kind == KindRefinement {
 		dirty = strings.TrimSpace(in.HubPorcelain) != ""
 		if !in.HubPushOK || dirty || in.HubAhead > 0 || !in.StoryDraftOK {
-			return FinishDecision{Queue: QueuePaused, Reason: ReasonDirty, HealingAttempts: in.HealingAttempts}
+			return FinishDecision{
+				Queue:                QueuePaused,
+				Reason:               ReasonDirty,
+				HealingAttempts:      in.HealingAttempts,
+				HealingReasonCode:    HealingReasonDirty,
+				HealingReasonMessage: "Refinement finished with unpushed or dirty hub state.",
+			}
 		}
 		return FinishDecision{Queue: QueueOpen, HealingAttempts: 0, Decrement: false}
 	}
 	if dirty {
-		return FinishDecision{Queue: QueuePaused, Reason: ReasonDirty, HealingAttempts: in.HealingAttempts}
+		return FinishDecision{
+			Queue:                QueuePaused,
+			Reason:               ReasonDirty,
+			HealingAttempts:      in.HealingAttempts,
+			HealingReasonCode:    HealingReasonDirty,
+			HealingReasonMessage: "Worktree or hub has uncommitted changes.",
+		}
 	}
 	if in.HubAhead > 0 {
-		return FinishDecision{Queue: QueuePaused, Reason: ReasonDirty, HealingAttempts: in.HealingAttempts}
+		return FinishDecision{
+			Queue:                QueuePaused,
+			Reason:               ReasonDirty,
+			HealingAttempts:      in.HealingAttempts,
+			HealingReasonCode:    HealingReasonBranchDiverged,
+			HealingReasonMessage: "Docs hub has unpushed commits ahead of upstream.",
+		}
 	}
 	if in.ASEComplete {
 		return FinishDecision{Queue: QueueOpen, HealingAttempts: 0, Decrement: true}
 	}
 	if in.HealingAttempts == 0 {
-		return FinishDecision{Queue: QueueHealing, HealingAttempts: 1, LeaseResume: true}
+		return FinishDecision{
+			Queue:                QueueHealing,
+			HealingAttempts:      1,
+			LeaseResume:          true,
+			HealingReasonCode:    HealingReasonPostRunFailed,
+			HealingReasonMessage: "Harness run completed without ASE completion proof; auto-healing scheduled.",
+		}
 	}
-	return FinishDecision{Queue: QueuePaused, HealingAttempts: in.HealingAttempts}
+	return FinishDecision{
+		Queue:                QueuePaused,
+		Reason:               ReasonHealFailed,
+		HealingAttempts:      in.HealingAttempts,
+		HealingReasonCode:    HealingReasonPostRunFailed,
+		HealingReasonMessage: "Exceeded healing attempts without achieving clean ASE completion.",
+	}
 }

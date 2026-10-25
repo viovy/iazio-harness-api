@@ -185,6 +185,35 @@ func TestScanRepoProfile_Validation(t *testing.T) {
 	}
 }
 
+func TestScanRepoProfile_AgentSnapshot(t *testing.T) {
+	e := NewEngine(time.Now)
+	e.RegisterHost("h-remote", "Host Remote", "permanent")
+	rawYAML := `name: meta-repo
+fleet_distribution:
+  tools:
+    - name: agy
+      target_version: 1.0.0
+      tier: required
+`
+	_ = e.UpsertRepo(Repo{
+		HostID:         "h-remote",
+		WorktreePath:   "/remote/work/meta-repo",
+		MetadataYmlRaw: rawYAML,
+		GitVersion:     "v1.2.3",
+	})
+
+	prof, err := e.ScanRepoProfile("h-remote", "/remote/work/meta-repo", "remote-prof")
+	if err != nil {
+		t.Fatalf("expected ScanRepoProfile to succeed via agent snapshot, got: %v", err)
+	}
+	if prof == nil || prof.Name != "remote-prof" {
+		t.Fatalf("unexpected profile returned: %+v", prof)
+	}
+	if len(prof.Tools) != 1 || prof.Tools[0].Name != "agy" {
+		t.Fatalf("expected tool agy in profile, got: %+v", prof.Tools)
+	}
+}
+
 func TestProfileTool_IsTrackingLatest_OptionalTier(t *testing.T) {
 	// F7: ProfileTool with tier: optional in default profile must auto-track latest
 	toolOptional := ProfileTool{
