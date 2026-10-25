@@ -138,6 +138,7 @@ type JobDetailResponse struct {
 	HeartbeatAt             string                  `json:"heartbeat_at,omitempty"`
 	LeaseExpiresAt          string                  `json:"lease_expires_at,omitempty"`
 	AgentAffinity           *dispatch.AgentAffinity `json:"agent_affinity,omitempty"`
+	DispatchDiagnostics     *dispatch.DispatchDiagnostics `json:"dispatch_diagnostics,omitempty"`
 	CreatedAt               string                  `json:"created_at"`
 	ClaimedAt               string                  `json:"claimed_at,omitempty"`
 	CompletedAt             string                  `json:"completed_at,omitempty"`
@@ -224,6 +225,62 @@ func (h *JobLifecycleHandler) GetJob(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("job %q not found", jobID))
 		return
+	}
+
+	if job.DispatchDiagnostics == nil && h.engine != nil && (job.Status == dispatch.JobStatusPending || job.Status == dispatch.JobStatusClaimed) {
+		diag := h.engine.EvaluateDispatchDiagnostics(job.TargetHost, job.TargetAgent)
+		if job.Status == dispatch.JobStatusClaimed {
+			diag.QueueState = "running"
+		}
+		_ = h.queue.SetDispatchDiagnostics(jobID, diag)
+		job.DispatchDiagnostics = diag
+	}
+
+	resp := formatJobDetail(job)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// ForceDispatchJob serves POST /api/v1/jobs/{id}/force-dispatch.
+func (h *JobLifecycleHandler) ForceDispatchJob(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	jobID := strings.TrimSpace(r.PathValue("id"))
+	if jobID == "" {
+		writeJSONError(w, http.StatusBadRequest, "job id is required")
+		return
+	}
+
+	// 1. Reconcile any stale workspace slots across the fleet
+	if h.engine != nil {
+		_ = h.engine.ReconcileStaleWorkspaceSlots(time.Now().UTC(), 45*time.Second)
+	}
+
+	// 2. Break claim on the job and re-queue it
+	job, err := h.queue.ForceDispatch(r.Context(), jobID)
+	if err != nil {
+		if errors.Is(err, dispatch.ErrJobNotFound) {
+			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("job %q not found", jobID))
+			return
+		}
+		if errors.Is(err, dispatch.ErrJobAlreadyCompleted) {
+			writeJSONError(w, http.StatusConflict, fmt.Sprintf("job %q has already completed or terminated", jobID))
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to force dispatch job: %v", err))
+		return
+	}
+
+	// 3. Evaluate live candidate diagnostics
+	if h.engine != nil {
+		diag := h.engine.EvaluateDispatchDiagnostics(job.TargetHost, job.TargetAgent)
+		diag.QueueState = "dispatching"
+		_ = h.queue.SetDispatchDiagnostics(jobID, diag)
+		job.DispatchDiagnostics = diag
 	}
 
 	resp := formatJobDetail(job)
@@ -634,6 +691,7 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		FencingToken:            j.FencingToken,
 		Attempts:                j.Attempts,
 		AgentAffinity:           j.AgentAffinity,
+		DispatchDiagnostics:     j.DispatchDiagnostics,
 		CreatedAt:               j.CreatedAt.Format(time.RFC3339),
 	}
 

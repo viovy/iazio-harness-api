@@ -175,6 +175,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/jobs", jobLifecycle.ListQueue)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/cancel", jobLifecycle.CancelJob)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/retry", jobLifecycle.RetryJob)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/force-dispatch", jobLifecycle.ForceDispatchJob)
+	mux.HandleFunc("POST /v1/jobs/{id}/force-dispatch", jobLifecycle.ForceDispatchJob)
+	mux.HandleFunc("POST /api/v1/global-queue/jobs/{id}/force-dispatch", jobLifecycle.ForceDispatchJob)
+	mux.HandleFunc("POST /v1/global-queue/jobs/{id}/force-dispatch", jobLifecycle.ForceDispatchJob)
 	mux.HandleFunc("POST /api/v1/stories/{id}/execute", jobLifecycle.ExecuteStory)
 	mux.HandleFunc("POST /api/v1/stories/execute", jobLifecycle.ExecuteStory)
 	mux.HandleFunc("POST /v1/stories/{id}/execute", jobLifecycle.ExecuteStory)
@@ -197,6 +201,21 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/notifications", s.createNotification)
 	mux.HandleFunc("POST /v1/fleet/tools/update-all", s.queueAllToolsUpdate)
 	mux.HandleFunc("POST /v1/hosts/all/tools/update", s.queueAllToolsUpdate)
+
+	// Periodic 15s Global Queue Slot & Lease Reconciler (STORY-GOV-3690)
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now().UTC()
+			if s.Engine != nil {
+				_ = s.Engine.ReconcileStaleWorkspaceSlots(now, 45*time.Second)
+			}
+			if queue != nil {
+				_ = queue.ReconcileGlobalQueueSlots(now, 45*time.Second)
+			}
+		}
+	}()
 
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{
@@ -1637,8 +1656,10 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		Presence              string   `json:"presence"`
 		FetchFailed           bool     `json:"fetch_failed"`
 		SupportedCapabilities []string `json:"supported_capabilities"`
-		Version               string   `json:"version"`
-		CommitSHA             string   `json:"commit_sha"`
+		Version               string     `json:"version"`
+		CommitSHA             string     `json:"commit_sha"`
+		EagerUpdateEnabled    bool       `json:"eager_update_enabled"`
+		LastEagerUpdateAt     *time.Time `json:"last_eager_update_at"`
 		Tools                 []struct {
 			Name             string   `json:"name"`
 			Path             string   `json:"path"`
@@ -1695,6 +1716,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, err)
 		return
 	}
+	s.Engine.SetHostEagerUpdate(hostID, raw.EagerUpdateEnabled, raw.LastEagerUpdateAt)
 	if s.SaveHost != nil {
 		if detail, ok := s.Engine.GetHostDetail(hostID); ok {
 			s.SaveHost(detail.Host)
@@ -1736,6 +1758,10 @@ func (s *Server) getAgentTools(w http.ResponseWriter, r *http.Request) {
 		"version":                detail.Host.Version,
 		"commit_sha":             detail.Host.CommitSHA,
 		"tools":                  tools,
+		"eager_update_enabled":   detail.Host.EagerUpdateEnabled,
+	}
+	if detail.Host.LastEagerUpdateAt != nil && !detail.Host.LastEagerUpdateAt.IsZero() {
+		resp["last_eager_update_at"] = detail.Host.LastEagerUpdateAt.Format(time.RFC3339)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

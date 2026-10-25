@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/viovy/iazio-harness-api/internal/dispatch"
 )
 
 var (
@@ -80,8 +82,6 @@ func extractStoryIDFromPorcelain(porcelain string) (storyID, reviewFile string) 
 const (
 	// RingCap is the live chunk ring per job.
 	RingCap = 500
-	// DefaultMaxExec is the schedule duration when unset.
-	DefaultMaxExec = 60 * time.Minute
 	// LeaseInterval is the heartbeat the agent must renew.
 	LeaseInterval = 30 * time.Second
 	// ReapFreeze keeps a cancel from looking like a missed heartbeat.
@@ -92,6 +92,11 @@ const (
 	EphemeralGrace = 10 * time.Minute
 	// MaxDeclineRetries is the maximum consecutive declines before a schedule is halted.
 	MaxDeclineRetries = 3
+)
+
+var (
+	// DefaultMaxExec is the schedule duration when unset (default 7 days for enterprise long-running execution).
+	DefaultMaxExec = 7 * 24 * time.Hour
 )
 
 var (
@@ -712,6 +717,8 @@ type Host struct {
 	FleetCheckedAt        *time.Time
 	RepoStatuses          map[string]RepoRuntimeStatus
 	EagerReadiness        *EagerUpdateReadinessReport
+	EagerUpdateEnabled    bool
+	LastEagerUpdateAt     *time.Time
 }
 
 // PingAck is a live acknowledgment from an agent responding to a PING command.
@@ -1048,8 +1055,14 @@ func (e *Engine) UpsertRepo(r Repo) error {
 	key := repoKey(r.HostID, r.WorktreePath)
 	if existing, exists := e.repos[key]; exists {
 		r.GlobalQueueAllocationEnabled = existing.GlobalQueueAllocationEnabled
+		if r.LastRuntimeCheck.IsZero() {
+			r.LastRuntimeCheck = existing.LastRuntimeCheck
+		}
 	} else {
 		r.GlobalQueueAllocationEnabled = true
+	}
+	if r.LastRuntimeCheck.IsZero() {
+		r.LastRuntimeCheck = e.now()
 	}
 	cp := r
 	e.repos[key] = &cp
@@ -2567,6 +2580,10 @@ func (e *Engine) reapExpiredLocked() {
 			hasActive := false
 			for _, job := range e.jobs {
 				if !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "CANCEL_REQUESTED") {
+					if job.ID == repo.RunningJobID {
+						hasActive = true
+						break
+					}
 					sch := e.schedules[job.ScheduleID]
 					if sch != nil && sch.HostID == repo.HostID && sch.WorktreePath == repo.WorktreePath {
 						hasActive = true
@@ -2603,7 +2620,10 @@ func (e *Engine) reapExpiredLocked() {
 		}
 	}
 
-	// 4. Reconcile orphaned RUNNING history rows where no active running job exists
+	// 4. Reconcile stale workspace slots across all hosts and repositories (STORY-GOV-3690)
+	e.reconcileStaleWorkspaceSlotsLocked(now, 45*time.Second)
+
+	// 5. Reconcile orphaned RUNNING or CLAIMING history rows where no active running job exists
 	for key, rows := range e.history {
 		parts := strings.Split(key, "\x00")
 		if len(parts) != 2 {
@@ -2612,7 +2632,7 @@ func (e *Engine) reapExpiredLocked() {
 		hHost, hPath := parts[0], parts[1]
 		repo := e.repos[key]
 		for i := range rows {
-			if rows[i].Status == "RUNNING" {
+			if rows[i].Status == "RUNNING" || rows[i].Status == "CLAIMED" || rows[i].Status == "CLAIMING" {
 				hasLiveJob := false
 				if j, ok := e.jobs[rows[i].JobID]; ok && !j.ExitPosted && (j.Status == "RUNNING" || j.Status == "CANCEL_REQUESTED") {
 					hasLiveJob = true
@@ -5521,6 +5541,186 @@ func (e *Engine) ReapExpired() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.reapExpiredLocked()
+}
+
+// ReconcileStaleWorkspaceSlots identifies and reclaims workspace slots held by jobs or hosts
+// whose heartbeat is stale (> staleGrace), whose process has exited, or whose execution is stuck.
+func (e *Engine) ReconcileStaleWorkspaceSlots(now time.Time, staleGrace time.Duration) []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.reconcileStaleWorkspaceSlotsLocked(now, staleGrace)
+}
+
+func (e *Engine) reconcileStaleWorkspaceSlotsLocked(now time.Time, staleGrace time.Duration) []string {
+	if now.IsZero() {
+		now = e.now()
+	}
+	if staleGrace <= 0 {
+		staleGrace = 45 * time.Second
+	}
+	var reclaimed []string
+
+	for _, repo := range e.repos {
+		if repo == nil || repo.Lock == LockIdle {
+			continue
+		}
+
+		// Never prematurely break active external Autopilot leases
+		if repo.Lock == LockAutopilot {
+			if repo.LockExpiresAt.IsZero() || now.Before(repo.LockExpiresAt) {
+				continue
+			}
+		}
+
+		shouldReclaim := false
+		reclaimReason := ""
+
+		// 1. Host presence and heartbeat check
+		if h, ok := e.hosts[repo.HostID]; ok {
+			if h.Presence == "OFFLINE" && !h.LastSeen.IsZero() && now.Sub(h.LastSeen) > staleGrace {
+				shouldReclaim = true
+				reclaimReason = fmt.Sprintf("host %s is offline (%v)", repo.HostID, now.Sub(h.LastSeen).Round(time.Second))
+			} else if !h.LastSeen.IsZero() && now.Sub(h.LastSeen) > staleGrace*4 {
+				shouldReclaim = true
+				reclaimReason = fmt.Sprintf("host %s heartbeat stale (%v)", repo.HostID, now.Sub(h.LastSeen).Round(time.Second))
+			}
+		}
+
+		// 2. Lock expiration check (for LockAutopilot or other timed locks)
+		if !repo.LockExpiresAt.IsZero() && now.After(repo.LockExpiresAt) {
+			shouldReclaim = true
+			reclaimReason = fmt.Sprintf("slot lock expired at %s", repo.LockExpiresAt.Format(time.RFC3339))
+		}
+
+		// 3. Running job check (supports both scheduled jobs and Global Queue job_<hex> tasks)
+		if repo.RunningJobID != "" {
+			if job, ok := e.jobs[repo.RunningJobID]; ok {
+				if job.ExitPosted || job.Status == "COMPLETED" || job.Status == "FAILED" || job.Status == "CANCELLED" || job.Status == "ABANDONED" {
+					shouldReclaim = true
+					reclaimReason = fmt.Sprintf("active job %s has completed/exited (status: %s)", repo.RunningJobID, job.Status)
+				} else if !job.LeaseExpiry.IsZero() && now.After(job.LeaseExpiry) {
+					shouldReclaim = true
+					reclaimReason = fmt.Sprintf("active job %s lease expired at %s", repo.RunningJobID, job.LeaseExpiry.Format(time.RFC3339))
+				}
+			} else {
+				// No known job in memory matches RunningJobID: only reclaim if slot has been unchanged longer than staleGrace
+				if !repo.LastRuntimeCheck.IsZero() && now.Sub(repo.LastRuntimeCheck) > staleGrace {
+					shouldReclaim = true
+					reclaimReason = fmt.Sprintf("orphaned running job id %s", repo.RunningJobID)
+				}
+			}
+		} else if repo.Lock == LockRunning || repo.Lock == LockASE || repo.Lock == LockCleaning || repo.Lock == LockCooling {
+			// Lock held but no RunningJobID recorded: only reclaim if slot has been unchanged longer than staleGrace
+			if !repo.LastRuntimeCheck.IsZero() && now.Sub(repo.LastRuntimeCheck) > staleGrace {
+				shouldReclaim = true
+				reclaimReason = fmt.Sprintf("slot locked in %s state without active job", repo.Lock)
+			}
+		}
+
+		if shouldReclaim {
+			slotDesc := fmt.Sprintf("%s:%s", repo.HostID, repo.WorktreePath)
+			repo.Lock = LockIdle
+			repo.RunningJobID = ""
+			repo.LockHolder = ""
+			repo.LockExpiresAt = time.Time{}
+			if repo.Reason == "" || repo.Reason == "BUSY" {
+				repo.Reason = "REMEDIATED"
+			}
+			repo.LastRuntimeCheck = now
+			e.notifyRepoLocked(repo)
+			reclaimed = append(reclaimed, fmt.Sprintf("%s (%s)", slotDesc, reclaimReason))
+		}
+	}
+
+	return reclaimed
+}
+
+// EvaluateDispatchDiagnostics evaluates all online hosts and workspace slots for candidate eligibility.
+func (e *Engine) EvaluateDispatchDiagnostics(targetHost, targetAgent string) *dispatch.DispatchDiagnostics {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	now := e.now()
+	toolsPriority := []string{"agy", "opencode", "claude", "cursor"}
+	if len(e.toolPriority) > 0 {
+		toolsPriority = e.toolPriority
+	}
+
+	diag := &dispatch.DispatchDiagnostics{
+		QueueState:               "queued",
+		EligibleHosts:            make([]dispatch.EligibleHost, 0),
+		LastDispatchEvaluationAt: now.Format(time.RFC3339),
+		BlockedReasonsByHost:     make(map[string]string),
+	}
+
+	for _, repo := range e.repos {
+		if repo == nil {
+			continue
+		}
+		slotID := fmt.Sprintf("%s/%s", repo.HostID, filepath.Base(repo.WorktreePath))
+		if targetHost != "" && repo.HostID != targetHost {
+			continue
+		}
+
+		host, hostExists := e.hosts[repo.HostID]
+		if !hostExists || host.Presence == "OFFLINE" {
+			diag.BlockedReasonsByHost[slotID] = "host offline or not registered"
+			continue
+		}
+		if !host.LastSeen.IsZero() && now.Sub(host.LastSeen) > 45*time.Second {
+			diag.BlockedReasonsByHost[slotID] = fmt.Sprintf("agent heartbeat stale (%v)", now.Sub(host.LastSeen).Round(time.Second))
+			continue
+		}
+
+		if repo.Lock != LockIdle {
+			diag.BlockedReasonsByHost[slotID] = fmt.Sprintf("workspace busy (%s with job %s)", repo.Lock, repo.RunningJobID)
+			continue
+		}
+
+		if repo.Queue == QueuePaused || repo.Queue == QueueBlocked {
+			diag.BlockedReasonsByHost[slotID] = fmt.Sprintf("queue paused/blocked (%s)", repo.Reason)
+			continue
+		}
+
+		// Check supported tool from tool priority
+		selectedTool := ""
+		for _, toolName := range toolsPriority {
+			if targetAgent != "" && !strings.EqualFold(targetAgent, toolName) {
+				continue
+			}
+			for _, t := range host.Tools {
+				if strings.EqualFold(t.Name, toolName) && t.Installed {
+					selectedTool = toolName
+					break
+				}
+			}
+			if selectedTool != "" {
+				break
+			}
+		}
+
+		if selectedTool == "" {
+			if targetAgent != "" {
+				diag.BlockedReasonsByHost[slotID] = fmt.Sprintf("target tool %s not installed/ready", targetAgent)
+			} else {
+				diag.BlockedReasonsByHost[slotID] = "no priority tools installed/ready"
+			}
+			continue
+		}
+
+		diag.EligibleHosts = append(diag.EligibleHosts, dispatch.EligibleHost{
+			Host:      repo.HostID,
+			Workspace: filepath.Base(repo.WorktreePath),
+			Tool:      selectedTool,
+			Status:    "ready",
+		})
+	}
+
+	if len(diag.EligibleHosts) > 0 {
+		diag.QueueState = "dispatching"
+	}
+
+	return diag
 }
 
 // EnqueueGlobalSchedule enqueues a prompt into Level 2 (Fleet Global Queue).
