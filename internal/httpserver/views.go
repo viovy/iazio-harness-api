@@ -231,40 +231,34 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 			targetHost = hostID
 		}
 		running = map[string]any{
-			"id":                          d.Running.ID,
-			"status":                      d.Running.Status,
-			"prompt_title":                d.RunningTitle,
-			"engine":                      d.RunningEngine,
-			"conversation_ids":            cids,
-			"silent_for_seconds":          d.RunningSilentSeconds,
-			"is_stalled":                  d.RunningIsStalled,
-			"started_at":                  startedAt,
-			"host_id":                     hostID,
-			"target_host":                 targetHost,
-			"harness_pid":                 d.Running.HarnessPID,
-			"tool_pid":                    d.Running.ToolPID,
-			"elapsed_seconds":             d.Running.ElapsedSeconds,
-			"resume_count":                d.Running.ResumeCount,
-			"parent_job_id":               d.Running.ParentJobID,
-			"root_job_id":                 d.Running.RootJobID,
-			"initial_conversation_id":     d.Running.InitialConversationID,
-			"active_conversation_id":      d.Running.ActiveConversationID,
-			"resume_mode":                 d.Running.ResumeMode,
-			"resume_fallback_reason":      d.Running.ResumeFallbackReason,
-			"same_conversation_confirmed": d.Running.SameConversationConfirmed || d.Running.ResumeMode == "same_conversation",
-			"attach_confirmation":         d.Running.AttachConfirmation,
-			"interrupted_ase_state":       d.Running.InterruptedASEState,
-			"workspace_state_manifest":    d.Running.WorkspaceStateManifest,
-			"reap_result":                 d.Running.ReapResult,
-			"rehydration_status":          d.Running.RehydrationStatus,
-			"conversation_lineage":        d.Running.ConversationLineage,
-			"termination_reason_code":     d.Running.TerminationReasonCode,
-			"termination_reason_message":  d.Running.TerminationReasonMessage,
-			"resumable":                   d.Running.Resumable,
-			"non_resumable_reason":        d.Running.NonResumableReason,
-			"workspace_dirty_files":       d.Running.WorkspaceDirtyFiles,
-			"background_tasks":            d.Running.BackgroundTasks,
+			"id":                 d.Running.ID,
+			"status":             d.Running.Status,
+			"prompt_title":       d.RunningTitle,
+			"engine":             d.RunningEngine,
+			"conversation_ids":   cids,
+			"silent_for_seconds": d.RunningSilentSeconds,
+			"is_stalled":         d.RunningIsStalled,
+			"started_at":         startedAt,
+			"host_id":            hostID,
+			"target_host":        targetHost,
+			"harness_pid":        d.Running.HarnessPID,
+			"tool_pid":           d.Running.ToolPID,
+			"elapsed_seconds":    d.Running.ElapsedSeconds,
+			"resume_count":       d.Running.ResumeCount,
 		}
+		populateJobResumptionFields(running.(map[string]any),
+			d.Running.ParentJobID, d.Running.RootJobID,
+			d.Running.InitialConversationID, d.Running.ActiveConversationID,
+			d.Running.ResumeMode, d.Running.ResumeFallbackReason,
+			d.Running.SameConversationConfirmed, d.Running.AttachConfirmation,
+			d.Running.InterruptedASEState, d.Running.WorkspaceStateManifest,
+			d.Running.ReapResult, d.Running.RehydrationStatus,
+			d.Running.ConversationLineage,
+			d.Running.TerminationReasonCode, d.Running.TerminationReasonMessage,
+			d.Running.Resumable, d.Running.NonResumableReason,
+			d.Running.WorkspaceDirtyFiles, d.Running.BackgroundTasks,
+			cids,
+		)
 	}
 	schedules := make([]map[string]any, 0, len(d.Schedules))
 	for _, s := range d.Schedules {
@@ -276,48 +270,7 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 	}
 	history := make([]map[string]any, 0, len(d.History))
 	for _, h := range d.History {
-		ids := h.ConversationIDs
-		if ids == nil {
-			ids = []string{}
-		}
-		history = append(history, map[string]any{
-			"job_id":                      h.JobID,
-			"schedule_id":                 h.ScheduleID,
-			"prompt_title":                h.PromptTitle,
-			"engine":                      h.Engine,
-			"status":                      h.Status,
-			"clean":                       h.Clean,
-			"ase_complete":                h.ASEComplete,
-			"conversation_ids":            ids,
-			"reason":                      h.Reason,
-			"error_message":               h.ErrorMessage,
-			"diagnostic_code":             h.DiagnosticCode,
-			"model":                       h.Model,
-			"remediation":                 h.Remediation,
-			"trace_id":                    h.TraceID,
-			"created_at":                  h.CreatedAt.UTC().Format(time.RFC3339),
-			"parent_job_id":               h.ParentJobID,
-			"root_job_id":                 h.RootJobID,
-			"execution_attempt":           h.ExecutionAttempt,
-			"execution_chain":             h.ExecutionChain,
-			"initial_conversation_id":     h.InitialConversationID,
-			"active_conversation_id":      h.ActiveConversationID,
-			"resume_mode":                 h.ResumeMode,
-			"resume_fallback_reason":      h.ResumeFallbackReason,
-			"same_conversation_confirmed": h.SameConversationConfirmed || h.ResumeMode == "same_conversation",
-			"attach_confirmation":         h.AttachConfirmation,
-			"interrupted_ase_state":       h.InterruptedASEState,
-			"workspace_state_manifest":    h.WorkspaceStateManifest,
-			"reap_result":                 h.ReapResult,
-			"rehydration_status":          h.RehydrationStatus,
-			"conversation_lineage":        h.ConversationLineage,
-			"termination_reason_code":     h.TerminationReasonCode,
-			"termination_reason_message":  h.TerminationReasonMessage,
-			"resumable":                   h.Resumable || h.ActiveConversationID != "" || len(ids) > 0,
-			"non_resumable_reason":        func() string { if h.Resumable || h.ActiveConversationID != "" || len(ids) > 0 { return "" }; return h.NonResumableReason }(),
-			"workspace_dirty_files":       h.WorkspaceDirtyFiles,
-			"background_tasks":            h.BackgroundTasks,
-		})
+		history = append(history, historyRowView(h))
 	}
 	var lockExpiresAt any
 	if !d.Repo.LockExpiresAt.IsZero() {
@@ -375,6 +328,93 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 	}
 }
 
+func populateJobResumptionFields(
+	m map[string]any,
+	parentJobID, rootJobID string,
+	initialCID, activeCID, resumeMode, resumeFallbackReason string,
+	sameConvConfirmed bool,
+	attachConfirmation string,
+	interruptedASEState, workspaceStateManifest, reapResult, rehydrationStatus map[string]any,
+	convLineage []control.ConversationLineage,
+	termCode, termMsg string,
+	resumable bool,
+	nonResumableReason string,
+	workspaceDirtyFiles []string,
+	bgTasks []control.BackgroundTaskInfo,
+	conversationIDs []string,
+) {
+	m["parent_job_id"] = parentJobID
+	m["root_job_id"] = rootJobID
+	m["initial_conversation_id"] = initialCID
+	m["active_conversation_id"] = activeCID
+	m["resume_mode"] = resumeMode
+	m["resume_fallback_reason"] = resumeFallbackReason
+	m["same_conversation_confirmed"] = sameConvConfirmed || resumeMode == "same_conversation"
+	m["attach_confirmation"] = attachConfirmation
+	m["interrupted_ase_state"] = interruptedASEState
+	m["workspace_state_manifest"] = workspaceStateManifest
+	m["reap_result"] = reapResult
+	m["rehydration_status"] = rehydrationStatus
+	m["conversation_lineage"] = convLineage
+	m["termination_reason_code"] = termCode
+	m["termination_reason_message"] = termMsg
+	isResumable := resumable || activeCID != "" || initialCID != "" || len(conversationIDs) > 0
+	m["resumable"] = isResumable
+	if isResumable {
+		m["non_resumable_reason"] = ""
+	} else {
+		m["non_resumable_reason"] = nonResumableReason
+	}
+	m["workspace_dirty_files"] = workspaceDirtyFiles
+	m["background_tasks"] = bgTasks
+}
+
+func historyRowView(h control.HistoryRow) map[string]any {
+	ids := h.ConversationIDs
+	if ids == nil {
+		ids = []string{}
+	}
+	m := map[string]any{
+		"job_id":                    h.JobID,
+		"schedule_id":               h.ScheduleID,
+		"prompt_title":              h.PromptTitle,
+		"engine":                    h.Engine,
+		"status":                    h.Status,
+		"clean":                     h.Clean,
+		"ase_complete":              h.ASEComplete,
+		"conversation_ids":          ids,
+		"reason":                    h.Reason,
+		"error_message":             h.ErrorMessage,
+		"diagnostic_code":           h.DiagnosticCode,
+		"model":                     h.Model,
+		"remediation":               h.Remediation,
+		"trace_id":                  h.TraceID,
+		"created_at":                h.CreatedAt.UTC().Format(time.RFC3339),
+		"execution_attempt":         h.ExecutionAttempt,
+		"execution_chain":           h.ExecutionChain,
+		"auto_resume_policy":        h.AutoResumePolicy,
+		"auto_resume_count":         h.AutoResumeCount,
+		"last_progress_fingerprint": h.LastProgressFingerprint,
+		"circuit_breaker_tripped":   h.CircuitBreakerTripped,
+		"ase_gate_status":           h.ASEGateStatus,
+		"liveness_pulse_seconds":    h.LivenessPulseSeconds,
+	}
+	populateJobResumptionFields(m,
+		h.ParentJobID, h.RootJobID,
+		h.InitialConversationID, h.ActiveConversationID,
+		h.ResumeMode, h.ResumeFallbackReason,
+		h.SameConversationConfirmed, h.AttachConfirmation,
+		h.InterruptedASEState, h.WorkspaceStateManifest,
+		h.ReapResult, h.RehydrationStatus,
+		h.ConversationLineage,
+		h.TerminationReasonCode, h.TerminationReasonMessage,
+		h.Resumable, h.NonResumableReason,
+		h.WorkspaceDirtyFiles, h.BackgroundTasks,
+		ids,
+	)
+	return m
+}
+
 func jobDetailView(j control.JobDetail) map[string]any {
 	cids := j.ConversationIDs
 	if cids == nil {
@@ -388,7 +428,7 @@ func jobDetailView(j control.JobDetail) map[string]any {
 	if hostID == "" {
 		hostID = j.TargetHost
 	}
-	return map[string]any{
+	m := map[string]any{
 		"id":                             j.ID,
 		"schedule_id":                    j.ScheduleID,
 		"kind":                           j.Kind,
@@ -415,21 +455,8 @@ func jobDetailView(j control.JobDetail) map[string]any {
 		"elapsed_seconds":                j.ElapsedSeconds,
 		"resume_count":                   j.ResumeCount,
 		"trace_id":                       j.TraceID,
-		"parent_job_id":                  j.ParentJobID,
-		"root_job_id":                    j.RootJobID,
 		"execution_attempt":              j.ExecutionAttempt,
 		"execution_chain":                j.ExecutionChain,
-		"initial_conversation_id":        j.InitialConversationID,
-		"active_conversation_id":         j.ActiveConversationID,
-		"resume_mode":                    j.ResumeMode,
-		"resume_fallback_reason":         j.ResumeFallbackReason,
-		"same_conversation_confirmed":    j.SameConversationConfirmed || j.ResumeMode == "same_conversation",
-		"attach_confirmation":            j.AttachConfirmation,
-		"interrupted_ase_state":          j.InterruptedASEState,
-		"workspace_state_manifest":       j.WorkspaceStateManifest,
-		"reap_result":                    j.ReapResult,
-		"rehydration_status":             j.RehydrationStatus,
-		"conversation_lineage":           j.ConversationLineage,
 		"auto_resume_policy":            j.AutoResumePolicy,
 		"auto_resume_count":             j.AutoResumeCount,
 		"last_progress_fingerprint":     j.LastProgressFingerprint,
@@ -437,133 +464,95 @@ func jobDetailView(j control.JobDetail) map[string]any {
 		"ase_gate_status":               j.ASEGateStatus,
 		"stall_timeout_sec":             j.StallTimeoutSec,
 		"liveness_pulse_seconds":        j.LivenessPulseSeconds,
-		"termination_reason_code":       j.TerminationReasonCode,
-		"termination_reason_message":    j.TerminationReasonMessage,
-		"resumable":                     j.Resumable || j.ActiveConversationID != "" || j.ResumeConversationID != "" || j.InitialConversationID != "" || len(cids) > 0,
-		"non_resumable_reason":          func() string { if j.Resumable || j.ActiveConversationID != "" || j.ResumeConversationID != "" || j.InitialConversationID != "" || len(cids) > 0 { return "" }; return j.NonResumableReason }(),
-		"workspace_dirty_files":         j.WorkspaceDirtyFiles,
-		"background_tasks":              j.BackgroundTasks,
 	}
-}
-
-func historyJobDetailView(r control.HistoryRow, host, path string) map[string]any {
-	cids := r.ConversationIDs
-	if cids == nil {
-		cids = []string{}
-	}
-	return map[string]any{
-		"id":                             r.JobID,
-		"schedule_id":                    r.ScheduleID,
-		"kind":                           "",
-		"status":                         r.Status,
-		"engine":                         r.Engine,
-		"prompt":                         r.PromptTitle,
-		"story_id":                       "",
-		"source_idea_id":                 "",
-		"transcript":                     "",
-		"worktree_path":                  path,
-		"docs_hub_path":                  "",
-		"env_vars":                       map[string]string{},
-		"max_execution_duration_seconds": 0,
-		"resume_conversation_id":         r.ActiveConversationID,
-		"conversation_ids":               cids,
-		"silent_for_seconds":             0,
-		"is_stalled":                     false,
-		"started_at":                     r.CreatedAt,
-		"reason":                         r.Reason,
-		"clean":                          r.Clean,
-		"ase_complete":                   r.ASEComplete,
-		"error_message":                  r.ErrorMessage,
-		"diagnostic_code":                r.DiagnosticCode,
-		"model":                          r.Model,
-		"remediation":                    r.Remediation,
-		"trace_id":                       r.TraceID,
-		"host_id":                        host,
-		"target_host":                    host,
-		"harness_pid":                    r.HarnessPID,
-		"tool_pid":                       r.ToolPID,
-		"parent_job_id":                  r.ParentJobID,
-		"root_job_id":                    r.RootJobID,
-		"execution_attempt":              r.ExecutionAttempt,
-		"execution_chain":                r.ExecutionChain,
-		"initial_conversation_id":        r.InitialConversationID,
-		"active_conversation_id":         r.ActiveConversationID,
-		"resume_mode":                    r.ResumeMode,
-		"resume_fallback_reason":         r.ResumeFallbackReason,
-		"same_conversation_confirmed":    r.SameConversationConfirmed || r.ResumeMode == "same_conversation",
-		"attach_confirmation":            r.AttachConfirmation,
-		"interrupted_ase_state":          r.InterruptedASEState,
-		"workspace_state_manifest":       r.WorkspaceStateManifest,
-		"reap_result":                    r.ReapResult,
-		"rehydration_status":             r.RehydrationStatus,
-		"conversation_lineage":           r.ConversationLineage,
-		"auto_resume_policy":            r.AutoResumePolicy,
-		"auto_resume_count":             r.AutoResumeCount,
-		"last_progress_fingerprint":     r.LastProgressFingerprint,
-		"circuit_breaker_tripped":       r.CircuitBreakerTripped,
-		"ase_gate_status":               r.ASEGateStatus,
-		"stall_timeout_sec":             0,
-		"liveness_pulse_seconds":        r.LivenessPulseSeconds,
-		"termination_reason_code":       r.TerminationReasonCode,
-		"termination_reason_message":    r.TerminationReasonMessage,
-		"resumable":                     r.Resumable || r.ActiveConversationID != "" || r.InitialConversationID != "" || len(cids) > 0,
-		"non_resumable_reason":          func() string { if r.Resumable || r.ActiveConversationID != "" || r.InitialConversationID != "" || len(cids) > 0 { return "" }; return r.NonResumableReason }(),
-		"workspace_dirty_files":         r.WorkspaceDirtyFiles,
-		"background_tasks":              r.BackgroundTasks,
-	}
+	populateJobResumptionFields(m,
+		j.ParentJobID, j.RootJobID,
+		j.InitialConversationID, j.ActiveConversationID,
+		j.ResumeMode, j.ResumeFallbackReason,
+		j.SameConversationConfirmed, j.AttachConfirmation,
+		j.InterruptedASEState, j.WorkspaceStateManifest,
+		j.ReapResult, j.RehydrationStatus,
+		j.ConversationLineage,
+		j.TerminationReasonCode, j.TerminationReasonMessage,
+		j.Resumable, j.NonResumableReason,
+		j.WorkspaceDirtyFiles, j.BackgroundTasks,
+		cids,
+	)
+	return m
 }
 
 func historyItemView(h control.HistoryItem) map[string]any {
-	ids := h.ConversationIDs
-	if ids == nil {
-		ids = []string{}
+	row := control.HistoryRow{
+		JobID:                     h.JobID,
+		ScheduleID:                h.ScheduleID,
+		PromptTitle:               h.PromptTitle,
+		Engine:                    h.Engine,
+		Status:                    h.Status,
+		Clean:                     h.Clean,
+		ASEComplete:               h.ASEComplete,
+		ConversationIDs:           h.ConversationIDs,
+		Reason:                    h.Reason,
+		ErrorMessage:              h.ErrorMessage,
+		DiagnosticCode:            h.DiagnosticCode,
+		Model:                     h.Model,
+		Remediation:               h.Remediation,
+		TraceID:                   h.TraceID,
+		CreatedAt:                 h.CreatedAt,
+		ParentJobID:               h.ParentJobID,
+		RootJobID:                 h.RootJobID,
+		ExecutionAttempt:          h.ExecutionAttempt,
+		ExecutionChain:            h.ExecutionChain,
+		InitialConversationID:     h.InitialConversationID,
+		ActiveConversationID:      h.ActiveConversationID,
+		ResumeMode:                h.ResumeMode,
+		ResumeFallbackReason:      h.ResumeFallbackReason,
+		SameConversationConfirmed: h.SameConversationConfirmed,
+		AttachConfirmation:        h.AttachConfirmation,
+		InterruptedASEState:       h.InterruptedASEState,
+		WorkspaceStateManifest:    h.WorkspaceStateManifest,
+		ReapResult:                h.ReapResult,
+		RehydrationStatus:         h.RehydrationStatus,
+		ConversationLineage:       h.ConversationLineage,
+		AutoResumePolicy:          h.AutoResumePolicy,
+		AutoResumeCount:           h.AutoResumeCount,
+		LastProgressFingerprint:   h.LastProgressFingerprint,
+		CircuitBreakerTripped:     h.CircuitBreakerTripped,
+		ASEGateStatus:             h.ASEGateStatus,
+		LivenessPulseSeconds:      h.LivenessPulseSeconds,
+		TerminationReasonCode:     h.TerminationReasonCode,
+		TerminationReasonMessage:  h.TerminationReasonMessage,
+		Resumable:                 h.Resumable,
+		NonResumableReason:        h.NonResumableReason,
+		WorkspaceDirtyFiles:       h.WorkspaceDirtyFiles,
+		BackgroundTasks:           h.BackgroundTasks,
+		HarnessPID:                h.HarnessPID,
+		ToolPID:                   h.ToolPID,
 	}
-	return map[string]any{
-		"host_id":                     h.HostID,
-		"repo_path":                   h.WorktreePath,
-		"job_id":                      h.JobID,
-		"schedule_id":                 h.ScheduleID,
-		"prompt_title":                h.PromptTitle,
-		"engine":                      h.Engine,
-		"status":                      h.Status,
-		"clean":                       h.Clean,
-		"ase_complete":                h.ASEComplete,
-		"conversation_ids":            ids,
-		"reason":                      h.Reason,
-		"error_message":               h.ErrorMessage,
-		"diagnostic_code":             h.DiagnosticCode,
-		"model":                       h.Model,
-		"remediation":                 h.Remediation,
-		"trace_id":                    h.TraceID,
-		"created_at":                  h.CreatedAt.UTC().Format(time.RFC3339),
-		"parent_job_id":               h.ParentJobID,
-		"root_job_id":                 h.RootJobID,
-		"execution_attempt":           h.ExecutionAttempt,
-		"execution_chain":             h.ExecutionChain,
-		"initial_conversation_id":     h.InitialConversationID,
-		"active_conversation_id":      h.ActiveConversationID,
-		"resume_mode":                 h.ResumeMode,
-		"resume_fallback_reason":      h.ResumeFallbackReason,
-		"same_conversation_confirmed": h.SameConversationConfirmed || h.ResumeMode == "same_conversation",
-		"attach_confirmation":         h.AttachConfirmation,
-		"interrupted_ase_state":       h.InterruptedASEState,
-		"workspace_state_manifest":    h.WorkspaceStateManifest,
-		"reap_result":                 h.ReapResult,
-		"rehydration_status":          h.RehydrationStatus,
-		"conversation_lineage":        h.ConversationLineage,
-		"auto_resume_policy":          h.AutoResumePolicy,
-		"auto_resume_count":           h.AutoResumeCount,
-		"last_progress_fingerprint":   h.LastProgressFingerprint,
-		"circuit_breaker_tripped":     h.CircuitBreakerTripped,
-		"ase_gate_status":             h.ASEGateStatus,
-		"liveness_pulse_seconds":      h.LivenessPulseSeconds,
-		"termination_reason_code":     h.TerminationReasonCode,
-		"termination_reason_message":  h.TerminationReasonMessage,
-		"resumable":                   h.Resumable,
-		"non_resumable_reason":        h.NonResumableReason,
-		"workspace_dirty_files":       h.WorkspaceDirtyFiles,
-		"background_tasks":            h.BackgroundTasks,
-	}
+	m := historyRowView(row)
+	m["host_id"] = h.HostID
+	m["repo_path"] = h.WorktreePath
+	return m
+}
+
+func historyJobDetailView(r control.HistoryRow, host, path string) map[string]any {
+	m := historyRowView(r)
+	m["id"] = r.JobID
+	m["prompt"] = r.PromptTitle
+	m["worktree_path"] = path
+	m["host_id"] = host
+	m["target_host"] = host
+	m["harness_pid"] = r.HarnessPID
+	m["tool_pid"] = r.ToolPID
+	m["transcript"] = ""
+	m["docs_hub_path"] = ""
+	m["env_vars"] = map[string]string{}
+	m["max_execution_duration_seconds"] = 0
+	m["resume_conversation_id"] = r.ActiveConversationID
+	m["silent_for_seconds"] = 0
+	m["is_stalled"] = false
+	m["started_at"] = r.CreatedAt
+	m["stall_timeout_sec"] = 0
+	return m
 }
 
 func parseDispatchPayload(payload []byte) (title, prompt, storyID string) {
