@@ -4478,3 +4478,72 @@ func TestReconcileStaleWorkspaceSlots_And_DispatchDiagnostics(t *testing.T) {
 		t.Fatalf("expected at least 2 eligible host slots, got %d: %+v", len(diag.EligibleHosts), diag.EligibleHosts)
 	}
 }
+
+func TestEngine_AckLease_Heartbeat_Failover_RetryRetriable(t *testing.T) {
+	e := NewEngine(nil)
+
+	e.mu.Lock()
+	e.schedules["sch-test-1"] = &Schedule{ID: "sch-test-1", Status: "RUNNING"}
+	e.jobs["job-test-1"] = &Job{
+		ID:         "job-test-1",
+		ScheduleID: "sch-test-1",
+		Status:     "LEASED",
+		LeaseToken: "tok-xyz-123",
+		TargetHost: "host-1",
+	}
+	e.mu.Unlock()
+
+	// Ack with wrong token -> error
+	if err := e.AckLease("job-test-1", "wrong-tok", 1234, "conv-1"); err == nil {
+		t.Fatalf("expected error on invalid lease token")
+	}
+
+	// Ack with correct token
+	if err := e.AckLease("job-test-1", "tok-xyz-123", 1234, "conv-1"); err != nil {
+		t.Fatalf("AckLease failed: %v", err)
+	}
+
+	// 2. Heartbeat
+	if err := e.HeartbeatJob("job-test-1", "wrong-tok"); err == nil {
+		t.Fatalf("expected error on wrong heartbeat token")
+	}
+	if err := e.HeartbeatJob("job-test-1", "tok-xyz-123"); err != nil {
+		t.Fatalf("HeartbeatJob failed: %v", err)
+	}
+
+	// 3. Failover
+	attempt := AttemptFailure{
+		Host:            "host-1",
+		Tool:            "agy",
+		Workspace:       "/work/app",
+		ExitCode:        429,
+		StderrTail:      "rate limit",
+		FailureCategory: "rate_limit_exceeded",
+		Reason:          "quota",
+	}
+	sch, err := e.FailoverJob("job-test-1", attempt)
+	if err != nil {
+		t.Fatalf("FailoverJob failed: %v", err)
+	}
+	if sch == nil || sch.Status != "QUEUED" {
+		t.Fatalf("expected schedule queued after failover, got %+v", sch)
+	}
+
+	// 4. RetryRetriableJobs
+	e.mu.Lock()
+	e.schedules["sch-test-1"].Status = "FAILED"
+	e.schedules["sch-test-1"].Retriable = true
+	e.jobs["job-test-1"].Status = "FAILED"
+	e.jobs["job-test-1"].Retriable = true
+	e.mu.Unlock()
+
+	retried, err := e.RetryRetriableJobs()
+	if err != nil {
+		t.Fatalf("RetryRetriableJobs failed: %v", err)
+	}
+	if len(retried) == 0 {
+		t.Fatalf("expected retried schedules, got 0")
+	}
+
+	_ = e.ReconcileHistoricalFailureTaxonomy()
+}
