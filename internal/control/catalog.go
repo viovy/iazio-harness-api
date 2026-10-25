@@ -166,8 +166,14 @@ func (e *Engine) HeartbeatWithCapabilities(id, presence string, tools []Tool, fe
 	h.HarnessActive = len(activeJobs) > 0
 	if len(supportedCaps) > 0 {
 		h.SupportedCapabilities = append([]string(nil), supportedCaps...)
-	} else {
-		h.SupportedCapabilities = []string{}
+	} else if len(h.SupportedCapabilities) == 0 {
+		h.SupportedCapabilities = []string{
+			"user_service_watchdog_v2",
+			"deterministic_resume_4tuple_v1",
+			"agy_conversation_pinning_v1",
+			"workspace_recovery_modes_v1",
+			"background_task_watchdog_v1",
+		}
 	}
 	if version != "" {
 		h.Version = version
@@ -194,6 +200,7 @@ func (e *Engine) HeartbeatWithCapabilities(id, presence string, tools []Tool, fe
 			}
 		}
 	}
+	e.reconcileQueuesLocked()
 	return nil
 }
 

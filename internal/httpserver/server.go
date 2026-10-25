@@ -238,6 +238,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/jobs/{id}/pause-auto-resume", s.pauseAutoResumeJob)
 	mux.HandleFunc("POST /v1/jobs/{id}/force-resume", s.forceResumeJob)
 	mux.HandleFunc("POST /v1/jobs/{id}/force-pause", s.forcePauseJob)
+	mux.HandleFunc("POST /v1/jobs/{id}/kill-background-tasks", s.killBackgroundTasks)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/kill-background-tasks", s.killBackgroundTasks)
+	mux.HandleFunc("POST /v1/jobs/{id}/stash-clean-restart", s.stashCleanRestart)
+	mux.HandleFunc("POST /api/v1/jobs/{id}/stash-clean-restart", s.stashCleanRestart)
 	mux.HandleFunc("POST /v1/jobs/{id}/retry-correlation", s.retryCorrelation)
 	mux.HandleFunc("POST /v1/jobs/{id}/chunks", s.appendChunk)
 	mux.HandleFunc("POST /v1/jobs/{id}/conversations", s.addJobConversation)
@@ -331,6 +335,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/agents/{host}/repos/force-clean-git", s.forceCleanGitRepo)
 	mux.HandleFunc("POST /v1/hosts/{host}/repos/clear-healing", s.clearHealingRepo)
 	mux.HandleFunc("POST /api/v1/agents/{host}/repos/clear-healing", s.clearHealingRepo)
+	mux.HandleFunc("POST /v1/hosts/{host}/repos/clean-and-dispatch-next", s.cleanAndDispatchNext)
+	mux.HandleFunc("POST /api/v1/agents/{host}/repos/clean-and-dispatch-next", s.cleanAndDispatchNext)
 	mux.HandleFunc("POST /v1/hosts/{host}/repos/status", s.updateRepoRuntimeStatus)
 	mux.HandleFunc("GET /v1/fleet/tool-priority", s.getToolPriority)
 	mux.HandleFunc("PUT /v1/fleet/tool-priority", s.setToolPriority)
@@ -3230,6 +3236,88 @@ func (s *Server) clearHealingRepo(w http.ResponseWriter, r *http.Request) {
 		"host_id":   hostID,
 		"repo_path": targetPath,
 		"status":    "healing_cleared",
+	})
+}
+
+func (s *Server) killBackgroundTasks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	jobID := r.PathValue("id")
+	if err := s.Engine.KillBackgroundTasks(jobID); err != nil {
+		if errors.Is(err, control.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, err)
+		} else {
+			writeErr(w, http.StatusBadRequest, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"job_id": jobID,
+		"status": "background_tasks_killed",
+	})
+}
+
+func (s *Server) stashCleanRestart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	jobID := r.PathValue("id")
+	sch, err := s.Engine.StashCleanRestart(jobID)
+	if err != nil {
+		if errors.Is(err, control.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, err)
+		} else {
+			writeErr(w, http.StatusBadRequest, err)
+		}
+		return
+	}
+	if s.SaveRepo != nil {
+		if repo, ok := s.Engine.GetRepo(sch.HostID, sch.WorktreePath); ok {
+			s.SaveRepo(repo)
+		}
+	}
+	writeJSON(w, http.StatusOK, scheduleView(sch))
+}
+
+func (s *Server) cleanAndDispatchNext(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	host := r.PathValue("host")
+	targetPath := strings.TrimSpace(r.URL.Query().Get("path"))
+	if targetPath == "" {
+		var req struct {
+			Path         string `json:"path"`
+			WorktreePath string `json:"worktree_path"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.WorktreePath != "" {
+			targetPath = strings.TrimSpace(req.WorktreePath)
+		} else {
+			targetPath = strings.TrimSpace(req.Path)
+		}
+	}
+	if err := s.Engine.CleanAndDispatchNext(host, targetPath); err != nil {
+		if errors.Is(err, control.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, err)
+		} else {
+			writeErr(w, http.StatusBadRequest, err)
+		}
+		return
+	}
+	if s.SaveRepo != nil {
+		if repo, ok := s.Engine.GetRepo(host, targetPath); ok {
+			s.SaveRepo(repo)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"host_id":   host,
+		"repo_path": targetPath,
+		"status":    "cleaned_and_dispatch_reconciled",
 	})
 }
 

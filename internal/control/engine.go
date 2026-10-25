@@ -260,6 +260,12 @@ type JobDetail struct {
 	ASEGateStatus               map[string]any        `json:"ase_gate_status,omitempty"`
 	StallTimeoutSec             int                   `json:"stall_timeout_sec,omitempty"`
 	LivenessPulseSeconds        int                   `json:"liveness_pulse_seconds,omitempty"`
+	TerminationReasonCode       string                `json:"termination_reason_code,omitempty"`
+	TerminationReasonMessage    string                `json:"termination_reason_message,omitempty"`
+	Resumable                   bool                  `json:"resumable"`
+	NonResumableReason          string                `json:"non_resumable_reason,omitempty"`
+	WorkspaceDirtyFiles         []string              `json:"workspace_dirty_files,omitempty"`
+	BackgroundTasks             []BackgroundTaskInfo  `json:"background_tasks,omitempty"`
 }
 
 // ActiveJob describes an active job reported on heartbeat.
@@ -313,6 +319,12 @@ type Job struct {
 	ASEGateStatus             map[string]any
 	StallTimeoutSec           int
 	LivenessPulseSeconds      int
+	TerminationReasonCode     string
+	TerminationReasonMessage  string
+	Resumable                 bool
+	NonResumableReason        string
+	WorkspaceDirtyFiles       []string
+	BackgroundTasks           []BackgroundTaskInfo
 }
 
 // Repo is one registered checkout.
@@ -358,6 +370,11 @@ type Repo struct {
 	MetadataYmlSHA               string
 	MetadataYmlModTime           string
 	GitVersion                   string
+	DispatchStatus               string
+	DispatchBlockedCode          string
+	DispatchBlockedMessage       string
+	BlockingJobID                string
+	LastDispatchAttemptAt        *time.Time
 }
 
 // RepoRuntimeStatus contains near real-time git and ASE telemetry for a repository.
@@ -484,6 +501,12 @@ type HistoryRow struct {
 	ASEGateStatus             map[string]any
 	StallTimeoutSec           int
 	LivenessPulseSeconds      int
+	TerminationReasonCode     string
+	TerminationReasonMessage  string
+	Resumable                 bool
+	NonResumableReason        string
+	WorkspaceDirtyFiles       []string
+	BackgroundTasks           []BackgroundTaskInfo
 }
 
 // HistoryItem is one execution record reported across repositories.
@@ -524,6 +547,12 @@ type HistoryItem struct {
 	ASEGateStatus             map[string]any
 	StallTimeoutSec           int
 	LivenessPulseSeconds      int
+	TerminationReasonCode     string
+	TerminationReasonMessage  string
+	Resumable                 bool
+	NonResumableReason        string
+	WorkspaceDirtyFiles       []string
+	BackgroundTasks           []BackgroundTaskInfo
 }
 
 // LogChunk is one stripped output event.
@@ -1418,6 +1447,45 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 			code = opt.ExitCode
 		}
 	}
+	job.TerminationReasonCode = opt.TerminationReasonCode
+	job.TerminationReasonMessage = opt.TerminationReasonMessage
+	job.Resumable = opt.Resumable
+	job.NonResumableReason = opt.NonResumableReason
+	if len(opt.WorkspaceDirtyFiles) > 0 {
+		job.WorkspaceDirtyFiles = append([]string(nil), opt.WorkspaceDirtyFiles...)
+	}
+	if len(opt.BackgroundTasks) > 0 {
+		job.BackgroundTasks = append([]BackgroundTaskInfo(nil), opt.BackgroundTasks...)
+	}
+	if job.TerminationReasonCode == "" {
+		if code == 0 {
+			job.TerminationReasonCode = "NORMAL_EXIT"
+			job.TerminationReasonMessage = "Execution completed with status 0"
+			job.Resumable = true
+		} else if opt.DiagnosticCode != "" {
+			job.TerminationReasonCode = opt.DiagnosticCode
+			job.TerminationReasonMessage = opt.ErrorMessage
+			if job.TerminationReasonMessage == "" {
+				job.TerminationReasonMessage = opt.Reason
+			}
+		} else {
+			job.TerminationReasonCode = "NON_ZERO_EXIT"
+			job.TerminationReasonMessage = fmt.Sprintf("Process exited with code %d", code)
+		}
+	}
+	if !job.Resumable && (len(job.ConversationIDs) > 0 || job.ResumeConversationID != "" || job.InitialConversationID != "") {
+		job.Resumable = true
+		job.NonResumableReason = ""
+	} else if !job.Resumable && job.NonResumableReason == "" {
+		job.NonResumableReason = "No conversation or checkpoint recorded before termination"
+	}
+	opt.TerminationReasonCode = job.TerminationReasonCode
+	opt.TerminationReasonMessage = job.TerminationReasonMessage
+	opt.Resumable = job.Resumable
+	opt.NonResumableReason = job.NonResumableReason
+	opt.WorkspaceDirtyFiles = job.WorkspaceDirtyFiles
+	opt.BackgroundTasks = job.BackgroundTasks
+
 	job.ExitPosted = true
 	var changedRepo *Repo
 	if job.Status == "CANCEL_REQUESTED" {
@@ -1568,6 +1636,7 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 	if changedRepo != nil {
 		e.notifyRepoLocked(changedRepo)
 	}
+	e.reconcileQueuesLocked()
 	return nil
 }
 
@@ -1653,6 +1722,7 @@ func (e *Engine) DeclineJob(jobID, reason string) error {
 	if changedRepo != nil {
 		e.notifyRepoLocked(changedRepo)
 	}
+	e.reconcileQueuesLocked()
 	return nil
 }
 
@@ -2145,6 +2215,12 @@ func (e *Engine) reapExpiredLocked() {
 				} else if leaseExpired && !timedOut {
 					reason = "LEASE_EXPIRED"
 				}
+				job.TerminationReasonCode = reason
+				job.TerminationReasonMessage = fmt.Sprintf("Job terminated: %s", reason)
+				job.Resumable = (len(job.ConversationIDs) > 0 || job.ResumeConversationID != "" || job.InitialConversationID != "")
+				if !job.Resumable {
+					job.NonResumableReason = "No conversation checkpoint was established before timeout"
+				}
 				if job.ResumeMode == "pending" {
 					job.ResumeMode = "same_conversation_unverified"
 					job.SameConversationConfirmed = false
@@ -2184,7 +2260,15 @@ func (e *Engine) reapExpiredLocked() {
 						repo.Reason = reason
 						e.notifyRepoLocked(repo)
 					}
-					e.updateHistoryStatusLocked(sch.HostID, sch.WorktreePath, job.ID, reason)
+					e.updateHistoryStatusLocked(sch.HostID, sch.WorktreePath, job.ID, reason, ExitOptions{
+						Reason:                   reason,
+						DiagnosticCode:           reason,
+						ErrorMessage:             job.TerminationReasonMessage,
+						TerminationReasonCode:    reason,
+						TerminationReasonMessage: job.TerminationReasonMessage,
+						Resumable:                job.Resumable,
+						NonResumableReason:       job.NonResumableReason,
+					})
 				}
 			}
 		}
@@ -2285,6 +2369,7 @@ func (e *Engine) reapExpiredLocked() {
 			}
 		}
 	}
+	e.reconcileQueuesLocked()
 }
 
 // PollHost leases the next queued schedule for the host.
@@ -2293,6 +2378,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.reapExpiredLocked()
+	now := e.now()
 	if h, ok := e.hosts[host]; ok && (h.Presence == "ONLINE_UPDATING_TOOLS" || h.Presence == "UPDATING_TOOLS") {
 		return Job{}, Schedule{}, "", false
 	}
@@ -2387,18 +2473,38 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 				continue
 			}
 			if repo.Lock == LockRunning || repo.Lock == LockCooling || repo.Lock == LockCleaning {
+				repo.DispatchStatus = "blocked"
+				repo.DispatchBlockedCode = fmt.Sprintf("LOCK_%s", repo.Lock)
+				repo.DispatchBlockedMessage = fmt.Sprintf("Repository is locked (%s)", repo.Lock)
+				repo.BlockingJobID = repo.RunningJobID
+				repo.LastDispatchAttemptAt = &now
 				continue
 			}
 			if repo.Queue != QueueOpen && repo.Queue != QueueHealing {
 				if !(repo.Queue == QueuePaused && (sch.Kind == KindIntervention || sch.Kind == KindResume)) {
+					repo.DispatchStatus = "blocked"
+					repo.DispatchBlockedCode = "QUEUE_PAUSED"
+					repo.DispatchBlockedMessage = fmt.Sprintf("Queue is %s (%s)", repo.Queue, repo.Reason)
+					repo.BlockingJobID = sch.ID
+					repo.LastDispatchAttemptAt = &now
 					continue
 				}
 			}
 			if repo.Reason != "" && repo.Reason != "REMEDIATED" && repo.Queue != QueueHealing {
 				if repo.Reason == ReasonDisk {
+					repo.DispatchStatus = "blocked"
+					repo.DispatchBlockedCode = "HALTED_DISK"
+					repo.DispatchBlockedMessage = "Repository halted due to low disk space"
+					repo.BlockingJobID = sch.ID
+					repo.LastDispatchAttemptAt = &now
 					continue
 				}
 				if sch.Kind != KindIntervention && sch.Kind != KindResume {
+					repo.DispatchStatus = "blocked"
+					repo.DispatchBlockedCode = repo.Reason
+					repo.DispatchBlockedMessage = fmt.Sprintf("Repository halted: %s", repo.Reason)
+					repo.BlockingJobID = sch.ID
+					repo.LastDispatchAttemptAt = &now
 					continue
 				}
 			}
@@ -2433,6 +2539,14 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 				}
 			}
 			if !hasResumeCap {
+				if repo != nil {
+					repo.DispatchStatus = "blocked"
+					repo.DispatchBlockedCode = "MISSING_RESUME_CAPABILITY"
+					repo.DispatchBlockedMessage = fmt.Sprintf("Host %s does not advertise deterministic_resume_4tuple_v1 capability", host)
+					repo.BlockingJobID = sch.ID
+					repo.LastDispatchAttemptAt = &now
+					e.notifyRepoLocked(repo)
+				}
 				if h != nil {
 					h.PendingToolUpdate = &PendingToolUpdate{
 						Tools: []string{"iazio-agent", "iazio-harvester"},
@@ -2568,6 +2682,11 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 		if repo != nil {
 			repo.Lock = LockRunning
 			repo.RunningJobID = id
+			repo.DispatchStatus = "running"
+			repo.DispatchBlockedCode = ""
+			repo.DispatchBlockedMessage = ""
+			repo.BlockingJobID = ""
+			repo.LastDispatchAttemptAt = &now
 			if repo.Reason == "REMEDIATED" {
 				repo.Reason = ""
 			}
@@ -2600,6 +2719,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 		e.notifyHistoryLocked(host, sch.WorktreePath, row)
 		return *job, *sch, docs, true
 	}
+	e.reconcileQueuesLocked()
 	return Job{}, Schedule{}, "", false
 }
 
@@ -2632,11 +2752,47 @@ func (e *Engine) updateHistoryStatusLocked(host, path, jobID, status string, opt
 				if opt.ASEComplete {
 					rows[i].ASEComplete = true
 				}
+				if opt.TerminationReasonCode != "" {
+					rows[i].TerminationReasonCode = opt.TerminationReasonCode
+				}
+				if opt.TerminationReasonMessage != "" {
+					rows[i].TerminationReasonMessage = opt.TerminationReasonMessage
+				}
+				if opt.Resumable {
+					rows[i].Resumable = true
+				}
+				if opt.NonResumableReason != "" {
+					rows[i].NonResumableReason = opt.NonResumableReason
+				}
+				if len(opt.WorkspaceDirtyFiles) > 0 {
+					rows[i].WorkspaceDirtyFiles = append([]string(nil), opt.WorkspaceDirtyFiles...)
+				}
+				if len(opt.BackgroundTasks) > 0 {
+					rows[i].BackgroundTasks = append([]BackgroundTaskInfo(nil), opt.BackgroundTasks...)
+				}
 			}
 			if rows[i].Reason == "" && (status == "LEASE_EXPIRED" || status == "EXECUTION_TIMEOUT" || status == "HOST_OFFLINE" || status == "FAILED") {
 				rows[i].Reason = status
 			}
 			if j, ok := e.jobs[jobID]; ok {
+				if rows[i].TerminationReasonCode == "" && j.TerminationReasonCode != "" {
+					rows[i].TerminationReasonCode = j.TerminationReasonCode
+				}
+				if rows[i].TerminationReasonMessage == "" && j.TerminationReasonMessage != "" {
+					rows[i].TerminationReasonMessage = j.TerminationReasonMessage
+				}
+				if !rows[i].Resumable && j.Resumable {
+					rows[i].Resumable = j.Resumable
+				}
+				if rows[i].NonResumableReason == "" && j.NonResumableReason != "" {
+					rows[i].NonResumableReason = j.NonResumableReason
+				}
+				if len(rows[i].WorkspaceDirtyFiles) == 0 && len(j.WorkspaceDirtyFiles) > 0 {
+					rows[i].WorkspaceDirtyFiles = append([]string(nil), j.WorkspaceDirtyFiles...)
+				}
+				if len(rows[i].BackgroundTasks) == 0 && len(j.BackgroundTasks) > 0 {
+					rows[i].BackgroundTasks = append([]BackgroundTaskInfo(nil), j.BackgroundTasks...)
+				}
 				if j.ResumeMode == "pending" && (status == "LEASE_EXPIRED" || status == "EXECUTION_TIMEOUT" || status == "HOST_OFFLINE" || status == "FAILED" || status == "CANCELLED" || status == "CANCEL_REQUESTED") {
 					j.ResumeMode = "same_conversation_unverified"
 					j.SameConversationConfirmed = false
@@ -3277,6 +3433,12 @@ func (e *Engine) GetJob(id string) (JobDetail, bool) {
 			AttachConfirmation:        r.AttachConfirmation,
 			InterruptedASEState:       r.InterruptedASEState,
 			ConversationLineage:       append([]ConversationLineage(nil), r.ConversationLineage...),
+			TerminationReasonCode:     r.TerminationReasonCode,
+			TerminationReasonMessage:  r.TerminationReasonMessage,
+			Resumable:                 r.Resumable,
+			NonResumableReason:        r.NonResumableReason,
+			WorkspaceDirtyFiles:       append([]string(nil), r.WorkspaceDirtyFiles...),
+			BackgroundTasks:           append([]BackgroundTaskInfo(nil), r.BackgroundTasks...),
 		}
 		if !r.CreatedAt.IsZero() {
 			detail.StartedAt = r.CreatedAt.UTC().Format(time.RFC3339)
@@ -3311,6 +3473,12 @@ func (e *Engine) buildJobDetailLocked(job *Job) JobDetail {
 		AttachConfirmation:        job.AttachConfirmation,
 		InterruptedASEState:       job.InterruptedASEState,
 		ConversationLineage:       append([]ConversationLineage(nil), job.ConversationLineage...),
+		TerminationReasonCode:     job.TerminationReasonCode,
+		TerminationReasonMessage:  job.TerminationReasonMessage,
+		Resumable:                 job.Resumable,
+		NonResumableReason:        job.NonResumableReason,
+		WorkspaceDirtyFiles:       append([]string(nil), job.WorkspaceDirtyFiles...),
+		BackgroundTasks:           append([]BackgroundTaskInfo(nil), job.BackgroundTasks...),
 	}
 	if !job.StartedAt.IsZero() {
 		detail.StartedAt = job.StartedAt.UTC().Format(time.RFC3339)
@@ -4601,6 +4769,324 @@ func (e *Engine) RemediateRepo(hostID, worktreePath string) error {
 	repo.Reason = "REMEDIATED"
 	e.notifyRepoLocked(repo)
 	e.reapExpiredLocked()
+	return nil
+}
+
+func (e *Engine) reconcileQueuesLocked() {
+	now := e.now()
+	for _, repo := range e.repos {
+		if repo.Lock == LockRunning {
+			repo.DispatchStatus = "running"
+			repo.DispatchBlockedCode = ""
+			repo.DispatchBlockedMessage = ""
+			repo.BlockingJobID = repo.RunningJobID
+			repo.LastDispatchAttemptAt = &now
+			continue
+		}
+
+		// Find queued candidates for this repo
+		var queuedForRepo []*Schedule
+		for _, sch := range e.schedules {
+			if sch.Status != "QUEUED" {
+				continue
+			}
+			if sch.HostID == repo.HostID && (sch.WorktreePath == repo.WorktreePath || sch.WorktreePath == repo.EffectiveAlias() || filepath.Clean(sch.WorktreePath) == filepath.Clean(repo.WorktreePath)) {
+				queuedForRepo = append(queuedForRepo, sch)
+			}
+		}
+
+		if len(queuedForRepo) == 0 {
+			repo.DispatchStatus = "idle"
+			repo.DispatchBlockedCode = ""
+			repo.DispatchBlockedMessage = ""
+			repo.BlockingJobID = ""
+			continue
+		}
+
+		// Sort queued candidates by priority then ID (same as PollHost)
+		sort.Slice(queuedForRepo, func(i, j int) bool {
+			if queuedForRepo[i].Priority != queuedForRepo[j].Priority {
+				return queuedForRepo[i].Priority > queuedForRepo[j].Priority
+			}
+			idxI := strings.LastIndex(queuedForRepo[i].ID, "-")
+			idxJ := strings.LastIndex(queuedForRepo[j].ID, "-")
+			if idxI >= 0 && idxJ >= 0 {
+				nI, errI := strconv.Atoi(queuedForRepo[i].ID[idxI+1:])
+				nJ, errJ := strconv.Atoi(queuedForRepo[j].ID[idxJ+1:])
+				if errI == nil && errJ == nil {
+					return nI < nJ
+				}
+			}
+			return queuedForRepo[i].ID < queuedForRepo[j].ID
+		})
+
+		headSch := queuedForRepo[0]
+		h := e.hosts[repo.HostID]
+		if h == nil || h.Presence == "OFFLINE" {
+			repo.DispatchStatus = "blocked"
+			repo.DispatchBlockedCode = "HOST_OFFLINE"
+			repo.DispatchBlockedMessage = fmt.Sprintf("Host %s is offline", repo.HostID)
+			repo.BlockingJobID = headSch.ID
+			repo.LastDispatchAttemptAt = &now
+			continue
+		}
+		if h.Presence == "ONLINE_UPDATING_TOOLS" || h.Presence == "UPDATING_TOOLS" {
+			repo.DispatchStatus = "blocked"
+			repo.DispatchBlockedCode = "UPDATING_TOOLS"
+			repo.DispatchBlockedMessage = fmt.Sprintf("Host %s is updating tools", repo.HostID)
+			repo.BlockingJobID = headSch.ID
+			repo.LastDispatchAttemptAt = &now
+			continue
+		}
+		if repo.Lock != LockIdle {
+			repo.DispatchStatus = "blocked"
+			repo.DispatchBlockedCode = fmt.Sprintf("LOCK_%s", repo.Lock)
+			repo.DispatchBlockedMessage = fmt.Sprintf("Repository is locked (%s)", repo.Lock)
+			repo.BlockingJobID = headSch.ID
+			repo.LastDispatchAttemptAt = &now
+			continue
+		}
+		if repo.Queue != QueueOpen && repo.Queue != QueueHealing {
+			if !(repo.Queue == QueuePaused && (headSch.Kind == KindIntervention || headSch.Kind == KindResume)) {
+				repo.DispatchStatus = "blocked"
+				repo.DispatchBlockedCode = "QUEUE_PAUSED"
+				repo.DispatchBlockedMessage = fmt.Sprintf("Queue is %s (%s)", repo.Queue, repo.Reason)
+				repo.BlockingJobID = headSch.ID
+				repo.LastDispatchAttemptAt = &now
+				continue
+			}
+		}
+		if headSch.Kind == KindResume {
+			hasResumeCap := false
+			for _, cap := range h.SupportedCapabilities {
+				if cap == "deterministic_resume_4tuple_v1" {
+					hasResumeCap = true
+					break
+				}
+			}
+			if !hasResumeCap {
+				for _, tool := range h.Tools {
+					if tool.Name == "iazio-agent" {
+						for _, cap := range tool.Capabilities {
+							if cap == "deterministic_resume_4tuple_v1" {
+								hasResumeCap = true
+								break
+							}
+						}
+					}
+				}
+			}
+			if !hasResumeCap {
+				repo.DispatchStatus = "blocked"
+				repo.DispatchBlockedCode = "MISSING_RESUME_CAPABILITY"
+				repo.DispatchBlockedMessage = fmt.Sprintf("Host %s does not advertise deterministic_resume_4tuple_v1 capability", repo.HostID)
+				repo.BlockingJobID = headSch.ID
+				repo.LastDispatchAttemptAt = &now
+				continue
+			}
+		}
+
+		// Check if dirty workspace blocks non-resume/non-intervention jobs
+		if headSch.Kind != KindResume && headSch.Kind != KindIntervention && (repo.Porcelain != "" || repo.DirtyStoryID != "") {
+			repo.DispatchStatus = "blocked"
+			repo.DispatchBlockedCode = "DIRTY_WORKSPACE"
+			repo.DispatchBlockedMessage = fmt.Sprintf("Workspace is dirty with uncommitted changes (%s)", repo.DirtyStoryID)
+			repo.BlockingJobID = headSch.ID
+			repo.LastDispatchAttemptAt = &now
+			continue
+		}
+
+		repo.DispatchStatus = "ready"
+		repo.DispatchBlockedCode = ""
+		repo.DispatchBlockedMessage = ""
+		repo.BlockingJobID = headSch.ID
+		repo.LastDispatchAttemptAt = &now
+	}
+}
+
+// ReconcileQueues evaluates queue readiness and dispatcher status for all repositories under the engine lock.
+func (e *Engine) ReconcileQueues() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.reconcileQueuesLocked()
+}
+
+// KillBackgroundTasks clears tracked child tasks on a job and updates history records.
+func (e *Engine) KillBackgroundTasks(jobID string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	job, ok := e.jobs[jobID]
+	if ok {
+		job.BackgroundTasks = nil
+		if job.LeaseHolder != "" {
+			if h, exists := e.hosts[job.LeaseHolder]; exists && h != nil {
+				cmdID := fmt.Sprintf("kill-tasks-%d", e.now().UnixNano())
+				h.PendingCommands = append(h.PendingCommands, CommandEnvelope{
+					ID:        cmdID,
+					Type:      "KILL_BACKGROUND_TASKS",
+					Payload:   job.ID,
+					CreatedAt: e.now().UTC().Format(time.RFC3339),
+				})
+			}
+		}
+	}
+	for k, rows := range e.history {
+		for i := range rows {
+			if rows[i].JobID == jobID {
+				rows[i].BackgroundTasks = nil
+				parts := strings.Split(k, "\x00")
+				if len(parts) == 2 {
+					e.notifyHistoryLocked(parts[0], parts[1], rows[i])
+				}
+				return nil
+			}
+		}
+	}
+	if !ok {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// StashCleanRestart atomically resets dirty working tree state and re-enqueues the job from step 1.
+func (e *Engine) StashCleanRestart(jobID string) (Schedule, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var (
+		hostID       string
+		worktreePath string
+		promptID     string
+		promptTitle  string
+		engine       string
+	)
+
+	job, ok := e.jobs[jobID]
+	if ok {
+		sch := e.schedules[job.ScheduleID]
+		hostID = job.HostID
+		if sch != nil {
+			hostID = sch.HostID
+			worktreePath = sch.WorktreePath
+			promptID = sch.PromptID
+			promptTitle = sch.PromptTitle
+			engine = sch.Engine
+		}
+		if !job.ExitPosted {
+			job.Status = "CANCELLED"
+			job.ExitPosted = true
+			job.TerminationReasonCode = "CLEAN_RESTARTED"
+			job.TerminationReasonMessage = "Job cancelled for clean restart"
+		}
+	} else {
+		for k, rows := range e.history {
+			for _, r := range rows {
+				if r.JobID == jobID {
+					parts := strings.Split(k, "\x00")
+					if len(parts) == 2 {
+						hostID, worktreePath = parts[0], parts[1]
+						promptTitle = r.PromptTitle
+						engine = r.Engine
+						sch := e.schedules[r.ScheduleID]
+						if sch != nil {
+							promptID = sch.PromptID
+							title := sch.PromptTitle
+							if title != "" {
+								promptTitle = title
+							}
+						}
+					}
+					break
+				}
+			}
+		}
+	}
+
+	if hostID == "" && worktreePath == "" {
+		return Schedule{}, ErrNotFound
+	}
+
+	repo := e.repos[repoKey(hostID, worktreePath)]
+	if repo != nil {
+		repo.Porcelain = ""
+		repo.DirtyStoryID = ""
+		repo.DirtyReviewFile = ""
+		repo.DetectedConversationID = ""
+		repo.DetectedVerdict = ""
+		repo.Lock = LockIdle
+		repo.RunningJobID = ""
+		repo.Queue = QueueOpen
+		repo.Reason = ""
+		e.notifyRepoLocked(repo)
+	}
+
+	if promptTitle == "" {
+		promptTitle = "Clean Restart of " + jobID
+	} else if !strings.Contains(promptTitle, "(Restart)") {
+		promptTitle = promptTitle + " (Restart)"
+	}
+
+	newSch := &Schedule{
+		ID:           e.next("sch-"),
+		HostID:       hostID,
+		WorktreePath: worktreePath,
+		Engine:       engine,
+		Status:       "QUEUED",
+		Kind:         KindOrdinary,
+		PromptID:     promptID,
+		PromptTitle:  promptTitle,
+		Priority:     10,
+	}
+	e.schedules[newSch.ID] = newSch
+	e.reconcileQueuesLocked()
+	return *newSch, nil
+}
+
+// CleanAndDispatchNext clears working tree locks/dirty flags on a repo and reconciles queue.
+func (e *Engine) CleanAndDispatchNext(host, path string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	repo := e.repos[repoKey(host, path)]
+	if repo == nil {
+		for _, candidate := range e.repos {
+			if candidate.HostID == host && (candidate.EffectiveAlias() == path || candidate.WorktreePath == path) {
+				repo = candidate
+				break
+			}
+		}
+	}
+	if repo == nil {
+		return ErrNotFound
+	}
+	repo.Porcelain = ""
+	repo.DirtyStoryID = ""
+	repo.DirtyReviewFile = ""
+	repo.DetectedConversationID = ""
+	repo.DetectedVerdict = ""
+	if repo.Lock != LockRunning {
+		repo.Lock = LockIdle
+		repo.RunningJobID = ""
+	}
+	repo.Queue = QueueOpen
+	repo.Reason = ""
+	repo.HealingAttempts = 0
+	repo.HealingAttemptCount = 0
+	repo.HealingReasonCode = ""
+	repo.HealingReasonMessage = ""
+	repo.LastHealingError = ""
+
+	// Dispatch FORCE_CLEAN_GIT command to agent
+	cmdID := fmt.Sprintf("clean-git-%d", e.now().UnixNano())
+	if h, ok := e.hosts[host]; ok && h != nil {
+		h.PendingCommands = append(h.PendingCommands, CommandEnvelope{
+			ID:        cmdID,
+			Type:      "FORCE_CLEAN_GIT",
+			Payload:   repo.WorktreePath,
+			CreatedAt: e.now().UTC().Format(time.RFC3339),
+		})
+	}
+
+	e.reconcileQueuesLocked()
+	e.notifyRepoLocked(repo)
 	return nil
 }
 
