@@ -253,6 +253,13 @@ type JobDetail struct {
 	AttachConfirmation          string                `json:"attach_confirmation,omitempty"`
 	InterruptedASEState         map[string]any        `json:"interrupted_ase_state,omitempty"`
 	ConversationLineage         []ConversationLineage `json:"conversation_lineage,omitempty"`
+	AutoResumePolicy            *AutoResumePolicy     `json:"auto_resume_policy,omitempty"`
+	AutoResumeCount             int                   `json:"auto_resume_count,omitempty"`
+	LastProgressFingerprint     string                `json:"last_progress_fingerprint,omitempty"`
+	CircuitBreakerTripped       bool                  `json:"circuit_breaker_tripped,omitempty"`
+	ASEGateStatus               map[string]any        `json:"ase_gate_status,omitempty"`
+	StallTimeoutSec             int                   `json:"stall_timeout_sec,omitempty"`
+	LivenessPulseSeconds        int                   `json:"liveness_pulse_seconds,omitempty"`
 }
 
 // ActiveJob describes an active job reported on heartbeat.
@@ -299,6 +306,13 @@ type Job struct {
 	AttachConfirmation        string
 	InterruptedASEState       map[string]any
 	ConversationLineage       []ConversationLineage
+	AutoResumePolicy          *AutoResumePolicy
+	AutoResumeCount           int
+	LastProgressFingerprint   string
+	CircuitBreakerTripped     bool
+	ASEGateStatus             map[string]any
+	StallTimeoutSec           int
+	LivenessPulseSeconds      int
 }
 
 // Repo is one registered checkout.
@@ -448,6 +462,13 @@ type HistoryRow struct {
 	AttachConfirmation        string
 	InterruptedASEState       map[string]any
 	ConversationLineage       []ConversationLineage
+	AutoResumePolicy          *AutoResumePolicy
+	AutoResumeCount           int
+	LastProgressFingerprint   string
+	CircuitBreakerTripped     bool
+	ASEGateStatus             map[string]any
+	StallTimeoutSec           int
+	LivenessPulseSeconds      int
 }
 
 // HistoryItem is one execution record reported across repositories.
@@ -481,6 +502,13 @@ type HistoryItem struct {
 	AttachConfirmation        string
 	InterruptedASEState       map[string]any
 	ConversationLineage       []ConversationLineage
+	AutoResumePolicy          *AutoResumePolicy
+	AutoResumeCount           int
+	LastProgressFingerprint   string
+	CircuitBreakerTripped     bool
+	ASEGateStatus             map[string]any
+	StallTimeoutSec           int
+	LivenessPulseSeconds      int
 }
 
 // LogChunk is one stripped output event.
@@ -4289,6 +4317,47 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 	}
 	e.schedules[schID] = newSch
 	return *newSch, nil
+}
+
+// ToggleAutoResume toggles the auto_resume_policy.enabled state for an active or historical job.
+func (e *Engine) ToggleAutoResume(jobID string) (bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	job, ok := e.jobs[jobID]
+	if ok {
+		if job.AutoResumePolicy == nil {
+			job.AutoResumePolicy = &AutoResumePolicy{
+				Enabled: false,
+			}
+		} else {
+			job.AutoResumePolicy.Enabled = !job.AutoResumePolicy.Enabled
+		}
+		return job.AutoResumePolicy.Enabled, nil
+	}
+
+	for _, rows := range e.history {
+		for i := range rows {
+			if rows[i].JobID == jobID {
+				if rows[i].AutoResumePolicy == nil {
+					rows[i].AutoResumePolicy = &AutoResumePolicy{
+						Enabled: false,
+					}
+				} else {
+					rows[i].AutoResumePolicy.Enabled = !rows[i].AutoResumePolicy.Enabled
+				}
+				return rows[i].AutoResumePolicy.Enabled, nil
+			}
+		}
+	}
+	return false, ErrNotFound
+}
+
+// ForceResumeJob forces an immediate resume of an interrupted job on its root conversation.
+func (e *Engine) ForceResumeJob(jobID string) (Schedule, error) {
+	return e.ResumeJob(jobID, ResumeOptions{
+		Force: true,
+	})
 }
 
 // RemediateRepo clears locks and re-opens the queue for a stuck worktree.

@@ -392,6 +392,13 @@ func jobDetailView(j control.JobDetail) map[string]any {
 		"attach_confirmation":            j.AttachConfirmation,
 		"interrupted_ase_state":          j.InterruptedASEState,
 		"conversation_lineage":           j.ConversationLineage,
+		"auto_resume_policy":            j.AutoResumePolicy,
+		"auto_resume_count":             j.AutoResumeCount,
+		"last_progress_fingerprint":     j.LastProgressFingerprint,
+		"circuit_breaker_tripped":       j.CircuitBreakerTripped,
+		"ase_gate_status":               j.ASEGateStatus,
+		"stall_timeout_sec":             j.StallTimeoutSec,
+		"liveness_pulse_seconds":        j.LivenessPulseSeconds,
 	}
 }
 
@@ -441,6 +448,13 @@ func historyJobDetailView(r control.HistoryRow, host, path string) map[string]an
 		"attach_confirmation":            r.AttachConfirmation,
 		"interrupted_ase_state":          r.InterruptedASEState,
 		"conversation_lineage":           r.ConversationLineage,
+		"auto_resume_policy":            r.AutoResumePolicy,
+		"auto_resume_count":             r.AutoResumeCount,
+		"last_progress_fingerprint":     r.LastProgressFingerprint,
+		"circuit_breaker_tripped":       r.CircuitBreakerTripped,
+		"ase_gate_status":               r.ASEGateStatus,
+		"stall_timeout_sec":             0,
+		"liveness_pulse_seconds":        r.LivenessPulseSeconds,
 	}
 }
 
@@ -479,6 +493,12 @@ func historyItemView(h control.HistoryItem) map[string]any {
 		"attach_confirmation":         h.AttachConfirmation,
 		"interrupted_ase_state":       h.InterruptedASEState,
 		"conversation_lineage":        h.ConversationLineage,
+		"auto_resume_policy":          h.AutoResumePolicy,
+		"auto_resume_count":           h.AutoResumeCount,
+		"last_progress_fingerprint":   h.LastProgressFingerprint,
+		"circuit_breaker_tripped":     h.CircuitBreakerTripped,
+		"ase_gate_status":             h.ASEGateStatus,
+		"liveness_pulse_seconds":      h.LivenessPulseSeconds,
 	}
 }
 

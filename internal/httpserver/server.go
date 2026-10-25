@@ -235,6 +235,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/jobs/{id}/cancel", s.cancel)
 	mux.HandleFunc("POST /v1/jobs/{id}/abandon", s.abandonJob)
 	mux.HandleFunc("POST /v1/jobs/{id}/resume", s.resumeJob)
+	mux.HandleFunc("POST /v1/jobs/{id}/pause-auto-resume", s.pauseAutoResumeJob)
+	mux.HandleFunc("POST /v1/jobs/{id}/force-resume", s.forceResumeJob)
 	mux.HandleFunc("POST /v1/jobs/{id}/force-pause", s.forcePauseJob)
 	mux.HandleFunc("POST /v1/jobs/{id}/retry-correlation", s.retryCorrelation)
 	mux.HandleFunc("POST /v1/jobs/{id}/chunks", s.appendChunk)
@@ -582,6 +584,38 @@ func (s *Server) resumeJob(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, scheduleView(sch))
+}
+
+func (s *Server) pauseAutoResumeJob(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("id")
+	enabled, err := s.Engine.ToggleAutoResume(jobID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":              "success",
+		"job_id":              jobID,
+		"auto_resume_enabled": enabled,
+	})
+}
+
+func (s *Server) forceResumeJob(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("id")
+	sch, err := s.Engine.ForceResumeJob(jobID)
+	if err != nil {
+		code := http.StatusConflict
+		if errors.Is(err, control.ErrNotFound) {
+			code = http.StatusNotFound
+		}
+		writeErr(w, code, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":      "resumed",
+		"job_id":      jobID,
+		"schedule_id": sch.ID,
+	})
 }
 
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {
