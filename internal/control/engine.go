@@ -331,6 +331,8 @@ type Job struct {
 	LivenessPulseSeconds      int
 	TerminationReasonCode     string
 	TerminationReasonMessage  string
+	ExitCode                  int
+	ASEComplete               bool
 	Resumable                 bool
 	NonResumableReason        string
 	WorkspaceDirtyFiles       []string
@@ -516,10 +518,13 @@ type HistoryRow struct {
 	LivenessPulseSeconds      int
 	TerminationReasonCode     string
 	TerminationReasonMessage  string
+	ExitCode                  int
 	Resumable                 bool
 	NonResumableReason        string
 	WorkspaceDirtyFiles       []string
 	BackgroundTasks           []BackgroundTaskInfo
+	HarnessPID                int
+	ToolPID                   int
 }
 
 // HistoryItem is one execution record reported across repositories.
@@ -565,10 +570,13 @@ type HistoryItem struct {
 	LivenessPulseSeconds      int
 	TerminationReasonCode     string
 	TerminationReasonMessage  string
+	ExitCode                  int
 	Resumable                 bool
 	NonResumableReason        string
 	WorkspaceDirtyFiles       []string
 	BackgroundTasks           []BackgroundTaskInfo
+	HarnessPID                int
+	ToolPID                   int
 }
 
 // LogChunk is one stripped output event.
@@ -1463,6 +1471,8 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 			code = opt.ExitCode
 		}
 	}
+	job.ExitCode = code
+	job.ASEComplete = opt.ASEComplete
 	job.TerminationReasonCode = opt.TerminationReasonCode
 	job.TerminationReasonMessage = opt.TerminationReasonMessage
 	job.Resumable = opt.Resumable
@@ -1489,7 +1499,9 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 			job.TerminationReasonMessage = fmt.Sprintf("Process exited with code %d", code)
 		}
 	}
-	if !job.Resumable && (len(job.ConversationIDs) > 0 || job.ResumeConversationID != "" || job.InitialConversationID != "") {
+	sch := e.schedules[job.ScheduleID]
+	hasStory := (sch != nil && sch.StoryID != "") || (job.InterruptedASEState != nil && job.InterruptedASEState["story_id"] != nil)
+	if !job.Resumable && (len(job.ConversationIDs) > 0 || job.ResumeConversationID != "" || job.InitialConversationID != "" || job.ActiveConversationID != "" || hasStory) {
 		job.Resumable = true
 		job.NonResumableReason = ""
 	} else if !job.Resumable && job.NonResumableReason == "" {
@@ -2233,9 +2245,12 @@ func (e *Engine) reapExpiredLocked() {
 				}
 				job.TerminationReasonCode = reason
 				job.TerminationReasonMessage = fmt.Sprintf("Job terminated: %s", reason)
-				job.Resumable = (len(job.ConversationIDs) > 0 || job.ResumeConversationID != "" || job.InitialConversationID != "")
+				hasStory := (sch != nil && sch.StoryID != "") || (job.InterruptedASEState != nil && job.InterruptedASEState["story_id"] != nil)
+				job.Resumable = (len(job.ConversationIDs) > 0 || job.ResumeConversationID != "" || job.InitialConversationID != "" || job.ActiveConversationID != "" || hasStory)
 				if !job.Resumable {
 					job.NonResumableReason = "No conversation checkpoint was established before timeout"
+				} else {
+					job.NonResumableReason = ""
 				}
 				if job.ResumeMode == "pending" {
 					job.ResumeMode = "same_conversation_unverified"
@@ -2400,7 +2415,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 	}
 	var candidates []*Schedule
 	for _, sch := range e.schedules {
-		if sch.Status != "QUEUED" {
+		if sch.Status != "QUEUED" && sch.Status != "SCHEDULED" && sch.Status != "PENDING" {
 			continue
 		}
 		// Level 1: Direct local repo schedule for this host
@@ -2551,6 +2566,17 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 								}
 							}
 						}
+					}
+				}
+				if !hasResumeCap && len(h.SupportedCapabilities) == 0 {
+					for _, tool := range h.Tools {
+						if (tool.Name == "iazio-agent" || tool.Name == "iazio-harness") && !strings.Contains(tool.Version, "legacy") {
+							hasResumeCap = true
+							break
+						}
+					}
+					if len(h.Tools) == 0 {
+						hasResumeCap = true
 					}
 				}
 			}
@@ -2733,6 +2759,8 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			ReapResult:             job.ReapResult,
 			RehydrationStatus:      job.RehydrationStatus,
 			ConversationLineage:   append([]ConversationLineage(nil), job.ConversationLineage...),
+			HarnessPID:            job.HarnessPID,
+			ToolPID:               job.ToolPID,
 		}
 		e.history[repoKey(host, sch.WorktreePath)] = append(e.history[repoKey(host, sch.WorktreePath)], row)
 		e.notifyHistoryLocked(host, sch.WorktreePath, row)
@@ -2794,6 +2822,12 @@ func (e *Engine) updateHistoryStatusLocked(host, path, jobID, status string, opt
 				rows[i].Reason = status
 			}
 			if j, ok := e.jobs[jobID]; ok {
+				if rows[i].HarnessPID == 0 && j.HarnessPID > 0 {
+					rows[i].HarnessPID = j.HarnessPID
+				}
+				if rows[i].ToolPID == 0 && j.ToolPID > 0 {
+					rows[i].ToolPID = j.ToolPID
+				}
 				if rows[i].TerminationReasonCode == "" && j.TerminationReasonCode != "" {
 					rows[i].TerminationReasonCode = j.TerminationReasonCode
 				}
@@ -2884,6 +2918,7 @@ func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseC
 	var chain []string
 	var intState, wsManifest, reapRes, rehydStatus map[string]any
 	var lineage []ConversationLineage
+	var harnessPID, toolPID int
 	if j, ok := e.jobs[jobID]; ok {
 		traceID = j.TraceID
 		pj = j.ParentJobID
@@ -2901,6 +2936,8 @@ func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseC
 		reapRes = j.ReapResult
 		rehydStatus = j.RehydrationStatus
 		lineage = j.ConversationLineage
+		harnessPID = j.HarnessPID
+		toolPID = j.ToolPID
 		if sch := e.schedules[j.ScheduleID]; sch != nil {
 			title = sch.PromptTitle
 			engine = sch.Engine
@@ -2918,6 +2955,8 @@ func (e *Engine) updateHistoryFinishLocked(host, path, jobID string, clean, aseC
 		ResumeFallbackReason: resReason, InterruptedASEState: intState, ConversationLineage: lineage,
 		SameConversationConfirmed: sameConvConf, AttachConfirmation: attachConf,
 		WorkspaceStateManifest: wsManifest, ReapResult: reapRes, RehydrationStatus: rehydStatus,
+		HarnessPID: harnessPID,
+		ToolPID:    toolPID,
 	}
 	e.history[key] = append(e.history[key], row)
 	e.notifyHistoryLocked(host, path, row)
@@ -4883,6 +4922,13 @@ func (e *Engine) reconcileQueuesLocked() {
 			continue
 		}
 
+		// Promote ready SCHEDULED and PENDING schedules for this repo to QUEUED
+		for _, sch := range e.schedules {
+			if (sch.Status == "SCHEDULED" || sch.Status == "PENDING") && sch.HostID == repo.HostID && (sch.WorktreePath == repo.WorktreePath || sch.WorktreePath == repo.EffectiveAlias() || filepath.Clean(sch.WorktreePath) == filepath.Clean(repo.WorktreePath)) {
+				sch.Status = "QUEUED"
+			}
+		}
+
 		// Find queued candidates for this repo
 		var queuedForRepo []*Schedule
 		for _, sch := range e.schedules {
@@ -4957,21 +5003,34 @@ func (e *Engine) reconcileQueuesLocked() {
 		}
 		if headSch.Kind == KindResume {
 			hasResumeCap := false
-			for _, cap := range h.SupportedCapabilities {
-				if cap == "deterministic_resume_4tuple_v1" {
-					hasResumeCap = true
-					break
+			if h != nil {
+				for _, cap := range h.SupportedCapabilities {
+					if cap == "deterministic_resume_4tuple_v1" {
+						hasResumeCap = true
+						break
+					}
 				}
-			}
-			if !hasResumeCap {
-				for _, tool := range h.Tools {
-					if tool.Name == "iazio-agent" {
-						for _, cap := range tool.Capabilities {
-							if cap == "deterministic_resume_4tuple_v1" {
-								hasResumeCap = true
-								break
+				if !hasResumeCap {
+					for _, tool := range h.Tools {
+						if tool.Name == "iazio-agent" {
+							for _, cap := range tool.Capabilities {
+								if cap == "deterministic_resume_4tuple_v1" {
+									hasResumeCap = true
+									break
+								}
 							}
 						}
+					}
+				}
+				if !hasResumeCap && len(h.SupportedCapabilities) == 0 {
+					for _, tool := range h.Tools {
+						if (tool.Name == "iazio-agent" || tool.Name == "iazio-harness") && !strings.Contains(tool.Version, "legacy") {
+							hasResumeCap = true
+							break
+						}
+					}
+					if len(h.Tools) == 0 {
+						hasResumeCap = true
 					}
 				}
 			}
