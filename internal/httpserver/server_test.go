@@ -359,6 +359,21 @@ func TestRepoResumeAndHistory(t *testing.T) {
 		t.Fatalf("expected 200 OK from /v1/conversations/conv-test-123/rehydration-bundle, got: %d", rr.Code)
 	}
 
+	// Verify GET /v1/jobs/:id includes workspace_state_manifest
+	req = httptest.NewRequest(http.MethodGet, "/v1/jobs/"+job.ID, nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /v1/jobs/%s, got: %d", job.ID, rr.Code)
+	}
+	var jobView map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &jobView); err != nil {
+		t.Fatalf("failed to unmarshal job view: %v", err)
+	}
+	if _, ok := jobView["workspace_state_manifest"]; !ok {
+		t.Errorf("expected workspace_state_manifest key in job view")
+	}
+
 	history, ok := detail["history"].([]any)
 	if !ok || len(history) != 1 {
 		t.Fatalf("expected 1 history item, got: %v", detail["history"])
