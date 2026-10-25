@@ -655,6 +655,49 @@ func TestJobStreamKeepaliveAndOutputTick(t *testing.T) {
 	_ = sch
 }
 
+func TestAppendChunk_TurnAutoContinued(t *testing.T) {
+	e := control.NewEngine(nil)
+	e.RegisterHost("host-1", "permanent")
+	_ = e.UpsertRepo(control.Repo{HostID: "host-1", WorktreePath: "/work/app"})
+	p := e.PutPrompt(control.Prompt{Title: "Task 1", Body: "do task 1", Status: "READY"})
+	sch, _ := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	job, _, _, _ := e.PollHost("host-1")
+
+	s := &Server{Engine: e}
+	handler := s.Handler()
+
+	payload := `{"type":"TURN_AUTO_CONTINUED","continuation_turn":2,"conversation_id":"conv-12345","unmet_gates":["clean_working_tree"],"active_child_tasks":"make run-review-scheme"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/chunks", bytes.NewBufferString(payload))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d", rr.Code)
+	}
+
+	detail, ok := e.GetJob(job.ID)
+	if !ok {
+		t.Fatal("expected job found")
+	}
+	if detail.ExecutionAttempt != 3 {
+		t.Fatalf("expected ExecutionAttempt=3, got %d", detail.ExecutionAttempt)
+	}
+	if detail.AutoResumeCount != 2 {
+		t.Fatalf("expected AutoResumeCount=2, got %d", detail.AutoResumeCount)
+	}
+	if detail.ContinuationTurn != 2 {
+		t.Fatalf("expected ContinuationTurn=2, got %d", detail.ContinuationTurn)
+	}
+	if detail.ActiveChildTasks != "make run-review-scheme" {
+		t.Fatalf("expected ActiveChildTasks='make run-review-scheme', got %q", detail.ActiveChildTasks)
+	}
+	if detail.ActiveConversationID != "conv-12345" {
+		t.Fatalf("expected ActiveConversationID='conv-12345', got %q", detail.ActiveConversationID)
+	}
+	_ = sch
+}
+
+
 func TestAbandonResumeAndRemediateEndpoints(t *testing.T) {
 	s := &Server{Engine: control.NewEngine(nil)}
 	handler := s.Handler()

@@ -469,6 +469,8 @@ func jobDetailView(j control.JobDetail) map[string]any {
 		"ase_gate_status":               j.ASEGateStatus,
 		"stall_timeout_sec":             j.StallTimeoutSec,
 		"liveness_pulse_seconds":        j.LivenessPulseSeconds,
+		"continuation_turn":             j.ContinuationTurn,
+		"active_child_tasks":            j.ActiveChildTasks,
 	}
 	populateJobResumptionFields(m,
 		j.ParentJobID, j.RootJobID,

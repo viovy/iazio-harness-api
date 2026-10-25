@@ -2915,26 +2915,39 @@ func (s *Server) retryCorrelation(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) appendChunk(w http.ResponseWriter, r *http.Request) {
 	var raw struct {
-		Type           string `json:"type"`
-		Stream         string `json:"stream"`
-		Text           string `json:"text"`
-		SilentForMs    int    `json:"silent_for_ms"`
-		HarnessPID     int    `json:"harness_pid"`
-		ToolPID        int    `json:"tool_pid"`
-		ElapsedSeconds int64  `json:"elapsed_seconds"`
+		Type             string   `json:"type"`
+		Stream           string   `json:"stream"`
+		Text             string   `json:"text"`
+		SilentForMs      int      `json:"silent_for_ms"`
+		HarnessPID       int      `json:"harness_pid"`
+		ToolPID          int      `json:"tool_pid"`
+		ElapsedSeconds   int64    `json:"elapsed_seconds"`
+		ContinuationTurn int      `json:"continuation_turn"`
+		ConversationID   string   `json:"conversation_id"`
+		UnmetGates       []string `json:"unmet_gates"`
+		ActiveChildTasks string   `json:"active_child_tasks"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	if raw.Type == "TURN_AUTO_CONTINUED" && raw.Text == "" {
+		raw.Stream = "stdout"
+		raw.Text = fmt.Sprintf("[iazio-harness] Turn auto-continued (turn %d) on conversation %s (unmet gates: %v; active: %s)\n",
+			raw.ContinuationTurn, raw.ConversationID, raw.UnmetGates, raw.ActiveChildTasks)
+	}
 	s.Engine.AppendLog(r.PathValue("id"), control.LogChunk{
-		Type:           raw.Type,
-		Stream:         raw.Stream,
-		Text:           raw.Text,
-		SilentForMs:    raw.SilentForMs,
-		HarnessPID:     raw.HarnessPID,
-		ToolPID:        raw.ToolPID,
-		ElapsedSeconds: raw.ElapsedSeconds,
+		Type:             raw.Type,
+		Stream:           raw.Stream,
+		Text:             raw.Text,
+		SilentForMs:      raw.SilentForMs,
+		HarnessPID:       raw.HarnessPID,
+		ToolPID:          raw.ToolPID,
+		ElapsedSeconds:   raw.ElapsedSeconds,
+		ContinuationTurn: raw.ContinuationTurn,
+		ConversationID:   raw.ConversationID,
+		UnmetGates:       raw.UnmetGates,
+		ActiveChildTasks: raw.ActiveChildTasks,
 	})
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "stored"})
 }
