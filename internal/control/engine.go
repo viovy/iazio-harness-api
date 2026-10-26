@@ -801,6 +801,7 @@ type Host struct {
 	HarnessActive         bool
 	FleetCheckedAt        *time.Time
 	RepoStatuses          map[string]RepoRuntimeStatus
+	ActiveJobs            []ActiveJob
 	EagerReadiness        *EagerUpdateReadinessReport
 	EagerUpdateEnabled    bool
 	LastEagerUpdateAt     *time.Time
@@ -3193,6 +3194,9 @@ func (e *Engine) reapExpiredLocked() {
 					createdAge = now.Sub(rows[i].CreatedAt)
 				} else if j, ok := e.jobs[rows[i].JobID]; ok && !j.StartedAt.IsZero() {
 					createdAge = now.Sub(j.StartedAt)
+				} else {
+					// Fallback: missing CreatedAt/StartedAt is treated as freshly dispatched; allow grace period
+					createdAge = 0
 				}
 				// Startup and dispatch grace window: allow at least 3 minutes for agent spawn, lease ack, and first heartbeat
 				if createdAge < 3*time.Minute {
@@ -3216,19 +3220,31 @@ func (e *Engine) reapExpiredLocked() {
 				}
 				if !hasLiveJob {
 					if h, ok := e.hosts[hHost]; ok && h != nil {
-						if h.HarnessActive {
-							if rstat, exists := h.RepoStatuses[hPath]; exists {
-								if rstat.ToolLiveness == "RUNNING" || rstat.ActiveStoryID != "" || rstat.ActiveConversationID != "" {
-									hasLiveJob = true
-								}
+						// 1. Direct PID verification from host's reported ActiveJobs
+						for _, aj := range h.ActiveJobs {
+							if aj.JobID == rows[i].JobID && aj.PID > 0 {
+								hasLiveJob = true
+								break
 							}
-						} else {
-							for _, rstat := range h.RepoStatuses {
-								if rstat.RepoPath == hPath {
+						}
+						// 2. Repo status verification
+						if !hasLiveJob {
+							if rstat, exists := h.RepoStatuses[hPath]; exists {
+								if rstat.ToolLiveness == "RUNNING" {
 									if (rows[i].StoryID != "" && rstat.ActiveStoryID == rows[i].StoryID) ||
-										(rows[i].ActiveConversationID != "" && rstat.ActiveConversationID == rows[i].ActiveConversationID) {
+										(rows[i].ActiveConversationID != "" && rstat.ActiveConversationID == rows[i].ActiveConversationID) ||
+										(h.HarnessActive && repo != nil && repo.RunningJobID == rows[i].JobID) {
 										hasLiveJob = true
-										break
+									}
+								}
+							} else {
+								for _, rstat := range h.RepoStatuses {
+									if rstat.RepoPath == hPath && rstat.ToolLiveness == "RUNNING" {
+										if (rows[i].StoryID != "" && rstat.ActiveStoryID == rows[i].StoryID) ||
+											(rows[i].ActiveConversationID != "" && rstat.ActiveConversationID == rows[i].ActiveConversationID) {
+											hasLiveJob = true
+											break
+										}
 									}
 								}
 							}

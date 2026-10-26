@@ -2826,6 +2826,78 @@ func TestReapExpiredLocked_ActiveHostLivenessProtectsRunningJob(t *testing.T) {
 	}
 }
 
+func TestReapExpiredLocked_ZeroCreatedAtTreatedWithGracePeriod(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{HostID: "mac-mini", WorktreePath: "/work/meta-04"})
+
+	key := repoKey("mac-mini", "/work/meta-04")
+	e.history[key] = []HistoryRow{
+		{
+			JobID:       "job-1500-zero-created",
+			ScheduleID:  "sch-1500",
+			PromptTitle: "dispatch test zero created",
+			Engine:      "mock-agy",
+			Status:      "RUNNING",
+			// CreatedAt is intentionally zero
+		},
+	}
+
+	e.mu.Lock()
+	e.reapExpiredLocked()
+	e.mu.Unlock()
+
+	detail, ok := e.GetRepoDetail("mac-mini", "/work/meta-04")
+	if !ok || len(detail.History) == 0 {
+		t.Fatal("expected repo detail and history")
+	}
+
+	row := detail.History[0]
+	if row.Status != "RUNNING" {
+		t.Fatalf("expected row with zero CreatedAt to remain RUNNING within grace period, got %s", row.Status)
+	}
+}
+
+func TestReapExpiredLocked_ActiveJobPIDProtectsJobFromExpiry(t *testing.T) {
+	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return now })
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{HostID: "mac-mini", WorktreePath: "/work/meta-04"})
+
+	// Agent heartbeats reporting ActiveJob with live OS PID
+	_ = e.HeartbeatDetailed("mac-mini", "ONLINE", nil, false, ActiveJob{
+		JobID:        "job-1509-live-pid",
+		WorktreePath: "/work/meta-04",
+		PID:          45678,
+	})
+
+	key := repoKey("mac-mini", "/work/meta-04")
+	e.history[key] = []HistoryRow{
+		{
+			JobID:       "job-1509-live-pid",
+			ScheduleID:  "sch-1509",
+			PromptTitle: "live pid test",
+			Engine:      "mock-agy",
+			Status:      "RUNNING",
+			CreatedAt:   now.Add(-15 * time.Minute), // older than 3m or 5m grace
+		},
+	}
+
+	e.mu.Lock()
+	e.reapExpiredLocked()
+	e.mu.Unlock()
+
+	detail, ok := e.GetRepoDetail("mac-mini", "/work/meta-04")
+	if !ok || len(detail.History) == 0 {
+		t.Fatal("expected repo detail and history")
+	}
+
+	row := detail.History[0]
+	if row.Status != "RUNNING" {
+		t.Fatalf("expected active PID to protect running job from expiry, got %s", row.Status)
+	}
+}
+
 func TestReapExpiredLocked_AutoResumesOrphanedRun(t *testing.T) {
 	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
 	e := NewEngine(func() time.Time { return now })

@@ -273,6 +273,7 @@ func (e *Engine) HeartbeatWithCapabilities(id, presence string, tools []Tool, fe
 	h.LastSeen = e.now()
 	h.FetchFailed = fetchFailed
 	h.Tools = append([]Tool(nil), tools...)
+	h.ActiveJobs = append([]ActiveJob(nil), activeJobs...)
 	h.HarnessActive = len(activeJobs) > 0
 	if len(supportedCaps) > 0 {
 		h.SupportedCapabilities = append([]string(nil), supportedCaps...)
