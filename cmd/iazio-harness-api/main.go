@@ -61,6 +61,9 @@ func run(ctx context.Context, args []string) error {
 	}
 	srv.Engine.StartReaper(ctx, 10*time.Second)
 	if srv.Queue != nil {
+		if inMem, ok := srv.Queue.(*dispatch.InMemoryQueue); ok {
+			inMem.SetStartupGrace(5 * time.Minute)
+		}
 		srv.Queue.StartReaper(ctx, 10*time.Second)
 	}
 	if script := os.Getenv("IAZIO_EXTRACT_WORKER"); script != "" {
@@ -74,6 +77,14 @@ func run(ctx context.Context, args []string) error {
 			return fmt.Errorf("pgstore.Open: %w", err)
 		}
 		defer store.Close()
+
+		if srv.Queue != nil {
+			if inMem, ok := srv.Queue.(*dispatch.InMemoryQueue); ok {
+				if err := inMem.SetStore(store); err != nil {
+					return fmt.Errorf("queue set store: %w", err)
+				}
+			}
+		}
 
 		if ideas, err := store.LoadIdeas(ctx); err == nil {
 			for _, it := range ideas {

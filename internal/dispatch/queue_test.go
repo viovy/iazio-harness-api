@@ -983,4 +983,273 @@ func TestInMemoryQueue_ExtendLeasesForHost(t *testing.T) {
 	}
 }
 
+func TestExtendLeasesForHost_AutoReconciliationAndStartupGrace(t *testing.T) {
+	q := NewInMemoryQueue()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
+	q.SetNowFunc(func() time.Time { return now })
+	q.startupTime = now
+	q.startupGrace = 5 * time.Minute
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type:             JobTypePromptExecute,
+		Repo:             "leaf-01",
+		NormalizedPrompt: "update tools",
+		CreatedAt:        now,
+		Status:           JobStatusFailed,
+		Error:            "LEASE_EXPIRED: execution lease expired without completion",
+		HostID:           "docker1",
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	// Host sends heartbeat with active job - should auto-reconcile and extend
+	extended, err := q.ExtendLeasesForHost(ctx, "docker1", []string{job.ID})
+	if err != nil {
+		t.Fatalf("ExtendLeasesForHost failed: %v", err)
+	}
+	if len(extended) != 1 || extended[0] != job.ID {
+		t.Fatalf("expected extended [%s], got %v", job.ID, extended)
+	}
+
+	cur, ok := q.Get(job.ID)
+	if !ok || cur.Status != JobStatusRunning {
+		t.Fatalf("expected job to be reconciled to RUNNING, got %+v", cur)
+	}
+	if cur.Error != "" {
+		t.Fatalf("expected error to be cleared on auto-reconciliation, got %q", cur.Error)
+	}
+
+	// Also verify re-hydration of job reported by host that is missing from queue
+	missingID := "job-external-123"
+	extMissing, err := q.ExtendLeasesForHost(ctx, "docker1", []string{missingID})
+	if err != nil {
+		t.Fatalf("ExtendLeasesForHost missing failed: %v", err)
+	}
+	if len(extMissing) == 0 {
+		t.Fatalf("expected missing job to be rehydrated and extended")
+	}
+	mJob, ok := q.Get(missingID)
+	if !ok || mJob.Status != JobStatusRunning {
+		t.Fatalf("expected missing job to be rehydrated as RUNNING, got %+v", mJob)
+	}
+}
+
+func TestCompleteWithFencing_AcceptsCompletionOnReconcilableFailure(t *testing.T) {
+	q := NewInMemoryQueue()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
+	q.SetNowFunc(func() time.Time { return now })
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type:             JobTypePromptExecute,
+		Repo:             "leaf-01",
+		NormalizedPrompt: "update tools",
+		CreatedAt:        now,
+		Status:           JobStatusFailed,
+		Error:            "EXECUTION_TIMEOUT: job exceeded max execution duration",
+		FencingToken:     12,
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	// Agent finishes and reports completion with fencing token
+	res := json.RawMessage(`{"status":"success","exit_code":0}`)
+	err = q.CompleteWithFencing(ctx, job.ID, 12, res, "")
+	if err != nil {
+		t.Fatalf("CompleteWithFencing should accept completion for reconcilable failure, got: %v", err)
+	}
+
+	completed, ok := q.Get(job.ID)
+	if !ok || completed.Status != JobStatusCompleted {
+		t.Fatalf("expected job to be COMPLETED, got %+v", completed)
+	}
+	if completed.Error != "" {
+		t.Fatalf("expected error to be cleared, got %q", completed.Error)
+	}
+}
+
+type mockQueueStore struct {
+	mu              sync.Mutex
+	saved           map[string]*Job
+	leases          map[string]int64
+	completed       map[string]string
+	failUpdateLease bool
+}
+
+func newMockQueueStore() *mockQueueStore {
+	return &mockQueueStore{
+		saved:     make(map[string]*Job),
+		leases:    make(map[string]int64),
+		completed: make(map[string]string),
+	}
+}
+
+func (m *mockQueueStore) SaveQueueJob(ctx context.Context, job *Job) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := *job
+	m.saved[job.ID] = &cp
+	return nil
+}
+
+func (m *mockQueueStore) LoadQueueJobs(ctx context.Context) ([]*Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []*Job
+	for _, j := range m.saved {
+		cp := *j
+		out = append(out, &cp)
+	}
+	return out, nil
+}
+
+func (m *mockQueueStore) UpdateQueueJobLease(ctx context.Context, jobID string, leaseOwner string, leaseVersion int64, heartbeatAt, expiresAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.failUpdateLease {
+		return errors.New("simulated store failure")
+	}
+	m.leases[jobID] = leaseVersion
+	if j, ok := m.saved[jobID]; ok {
+		j.LeaseOwner = leaseOwner
+		j.LeaseVersion = leaseVersion
+		j.HeartbeatAt = &heartbeatAt
+		j.LeaseExpiresAt = &expiresAt
+	}
+	return nil
+}
+
+func (m *mockQueueStore) CompleteQueueJob(ctx context.Context, jobID string, status string, result json.RawMessage, errStr string, completedAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.completed[jobID] = status
+	if j, ok := m.saved[jobID]; ok {
+		j.Status = status
+		j.Result = result
+		j.Error = errStr
+		j.CompletedAt = &completedAt
+	}
+	return nil
+}
+
+func TestQueue_DurableQueueStore_RestartRehydrationAndFencing(t *testing.T) {
+	ctx := context.Background()
+	store := newMockQueueStore()
+
+	q1 := NewInMemoryQueue()
+	if err := q1.SetStore(store); err != nil {
+		t.Fatalf("SetStore failed: %v", err)
+	}
+
+	job, err := q1.Enqueue(ctx, &Job{
+		Type:             JobTypePromptExecute,
+		Repo:             "leaf-durable",
+		NormalizedPrompt: "verify durable queue",
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	// Verify job was persisted to store on enqueue
+	store.mu.Lock()
+	if _, ok := store.saved[job.ID]; !ok {
+		t.Fatalf("expected job to be persisted in store on enqueue")
+	}
+	store.mu.Unlock()
+
+	// Claim job on q1
+	claimed, err := q1.Claim(ctx, "host-primary", []string{JobTypePromptExecute})
+	if err != nil || claimed == nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+	if claimed.LeaseOwner != "host-primary" || claimed.LeaseVersion != claimed.FencingToken {
+		t.Fatalf("expected lease_owner and lease_version to be set on claim, got owner=%s version=%d",
+			claimed.LeaseOwner, claimed.LeaseVersion)
+	}
+
+	// Simulate complete API crash / restart by initializing a brand new queue instance
+	q2 := NewInMemoryQueue()
+	if err := q2.SetStore(store); err != nil {
+		t.Fatalf("re-hydrating SetStore failed: %v", err)
+	}
+
+	// Verify q2 re-hydrated the claimed job from store with fencing token and status
+	restored, ok := q2.Get(job.ID)
+	if !ok || restored == nil {
+		t.Fatalf("expected job to be re-hydrated from database in new queue instance")
+	}
+	if restored.Status != JobStatusLeased {
+		t.Fatalf("expected re-hydrated status %s, got %s", JobStatusLeased, restored.Status)
+	}
+	if restored.FencingToken != claimed.FencingToken {
+		t.Fatalf("expected fencing token %d, got %d", claimed.FencingToken, restored.FencingToken)
+	}
+
+	// Complete on q2
+	res := json.RawMessage(`{"success":true}`)
+	if err := q2.CompleteWithFencing(ctx, job.ID, restored.FencingToken, res, ""); err != nil {
+		t.Fatalf("CompleteWithFencing on q2 failed: %v", err)
+	}
+
+	// Verify store updated with completed status
+	store.mu.Lock()
+	if store.completed[job.ID] != JobStatusCompleted {
+		t.Fatalf("expected store to record completed status, got %s", store.completed[job.ID])
+	}
+	store.mu.Unlock()
+}
+
+func TestExtendLeasesForHost_FailsClosedOnStoreError(t *testing.T) {
+	ctx := context.Background()
+	store := newMockQueueStore()
+	store.failUpdateLease = true
+
+	q := NewInMemoryQueue()
+	if err := q.SetStore(store); err != nil {
+		t.Fatalf("SetStore failed: %v", err)
+	}
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type: JobTypePromptExecute,
+		Repo: "leaf-failclosed",
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	claimed, err := q.Claim(ctx, "host-1", nil)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+
+	originalExpires := *claimed.LeaseExpiresAt
+
+	// Advance clock slightly (within lease window)
+	now := claimed.HeartbeatAt.Add(10 * time.Second)
+	q.SetNowFunc(func() time.Time { return now })
+
+	extended, err := q.ExtendLeasesForHost(ctx, "host-1", []string{job.ID})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(extended) != 0 {
+		t.Fatalf("expected 0 extended jobs when store fails, got %d", len(extended))
+	}
+
+	// Verify in-memory expiration was not extended to now + DefaultHeartbeatTimeout
+	j, ok := q.Get(job.ID)
+	if !ok || j == nil {
+		t.Fatalf("expected job %s to exist in queue", job.ID)
+	}
+	if j.LeaseExpiresAt == nil {
+		t.Fatalf("expected non-nil LeaseExpiresAt")
+	}
+	if !j.LeaseExpiresAt.Equal(originalExpires) {
+		t.Fatalf("expected lease expiration %v to remain unchanged on store failure, got %v", originalExpires, *j.LeaseExpiresAt)
+	}
+}
+
 

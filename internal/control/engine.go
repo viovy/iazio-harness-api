@@ -2016,14 +2016,42 @@ func (e *Engine) RetryRetriableJobs() ([]Schedule, error) {
 }
 
 // ReconcileHistoricalFailureTaxonomy inspects all history rows across all repos,
-// populates canonical failure taxonomy, and returns the count of updated records.
+// populates canonical failure taxonomy, reconciles false failure states where execution
+// completed successfully (e.g. job-1506 with COMPLETED_SUCCESS), and returns the count of updated records.
 func (e *Engine) ReconcileHistoricalFailureTaxonomy() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	count := 0
 	for key, rows := range e.history {
+		parts := strings.Split(key, "\x00")
+		var host, path string
+		if len(parts) == 2 {
+			host, path = parts[0], parts[1]
+		}
 		for i := range rows {
+			modified := false
+			// Reconcile false timeouts/failures where execution has evidence of successful completion
+			hasSuccessEvidence := rows[i].TerminationReasonCode == "COMPLETED_SUCCESS" ||
+				strings.Contains(rows[i].TerminationReasonMessage, "completed successfully") ||
+				strings.Contains(rows[i].Reason, "completed successfully") ||
+				strings.Contains(rows[i].ErrorMessage, "completed successfully")
+			if hasSuccessEvidence {
+				if rows[i].Status != "COMPLETED" {
+					rows[i].Status = "COMPLETED"
+					rows[i].Clean = true
+					rows[i].Reason = ""
+					rows[i].ErrorMessage = ""
+					rows[i].DiagnosticCode = ""
+					rows[i].FailureCategory = FailureCategoryNone
+					rows[i].FailureStage = ""
+					rows[i].FailureReasonSummary = ""
+					rows[i].ExitCode = 0
+					modified = true
+					count++
+				}
+			}
+
 			isFailed := rows[i].Status == "FAILED" || rows[i].Status == "DECLINED" || rows[i].Status == "ABANDONED" || rows[i].Status == "LEASE_EXPIRED" || rows[i].Status == "EXECUTION_TIMEOUT"
 			if isFailed && (rows[i].FailureCategory == "" || rows[i].FailureCategory == FailureCategoryNone) {
 				cat, stage, summary, retriable := ClassifyFailure(rows[i].Reason, rows[i].ErrorMessage, rows[i].DiagnosticCode)
@@ -2037,11 +2065,28 @@ func (e *Engine) ReconcileHistoricalFailureTaxonomy() int {
 				if rows[i].ZipkinTraceURL == "" && rows[i].ZipkinTraceID != "" {
 					rows[i].ZipkinTraceURL = "/zipkin/traces/" + rows[i].ZipkinTraceID
 				}
+				modified = true
 				count++
+			}
+
+			if modified && host != "" {
+				e.notifyHistoryLocked(host, path, rows[i])
 			}
 		}
 		e.history[key] = rows
 	}
+
+	for _, j := range e.jobs {
+		if (j.TerminationReasonCode == "COMPLETED_SUCCESS" || strings.Contains(j.TerminationReasonMessage, "completed successfully")) && j.Status != "COMPLETED" {
+			j.Status = "COMPLETED"
+			j.ExitCode = 0
+			j.TerminationReasonCode = "COMPLETED_SUCCESS"
+			j.TerminationReasonMessage = "Job execution completed successfully."
+			j.Reason = ""
+			count++
+		}
+	}
+
 	return count
 }
 
