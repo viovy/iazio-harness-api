@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -26,7 +27,9 @@ type CompleteJobRequest struct {
 
 // HeartbeatJobRequest is sent by an iazio-agent daemon to extend its execution lease.
 type HeartbeatJobRequest struct {
-	FencingToken int64 `json:"fencing_token"`
+	FencingToken int64  `json:"fencing_token"`
+	LeaseToken   string `json:"lease_token,omitempty"`
+	StoryID      string `json:"story_id,omitempty"`
 }
 
 // AgentJobsHandler manages agent job claims and completion reports.
@@ -174,7 +177,15 @@ func (h *AgentJobsHandler) HeartbeatHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	job, err := h.queue.Heartbeat(r.Context(), jobID, req.FencingToken)
+	var job *dispatch.Job
+	var err error
+	if hbWithStory, ok := h.queue.(interface {
+		HeartbeatWithStory(ctx context.Context, jobID string, fencingToken int64, storyID string) (*dispatch.Job, error)
+	}); ok && strings.TrimSpace(req.StoryID) != "" {
+		job, err = hbWithStory.HeartbeatWithStory(r.Context(), jobID, req.FencingToken, strings.TrimSpace(req.StoryID))
+	} else {
+		job, err = h.queue.Heartbeat(r.Context(), jobID, req.FencingToken)
+	}
 	if err != nil {
 		if err == dispatch.ErrJobNotFound {
 			writeJSONError(w, http.StatusNotFound, "job not found")

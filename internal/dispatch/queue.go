@@ -202,6 +202,7 @@ type Queue interface {
 	Enqueue(ctx context.Context, job *Job) (*Job, error)
 	Claim(ctx context.Context, hostID string, jobTypes []string) (*Job, error)
 	Heartbeat(ctx context.Context, jobID string, fencingToken int64) (*Job, error)
+	HeartbeatWithStory(ctx context.Context, jobID string, fencingToken int64, storyID string) (*Job, error)
 	Complete(ctx context.Context, jobID string, result json.RawMessage, errStr string) error
 	CompleteWithFencing(ctx context.Context, jobID string, fencingToken int64, result json.RawMessage, errStr string) error
 	Get(jobID string) (*Job, bool)
@@ -209,6 +210,7 @@ type Queue interface {
 	Cancel(ctx context.Context, jobID string, reason string) (*Job, error)
 	Retry(ctx context.Context, jobID string) (*Job, error)
 	BindStory(ctx context.Context, jobID, storyID, storyTitle, storyPath string) (*Job, error)
+	BindStoryWithFencing(ctx context.Context, jobID, storyID, storyTitle, storyPath string, fencingToken int64) (*Job, error)
 	Await(ctx context.Context, jobID string, timeout time.Duration) (*Job, error)
 	GetAttribution(ctx context.Context, jobID string) (JobAttributionResponse, error)
 	ReapExpired(now time.Time) []string
@@ -618,6 +620,11 @@ func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []str
 
 // Heartbeat extends the lease expiration of an in-flight claimed job, validating the worker's fencing token.
 func (q *InMemoryQueue) Heartbeat(ctx context.Context, jobID string, fencingToken int64) (*Job, error) {
+	return q.HeartbeatWithStory(ctx, jobID, fencingToken, "")
+}
+
+// HeartbeatWithStory extends the lease expiration and optionally binds an allocated story ID atomically.
+func (q *InMemoryQueue) HeartbeatWithStory(ctx context.Context, jobID string, fencingToken int64, storyID string) (*Job, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -632,6 +639,21 @@ func (q *InMemoryQueue) Heartbeat(ctx context.Context, jobID string, fencingToke
 		return nil, ErrLeaseFenced
 	}
 
+	cleanStoryID := strings.TrimSpace(storyID)
+	if cleanStoryID != "" && cleanStoryID != "pending-allocation" && cleanStoryID != "pending" {
+		job.StoryID = cleanStoryID
+		job.StoryAllocationStatus = "allocated"
+		if len(job.Payload) > 0 {
+			var payloadMap map[string]any
+			if err := json.Unmarshal(job.Payload, &payloadMap); err == nil {
+				payloadMap["story_id"] = cleanStoryID
+				if updated, err := json.Marshal(payloadMap); err == nil {
+					job.Payload = updated
+				}
+			}
+		}
+	}
+
 	now := q.now()
 	job.HeartbeatAt = &now
 	expires := now.Add(DefaultHeartbeatTimeout)
@@ -640,6 +662,9 @@ func (q *InMemoryQueue) Heartbeat(ctx context.Context, jobID string, fencingToke
 		if err := q.store.UpdateQueueJobLease(ctx, job.ID, job.LeaseOwner, job.FencingToken, now, expires); err != nil {
 			log.Printf("[dispatch-queue] ERROR: failed to persist heartbeat lease for %s: %v", jobID, err)
 			return nil, fmt.Errorf("persist heartbeat lease: %w", err)
+		}
+		if cleanStoryID != "" && cleanStoryID != "pending-allocation" && cleanStoryID != "pending" {
+			_ = q.store.SaveQueueJob(ctx, job)
 		}
 	}
 	return job, nil
@@ -1202,12 +1227,21 @@ func (q *InMemoryQueue) RetryRetriable(ctx context.Context) ([]*Job, error) {
 
 // BindStory binds a newly allocated story ID and metadata to a job.
 func (q *InMemoryQueue) BindStory(ctx context.Context, jobID, storyID, storyTitle, storyPath string) (*Job, error) {
+	return q.BindStoryWithFencing(ctx, jobID, storyID, storyTitle, storyPath, 0)
+}
+
+// BindStoryWithFencing binds an allocated story ID and metadata to a job while enforcing monotonic fencing token CAS.
+func (q *InMemoryQueue) BindStoryWithFencing(ctx context.Context, jobID, storyID, storyTitle, storyPath string, fencingToken int64) (*Job, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	job, exists := q.jobs[jobID]
 	if !exists {
 		return nil, ErrJobNotFound
+	}
+
+	if job.FencingToken > 0 && fencingToken != job.FencingToken {
+		return nil, ErrLeaseFenced
 	}
 
 	cleanStoryID := strings.TrimSpace(storyID)
@@ -1235,6 +1269,10 @@ func (q *InMemoryQueue) BindStory(ctx context.Context, jobID, storyID, storyTitl
 				job.Payload = updated
 			}
 		}
+	}
+
+	if q.store != nil {
+		_ = q.store.SaveQueueJob(ctx, job)
 	}
 
 	return job, nil

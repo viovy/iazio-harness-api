@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -194,9 +195,10 @@ type ExecuteStoryResponse struct {
 
 // BindStoryRequest is the payload for PATCH /api/v1/jobs/{id}/story-binding.
 type BindStoryRequest struct {
-	StoryID    string `json:"story_id"`
-	StoryTitle string `json:"story_title,omitempty"`
-	StoryPath  string `json:"story_path,omitempty"`
+	FencingToken int64  `json:"fencing_token,omitempty"`
+	StoryID      string `json:"story_id"`
+	StoryTitle   string `json:"story_title,omitempty"`
+	StoryPath    string `json:"story_path,omitempty"`
 }
 
 // GetJob serves GET /api/v1/jobs/{id}.
@@ -619,8 +621,20 @@ func (h *JobLifecycleHandler) BindStory(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	job, err := h.queue.BindStory(r.Context(), jobID, storyID, req.StoryTitle, req.StoryPath)
+	var job *dispatch.Job
+	var err error
+	if fencer, ok := h.queue.(interface {
+		BindStoryWithFencing(ctx context.Context, jobID, storyID, storyTitle, storyPath string, fencingToken int64) (*dispatch.Job, error)
+	}); ok {
+		job, err = fencer.BindStoryWithFencing(r.Context(), jobID, storyID, req.StoryTitle, req.StoryPath, req.FencingToken)
+	} else {
+		job, err = h.queue.BindStory(r.Context(), jobID, storyID, req.StoryTitle, req.StoryPath)
+	}
 	if err != nil {
+		if errors.Is(err, dispatch.ErrLeaseFenced) {
+			writeJSONError(w, http.StatusConflict, "LEASE_FENCED: stale fencing token presented")
+			return
+		}
 		if errors.Is(err, dispatch.ErrJobNotFound) {
 			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("job %q not found", jobID))
 			return

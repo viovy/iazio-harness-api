@@ -1252,4 +1252,62 @@ func TestExtendLeasesForHost_FailsClosedOnStoreError(t *testing.T) {
 	}
 }
 
+func TestInMemoryQueue_BindStoryWithFencing_And_HeartbeatWithStory(t *testing.T) {
+	ctx := context.Background()
+	q := NewInMemoryQueue()
+
+	if _, err := q.Enqueue(ctx, &Job{
+		Type:        JobTypePromptExecute,
+		Repo:        "test-repo",
+		TargetAgent: "agy",
+		StoryID:     "pending-allocation",
+	}); err != nil {
+		t.Fatalf("failed to enqueue: %v", err)
+	}
+
+	claimed, err := q.Claim(ctx, "host-worker-1", []string{JobTypePromptExecute})
+	if err != nil {
+		t.Fatalf("failed to claim: %v", err)
+	}
+	if claimed.FencingToken <= 0 {
+		t.Fatalf("expected positive fencing token, got %d", claimed.FencingToken)
+	}
+
+	// 1. Heartbeat with story updates story atomically
+	hbJob, err := q.HeartbeatWithStory(ctx, claimed.ID, claimed.FencingToken, "STORY-GOV-DYNAMIC-1")
+	if err != nil {
+		t.Fatalf("HeartbeatWithStory failed: %v", err)
+	}
+	if hbJob.StoryID != "STORY-GOV-DYNAMIC-1" {
+		t.Errorf("expected story ID STORY-GOV-DYNAMIC-1, got %q", hbJob.StoryID)
+	}
+
+	// 2. Heartbeat with stale fencing token rejected
+	_, err = q.HeartbeatWithStory(ctx, claimed.ID, claimed.FencingToken+10, "STORY-STALE")
+	if !errors.Is(err, ErrLeaseFenced) {
+		t.Fatalf("expected ErrLeaseFenced for stale heartbeat, got %v", err)
+	}
+
+	// 3. BindStory with stale fencing token rejected
+	_, err = q.BindStoryWithFencing(ctx, claimed.ID, "STORY-STALE-2", "Title", "path", claimed.FencingToken+10)
+	if !errors.Is(err, ErrLeaseFenced) {
+		t.Fatalf("expected ErrLeaseFenced for stale BindStoryWithFencing, got %v", err)
+	}
+
+	// 4. BindStory with valid fencing token succeeds
+	boundJob, err := q.BindStoryWithFencing(ctx, claimed.ID, "STORY-GOV-FINAL", "Final Title", "docs/stories/final.story.md", claimed.FencingToken)
+	if err != nil {
+		t.Fatalf("BindStoryWithFencing failed: %v", err)
+	}
+	if boundJob.StoryID != "STORY-GOV-FINAL" {
+		t.Errorf("expected STORY-GOV-FINAL, got %q", boundJob.StoryID)
+	}
+
+	// 5. BindStory with zero/omitted fencing token on claimed job is rejected (no bypass)
+	_, err = q.BindStoryWithFencing(ctx, claimed.ID, "STORY-BYPASS", "Bypass Title", "docs/stories/bypass.story.md", 0)
+	if !errors.Is(err, ErrLeaseFenced) {
+		t.Fatalf("expected ErrLeaseFenced for zero fencing token on claimed job, got %v", err)
+	}
+}
+
 
