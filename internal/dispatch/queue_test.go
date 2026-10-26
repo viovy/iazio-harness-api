@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -806,3 +807,125 @@ func TestInMemoryQueue_Failover_RetryRetriable_BindStory_Attribution(t *testing.
 		t.Fatalf("expected jobID %s, got %s", job.ID, attr.JobID)
 	}
 }
+
+func TestQueue_Failover_CapsRetriesOnIdenticalConsecutiveFailures(t *testing.T) {
+	ctx := context.Background()
+	q := NewInMemoryQueue()
+
+	job, err := q.Enqueue(ctx, &Job{
+		ID:          "job-1466",
+		Type:        JobTypePromptExecute,
+		Repo:        "/work/meta-repo",
+		TargetAgent: "agy",
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	// Attempt 1 failover
+	att1 := AttemptFailure{
+		Host:            "mac-mini",
+		Tool:            "agy",
+		FailureCategory: "TOOL_CRASH",
+		Reason:          "NON_ZERO_EXIT",
+		ExitCode:        1,
+		StderrTail:      "child exited with 1",
+	}
+	job1, err := q.Failover(ctx, job.ID, att1)
+	if err != nil {
+		t.Fatalf("attempt 1 failover failed: %v", err)
+	}
+	if job1.Status != JobStatusPending || !job1.Retriable {
+		t.Fatalf("expected pending retriable after attempt 1, got status=%s retriable=%v", job1.Status, job1.Retriable)
+	}
+	if len(job1.AttemptHistory) != 1 {
+		t.Fatalf("expected 1 attempt history, got %d", len(job1.AttemptHistory))
+	}
+
+	// Attempt 2 failover with IDENTICAL error: must be capped!
+	att2 := AttemptFailure{
+		Host:            "mac-mini",
+		Tool:            "agy",
+		FailureCategory: "TOOL_CRASH",
+		Reason:          "NON_ZERO_EXIT",
+		ExitCode:        1,
+		StderrTail:      "child exited with 1",
+	}
+	job2, err := q.Failover(ctx, job.ID, att2)
+	if err != nil {
+		t.Fatalf("attempt 2 failover failed: %v", err)
+	}
+	if job2.Status != JobStatusFailed {
+		t.Errorf("expected job to be FAILED after consecutive identical failures, got %s", job2.Status)
+	}
+	if job2.Retriable {
+		t.Errorf("expected job to NOT be retriable after consecutive identical failures")
+	}
+	if !strings.Contains(job2.Error, "RETRY_CAPPED") {
+		t.Errorf("expected RETRY_CAPPED error message, got %s", job2.Error)
+	}
+}
+
+func TestQueue_ReapExpired_CapsRetriesOnConsecutiveLeaseExpired(t *testing.T) {
+	ctx := context.Background()
+	q := NewInMemoryQueue()
+	now := time.Now()
+	q.SetNowFunc(func() time.Time { return now })
+
+	job, err := q.Enqueue(ctx, &Job{
+		ID:          "job-1468",
+		Type:        JobTypePromptExecute,
+		Repo:        "/work/meta-repo",
+		TargetAgent: "agy",
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	// Claim job for Attempt 1
+	claimed, err := q.Claim(ctx, "mac-mini", []string{JobTypePromptExecute})
+	if err != nil || claimed == nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+	if _, err := q.AckLease(ctx, claimed.ID, claimed.LeaseToken, 1001, ""); err != nil {
+		t.Fatalf("ack lease 1 failed: %v", err)
+	}
+
+	// Expire lease 1
+	now = now.Add(DefaultHeartbeatTimeout + 1*time.Second)
+	reaped := q.ReapExpired(now)
+	if len(reaped) == 0 {
+		t.Fatalf("expected job to be reaped on first lease expiry")
+	}
+
+	// Check job after first lease expiry: reverted to pending for safe recovery
+	j1, _ := q.Get(job.ID)
+	if j1.Status != JobStatusPending {
+		t.Fatalf("expected pending after first lease expiry, got %s", j1.Status)
+	}
+
+	// Claim job for Attempt 2
+	claimed2, err := q.Claim(ctx, "mac-mini", []string{JobTypePromptExecute})
+	if err != nil || claimed2 == nil {
+		t.Fatalf("second claim failed: %v", err)
+	}
+	if _, err := q.AckLease(ctx, claimed2.ID, claimed2.LeaseToken, 1002, ""); err != nil {
+		t.Fatalf("ack lease 2 failed: %v", err)
+	}
+
+	// Expire lease 2: consecutive LEASE_EXPIRED must cap retries!
+	now = now.Add(DefaultHeartbeatTimeout + 1*time.Second)
+	_ = q.ReapExpired(now)
+
+	j2, _ := q.Get(job.ID)
+	if j2.Status != JobStatusFailed {
+		t.Errorf("expected job to be FAILED after consecutive lease expirations, got %s", j2.Status)
+	}
+	if j2.Retriable {
+		t.Errorf("expected job to NOT be retriable after consecutive lease expirations")
+	}
+	if !strings.Contains(j2.Error, "LEASE_EXPIRED: consecutive attempts expired lease") {
+		t.Errorf("expected consecutive LEASE_EXPIRED error, got %s", j2.Error)
+	}
+}
+

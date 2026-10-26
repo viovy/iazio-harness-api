@@ -78,6 +78,12 @@ type AttemptFailure struct {
 	StderrTail      string `json:"stderr_tail,omitempty"`
 	ZipkinSpanID    string `json:"zipkin_span_id,omitempty"`
 	Timestamp       string `json:"timestamp,omitempty"`
+	StartedAt       string `json:"started_at,omitempty"`
+	EndedAt         string `json:"ended_at,omitempty"`
+	TriggerReason   string `json:"trigger_reason,omitempty"`
+	OutcomeSummary  string `json:"outcome_summary,omitempty"`
+	LogSeqOffset    int    `json:"log_seq_offset,omitempty"`
+	LogByteOffset   int64  `json:"log_byte_offset,omitempty"`
 }
 
 const (
@@ -342,7 +348,35 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 			}
 
 			if j.LeaseExpiresAt != nil && !j.LeaseExpiresAt.IsZero() && now.After(*j.LeaseExpiresAt) {
-				if j.Attempts < DefaultMaxAttempts {
+				attemptNum := j.Attempts
+				if attemptNum <= 0 {
+					attemptNum = len(j.AttemptHistory) + 1
+				}
+				attemptRecord := AttemptFailure{
+					AttemptNumber:   attemptNum,
+					Host:            j.HostID,
+					Workspace:       j.Repo,
+					Tool:            j.TargetAgent,
+					FailureCategory: FailureCategoryBackgroundDrainTimeout,
+					FailureStage:    FailureStageBackgroundDrain,
+					Reason:          "LEASE_EXPIRED",
+					ExitCode:        0,
+					StderrTail:      "Job execution lease expired before completion",
+					Timestamp:       now.UTC().Format(time.RFC3339),
+					TriggerReason:   "lease_expired",
+					OutcomeSummary:  "Execution lease expired without heartbeat",
+				}
+				j.AttemptHistory = append(j.AttemptHistory, attemptRecord)
+
+				consecutiveLeaseExpired := false
+				if len(j.AttemptHistory) >= 2 {
+					prev := j.AttemptHistory[len(j.AttemptHistory)-2]
+					if prev.Reason == "LEASE_EXPIRED" {
+						consecutiveLeaseExpired = true
+					}
+				}
+
+				if j.Attempts < DefaultMaxAttempts && !consecutiveLeaseExpired {
 					// Safe runner recovery: revert to pending for retry without duplicate execution
 					j.Status = JobStatusPending
 					j.ClaimedHost = ""
@@ -353,7 +387,12 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 					expiredIDs = append(expiredIDs, j.ID)
 				} else {
 					j.Status = JobStatusFailed
-					j.Error = "HEARTBEAT_TIMEOUT: runner heartbeat stopped, max retry attempts exceeded"
+					j.Retriable = false
+					if consecutiveLeaseExpired {
+						j.Error = "LEASE_EXPIRED: consecutive attempts expired lease without progress"
+					} else {
+						j.Error = "HEARTBEAT_TIMEOUT: runner heartbeat stopped, max retry attempts exceeded"
+					}
 					completedAt := now
 					j.CompletedAt = &completedAt
 					expiredIDs = append(expiredIDs, j.ID)
@@ -834,7 +873,42 @@ func (q *InMemoryQueue) Failover(ctx context.Context, jobID string, req AttemptF
 	if req.Timestamp == "" {
 		req.Timestamp = q.now().UTC().Format(time.RFC3339)
 	}
+	if req.TriggerReason == "" {
+		req.TriggerReason = req.Reason
+	}
+	if req.OutcomeSummary == "" {
+		req.OutcomeSummary = fmt.Sprintf("Tool %s on %s failed (exit %d): %s", req.Tool, req.Host, req.ExitCode, req.StderrTail)
+	}
 	job.AttemptHistory = append(job.AttemptHistory, req)
+	job.FailureCategory = req.FailureCategory
+	job.FailureStage = FailureStageToolExecution
+	job.FailureReasonSummary = req.OutcomeSummary
+
+	// Cap retries if consecutive attempts fail with identical error or identical failure category/exit code
+	consecutiveFailures := false
+	if len(job.AttemptHistory) >= 2 {
+		prev := job.AttemptHistory[len(job.AttemptHistory)-2]
+		if (prev.FailureCategory == req.FailureCategory && prev.ExitCode == req.ExitCode && prev.Reason == req.Reason) || len(job.AttemptHistory) >= DefaultMaxAttempts {
+			consecutiveFailures = true
+		}
+	}
+
+	if consecutiveFailures {
+		job.Status = JobStatusFailed
+		job.Error = fmt.Sprintf("RETRY_CAPPED: consecutive attempts failed with identical error (%s)", req.Reason)
+		job.Retriable = false
+		completedAt := q.now()
+		job.CompletedAt = &completedAt
+		if job.doneCh != nil {
+			select {
+			case <-job.doneCh:
+			default:
+				close(job.doneCh)
+			}
+		}
+		return job, nil
+	}
+
 	job.Status = JobStatusPending
 	job.ClaimedHost = ""
 	job.HostID = ""
@@ -843,9 +917,6 @@ func (q *InMemoryQueue) Failover(ctx context.Context, jobID string, req AttemptF
 	job.LeaseExpiresAt = nil
 	job.LeaseToken = ""
 	job.LeaseAckDeadlineAt = nil
-	job.FailureCategory = req.FailureCategory
-	job.FailureStage = FailureStageToolExecution
-	job.FailureReasonSummary = fmt.Sprintf("Tool %s on %s failed (exit %d): %s", req.Tool, req.Host, req.ExitCode, req.StderrTail)
 	job.Retriable = true
 
 	return job, nil

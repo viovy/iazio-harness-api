@@ -1,6 +1,7 @@
 package control
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -471,4 +472,87 @@ func TestCatalog_SynthesizeLogsAndCoverage(t *testing.T) {
 		t.Errorf("expected empty logs for unknown job, got %+v", noneSynth)
 	}
 }
+
+func TestCatalog_AppendLog_PreservesInitialHeadAndAttemptHeadersOnRingCap(t *testing.T) {
+	e := NewEngine(nil)
+	jobID := "job-1466"
+
+	// 1. Append initial Attempt 1 startup chunk (Seq 1)
+	chunk1 := LogChunk{
+		Stream: "stdout",
+		Text:   "[ASE-SUPERVISOR] Starting execution for job job-1466 (kind: ordinary, engine: agy, worktree: /work/meta-repo)\n[ASE-SUPERVISOR] Initializing execution for job job-1466...\n",
+	}
+	e.AppendLog(jobID, chunk1)
+
+	// 2. Append enough chunks to well exceed RingCap (e.g. 600 chunks)
+	for i := 2; i <= 250; i++ {
+		e.AppendLog(jobID, LogChunk{
+			Stream: "stdout",
+			Text:   fmt.Sprintf("Attempt 1 model output stream line %d\n", i),
+		})
+	}
+
+	// 3. Append Attempt 2 separator banner in the middle
+	attempt2Banner := LogChunk{
+		Stream: "stdout",
+		Text:   "\n================================================================================\n[iazio] Starting Attempt #2 (trigger_reason: lease_expired, previous_exit_code: 1, previous_error: LEASE_EXPIRED, conversation_id: 110d238e, timestamp: 2026-10-26T04:18:46Z)\n================================================================================\n",
+	}
+	e.AppendLog(jobID, attempt2Banner)
+
+	// 4. Append more chunks so total chunks = 700 (well above RingCap 500)
+	for i := 252; i <= 700; i++ {
+		e.AppendLog(jobID, LogChunk{
+			Stream: "stdout",
+			Text:   fmt.Sprintf("Attempt 2 model output stream line %d\n", i),
+		})
+	}
+
+	// 5. Verify stored logs in e.logs[jobID]
+	e.mu.Lock()
+	logs := e.logs[jobID]
+	e.mu.Unlock()
+
+	if len(logs) > RingCap {
+		t.Errorf("expected logs to be bounded by RingCap %d, got %d", RingCap, len(logs))
+	}
+
+	// Verify Chunk 1 (Attempt 1 startup) was NOT dropped!
+	foundChunk1 := false
+	foundAttempt2Banner := false
+	for _, c := range logs {
+		if c.Seq == 1 && strings.Contains(c.Text, "[ASE-SUPERVISOR] Starting execution for job job-1466") {
+			foundChunk1 = true
+		}
+		if strings.Contains(c.Text, "[iazio] Starting Attempt #2") {
+			foundAttempt2Banner = true
+		}
+	}
+
+	if !foundChunk1 {
+		t.Errorf("Attempt 1 startup log (Seq 1) was lost after RingCap truncation!")
+	}
+	if !foundAttempt2Banner {
+		t.Errorf("Attempt 2 banner in the middle was lost after RingCap truncation!")
+	}
+
+	// 6. Verify TailLogs returns the head chunk and attempt banner when tailing
+	tailChunks, _, _ := e.TailLogs(jobID, 100, 0)
+	tailHasChunk1 := false
+	tailHasBanner := false
+	for _, c := range tailChunks {
+		if c.Seq == 1 {
+			tailHasChunk1 = true
+		}
+		if strings.Contains(c.Text, "[iazio] Starting Attempt #2") {
+			tailHasBanner = true
+		}
+	}
+	if !tailHasChunk1 {
+		t.Errorf("TailLogs with afterSeq=0 lost initial Attempt 1 chunk 1!")
+	}
+	if !tailHasBanner {
+		t.Errorf("TailLogs with afterSeq=0 lost Attempt 2 banner!")
+	}
+}
+
 
