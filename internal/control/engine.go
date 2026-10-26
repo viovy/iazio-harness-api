@@ -1787,6 +1787,8 @@ func ClassifyFailure(reason, errorMsg, diagCode string) (category, stage, summar
 		return FailureCategoryToolQuotaOrAuth, FailureStageToolExecution, "Tool startup failed due to quota exhaustion, rate limit, or auth expiration", true
 	case strings.Contains(combined, "crash") || strings.Contains(combined, "exit status") || strings.Contains(combined, "sigsegv") || strings.Contains(combined, "binary"):
 		return FailureCategoryToolCrash, FailureStageToolExecution, "AI agent tool process crashed or exited non-zero during early execution", true
+	case strings.Contains(combined, "dirty_worktree_post_exit") || strings.Contains(combined, "post_exit"):
+		return FailureCategoryASEGateIncomplete, FailureStageCompletionGate, "Post-execution gate: child engine exited but left uncommitted worktree changes", true
 	case strings.Contains(combined, "worktree") || strings.Contains(combined, "workspace_prep") || strings.Contains(combined, "lock") || strings.Contains(combined, "porcelain") || strings.Contains(combined, "submodule") || strings.Contains(combined, "dirty"):
 		return FailureCategoryWorkspacePrepError, FailureStageWorkspacePrep, "Workspace preparation conflict: dirty worktree or stale git locks", true
 	case strings.Contains(combined, "1h0m0s") || strings.Contains(combined, "background task") || strings.Contains(combined, "drain") || strings.Contains(combined, "lease_expired") || strings.Contains(combined, "execution_timeout"):
