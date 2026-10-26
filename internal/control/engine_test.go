@@ -2743,6 +2743,40 @@ func TestReapExpiredLocked_OrphanedHistoryReconciled(t *testing.T) {
 	}
 }
 
+func TestReapExpiredLocked_FreshJobNotReaped(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{HostID: "mac-mini", WorktreePath: "/work/meta-04"})
+
+	// Inject a freshly created RUNNING history row (created 10s ago, within 90s grace window)
+	key := repoKey("mac-mini", "/work/meta-04")
+	e.history[key] = []HistoryRow{
+		{
+			JobID:       "job-1509",
+			ScheduleID:  "sch-1508",
+			PromptTitle: "governance run",
+			Engine:      "agy",
+			Status:      "RUNNING",
+			CreatedAt:   time.Now().Add(-10 * time.Second),
+		},
+	}
+
+	// Trigger reap
+	e.mu.Lock()
+	e.reapExpiredLocked()
+	e.mu.Unlock()
+
+	detail, ok := e.GetRepoDetail("mac-mini", "/work/meta-04")
+	if !ok || len(detail.History) == 0 {
+		t.Fatal("expected repo detail and history")
+	}
+
+	row := detail.History[0]
+	if row.Status != "RUNNING" {
+		t.Fatalf("expected fresh history row within 90s grace window to remain RUNNING, got %s (reason: %s)", row.Status, row.Reason)
+	}
+}
+
 func TestPollHost_GlobalScheduleSkipsDirtyRepo(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("pc1", "permanent")
