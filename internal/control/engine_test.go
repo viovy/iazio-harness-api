@@ -2743,21 +2743,21 @@ func TestReapExpiredLocked_OrphanedHistoryReconciled(t *testing.T) {
 	}
 }
 
-func TestReapExpiredLocked_FreshJobNotReaped(t *testing.T) {
+func TestReapExpiredLocked_GracePeriodProtectsRecentDispatches(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("mac-mini", "permanent")
 	_ = e.UpsertRepo(Repo{HostID: "mac-mini", WorktreePath: "/work/meta-04"})
 
-	// Inject a freshly created RUNNING history row (created 10s ago, within 90s grace window)
+	// Inject a freshly dispatched RUNNING history row (created 30s ago)
 	key := repoKey("mac-mini", "/work/meta-04")
 	e.history[key] = []HistoryRow{
 		{
-			JobID:       "job-1509",
-			ScheduleID:  "sch-1508",
-			PromptTitle: "governance run",
-			Engine:      "agy",
+			JobID:       "job-1500",
+			ScheduleID:  "sch-1500",
+			PromptTitle: "dispatch test",
+			Engine:      "mock-agy",
 			Status:      "RUNNING",
-			CreatedAt:   time.Now().Add(-10 * time.Second),
+			CreatedAt:   time.Now().Add(-30 * time.Second),
 		},
 	}
 
@@ -2773,7 +2773,53 @@ func TestReapExpiredLocked_FreshJobNotReaped(t *testing.T) {
 
 	row := detail.History[0]
 	if row.Status != "RUNNING" {
-		t.Fatalf("expected fresh history row within 90s grace window to remain RUNNING, got %s (reason: %s)", row.Status, row.Reason)
+		t.Fatalf("expected recent history row to remain RUNNING within grace period, got %s", row.Status)
+	}
+}
+
+func TestReapExpiredLocked_ActiveHostLivenessProtectsRunningJob(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{HostID: "mac-mini", WorktreePath: "/work/meta-04"})
+
+	// Set host repo status showing active tool running
+	h := e.hosts["mac-mini"]
+	h.Presence = "ONLINE"
+	h.LastSeen = time.Now()
+	h.RepoStatuses = map[string]RepoRuntimeStatus{
+		"/work/meta-04": {
+			RepoPath:     "/work/meta-04",
+			ToolLiveness: "RUNNING",
+			ActiveTool:   "mock-agy",
+		},
+	}
+
+	// Inject an older RUNNING history row (> 3 min ago, but within 5 min host liveness window)
+	key := repoKey("mac-mini", "/work/meta-04")
+	e.history[key] = []HistoryRow{
+		{
+			JobID:       "job-1509",
+			ScheduleID:  "sch-1509",
+			PromptTitle: "liveness test",
+			Engine:      "mock-agy",
+			Status:      "RUNNING",
+			CreatedAt:   time.Now().Add(-200 * time.Second),
+		},
+	}
+
+	// Trigger reap
+	e.mu.Lock()
+	e.reapExpiredLocked()
+	e.mu.Unlock()
+
+	detail, ok := e.GetRepoDetail("mac-mini", "/work/meta-04")
+	if !ok || len(detail.History) == 0 {
+		t.Fatal("expected repo detail and history")
+	}
+
+	row := detail.History[0]
+	if row.Status != "RUNNING" {
+		t.Fatalf("expected active host process to protect history row, got %s", row.Status)
 	}
 }
 
@@ -4649,6 +4695,44 @@ func TestReconcileHistoricalFailureTaxonomy_ReconcilesJob1506AndCompletedSuccess
 	defer savedMu.Unlock()
 	if len(savedRows) < 2 {
 		t.Fatalf("expected at least 2 saved history notifications for DB persistence, got %d", len(savedRows))
+	}
+}
+
+func TestReconcileHistoricalFailureTaxonomy_ReconcilesJob1500And1509(t *testing.T) {
+	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return now })
+
+	e.history["mac-mini\x00/work/repo"] = []HistoryRow{
+		{
+			JobID:         "job-1500",
+			Status:        "TIMED_OUT",
+			Reason:        "ORPHANED_RUN_EXPIRED",
+			ZipkinTraceID: "job15000000000000000000000000000", // invalid non-hex
+		},
+		{
+			JobID:         "job-1509",
+			Status:        "TIMED_OUT",
+			Reason:        "ORPHANED_RUN_EXPIRED",
+			ZipkinTraceID: "job15090000000000000000000000000", // invalid non-hex
+		},
+	}
+
+	count := e.ReconcileHistoricalFailureTaxonomy()
+	if count < 2 {
+		t.Fatalf("expected at least 2 reconciled records, got %d", count)
+	}
+
+	rows := e.history["mac-mini\x00/work/repo"]
+	for _, r := range rows {
+		if !r.Resumable {
+			t.Fatalf("expected row %s to be Resumable: true", r.JobID)
+		}
+		if len(r.ZipkinTraceID) != 32 || !isHexString(r.ZipkinTraceID) {
+			t.Fatalf("expected row %s ZipkinTraceID to be valid 32-hex, got %q", r.JobID, r.ZipkinTraceID)
+		}
+		if !strings.HasPrefix(r.Traceparent, "00-"+r.ZipkinTraceID) {
+			t.Fatalf("expected row %s Traceparent to match W3C format, got %q", r.JobID, r.Traceparent)
+		}
 	}
 }
 
