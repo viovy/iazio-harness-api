@@ -21,8 +21,8 @@ func TestGitLeaseEndpoints_AcquireRenewRelease(t *testing.T) {
 	}
 	handler := srv.Handler()
 
-	// 1. Acquire lease for viovy/meta-repo
-	acquireBody := []byte(`{"repo":"viovy/meta-repo","holder":"mac-mini/meta-repo-03","ttl_seconds":60}`)
+	// 1. Acquire lease for viovy/superproject-root
+	acquireBody := []byte(`{"repo":"viovy/superproject-root","holder":"mac-mini/workspace-03","ttl_seconds":60}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/git-leases/acquire", bytes.NewReader(acquireBody))
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -43,7 +43,7 @@ func TestGitLeaseEndpoints_AcquireRenewRelease(t *testing.T) {
 	leaseID := acqResp.Lease.LeaseID
 
 	// 2. Conflicting acquire from another holder must return 409 Conflict
-	conflictBody := []byte(`{"repo":"viovy/meta-repo","holder":"pc1/meta-repo-03","ttl_seconds":60}`)
+	conflictBody := []byte(`{"repo":"viovy/superproject-root","holder":"pc1/workspace-03","ttl_seconds":60}`)
 	reqConf := httptest.NewRequest(http.MethodPost, "/api/v1/git-leases/acquire", bytes.NewReader(conflictBody))
 	recConf := httptest.NewRecorder()
 	handler.ServeHTTP(recConf, reqConf)
@@ -54,8 +54,8 @@ func TestGitLeaseEndpoints_AcquireRenewRelease(t *testing.T) {
 
 	// 3. Renew lease
 	renewBody, _ := json.Marshal(map[string]any{
-		"repo":        "viovy/meta-repo",
-		"holder":      "mac-mini/meta-repo-03",
+		"repo":        "viovy/superproject-root",
+		"holder":      "mac-mini/workspace-03",
 		"lease_id":    leaseID,
 		"ttl_seconds": 90,
 	})
@@ -79,14 +79,14 @@ func TestGitLeaseEndpoints_AcquireRenewRelease(t *testing.T) {
 		Leases []*gitlease.Lease `json:"leases"`
 	}
 	_ = json.Unmarshal(recList.Body.Bytes(), &listResp)
-	if len(listResp.Leases) != 1 || listResp.Leases[0].Repo != "viovy/meta-repo" {
+	if len(listResp.Leases) != 1 || listResp.Leases[0].Repo != "viovy/superproject-root" {
 		t.Fatalf("unexpected list response: %+v", listResp)
 	}
 
 	// 5. Release lease
 	relBody, _ := json.Marshal(map[string]any{
-		"repo":     "viovy/meta-repo",
-		"holder":   "mac-mini/meta-repo-03",
+		"repo":     "viovy/superproject-root",
+		"holder":   "mac-mini/workspace-03",
 		"lease_id": leaseID,
 	})
 	reqRel := httptest.NewRequest(http.MethodPost, "/api/v1/git-leases/release", bytes.NewReader(relBody))

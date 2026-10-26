@@ -8,19 +8,19 @@ import (
 func TestGitLeaseManager_AcquireAndRelease(t *testing.T) {
 	mgr := NewManager()
 
-	lease, acquired, err := mgr.Acquire("viovy/meta-repo", "workspace-1", 60)
+	lease, acquired, err := mgr.Acquire("viovy/superproject-root", "workspace-1", 60)
 	if err != nil {
 		t.Fatalf("unexpected acquire error: %v", err)
 	}
 	if !acquired {
 		t.Fatalf("expected lease to be acquired")
 	}
-	if lease.Repo != "viovy/meta-repo" || lease.Holder != "workspace-1" {
+	if lease.Repo != "viovy/superproject-root" || lease.Holder != "workspace-1" {
 		t.Errorf("unexpected lease fields: %+v", lease)
 	}
 
 	// Second holder trying to acquire same repo should fail
-	conflict, acquired2, err := mgr.Acquire("viovy/meta-repo", "workspace-2", 60)
+	conflict, acquired2, err := mgr.Acquire("viovy/superproject-root", "workspace-2", 60)
 	if err != nil {
 		t.Fatalf("unexpected conflict acquire error: %v", err)
 	}
@@ -32,19 +32,19 @@ func TestGitLeaseManager_AcquireAndRelease(t *testing.T) {
 	}
 
 	// Release with wrong leaseID should fail
-	ok, err := mgr.Release("viovy/meta-repo", "workspace-1", "bad-id")
+	ok, err := mgr.Release("viovy/superproject-root", "workspace-1", "bad-id")
 	if err != ErrLeaseIDMismatch || ok {
 		t.Errorf("expected ErrLeaseIDMismatch, got ok=%v err=%v", ok, err)
 	}
 
 	// Release with correct leaseID should succeed
-	ok, err = mgr.Release("viovy/meta-repo", "workspace-1", lease.LeaseID)
+	ok, err = mgr.Release("viovy/superproject-root", "workspace-1", lease.LeaseID)
 	if err != nil || !ok {
 		t.Fatalf("expected successful release: ok=%v err=%v", ok, err)
 	}
 
 	// Now workspace-2 can acquire
-	lease2, acquired3, err := mgr.Acquire("viovy/meta-repo", "workspace-2", 30)
+	lease2, acquired3, err := mgr.Acquire("viovy/superproject-root", "workspace-2", 30)
 	if err != nil || !acquired3 {
 		t.Fatalf("expected workspace-2 to acquire: acquired=%v err=%v", acquired3, err)
 	}
@@ -104,13 +104,13 @@ func TestGitLeaseManager_Renew(t *testing.T) {
 func TestGitLeaseManager_Normalization(t *testing.T) {
 	mgr := NewManager()
 
-	lease, acquired, err := mgr.Acquire("/Viovy/Meta-Repo.git/", "holder-d", 60)
+	lease, acquired, err := mgr.Acquire("/Viovy/Superproject-Root.git/", "holder-d", 60)
 	if err != nil || !acquired {
 		t.Fatalf("acquire error: %v", err)
 	}
 
 	// Check with different casing and formatting
-	found := mgr.Get("viovy/meta-repo")
+	found := mgr.Get("viovy/superproject-root")
 	if found == nil || found.LeaseID != lease.LeaseID {
 		t.Errorf("normalization lookup failed: found=%+v", found)
 	}

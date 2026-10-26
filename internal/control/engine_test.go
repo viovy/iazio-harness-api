@@ -4553,9 +4553,9 @@ func TestScheduleLifecycle_TransitionsCleanlyAndCapsRetries(t *testing.T) {
 	e := NewEngine(func() time.Time { return now })
 
 	e.hosts["mac-mini"] = &Host{ID: "mac-mini", Presence: "ONLINE"}
-	e.repos["mac-mini\x00/work/meta-repo"] = &Repo{
+	e.repos["mac-mini\x00/work/sample-repo"] = &Repo{
 		HostID:                       "mac-mini",
-		WorktreePath:                 "/work/meta-repo",
+		WorktreePath:                 "/work/sample-repo",
 		GlobalQueueAllocationEnabled: true,
 		Queue:                        QueueOpen,
 		Lock:                         LockIdle,
@@ -4565,7 +4565,7 @@ func TestScheduleLifecycle_TransitionsCleanlyAndCapsRetries(t *testing.T) {
 		ID:                   "sch-1467",
 		PromptID:             "prompt-1086",
 		HostID:               "mac-mini",
-		WorktreePath:         "/work/meta-repo",
+		WorktreePath:         "/work/sample-repo",
 		Kind:                 KindResume,
 		Status:               "QUEUED",
 		IterationsTotal:      1,

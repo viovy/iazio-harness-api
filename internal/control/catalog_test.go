@@ -480,7 +480,7 @@ func TestCatalog_AppendLog_PreservesInitialHeadAndAttemptHeadersOnRingCap(t *tes
 	// 1. Append initial Attempt 1 startup chunk (Seq 1)
 	chunk1 := LogChunk{
 		Stream: "stdout",
-		Text:   "[ASE-SUPERVISOR] Starting execution for job job-1466 (kind: ordinary, engine: agy, worktree: /work/meta-repo)\n[ASE-SUPERVISOR] Initializing execution for job job-1466...\n",
+		Text:   "[ASE-SUPERVISOR] Starting execution for job job-1466 (kind: ordinary, engine: agy, worktree: /work/sample-repo)\n[ASE-SUPERVISOR] Initializing execution for job job-1466...\n",
 	}
 	e.AppendLog(jobID, chunk1)
 

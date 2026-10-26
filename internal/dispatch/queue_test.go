@@ -815,7 +815,7 @@ func TestQueue_Failover_CapsRetriesOnIdenticalConsecutiveFailures(t *testing.T) 
 	job, err := q.Enqueue(ctx, &Job{
 		ID:          "job-1466",
 		Type:        JobTypePromptExecute,
-		Repo:        "/work/meta-repo",
+		Repo:        "/work/sample-repo",
 		TargetAgent: "agy",
 	})
 	if err != nil {
@@ -875,7 +875,7 @@ func TestQueue_ReapExpired_CapsRetriesOnConsecutiveLeaseExpired(t *testing.T) {
 	job, err := q.Enqueue(ctx, &Job{
 		ID:          "job-1468",
 		Type:        JobTypePromptExecute,
-		Repo:        "/work/meta-repo",
+		Repo:        "/work/sample-repo",
 		TargetAgent: "agy",
 	})
 	if err != nil {
