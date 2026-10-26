@@ -218,6 +218,7 @@ type Queue interface {
 	Failover(ctx context.Context, jobID string, req AttemptFailure) (*Job, error)
 	RetryRetriable(ctx context.Context) ([]*Job, error)
 	SetFinalHarvest(jobID string, turnCount int, sha string)
+	ExtendLeasesForHost(ctx context.Context, hostID string, activeJobIDs []string) ([]string, error)
 }
 
 // JobAttributionResponse models the attribution of a job outcome to retrieval context.
@@ -570,6 +571,59 @@ func (q *InMemoryQueue) Heartbeat(ctx context.Context, jobID string, fencingToke
 	expires := now.Add(DefaultHeartbeatTimeout)
 	job.LeaseExpiresAt = &expires
 	return job, nil
+}
+
+// ExtendLeasesForHost refreshes heartbeat timestamps and lease deadlines for all active jobs
+// associated with the reporting host, preventing lease expiration timeouts while the host is healthy.
+func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, activeJobIDs []string) ([]string, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if hostID == "" {
+		return nil, nil
+	}
+
+	activeSet := make(map[string]bool, len(activeJobIDs))
+	for _, id := range activeJobIDs {
+		trimmed := strings.TrimSpace(id)
+		if trimmed != "" {
+			activeSet[trimmed] = true
+		}
+	}
+
+	now := q.now()
+	var extended []string
+	for _, j := range q.jobs {
+		if j == nil {
+			continue
+		}
+		// Match jobs allocated to this host
+		hostMatch := (j.ClaimedHost == hostID || j.HostID == hostID || (j.AgentAffinity != nil && j.AgentAffinity.HostID == hostID))
+		if !hostMatch {
+			continue
+		}
+
+		// Only extend active jobs (leased, claimed, running)
+		if j.Status != JobStatusClaimed && j.Status != JobStatusLeased && j.Status != JobStatusRunning {
+			continue
+		}
+
+		// If specific active jobs were reported, require membership in the active set.
+		// If no active jobs were reported, keep all active jobs on this host alive as long as host heartbeats.
+		if len(activeSet) > 0 && !activeSet[j.ID] {
+			continue
+		}
+
+		j.HeartbeatAt = &now
+		expires := now.Add(DefaultHeartbeatTimeout)
+		j.LeaseExpiresAt = &expires
+		if j.Status == JobStatusLeased || j.Status == JobStatusClaimed {
+			j.Status = JobStatusRunning
+		}
+		extended = append(extended, j.ID)
+	}
+
+	return extended, nil
 }
 
 // Complete updates a job with final result or error and signals any awaiting callers.

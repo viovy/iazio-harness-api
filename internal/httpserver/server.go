@@ -357,6 +357,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/admin/jobs/reconcile-lineage", s.reconcileLineage)
 	mux.HandleFunc("POST /v1/admin/jobs/reconcile-lineage", s.reconcileLineage)
 	mux.HandleFunc("POST /v1/hosts/{id}/heartbeat", s.heartbeat)
+	mux.HandleFunc("POST /api/v1/hosts/{id}/heartbeat", s.heartbeat)
+	mux.HandleFunc("POST /api/hosts/{id}/heartbeat", s.heartbeat)
 	mux.HandleFunc("POST /v1/hosts/{id}/tools/update", s.queueToolUpdate)
 	mux.HandleFunc("POST /v1/hosts/{id}/tools/{tool}/update", s.queueToolUpdate)
 	mux.HandleFunc("POST /v1/hosts/{id}/tools/force-update", s.queueToolUpdate)
@@ -1817,6 +1819,15 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	if err := s.Engine.HeartbeatWithCapabilities(hostID, raw.Presence, tools, raw.FetchFailed, raw.SupportedCapabilities, raw.Version, raw.CommitSHA, activeJobs...); err != nil {
 		writeErr(w, http.StatusNotFound, err)
 		return
+	}
+	if s.Queue != nil {
+		activeJobIDs := make([]string, 0, len(activeJobs))
+		for _, aj := range activeJobs {
+			if aj.JobID != "" {
+				activeJobIDs = append(activeJobIDs, aj.JobID)
+			}
+		}
+		_, _ = s.Queue.ExtendLeasesForHost(r.Context(), hostID, activeJobIDs)
 	}
 	s.Engine.SetHostEagerUpdate(hostID, raw.EagerUpdateEnabled, raw.LastEagerUpdateAt)
 	if len(raw.DiscoveredDevBinaries) > 0 {

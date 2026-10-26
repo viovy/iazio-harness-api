@@ -929,3 +929,58 @@ func TestQueue_ReapExpired_CapsRetriesOnConsecutiveLeaseExpired(t *testing.T) {
 	}
 }
 
+func TestInMemoryQueue_ExtendLeasesForHost(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+
+	job, err := q.Enqueue(ctx, &Job{
+		ID:          "job-extend-1",
+		Type:        JobTypePromptExecute,
+		TargetHost:  "mac-mini",
+		Repo:        "/Users/romeo/work/meta-repo",
+		TargetAgent: "agy",
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	claimed, err := q.Claim(ctx, "mac-mini", []string{JobTypePromptExecute})
+	if err != nil || claimed == nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+	if _, err := q.AckLease(ctx, claimed.ID, claimed.LeaseToken, 1001, ""); err != nil {
+		t.Fatalf("ack lease failed: %v", err)
+	}
+
+	// 60s passes (original deadline was now+90s)
+	now = now.Add(60 * time.Second)
+
+	// Host sends periodic heartbeat with active jobs
+	extended, err := q.ExtendLeasesForHost(ctx, "mac-mini", []string{job.ID})
+	if err != nil {
+		t.Fatalf("ExtendLeasesForHost failed: %v", err)
+	}
+	if len(extended) != 1 || extended[0] != job.ID {
+		t.Fatalf("expected extended [%s], got %v", job.ID, extended)
+	}
+
+	// Another 45s passes (total 105s from initial claim).
+	// Without ExtendLeasesForHost, the 90s deadline would have expired.
+	now = now.Add(45 * time.Second)
+	reaped := q.ReapExpired(now)
+	if len(reaped) > 0 {
+		t.Fatalf("job was unexpectedly reaped: %v", reaped)
+	}
+
+	current, ok := q.Get(job.ID)
+	if !ok {
+		t.Fatalf("job not found")
+	}
+	if current.Status != JobStatusRunning {
+		t.Fatalf("expected job to remain RUNNING, got %s", current.Status)
+	}
+}
+
+
