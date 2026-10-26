@@ -1302,6 +1302,12 @@ func TestInMemoryQueue_BindStoryWithFencing_And_HeartbeatWithStory(t *testing.T)
 	if boundJob.StoryID != "STORY-GOV-FINAL" {
 		t.Errorf("expected STORY-GOV-FINAL, got %q", boundJob.StoryID)
 	}
+
+	// 5. BindStory with zero/omitted fencing token on claimed job is rejected (no bypass)
+	_, err = q.BindStoryWithFencing(ctx, claimed.ID, "STORY-BYPASS", "Bypass Title", "docs/stories/bypass.story.md", 0)
+	if !errors.Is(err, ErrLeaseFenced) {
+		t.Fatalf("expected ErrLeaseFenced for zero fencing token on claimed job, got %v", err)
+	}
 }
 
 

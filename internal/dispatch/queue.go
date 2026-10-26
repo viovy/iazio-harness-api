@@ -1240,7 +1240,7 @@ func (q *InMemoryQueue) BindStoryWithFencing(ctx context.Context, jobID, storyID
 		return nil, ErrJobNotFound
 	}
 
-	if fencingToken > 0 && job.FencingToken > 0 && fencingToken != job.FencingToken {
+	if job.FencingToken > 0 && fencingToken != job.FencingToken {
 		return nil, ErrLeaseFenced
 	}
 

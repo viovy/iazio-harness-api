@@ -625,7 +625,7 @@ func (h *JobLifecycleHandler) BindStory(w http.ResponseWriter, r *http.Request) 
 	var err error
 	if fencer, ok := h.queue.(interface {
 		BindStoryWithFencing(ctx context.Context, jobID, storyID, storyTitle, storyPath string, fencingToken int64) (*dispatch.Job, error)
-	}); ok && req.FencingToken > 0 {
+	}); ok {
 		job, err = fencer.BindStoryWithFencing(r.Context(), jobID, storyID, req.StoryTitle, req.StoryPath, req.FencingToken)
 	} else {
 		job, err = h.queue.BindStory(r.Context(), jobID, storyID, req.StoryTitle, req.StoryPath)

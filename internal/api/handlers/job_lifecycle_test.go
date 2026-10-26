@@ -404,6 +404,15 @@ func TestJobLifecycleHandler_ExecuteStory_HarnessAllocated(t *testing.T) {
 	if validBindRr.Code != http.StatusOK {
 		t.Fatalf("expected 200 OK for valid fencing token, got %d: %s", validBindRr.Code, validBindRr.Body.String())
 	}
+
+	// Zero/omitted fencing token on claimed job is rejected with 409 Conflict (no bypass)
+	bypassBindBody := bytes.NewReader([]byte(`{"fencing_token":0,"story_id":"STORY-BYPASS"}`))
+	bypassBindReq := httptest.NewRequest(http.MethodPatch, "/api/v1/jobs/"+claimed.ID+"/story-binding", bypassBindBody)
+	bypassBindRr := httptest.NewRecorder()
+	mux.ServeHTTP(bypassBindRr, bypassBindReq)
+	if bypassBindRr.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for omitted/zero fencing token on claimed job, got %d: %s", bypassBindRr.Code, bypassBindRr.Body.String())
+	}
 }
 
 func TestJobLifecycleHandler_AckLease_Heartbeat_Failover(t *testing.T) {
