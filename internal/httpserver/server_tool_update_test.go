@@ -679,3 +679,113 @@ func TestServer_DeleteAgentTool(t *testing.T) {
 		t.Fatalf("expected 404 on nonexistent host, got %d", recDel4.Code)
 	}
 }
+
+func TestServer_EnterpriseToolUpdateAndCleanup(t *testing.T) {
+	e := control.NewEngine(time.Now)
+	srv := &Server{Engine: e}
+	handler := srv.Handler()
+
+	// 1. Register mac-mini and pc1
+	e.RegisterHost("mac-mini", "runner", "generic")
+	e.RegisterHost("pc1", "runner", "generic")
+
+	// 2. Heartbeat with CommitSHA and DiscoveredDevBinaries
+	hbBody := `{
+		"presence": "ONLINE",
+		"version": "1.0.0",
+		"commit_sha": "abc1234",
+		"discovered_dev_binaries": ["/opt/homebrew/bin/iazio-agent-dev", "/usr/local/bin/iazio-harvester.old"],
+		"tools": [
+			{
+				"name": "iazio-agent",
+				"version": "1.0.0",
+				"commit_sha": "abc1234",
+				"status": "OK"
+			}
+		]
+	}`
+	recHB := httptest.NewRecorder()
+	handler.ServeHTTP(recHB, httptest.NewRequest("POST", "/v1/hosts/mac-mini/heartbeat", bytes.NewReader([]byte(hbBody))))
+	if recHB.Code != http.StatusOK {
+		t.Fatalf("expected 200 on heartbeat, got %d: %s", recHB.Code, recHB.Body.String())
+	}
+
+	// 3. Verify GET /v1/hosts/mac-mini returns commit_sha and discovered_dev_binaries
+	recHost := httptest.NewRecorder()
+	handler.ServeHTTP(recHost, httptest.NewRequest("GET", "/v1/hosts/mac-mini", nil))
+	if recHost.Code != http.StatusOK {
+		t.Fatalf("expected 200 on get host, got %d: %s", recHost.Code, recHost.Body.String())
+	}
+	var hostResp struct {
+		Host struct {
+			CommitSHA             string   `json:"commit_sha"`
+			DiscoveredDevBinaries []string `json:"discovered_dev_binaries"`
+		} `json:"host"`
+		Tools []struct {
+			Name      string `json:"name"`
+			CommitSHA string `json:"commit_sha"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(recHost.Body.Bytes(), &hostResp); err != nil {
+		t.Fatalf("unmarshal host detail: %v", err)
+	}
+	if hostResp.Host.CommitSHA != "abc1234" {
+		t.Errorf("expected host commit_sha abc1234, got %s", hostResp.Host.CommitSHA)
+	}
+	if len(hostResp.Host.DiscoveredDevBinaries) != 2 {
+		t.Errorf("expected 2 discovered dev binaries, got %d", len(hostResp.Host.DiscoveredDevBinaries))
+	}
+	if len(hostResp.Tools) != 1 || hostResp.Tools[0].CommitSHA != "abc1234" {
+		t.Errorf("expected tool commit_sha abc1234, got %+v", hostResp.Tools)
+	}
+
+	// 4. Test POST /api/v1/agents/pc1/tools/update with force: true and tool: "*"
+	upReq := `{"tool": "*", "force": true}`
+	recUp := httptest.NewRecorder()
+	handler.ServeHTTP(recUp, httptest.NewRequest("POST", "/api/v1/agents/pc1/tools/update", bytes.NewReader([]byte(upReq))))
+	if recUp.Code != http.StatusOK {
+		t.Fatalf("expected 200 on tool update, got %d: %s", recUp.Code, recUp.Body.String())
+	}
+	var upRes struct {
+		Status string   `json:"status"`
+		Tools  []string `json:"tools"`
+		Force  bool     `json:"force"`
+	}
+	if err := json.Unmarshal(recUp.Body.Bytes(), &upRes); err != nil {
+		t.Fatalf("unmarshal update response: %v", err)
+	}
+	if upRes.Status != "queued" || !upRes.Force || len(upRes.Tools) == 0 {
+		t.Fatalf("unexpected update response: %+v", upRes)
+	}
+
+	// 5. Test POST /api/v1/agents/mac-mini/tools/cleanup-binaries
+	cleanReq := `{"dry_run": false}`
+	recClean := httptest.NewRecorder()
+	handler.ServeHTTP(recClean, httptest.NewRequest("POST", "/api/v1/agents/mac-mini/tools/cleanup-binaries", bytes.NewReader([]byte(cleanReq))))
+	if recClean.Code != http.StatusOK {
+		t.Fatalf("expected 200 on cleanup-binaries, got %d: %s", recClean.Code, recClean.Body.String())
+	}
+	var cleanRes struct {
+		Status string `json:"status"`
+		Action string `json:"action"`
+	}
+	if err := json.Unmarshal(recClean.Body.Bytes(), &cleanRes); err != nil {
+		t.Fatalf("unmarshal cleanup response: %v", err)
+	}
+	if cleanRes.Status != "queued" || cleanRes.Action != "cleanup-binaries" {
+		t.Fatalf("unexpected cleanup response: %+v", cleanRes)
+	}
+
+	// 6. Verify CLEANUP_BINARIES command was queued for mac-mini
+	cmds := e.ConsumePendingCommands("mac-mini")
+	var foundCleanup bool
+	for _, cmd := range cmds {
+		if cmd.Type == "CLEANUP_BINARIES" {
+			foundCleanup = true
+			break
+		}
+	}
+	if !foundCleanup {
+		t.Errorf("expected CLEANUP_BINARIES in pending commands for mac-mini, got %+v", cmds)
+	}
+}

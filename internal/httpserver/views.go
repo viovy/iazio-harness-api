@@ -109,7 +109,7 @@ func hostView(h control.Host, paused int) map[string]any {
 	if h.EagerReadiness != nil {
 		eagerReadiness = h.EagerReadiness
 	}
-	return map[string]any{
+	res := map[string]any{
 		"id":                   h.ID,
 		"name":                 name,
 		"kind":                 h.Kind,
@@ -125,6 +125,13 @@ func hostView(h control.Host, paused int) map[string]any {
 		"tools":                tools,
 		"eager_readiness":      eagerReadiness,
 	}
+	if h.CommitSHA != "" {
+		res["commit_sha"] = h.CommitSHA
+	}
+	if len(h.DiscoveredDevBinaries) > 0 {
+		res["discovered_dev_binaries"] = h.DiscoveredDevBinaries
+	}
+	return res
 }
 
 func repoSummary(r control.Repo) map[string]any {
@@ -191,7 +198,7 @@ func toolView(t control.Tool) map[string]any {
 		configStatus = "synced"
 	}
 
-	return map[string]any{
+	res := map[string]any{
 		"name":              t.Name,
 		"path":              t.Path,
 		"version":           t.Version,
@@ -206,6 +213,16 @@ func toolView(t control.Tool) map[string]any {
 		"watchdog_enabled":  watchdogEnabled,
 		"config_status":     configStatus,
 	}
+	if t.CommitSHA != "" {
+		res["commit_sha"] = t.CommitSHA
+	}
+	if t.TargetVersion != "" {
+		res["target_version"] = t.TargetVersion
+	}
+	if t.TargetCommitSHA != "" {
+		res["target_commit_sha"] = t.TargetCommitSHA
+	}
+	return res
 }
 
 func chunkView(c control.LogChunk) map[string]any {

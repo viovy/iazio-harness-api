@@ -134,6 +134,15 @@ func (e *Engine) ConsumePendingCommands(hostID string) []CommandEnvelope {
 	return cmds
 }
 
+// SetHostDevBinaries records the list of discovered dev and shadow binaries for a host.
+func (e *Engine) SetHostDevBinaries(hostID string, bins []string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if h, ok := e.hosts[hostID]; ok && h != nil {
+		h.DiscoveredDevBinaries = append([]string(nil), bins...)
+	}
+}
+
 // RegisterPingWaiter registers a channel to receive a live ping acknowledgment.
 func (e *Engine) RegisterPingWaiter(pingID string) chan PingAck {
 	e.mu.Lock()
