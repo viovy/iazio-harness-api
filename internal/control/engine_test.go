@@ -4547,3 +4547,78 @@ func TestEngine_AckLease_Heartbeat_Failover_RetryRetriable(t *testing.T) {
 
 	_ = e.ReconcileHistoricalFailureTaxonomy()
 }
+
+func TestScheduleLifecycle_TransitionsCleanlyAndCapsRetries(t *testing.T) {
+	now := time.Date(2026, 10, 26, 4, 0, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return now })
+
+	e.hosts["mac-mini"] = &Host{ID: "mac-mini", Presence: "ONLINE"}
+	e.repos["mac-mini\x00/work/meta-repo"] = &Repo{
+		HostID:                       "mac-mini",
+		WorktreePath:                 "/work/meta-repo",
+		GlobalQueueAllocationEnabled: true,
+		Queue:                        QueueOpen,
+		Lock:                         LockIdle,
+	}
+
+	sch := &Schedule{
+		ID:                   "sch-1467",
+		PromptID:             "prompt-1086",
+		HostID:               "mac-mini",
+		WorktreePath:         "/work/meta-repo",
+		Kind:                 KindResume,
+		Status:               "QUEUED",
+		IterationsTotal:      1,
+		IterationsRemaining:  1,
+		IterationsCompleted:  0,
+		ParentJobID:          "job-1466",
+		RootJobID:            "job-1466",
+		ResumeConversationID: "110d238e-1851-4036-a4f8-c4633e56ae27",
+	}
+	e.schedules["sch-1467"] = sch
+
+	// 1. First poll leases the schedule and starts job-1468
+	job1, leasedSch, _, ok := e.PollHost("mac-mini")
+	if !ok {
+		t.Fatalf("expected PollHost to return schedule, got nothing")
+	}
+	if leasedSch.ID != "sch-1467" {
+		t.Fatalf("expected sch-1467, got %s", leasedSch.ID)
+	}
+	if job1.ID == "" {
+		t.Fatalf("expected job created")
+	}
+
+	// Verify schedule cannot be polled again while job1 is active
+	_, _, _, okDuplicate := e.PollHost("mac-mini")
+	if okDuplicate {
+		t.Errorf("PollHost should NOT lease a schedule that already has an active running job!")
+	}
+
+	// 2. Job 1 fails with NON_ZERO_EXIT (Attempt 1)
+	err := e.PostExit(job1.ID, 1, ExitOptions{
+		Reason:                   "NON_ZERO_EXIT",
+		DiagnosticCode:           "NON_ZERO_EXIT",
+		ErrorMessage:             "Interrupted or killed",
+		TerminationReasonCode:    "NON_ZERO_EXIT",
+		TerminationReasonMessage: "Interrupted or killed",
+	})
+	if err != nil {
+		t.Fatalf("PostExit failed: %v", err)
+	}
+
+	// Verify attempt history on schedule
+	e.mu.Lock()
+	s1 := e.schedules["sch-1467"]
+	e.mu.Unlock()
+	if len(s1.AttemptHistory) != 1 {
+		t.Fatalf("expected 1 attempt in schedule history, got %d", len(s1.AttemptHistory))
+	}
+	if s1.Status != "FAILED" {
+		t.Errorf("expected schedule status FAILED after non-retriable iteration failure, got %s", s1.Status)
+	}
+	if s1.IterationsRemaining != 0 {
+		t.Errorf("expected iterations remaining 0, got %d", s1.IterationsRemaining)
+	}
+}
+

@@ -2167,13 +2167,62 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 			opt.FailureStage = job.FailureStage
 			opt.FailureReasonSummary = job.FailureReasonSummary
 			opt.Retriable = &job.Retriable
+
+			worktreePath := ""
+			toolName := "agy"
+			if sch != nil {
+				worktreePath = sch.WorktreePath
+				if sch.Engine != "" {
+					toolName = sch.Engine
+				}
+			}
+			attemptRec := AttemptFailure{
+				AttemptNumber:   job.ExecutionAttempt,
+				Host:            job.HostID,
+				Workspace:       worktreePath,
+				Tool:            toolName,
+				FailureCategory: job.FailureCategory,
+				FailureStage:    job.FailureStage,
+				Reason:          job.Reason,
+				ExitCode:        code,
+				StderrTail:      opt.ErrorMessage,
+				Timestamp:       e.now().UTC().Format(time.RFC3339),
+				StartedAt:       job.StartedAt.UTC().Format(time.RFC3339),
+				EndedAt:         e.now().UTC().Format(time.RFC3339),
+				TriggerReason:   job.Reason,
+				OutcomeSummary:  job.FailureReasonSummary,
+			}
+			job.AttemptHistory = append(job.AttemptHistory, attemptRec)
+
 			isDirtyWorktreeAutoHeal := (opt.DiagnosticCode == "INCOMPLETE_DIRTY_WORKTREE" || opt.Reason == "INCOMPLETE_DIRTY_WORKTREE")
 			if sch, ok := e.schedules[job.ScheduleID]; ok {
+				sch.AttemptHistory = append(sch.AttemptHistory, attemptRec)
 				sch.FailureCategory = job.FailureCategory
 				sch.FailureStage = job.FailureStage
 				sch.FailureReasonSummary = job.FailureReasonSummary
 				sch.Retriable = job.Retriable
-				if isDirtyWorktreeAutoHeal {
+
+				consecutiveFailures := false
+				if len(sch.AttemptHistory) >= 2 {
+					prev := sch.AttemptHistory[len(sch.AttemptHistory)-2]
+					if prev.FailureCategory == job.FailureCategory && prev.ExitCode == code && prev.Reason == job.Reason {
+						consecutiveFailures = true
+					}
+				}
+				if len(job.AttemptHistory) >= 2 {
+					prev := job.AttemptHistory[len(job.AttemptHistory)-2]
+					if prev.FailureCategory == job.FailureCategory && prev.ExitCode == code && prev.Reason == job.Reason {
+						consecutiveFailures = true
+					}
+				}
+
+				if consecutiveFailures {
+					job.Retriable = false
+					sch.Retriable = false
+					sch.Status = "FAILED"
+					sch.IterationsRemaining = 0
+					sch.FailureReasonSummary = fmt.Sprintf("Capped retries: consecutive attempts failed with identical error (%s)", job.FailureReasonSummary)
+				} else if isDirtyWorktreeAutoHeal && sch.ExecutionAttempt < 3 {
 					// Incomplete dirty worktree indicates interrupted in-flight ASE turn.
 					// Keep schedule in QUEUED for auto-resumption with KindResume and elevated priority.
 					sch.Status = "QUEUED"
@@ -2184,8 +2233,9 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 					if sch.ResumeConversationID == "" && len(job.ConversationIDs) > 0 {
 						sch.ResumeConversationID = job.ConversationIDs[len(job.ConversationIDs)-1]
 					}
-				} else if sch.IterationsRemaining <= 0 {
+				} else if sch.IterationsRemaining <= 0 || !job.Retriable {
 					sch.Status = "FAILED"
+					sch.IterationsRemaining = 0
 				} else {
 					sch.Status = "QUEUED"
 				}
@@ -2903,7 +2953,35 @@ func (e *Engine) reapExpiredLocked() {
 					}
 				}
 				if sch != nil {
-					if leaseExpired && !timedOut && sch.LeaseRetries < 2 {
+					attemptRec := AttemptFailure{
+						AttemptNumber:   sch.ExecutionAttempt,
+						Host:            sch.HostID,
+						Workspace:       sch.WorktreePath,
+						Tool:            sch.Engine,
+						FailureCategory: FailureCategoryBackgroundDrainTimeout,
+						FailureStage:    FailureStageBackgroundDrain,
+						Reason:          reason,
+						ExitCode:        0,
+						StderrTail:      job.TerminationReasonMessage,
+						Timestamp:       now.UTC().Format(time.RFC3339),
+						TriggerReason:   reason,
+						OutcomeSummary:  job.TerminationReasonMessage,
+					}
+					job.AttemptHistory = append(job.AttemptHistory, attemptRec)
+					sch.AttemptHistory = append(sch.AttemptHistory, attemptRec)
+					sch.FailureCategory = FailureCategoryBackgroundDrainTimeout
+					sch.FailureStage = FailureStageBackgroundDrain
+					sch.FailureReasonSummary = job.TerminationReasonMessage
+
+					consecutiveLeaseExpired := false
+					if len(sch.AttemptHistory) >= 2 {
+						prev := sch.AttemptHistory[len(sch.AttemptHistory)-2]
+						if prev.Reason == "LEASE_EXPIRED" && reason == "LEASE_EXPIRED" {
+							consecutiveLeaseExpired = true
+						}
+					}
+
+					if leaseExpired && !timedOut && sch.LeaseRetries < 2 && !consecutiveLeaseExpired {
 						sch.LeaseRetries++
 						sch.IterationsRemaining++
 						if sch.IterationsCompleted > 0 {
@@ -2912,14 +2990,19 @@ func (e *Engine) reapExpiredLocked() {
 						sch.Status = "QUEUED"
 						sch.LeaseToken = ""
 						sch.LeaseAckDeadlineAt = nil
-					} else if sch.IterationsRemaining > 0 {
+					} else if sch.IterationsRemaining > 0 && !consecutiveLeaseExpired {
 						sch.Status = "QUEUED"
 						sch.LeaseToken = ""
 						sch.LeaseAckDeadlineAt = nil
 					} else {
 						sch.Status = "FAILED"
+						sch.IterationsRemaining = 0
+						sch.Retriable = false
 						sch.LeaseToken = ""
 						sch.LeaseAckDeadlineAt = nil
+						if consecutiveLeaseExpired {
+							sch.FailureReasonSummary = "Capped retries: consecutive attempts failed with LEASE_EXPIRED"
+						}
 					}
 					if sch.CloneURL != "" && sch.IterationsRemaining <= 0 {
 						delete(e.cloneLease, sch.CloneURL)
@@ -2960,9 +3043,9 @@ func (e *Engine) reapExpiredLocked() {
 				}
 			}
 			if !hasActive {
-				if sch.IterationsRemaining > 0 && (sch.IterationsTotal <= 0 || sch.IterationsCompleted < sch.IterationsTotal) {
+				if sch.IterationsRemaining > 0 && (sch.IterationsTotal <= 0 || sch.IterationsCompleted < sch.IterationsTotal) && sch.Status != "COMPLETED" && sch.Status != "FAILED" {
 					sch.Status = "QUEUED"
-				} else {
+				} else if sch.Status != "FAILED" {
 					sch.Status = "FINISHED"
 					sch.IterationsRemaining = 0
 				}
@@ -3067,6 +3150,17 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 	var candidates []*Schedule
 	for _, sch := range e.schedules {
 		if sch.Status != "QUEUED" && sch.Status != "SCHEDULED" && sch.Status != "PENDING" {
+			continue
+		}
+		// Prevent duplicate/looping dispatch if an associated job is already active or leased
+		hasActiveJob := false
+		for _, jID := range sch.AssociatedJobs {
+			if j, exists := e.jobs[jID]; exists && !j.ExitPosted && (j.Status == "RUNNING" || j.Status == "LEASED" || j.Status == "CLAIMED") {
+				hasActiveJob = true
+				break
+			}
+		}
+		if hasActiveJob {
 			continue
 		}
 		// Level 1: Direct local repo schedule for this host

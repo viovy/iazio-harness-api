@@ -10,7 +10,85 @@ import (
 	"time"
 )
 
-const logPageSize = 100
+const (
+	logPageSize    = 100
+	DefaultHeadCap = 25
+)
+
+func isAttemptHeader(c LogChunk) bool {
+	if c.Type == "TURN_AUTO_CONTINUED" {
+		return true
+	}
+	text := c.Text
+	if text == "" {
+		return false
+	}
+	return strings.Contains(text, "[iazio] Starting Attempt") ||
+		strings.Contains(text, "[ASE-SUPERVISOR] Starting execution") ||
+		strings.Contains(text, "[ASE-SUPERVISOR] Initializing execution") ||
+		strings.Contains(text, "Initiating in-job continuation turn") ||
+		strings.Contains(text, "Autonomously resuming execution")
+}
+
+func trimLogsPreservingHead(logs []LogChunk, capLimit int) []LogChunk {
+	if len(logs) <= capLimit {
+		return logs
+	}
+	headLimit := DefaultHeadCap
+	if headLimit > capLimit/4 {
+		headLimit = capLimit / 4
+	}
+	if headLimit > len(logs) {
+		headLimit = len(logs)
+	}
+
+	head := logs[:headLimit]
+	seenSeq := make(map[int]bool, capLimit)
+	for _, c := range head {
+		seenSeq[c.Seq] = true
+	}
+
+	tailAllowance := capLimit - headLimit
+	if tailAllowance < 0 {
+		tailAllowance = 0
+	}
+	tailStart := len(logs) - tailAllowance
+	if tailStart < headLimit {
+		tailStart = headLimit
+	}
+
+	var attemptHeaders []LogChunk
+	for i := headLimit; i < tailStart; i++ {
+		c := logs[i]
+		if isAttemptHeader(c) {
+			attemptHeaders = append(attemptHeaders, c)
+			seenSeq[c.Seq] = true
+		}
+	}
+
+	availableForTail := capLimit - len(head) - len(attemptHeaders)
+	if availableForTail < 0 {
+		availableForTail = 50
+	}
+	actualTailStart := len(logs) - availableForTail
+	if actualTailStart < headLimit {
+		actualTailStart = headLimit
+	}
+
+	var tail []LogChunk
+	for i := actualTailStart; i < len(logs); i++ {
+		c := logs[i]
+		if !seenSeq[c.Seq] {
+			tail = append(tail, c)
+		}
+	}
+
+	result := make([]LogChunk, 0, len(head)+len(attemptHeaders)+len(tail))
+	result = append(result, head...)
+	result = append(result, attemptHeaders...)
+	result = append(result, tail...)
+	return result
+}
 
 var (
 	// ErrNotReady rejects Execute on a draft prompt.
@@ -764,7 +842,7 @@ func (e *Engine) AppendLog(jobID string, chunk LogChunk) {
 	if chunk.Type != "OUTPUT_TICK" {
 		e.logs[jobID] = append(e.logs[jobID], chunk)
 		if len(e.logs[jobID]) > RingCap {
-			e.logs[jobID] = e.logs[jobID][len(e.logs[jobID])-RingCap:]
+			e.logs[jobID] = trimLogsPreservingHead(e.logs[jobID], RingCap)
 		}
 	}
 	if job, ok := e.jobs[jobID]; ok {
@@ -1086,7 +1164,7 @@ func (e *Engine) TailLogs(jobID string, tail, afterSeq int) (chunks []LogChunk, 
 		return chunks, gapFrom, gapTo
 	}
 	if len(all) > tail {
-		all = all[len(all)-tail:]
+		return trimLogsPreservingHead(all, tail), 0, 0
 	}
 	return append([]LogChunk(nil), all...), 0, 0
 }
