@@ -13,6 +13,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/viovy/iazio-harness-api/internal/codebase"
 	"github.com/viovy/iazio-harness-api/internal/control"
+	"github.com/viovy/iazio-harness-api/internal/dispatch"
 )
 
 const schema = `
@@ -271,6 +272,38 @@ ALTER TABLE harness_stories ADD COLUMN IF NOT EXISTS acceptance_criteria jsonb N
 ALTER TABLE harness_stories ADD COLUMN IF NOT EXISTS target_files jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE harness_stories ADD COLUMN IF NOT EXISTS depends_on jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE harness_stories ADD COLUMN IF NOT EXISTS verification_commands jsonb NOT NULL DEFAULT '[]'::jsonb;
+
+-- Durable global dispatch queue jobs with fencing tokens and lease tracking.
+CREATE TABLE IF NOT EXISTS harness_dispatch_jobs (
+  id text PRIMARY KEY,
+  type text NOT NULL,
+  repo text NOT NULL DEFAULT '',
+  target_host text NOT NULL DEFAULT '',
+  claimed_host text NOT NULL DEFAULT '',
+  host_id text NOT NULL DEFAULT '',
+  target_agent text NOT NULL DEFAULT '',
+  story_id text NOT NULL DEFAULT '',
+  normalized_prompt text NOT NULL DEFAULT '',
+  payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+  status text NOT NULL DEFAULT 'pending',
+  result jsonb,
+  error text NOT NULL DEFAULT '',
+  trace_id text NOT NULL DEFAULT '',
+  fencing_token bigint NOT NULL DEFAULT 0,
+  lease_version bigint NOT NULL DEFAULT 0,
+  lease_owner text NOT NULL DEFAULT '',
+  lease_token text NOT NULL DEFAULT '',
+  attempts integer NOT NULL DEFAULT 0,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  claimed_at timestamp with time zone,
+  heartbeat_at timestamp with time zone,
+  lease_expires_at timestamp with time zone,
+  completed_at timestamp with time zone,
+  updated_at timestamp with time zone NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS harness_dispatch_jobs_status_idx ON harness_dispatch_jobs (status);
+CREATE INDEX IF NOT EXISTS harness_dispatch_jobs_host_idx ON harness_dispatch_jobs (claimed_host, status);
 `
 
 // Store is a Postgres connection for the control plane.
@@ -1163,4 +1196,126 @@ SET parent_job_id = 'job-1311',
 WHERE job_id = 'job-1313' AND (parent_job_id = '' OR parent_job_id IS NULL OR initial_conversation_id != 'aad902c8-bda6-44c7-8a68-c468a1562399');
 `)
 	return err
+}
+
+// SaveQueueJob persists or upserts a dispatch queue job into harness_dispatch_jobs.
+func (s *Store) SaveQueueJob(ctx context.Context, job *dispatch.Job) error {
+	if s == nil || s.db == nil || job == nil {
+		return nil
+	}
+	payloadBytes := job.Payload
+	if len(payloadBytes) == 0 {
+		payloadBytes = []byte("{}")
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO harness_dispatch_jobs (
+  id, type, repo, target_host, claimed_host, host_id, target_agent, story_id,
+  normalized_prompt, payload, status, error, trace_id, fencing_token, lease_version,
+  lease_owner, lease_token, attempts, created_at, claimed_at, heartbeat_at, lease_expires_at, completed_at, updated_at
+) VALUES (
+  $1, $2, $3, $4, $5, $6, $7, $8,
+  $9, $10, $11, $12, $13, $14, $15,
+  $16, $17, $18, $19, $20, $21, $22, $23, now()
+)
+ON CONFLICT (id) DO UPDATE SET
+  status = EXCLUDED.status,
+  claimed_host = EXCLUDED.claimed_host,
+  host_id = EXCLUDED.host_id,
+  error = EXCLUDED.error,
+  fencing_token = EXCLUDED.fencing_token,
+  lease_version = EXCLUDED.lease_version,
+  lease_owner = EXCLUDED.lease_owner,
+  lease_token = EXCLUDED.lease_token,
+  attempts = EXCLUDED.attempts,
+  claimed_at = EXCLUDED.claimed_at,
+  heartbeat_at = EXCLUDED.heartbeat_at,
+  lease_expires_at = EXCLUDED.lease_expires_at,
+  completed_at = EXCLUDED.completed_at,
+  updated_at = now();
+`,
+		job.ID, job.Type, job.Repo, job.TargetHost, job.ClaimedHost, job.HostID, job.TargetAgent, job.StoryID,
+		job.NormalizedPrompt, payloadBytes, job.Status, job.Error, job.TraceID, job.FencingToken, job.LeaseVersion,
+		job.LeaseOwner, job.LeaseToken, job.Attempts, job.CreatedAt, job.ClaimedAt, job.HeartbeatAt, job.LeaseExpiresAt, job.CompletedAt,
+	)
+	return err
+}
+
+// UpdateQueueJobLease updates the lease owner, version, and heartbeat timestamps with optimistic concurrency.
+func (s *Store) UpdateQueueJobLease(ctx context.Context, jobID string, leaseOwner string, leaseVersion int64, heartbeatAt, expiresAt time.Time) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+UPDATE harness_dispatch_jobs
+SET lease_owner = $2,
+    lease_version = $3,
+    heartbeat_at = $4,
+    lease_expires_at = $5,
+    updated_at = now()
+WHERE id = $1;
+`, jobID, leaseOwner, leaseVersion, heartbeatAt, expiresAt)
+	return err
+}
+
+// CompleteQueueJob marks a queue job as completed or failed with result payload.
+func (s *Store) CompleteQueueJob(ctx context.Context, jobID string, status string, result json.RawMessage, errStr string, completedAt time.Time) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	var resBytes []byte = result
+	if len(resBytes) == 0 {
+		resBytes = nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+UPDATE harness_dispatch_jobs
+SET status = $2,
+    result = $3,
+    error = $4,
+    completed_at = $5,
+    updated_at = now()
+WHERE id = $1;
+`, jobID, status, resBytes, errStr, completedAt)
+	return err
+}
+
+// LoadQueueJobs loads active, pending, and recent jobs from harness_dispatch_jobs.
+func (s *Store) LoadQueueJobs(ctx context.Context) ([]*dispatch.Job, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, type, repo, target_host, claimed_host, host_id, target_agent, story_id,
+       normalized_prompt, payload, status, result, error, trace_id, fencing_token,
+       lease_version, lease_owner, lease_token, attempts, created_at, claimed_at,
+       heartbeat_at, lease_expires_at, completed_at
+FROM harness_dispatch_jobs
+ORDER BY created_at ASC;
+`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []*dispatch.Job
+	for rows.Next() {
+		var j dispatch.Job
+		var payloadBytes, resultBytes []byte
+		var claimedAt, heartbeatAt, leaseExpiresAt, completedAt *time.Time
+		if err := rows.Scan(
+			&j.ID, &j.Type, &j.Repo, &j.TargetHost, &j.ClaimedHost, &j.HostID, &j.TargetAgent, &j.StoryID,
+			&j.NormalizedPrompt, &payloadBytes, &j.Status, &resultBytes, &j.Error, &j.TraceID, &j.FencingToken,
+			&j.LeaseVersion, &j.LeaseOwner, &j.LeaseToken, &j.Attempts, &j.CreatedAt, &claimedAt,
+			&heartbeatAt, &leaseExpiresAt, &completedAt,
+		); err != nil {
+			return nil, err
+		}
+		j.Payload = payloadBytes
+		j.Result = resultBytes
+		j.ClaimedAt = claimedAt
+		j.HeartbeatAt = heartbeatAt
+		j.LeaseExpiresAt = leaseExpiresAt
+		j.CompletedAt = completedAt
+		jobs = append(jobs, &j)
+	}
+	return jobs, rows.Err()
 }

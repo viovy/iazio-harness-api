@@ -78,6 +78,14 @@ func run(ctx context.Context, args []string) error {
 		}
 		defer store.Close()
 
+		if srv.Queue != nil {
+			if inMem, ok := srv.Queue.(*dispatch.InMemoryQueue); ok {
+				if err := inMem.SetStore(store); err != nil {
+					log.Printf("warning: queue set store failed: %v", err)
+				}
+			}
+		}
+
 		if ideas, err := store.LoadIdeas(ctx); err == nil {
 			for _, it := range ideas {
 				srv.Engine.PutIdea(it)

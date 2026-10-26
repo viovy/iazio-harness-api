@@ -2024,7 +2024,13 @@ func (e *Engine) ReconcileHistoricalFailureTaxonomy() int {
 
 	count := 0
 	for key, rows := range e.history {
+		parts := strings.Split(key, "\x00")
+		var host, path string
+		if len(parts) == 2 {
+			host, path = parts[0], parts[1]
+		}
 		for i := range rows {
+			modified := false
 			// Reconcile false timeouts/failures where execution completed successfully (e.g. job-1506)
 			if rows[i].TerminationReasonCode == "COMPLETED_SUCCESS" || rows[i].JobID == "job-1506" {
 				if rows[i].Status != "COMPLETED" {
@@ -2037,6 +2043,7 @@ func (e *Engine) ReconcileHistoricalFailureTaxonomy() int {
 					rows[i].FailureStage = ""
 					rows[i].FailureReasonSummary = ""
 					rows[i].ExitCode = 0
+					modified = true
 					count++
 				}
 			}
@@ -2054,7 +2061,12 @@ func (e *Engine) ReconcileHistoricalFailureTaxonomy() int {
 				if rows[i].ZipkinTraceURL == "" && rows[i].ZipkinTraceID != "" {
 					rows[i].ZipkinTraceURL = "/zipkin/traces/" + rows[i].ZipkinTraceID
 				}
+				modified = true
 				count++
+			}
+
+			if modified && host != "" {
+				e.notifyHistoryLocked(host, path, rows[i])
 			}
 		}
 		e.history[key] = rows

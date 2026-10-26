@@ -169,6 +169,8 @@ type Job struct {
 	DispatchDiagnostics *DispatchDiagnostics `json:"dispatch_diagnostics,omitempty"`
 	LeaseToken           string            `json:"lease_token,omitempty"`
 	LeaseAckDeadlineAt   *time.Time        `json:"lease_ack_deadline_at,omitempty"`
+	LeaseOwner           string            `json:"lease_owner,omitempty"`
+	LeaseVersion         int64             `json:"lease_version,omitempty"`
 	FailureCategory      string            `json:"failure_category,omitempty"`
 	FailureStage         string            `json:"failure_stage,omitempty"`
 	FailureReasonSummary string            `json:"failure_reason_summary,omitempty"`
@@ -232,7 +234,15 @@ type JobAttributionResponse struct {
 	CompletedAt      *time.Time `json:"completed_at,omitempty"`
 }
 
-// InMemoryQueue is a thread-safe in-memory implementation of Queue.
+// QueueStore defines the database persistence interface for queue jobs and distributed leases.
+type QueueStore interface {
+	SaveQueueJob(ctx context.Context, job *Job) error
+	LoadQueueJobs(ctx context.Context) ([]*Job, error)
+	UpdateQueueJobLease(ctx context.Context, jobID string, leaseOwner string, leaseVersion int64, heartbeatAt, expiresAt time.Time) error
+	CompleteQueueJob(ctx context.Context, jobID string, status string, result json.RawMessage, errStr string, completedAt time.Time) error
+}
+
+// InMemoryQueue is a thread-safe in-memory implementation of Queue with optional database backing.
 type InMemoryQueue struct {
 	mu             sync.Mutex
 	jobs           map[string]*Job
@@ -243,7 +253,36 @@ type InMemoryQueue struct {
 	jobTimeout     time.Duration
 	startupTime    time.Time
 	startupGrace   time.Duration
+	store          QueueStore
 	nowFunc        func() time.Time
+}
+
+// SetStore binds a durable database backing store to the queue and re-hydrates in-flight jobs.
+func (q *InMemoryQueue) SetStore(s QueueStore) error {
+	q.mu.Lock()
+	q.store = s
+	q.mu.Unlock()
+
+	if s != nil {
+		persisted, err := s.LoadQueueJobs(context.Background())
+		if err != nil {
+			return err
+		}
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		for _, j := range persisted {
+			if existing, ok := q.jobs[j.ID]; !ok || existing.CreatedAt.Before(j.CreatedAt) {
+				if j.doneCh == nil {
+					j.doneCh = make(chan struct{})
+					if j.Status == JobStatusCompleted || j.Status == JobStatusFailed || j.Status == JobStatusCanceled {
+						close(j.doneCh)
+					}
+				}
+				q.jobs[j.ID] = j
+			}
+		}
+	}
+	return nil
 }
 
 // SetAttributionConfig sets the URL and optional client used for relevance attribution dispatches.
@@ -484,6 +523,9 @@ func (q *InMemoryQueue) Enqueue(ctx context.Context, job *Job) (*Job, error) {
 
 	// Store copy
 	q.jobs[job.ID] = job
+	if q.store != nil {
+		_ = q.store.SaveQueueJob(ctx, job)
+	}
 
 	var spanOpts []telemetry.SpanOption
 	spanOpts = append(spanOpts, telemetry.WithTag("job.id", job.ID))
@@ -552,6 +594,11 @@ func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []str
 	oldest.HeartbeatAt = &now
 	expires := now.Add(DefaultHeartbeatTimeout)
 	oldest.LeaseExpiresAt = &expires
+	oldest.LeaseOwner = hostID
+	oldest.LeaseVersion = oldest.FencingToken
+	if q.store != nil {
+		_ = q.store.SaveQueueJob(ctx, oldest)
+	}
 
 	var claimSpanOpts []telemetry.SpanOption
 	claimSpanOpts = append(claimSpanOpts, telemetry.WithTag("job.id", oldest.ID), telemetry.WithTag("host.id", hostID))
@@ -640,24 +687,58 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 		j.HeartbeatAt = &now
 		expires := now.Add(DefaultHeartbeatTimeout)
 		j.LeaseExpiresAt = &expires
+		j.LeaseOwner = hostID
+		j.LeaseVersion = j.FencingToken
 		if j.Status == JobStatusLeased || j.Status == JobStatusClaimed {
 			j.Status = JobStatusRunning
+		}
+		if q.store != nil {
+			_ = q.store.UpdateQueueJobLease(ctx, j.ID, hostID, j.FencingToken, now, expires)
 		}
 		extended = append(extended, j.ID)
 	}
 
 	for jobID := range activeSet {
 		if _, exists := q.jobs[jobID]; !exists {
+			var rehydrated *Job
+			if q.store != nil {
+				if loaded, err := q.store.LoadQueueJobs(ctx); err == nil {
+					for _, lj := range loaded {
+						if lj.ID == jobID {
+							rehydrated = lj
+							break
+						}
+					}
+				}
+			}
 			expires := now.Add(DefaultHeartbeatTimeout)
-			q.jobs[jobID] = &Job{
-				ID:             jobID,
-				Status:         JobStatusRunning,
-				ClaimedHost:    hostID,
-				HostID:         hostID,
-				HeartbeatAt:    &now,
-				LeaseExpiresAt: &expires,
-				CreatedAt:      now,
-				doneCh:         make(chan struct{}),
+			if rehydrated != nil {
+				rehydrated.Status = JobStatusRunning
+				rehydrated.ClaimedHost = hostID
+				rehydrated.HostID = hostID
+				rehydrated.HeartbeatAt = &now
+				rehydrated.LeaseExpiresAt = &expires
+				rehydrated.LeaseOwner = hostID
+				rehydrated.LeaseVersion = rehydrated.FencingToken
+				if rehydrated.doneCh == nil {
+					rehydrated.doneCh = make(chan struct{})
+				}
+				q.jobs[jobID] = rehydrated
+			} else {
+				q.jobs[jobID] = &Job{
+					ID:             jobID,
+					Status:         JobStatusRunning,
+					ClaimedHost:    hostID,
+					HostID:         hostID,
+					HeartbeatAt:    &now,
+					LeaseExpiresAt: &expires,
+					LeaseOwner:     hostID,
+					CreatedAt:      now,
+					doneCh:         make(chan struct{}),
+				}
+			}
+			if q.store != nil {
+				_ = q.store.UpdateQueueJobLease(ctx, jobID, hostID, q.jobs[jobID].FencingToken, now, expires)
 			}
 			extended = append(extended, jobID)
 		}
@@ -721,6 +802,10 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 		job.Status = JobStatusCompleted
 		job.Result = result
 		job.Error = ""
+	}
+
+	if q.store != nil && job.CompletedAt != nil {
+		_ = q.store.CompleteQueueJob(ctx, job.ID, job.Status, job.Result, job.Error, *job.CompletedAt)
 	}
 
 	searchID := job.SearchID

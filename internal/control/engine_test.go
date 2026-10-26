@@ -4552,6 +4552,14 @@ func TestReconcileHistoricalFailureTaxonomy_ReconcilesJob1506AndCompletedSuccess
 	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
 	e := NewEngine(func() time.Time { return now })
 
+	var savedRows []HistoryRow
+	var savedMu sync.Mutex
+	e.OnHistoryChange = func(host, path string, row HistoryRow) {
+		savedMu.Lock()
+		defer savedMu.Unlock()
+		savedRows = append(savedRows, row)
+	}
+
 	e.history["mac-mini\x00/work/repo"] = []HistoryRow{
 		{
 			JobID:                 "job-1506",
@@ -4599,6 +4607,13 @@ func TestReconcileHistoricalFailureTaxonomy_ReconcilesJob1506AndCompletedSuccess
 
 	if e.jobs["job-1506"].Status != "COMPLETED" {
 		t.Fatalf("expected job-1506 to be COMPLETED, got %s", e.jobs["job-1506"].Status)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	savedMu.Lock()
+	defer savedMu.Unlock()
+	if len(savedRows) < 2 {
+		t.Fatalf("expected at least 2 saved history notifications for DB persistence, got %d", len(savedRows))
 	}
 }
 

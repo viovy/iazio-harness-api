@@ -151,3 +151,36 @@ CREATE TABLE IF NOT EXISTS harness_stories (
   updated_at timestamp with time zone NOT NULL DEFAULT now()
 );
 
+-- Durable global dispatch queue jobs with fencing tokens and lease tracking.
+CREATE TABLE IF NOT EXISTS harness_dispatch_jobs (
+  id text PRIMARY KEY,
+  type text NOT NULL,
+  repo text NOT NULL DEFAULT '',
+  target_host text NOT NULL DEFAULT '',
+  claimed_host text NOT NULL DEFAULT '',
+  host_id text NOT NULL DEFAULT '',
+  target_agent text NOT NULL DEFAULT '',
+  story_id text NOT NULL DEFAULT '',
+  normalized_prompt text NOT NULL DEFAULT '',
+  payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+  status text NOT NULL DEFAULT 'pending',
+  result jsonb,
+  error text NOT NULL DEFAULT '',
+  trace_id text NOT NULL DEFAULT '',
+  fencing_token bigint NOT NULL DEFAULT 0,
+  lease_version bigint NOT NULL DEFAULT 0,
+  lease_owner text NOT NULL DEFAULT '',
+  lease_token text NOT NULL DEFAULT '',
+  attempts integer NOT NULL DEFAULT 0,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  claimed_at timestamp with time zone,
+  heartbeat_at timestamp with time zone,
+  lease_expires_at timestamp with time zone,
+  completed_at timestamp with time zone,
+  updated_at timestamp with time zone NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS harness_dispatch_jobs_status_idx ON harness_dispatch_jobs (status);
+CREATE INDEX IF NOT EXISTS harness_dispatch_jobs_host_idx ON harness_dispatch_jobs (claimed_host, status);
+
+
