@@ -380,6 +380,30 @@ func TestJobLifecycleHandler_ExecuteStory_HarnessAllocated(t *testing.T) {
 	if detail.StoryTitle != "Gemini Web MCP Frictionless ASE" {
 		t.Errorf("expected story_title, got %q", detail.StoryTitle)
 	}
+
+	// Claim the job to give it a non-zero fencing token
+	claimed, claimErr := q.Claim(context.Background(), "test-host", []string{dispatch.JobTypePromptExecute})
+	if claimErr != nil || claimed == nil {
+		t.Fatalf("failed to claim job: %v", claimErr)
+	}
+
+	// Stale fencing token in BindStory is rejected with 409 Conflict
+	staleBindBody := bytes.NewReader([]byte(fmt.Sprintf(`{"fencing_token":%d,"story_id":"STORY-OVERWRITE"}`, claimed.FencingToken+999)))
+	staleBindReq := httptest.NewRequest(http.MethodPatch, "/api/v1/jobs/"+claimed.ID+"/story-binding", staleBindBody)
+	staleBindRr := httptest.NewRecorder()
+	mux.ServeHTTP(staleBindRr, staleBindReq)
+	if staleBindRr.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for stale fencing token, got %d: %s", staleBindRr.Code, staleBindRr.Body.String())
+	}
+
+	// Valid fencing token in BindStory succeeds with 200 OK
+	validBindBody := bytes.NewReader([]byte(fmt.Sprintf(`{"fencing_token":%d,"story_id":"STORY-VALID-BOUND"}`, claimed.FencingToken)))
+	validBindReq := httptest.NewRequest(http.MethodPatch, "/api/v1/jobs/"+claimed.ID+"/story-binding", validBindBody)
+	validBindRr := httptest.NewRecorder()
+	mux.ServeHTTP(validBindRr, validBindReq)
+	if validBindRr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for valid fencing token, got %d: %s", validBindRr.Code, validBindRr.Body.String())
+	}
 }
 
 func TestJobLifecycleHandler_AckLease_Heartbeat_Failover(t *testing.T) {
