@@ -2904,10 +2904,16 @@ func (e *Engine) reapExpiredLocked() {
 							sch.IterationsCompleted--
 						}
 						sch.Status = "QUEUED"
+						sch.LeaseToken = ""
+						sch.LeaseAckDeadlineAt = nil
 					} else if sch.IterationsRemaining > 0 {
 						sch.Status = "QUEUED"
+						sch.LeaseToken = ""
+						sch.LeaseAckDeadlineAt = nil
 					} else {
 						sch.Status = "FAILED"
+						sch.LeaseToken = ""
+						sch.LeaseAckDeadlineAt = nil
 					}
 					if sch.CloneURL != "" && sch.IterationsRemaining <= 0 {
 						delete(e.cloneLease, sch.CloneURL)
