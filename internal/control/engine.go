@@ -2031,8 +2031,12 @@ func (e *Engine) ReconcileHistoricalFailureTaxonomy() int {
 		}
 		for i := range rows {
 			modified := false
-			// Reconcile false timeouts/failures where execution completed successfully (e.g. job-1506)
-			if rows[i].TerminationReasonCode == "COMPLETED_SUCCESS" || rows[i].JobID == "job-1506" {
+			// Reconcile false timeouts/failures where execution has evidence of successful completion
+			hasSuccessEvidence := rows[i].TerminationReasonCode == "COMPLETED_SUCCESS" ||
+				strings.Contains(rows[i].TerminationReasonMessage, "completed successfully") ||
+				strings.Contains(rows[i].Reason, "completed successfully") ||
+				strings.Contains(rows[i].ErrorMessage, "completed successfully")
+			if hasSuccessEvidence {
 				if rows[i].Status != "COMPLETED" {
 					rows[i].Status = "COMPLETED"
 					rows[i].Clean = true
@@ -2072,8 +2076,8 @@ func (e *Engine) ReconcileHistoricalFailureTaxonomy() int {
 		e.history[key] = rows
 	}
 
-	if j, ok := e.jobs["job-1506"]; ok {
-		if j.Status != "COMPLETED" {
+	for _, j := range e.jobs {
+		if (j.TerminationReasonCode == "COMPLETED_SUCCESS" || strings.Contains(j.TerminationReasonMessage, "completed successfully")) && j.Status != "COMPLETED" {
 			j.Status = "COMPLETED"
 			j.ExitCode = 0
 			j.TerminationReasonCode = "COMPLETED_SUCCESS"

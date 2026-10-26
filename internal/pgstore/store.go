@@ -1241,20 +1241,31 @@ ON CONFLICT (id) DO UPDATE SET
 }
 
 // UpdateQueueJobLease updates the lease owner, version, and heartbeat timestamps with optimistic concurrency.
+// It fails if a newer lease version has already taken over, preventing split-brain lease overwrites.
 func (s *Store) UpdateQueueJobLease(ctx context.Context, jobID string, leaseOwner string, leaseVersion int64, heartbeatAt, expiresAt time.Time) error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	_, err := s.db.ExecContext(ctx, `
+	res, err := s.db.ExecContext(ctx, `
 UPDATE harness_dispatch_jobs
 SET lease_owner = $2,
     lease_version = $3,
     heartbeat_at = $4,
     lease_expires_at = $5,
     updated_at = now()
-WHERE id = $1;
+WHERE id = $1 AND (lease_version IS NULL OR lease_version <= $3);
 `, jobID, leaseOwner, leaseVersion, heartbeatAt, expiresAt)
-	return err
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("lease update conflict for job %s: lease_version %d was fenced or job not found", jobID, leaseVersion)
+	}
+	return nil
 }
 
 // CompleteQueueJob marks a queue job as completed or failed with result payload.
@@ -1266,16 +1277,20 @@ func (s *Store) CompleteQueueJob(ctx context.Context, jobID string, status strin
 	if len(resBytes) == 0 {
 		resBytes = nil
 	}
-	_, err := s.db.ExecContext(ctx, `
+	res, err := s.db.ExecContext(ctx, `
 UPDATE harness_dispatch_jobs
 SET status = $2,
     result = $3,
     error = $4,
     completed_at = $5,
     updated_at = now()
-WHERE id = $1;
+WHERE id = $1 AND status != 'completed';
 `, jobID, status, resBytes, errStr, completedAt)
-	return err
+	if err != nil {
+		return err
+	}
+	_ = res
+	return nil
 }
 
 // LoadQueueJobs loads active, pending, and recent jobs from harness_dispatch_jobs.

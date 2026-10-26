@@ -4580,8 +4580,9 @@ func TestReconcileHistoricalFailureTaxonomy_ReconcilesJob1506AndCompletedSuccess
 		},
 	}
 	e.jobs["job-1506"] = &Job{
-		ID:     "job-1506",
-		Status: "FAILED",
+		ID:                    "job-1506",
+		Status:                "FAILED",
+		TerminationReasonCode: "COMPLETED_SUCCESS",
 	}
 
 	count := e.ReconcileHistoricalFailureTaxonomy()

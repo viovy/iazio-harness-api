@@ -597,7 +597,10 @@ func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []str
 	oldest.LeaseOwner = hostID
 	oldest.LeaseVersion = oldest.FencingToken
 	if q.store != nil {
-		_ = q.store.SaveQueueJob(ctx, oldest)
+		if err := q.store.SaveQueueJob(ctx, oldest); err != nil {
+			log.Printf("[dispatch-queue] ERROR: failed to persist claimed job %s: %v", oldest.ID, err)
+			return nil, fmt.Errorf("persist claimed job %s: %w", oldest.ID, err)
+		}
 	}
 
 	var claimSpanOpts []telemetry.SpanOption
@@ -633,6 +636,12 @@ func (q *InMemoryQueue) Heartbeat(ctx context.Context, jobID string, fencingToke
 	job.HeartbeatAt = &now
 	expires := now.Add(DefaultHeartbeatTimeout)
 	job.LeaseExpiresAt = &expires
+	if q.store != nil {
+		if err := q.store.UpdateQueueJobLease(ctx, job.ID, job.LeaseOwner, job.FencingToken, now, expires); err != nil {
+			log.Printf("[dispatch-queue] ERROR: failed to persist heartbeat lease for %s: %v", jobID, err)
+			return nil, fmt.Errorf("persist heartbeat lease: %w", err)
+		}
+	}
 	return job, nil
 }
 
@@ -693,7 +702,9 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 			j.Status = JobStatusRunning
 		}
 		if q.store != nil {
-			_ = q.store.UpdateQueueJobLease(ctx, j.ID, hostID, j.FencingToken, now, expires)
+			if err := q.store.UpdateQueueJobLease(ctx, j.ID, hostID, j.FencingToken, now, expires); err != nil {
+				log.Printf("[dispatch-queue] WARN: failed to persist lease update for %s: %v", j.ID, err)
+			}
 		}
 		extended = append(extended, j.ID)
 	}
@@ -738,7 +749,9 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 				}
 			}
 			if q.store != nil {
-				_ = q.store.UpdateQueueJobLease(ctx, jobID, hostID, q.jobs[jobID].FencingToken, now, expires)
+				if err := q.store.UpdateQueueJobLease(ctx, jobID, hostID, q.jobs[jobID].FencingToken, now, expires); err != nil {
+					log.Printf("[dispatch-queue] WARN: failed to persist rehydrated lease for %s: %v", jobID, err)
+				}
 			}
 			extended = append(extended, jobID)
 		}
@@ -805,7 +818,11 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 	}
 
 	if q.store != nil && job.CompletedAt != nil {
-		_ = q.store.CompleteQueueJob(ctx, job.ID, job.Status, job.Result, job.Error, *job.CompletedAt)
+		if err := q.store.CompleteQueueJob(ctx, job.ID, job.Status, job.Result, job.Error, *job.CompletedAt); err != nil {
+			log.Printf("[dispatch-queue] ERROR: failed to persist job completion for %s: %v", job.ID, err)
+			q.mu.Unlock()
+			return fmt.Errorf("persist job completion: %w", err)
+		}
 	}
 
 	searchID := job.SearchID
@@ -1068,6 +1085,12 @@ func (q *InMemoryQueue) AckLease(ctx context.Context, jobID, leaseToken string, 
 	job.HeartbeatAt = &now
 	expires := now.Add(DefaultHeartbeatTimeout)
 	job.LeaseExpiresAt = &expires
+	if q.store != nil {
+		if err := q.store.UpdateQueueJobLease(ctx, job.ID, job.LeaseOwner, job.FencingToken, now, expires); err != nil {
+			log.Printf("[dispatch-queue] ERROR: failed to persist heartbeat lease for %s: %v", jobID, err)
+			return nil, fmt.Errorf("persist heartbeat lease: %w", err)
+		}
+	}
 	return job, nil
 }
 
