@@ -22,6 +22,7 @@ import (
 	"github.com/viovy/iazio-harness-api/internal/codebase"
 	"github.com/viovy/iazio-harness-api/internal/control"
 	"github.com/viovy/iazio-harness-api/internal/dispatch"
+	"github.com/viovy/iazio-harness-api/internal/gitlease"
 	"github.com/viovy/iazio-harness-api/internal/sse"
 	"github.com/viovy/iazio-harness-api/internal/telemetry"
 	"github.com/viovy/iazio-harness-api/internal/version"
@@ -62,6 +63,8 @@ type Server struct {
 	EventHub *sse.Hub
 	// Queue manages async job dispatching and execution for prompts and stories.
 	Queue dispatch.Queue
+	// GitLeaseManager coordinates distributed git commit serialization and submodule merge leases.
+	GitLeaseManager *gitlease.Manager
 	// Idempotency manages API idempotency caches.
 	Idempotency *handlers.IdempotencyStore
 	// StoryValidator validates story existence before execution.
@@ -139,6 +142,11 @@ func (s *Server) Handler() http.Handler {
 	if idempotency == nil {
 		idempotency = handlers.NewIdempotencyStore(24 * time.Hour)
 		s.Idempotency = idempotency
+	}
+	gitLeaseManager := s.GitLeaseManager
+	if gitLeaseManager == nil {
+		gitLeaseManager = gitlease.NewManager()
+		s.GitLeaseManager = gitLeaseManager
 	}
 
 	mux.Handle("GET /api/v1/repos", handlers.NewReposHandler(codebaseStore))
@@ -303,6 +311,21 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/conversations/{id}/rehydration-bundle", s.getRehydrationBundle)
 	mux.HandleFunc("GET /v1/jobs/{id}/logs", s.jobLogs)
 	mux.HandleFunc("GET /v1/jobs/{id}/stream", s.jobStream)
+	mux.HandleFunc("GET /api/v1/jobs/{id}/stream", s.jobStream)
+	mux.HandleFunc("GET /v1/global-queue/jobs/{id}/stream", s.jobStream)
+	mux.HandleFunc("GET /api/v1/global-queue/jobs/{id}/stream", s.jobStream)
+
+	// Git merge lease coordinator endpoints (STORY-GOV-3705)
+	mux.HandleFunc("POST /api/v1/git-leases/acquire", s.acquireGitLease)
+	mux.HandleFunc("POST /v1/git-leases/acquire", s.acquireGitLease)
+	mux.HandleFunc("POST /api/v1/git-leases/renew", s.renewGitLease)
+	mux.HandleFunc("POST /v1/git-leases/renew", s.renewGitLease)
+	mux.HandleFunc("POST /api/v1/git-leases/release", s.releaseGitLease)
+	mux.HandleFunc("POST /v1/git-leases/release", s.releaseGitLease)
+	mux.HandleFunc("GET /api/v1/git-leases", s.listGitLeases)
+	mux.HandleFunc("GET /v1/git-leases", s.listGitLeases)
+	mux.HandleFunc("GET /api/v1/git-leases/{repo...}", s.getGitLease)
+	mux.HandleFunc("GET /v1/git-leases/{repo...}", s.getGitLease)
 	mux.HandleFunc("GET /v1/jobs/{id}/events", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
 		eventHub.ServeHTTP(w, r, id)
@@ -3266,6 +3289,11 @@ func (s *Server) jobStream(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 	tail := atoiQuery(r.URL.Query().Get("tail"))
 	after := atoiQuery(r.URL.Query().Get("after_seq"))
+	if after == 0 {
+		if lastID := r.Header.Get("Last-Event-ID"); lastID != "" {
+			after = atoiQuery(lastID)
+		}
+	}
 	chunks, gapFrom, gapTo := s.Engine.TailLogs(id, tail, after)
 	if gapFrom > 0 {
 		writeSSE(w, "GAP", map[string]any{"type": "GAP", "from_seq": gapFrom, "to_seq": gapTo})
@@ -3297,7 +3325,138 @@ func (s *Server) jobStream(w http.ResponseWriter, r *http.Request) {
 
 func writeSSE(w http.ResponseWriter, event string, payload any) {
 	b, _ := json.Marshal(payload)
+	if m, ok := payload.(map[string]any); ok {
+		if seq, ok := m["seq"].(int); ok && seq > 0 {
+			_, _ = fmt.Fprintf(w, "id: %d\n", seq)
+		} else if seq64, ok := m["seq"].(int64); ok && seq64 > 0 {
+			_, _ = fmt.Fprintf(w, "id: %d\n", seq64)
+		}
+	}
 	_, _ = w.Write([]byte("event: " + event + "\ndata: " + string(b) + "\n\n"))
+}
+
+// Git merge lease coordinator requests and handlers (STORY-GOV-3705)
+
+type gitLeaseRequest struct {
+	Repo       string `json:"repo"`
+	Holder     string `json:"holder"`
+	LeaseID    string `json:"lease_id,omitempty"`
+	TTLSeconds int    `json:"ttl_seconds,omitempty"`
+}
+
+func (s *Server) acquireGitLease(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req gitLeaseRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if s.GitLeaseManager == nil {
+		s.GitLeaseManager = gitlease.NewManager()
+	}
+	lease, acquired, err := s.GitLeaseManager.Acquire(req.Repo, req.Holder, req.TTLSeconds)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if !acquired {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"acquired":      false,
+			"error":         "repository merge lease held by another workspace",
+			"current_lease": lease,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"acquired": true,
+		"lease":    lease,
+	})
+}
+
+func (s *Server) renewGitLease(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req gitLeaseRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if s.GitLeaseManager == nil {
+		s.GitLeaseManager = gitlease.NewManager()
+	}
+	lease, renewed, err := s.GitLeaseManager.Renew(req.Repo, req.Holder, req.LeaseID, req.TTLSeconds)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if !renewed {
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"renewed": false,
+			"error":   "lease not active or expired",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"renewed": true,
+		"lease":   lease,
+	})
+}
+
+func (s *Server) releaseGitLease(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req gitLeaseRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if s.GitLeaseManager == nil {
+		s.GitLeaseManager = gitlease.NewManager()
+	}
+	ok, err := s.GitLeaseManager.Release(req.Repo, req.Holder, req.LeaseID)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"released": ok,
+	})
+}
+
+func (s *Server) listGitLeases(w http.ResponseWriter, r *http.Request) {
+	if s.GitLeaseManager == nil {
+		s.GitLeaseManager = gitlease.NewManager()
+	}
+	leases := s.GitLeaseManager.List()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"leases": leases,
+	})
+}
+
+func (s *Server) getGitLease(w http.ResponseWriter, r *http.Request) {
+	repo := r.PathValue("repo")
+	if s.GitLeaseManager == nil {
+		s.GitLeaseManager = gitlease.NewManager()
+	}
+	lease := s.GitLeaseManager.Get(repo)
+	if lease == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"found": false,
+			"error": "no active lease found for repository",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"found": true,
+		"lease": lease,
+	})
 }
 
 func atoiQuery(s string) int {
