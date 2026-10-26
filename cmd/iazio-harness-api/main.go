@@ -61,6 +61,9 @@ func run(ctx context.Context, args []string) error {
 	}
 	srv.Engine.StartReaper(ctx, 10*time.Second)
 	if srv.Queue != nil {
+		if inMem, ok := srv.Queue.(*dispatch.InMemoryQueue); ok {
+			inMem.SetStartupGrace(5 * time.Minute)
+		}
 		srv.Queue.StartReaper(ctx, 10*time.Second)
 	}
 	if script := os.Getenv("IAZIO_EXTRACT_WORKER"); script != "" {

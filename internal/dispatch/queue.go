@@ -241,6 +241,8 @@ type InMemoryQueue struct {
 	httpClient     *http.Client
 	claimTimeout   time.Duration
 	jobTimeout     time.Duration
+	startupTime    time.Time
+	startupGrace   time.Duration
 	nowFunc        func() time.Time
 }
 
@@ -250,6 +252,13 @@ func (q *InMemoryQueue) SetAttributionConfig(apiURL string, client *http.Client)
 	defer q.mu.Unlock()
 	q.attributionURL = apiURL
 	q.httpClient = client
+}
+
+// SetStartupGrace sets the post-startup reconciliation grace window.
+func (q *InMemoryQueue) SetStartupGrace(d time.Duration) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.startupGrace = d
 }
 
 // NewInMemoryQueue constructs a new thread-safe InMemoryQueue.
@@ -428,10 +437,14 @@ func (q *InMemoryQueue) ReapExpired(now time.Time) []string {
 }
 
 // StartReaper runs background expiration sweeps periodically until context is cancelled.
+// During the initial startup grace window (default 5m), the reaper does not mark jobs as lease_expired,
+// allowing re-connecting agents to re-hydrate and extend active leases across API restarts/redeployments.
 func (q *InMemoryQueue) StartReaper(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 10 * time.Second
 	}
+	startedAt := q.now()
+	grace := q.startupGrace
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -440,6 +453,9 @@ func (q *InMemoryQueue) StartReaper(ctx context.Context, interval time.Duration)
 			case <-ctx.Done():
 				return
 			case now := <-ticker.C:
+				if grace > 0 && now.Sub(startedAt) < grace {
+					continue
+				}
 				q.ReapExpired(now.UTC())
 			}
 		}
@@ -603,6 +619,13 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 			continue
 		}
 
+		// Auto-reconcile jobs marked failed due to lease expiration or timeout if reported active by agent
+		if j.Status == JobStatusFailed && activeSet[j.ID] && isReconcilableFailure(j.Error) {
+			j.Status = JobStatusRunning
+			j.Error = ""
+			j.CompletedAt = nil
+		}
+
 		// Only extend active jobs (leased, claimed, running)
 		if j.Status != JobStatusClaimed && j.Status != JobStatusLeased && j.Status != JobStatusRunning {
 			continue
@@ -623,6 +646,23 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 		extended = append(extended, j.ID)
 	}
 
+	for jobID := range activeSet {
+		if _, exists := q.jobs[jobID]; !exists {
+			expires := now.Add(DefaultHeartbeatTimeout)
+			q.jobs[jobID] = &Job{
+				ID:             jobID,
+				Status:         JobStatusRunning,
+				ClaimedHost:    hostID,
+				HostID:         hostID,
+				HeartbeatAt:    &now,
+				LeaseExpiresAt: &expires,
+				CreatedAt:      now,
+				doneCh:         make(chan struct{}),
+			}
+			extended = append(extended, jobID)
+		}
+	}
+
 	return extended, nil
 }
 
@@ -638,6 +678,17 @@ func (q *InMemoryQueue) Complete(ctx context.Context, jobID string, result json.
 	return q.CompleteWithFencing(ctx, jobID, fencingToken, result, errStr)
 }
 
+// isReconcilableFailure checks whether a failure reason was caused by lease/heartbeat/reaper timeout.
+func isReconcilableFailure(errStr string) bool {
+	lower := strings.ToLower(errStr)
+	return strings.Contains(lower, "lease_expired") ||
+		strings.Contains(lower, "heartbeat_timeout") ||
+		strings.Contains(lower, "execution_timeout") ||
+		strings.Contains(lower, "stalled") ||
+		strings.Contains(lower, "process_died") ||
+		strings.Contains(lower, "lease expired")
+}
+
 // CompleteWithFencing validates the fencing token and updates the job with final result or error.
 func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, fencingToken int64, result json.RawMessage, errStr string) error {
 	q.mu.Lock()
@@ -646,9 +697,15 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 		q.mu.Unlock()
 		return ErrJobNotFound
 	}
-	if job.Status == JobStatusCompleted || job.Status == JobStatusFailed || job.Status == JobStatusCanceled {
+	if job.Status == JobStatusCompleted || job.Status == JobStatusCanceled {
 		q.mu.Unlock()
 		return ErrJobAlreadyCompleted
+	}
+	if job.Status == JobStatusFailed {
+		if !isReconcilableFailure(job.Error) {
+			q.mu.Unlock()
+			return ErrJobAlreadyCompleted
+		}
 	}
 	if job.FencingToken > 0 && fencingToken != job.FencingToken {
 		q.mu.Unlock()
@@ -663,6 +720,7 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 	} else {
 		job.Status = JobStatusCompleted
 		job.Result = result
+		job.Error = ""
 	}
 
 	searchID := job.SearchID

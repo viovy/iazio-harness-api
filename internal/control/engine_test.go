@@ -4548,6 +4548,60 @@ func TestEngine_AckLease_Heartbeat_Failover_RetryRetriable(t *testing.T) {
 	_ = e.ReconcileHistoricalFailureTaxonomy()
 }
 
+func TestReconcileHistoricalFailureTaxonomy_ReconcilesJob1506AndCompletedSuccess(t *testing.T) {
+	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return now })
+
+	e.history["mac-mini\x00/work/repo"] = []HistoryRow{
+		{
+			JobID:                 "job-1506",
+			Status:                "FAILED",
+			Clean:                 false,
+			Reason:                "execution_timeout",
+			ErrorMessage:          "execution timeout reached",
+			TerminationReasonCode: "COMPLETED_SUCCESS",
+			ExitCode:              1,
+		},
+		{
+			JobID:                 "job-other-success",
+			Status:                "FAILED",
+			Clean:                 false,
+			Reason:                "lease_expired",
+			TerminationReasonCode: "COMPLETED_SUCCESS",
+			ExitCode:              1,
+		},
+	}
+	e.jobs["job-1506"] = &Job{
+		ID:     "job-1506",
+		Status: "FAILED",
+	}
+
+	count := e.ReconcileHistoricalFailureTaxonomy()
+	if count == 0 {
+		t.Fatalf("expected reconciled records > 0")
+	}
+
+	rows := e.history["mac-mini\x00/work/repo"]
+	for _, r := range rows {
+		if r.Status != "COMPLETED" {
+			t.Fatalf("expected row %s to be COMPLETED, got %s", r.JobID, r.Status)
+		}
+		if !r.Clean {
+			t.Fatalf("expected row %s to be clean", r.JobID)
+		}
+		if r.Reason != "" {
+			t.Fatalf("expected row %s reason to be cleared, got %q", r.JobID, r.Reason)
+		}
+		if r.ExitCode != 0 {
+			t.Fatalf("expected row %s exit code to be 0, got %d", r.JobID, r.ExitCode)
+		}
+	}
+
+	if e.jobs["job-1506"].Status != "COMPLETED" {
+		t.Fatalf("expected job-1506 to be COMPLETED, got %s", e.jobs["job-1506"].Status)
+	}
+}
+
 func TestScheduleLifecycle_TransitionsCleanlyAndCapsRetries(t *testing.T) {
 	now := time.Date(2026, 10, 26, 4, 0, 0, 0, time.UTC)
 	e := NewEngine(func() time.Time { return now })

@@ -983,4 +983,92 @@ func TestInMemoryQueue_ExtendLeasesForHost(t *testing.T) {
 	}
 }
 
+func TestExtendLeasesForHost_AutoReconciliationAndStartupGrace(t *testing.T) {
+	q := NewInMemoryQueue()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
+	q.SetNowFunc(func() time.Time { return now })
+	q.startupTime = now
+	q.startupGrace = 5 * time.Minute
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type:             JobTypePromptExecute,
+		Repo:             "leaf-01",
+		NormalizedPrompt: "update tools",
+		CreatedAt:        now,
+		Status:           JobStatusFailed,
+		Error:            "LEASE_EXPIRED: execution lease expired without completion",
+		HostID:           "docker1",
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	// Host sends heartbeat with active job - should auto-reconcile and extend
+	extended, err := q.ExtendLeasesForHost(ctx, "docker1", []string{job.ID})
+	if err != nil {
+		t.Fatalf("ExtendLeasesForHost failed: %v", err)
+	}
+	if len(extended) != 1 || extended[0] != job.ID {
+		t.Fatalf("expected extended [%s], got %v", job.ID, extended)
+	}
+
+	cur, ok := q.Get(job.ID)
+	if !ok || cur.Status != JobStatusRunning {
+		t.Fatalf("expected job to be reconciled to RUNNING, got %+v", cur)
+	}
+	if cur.Error != "" {
+		t.Fatalf("expected error to be cleared on auto-reconciliation, got %q", cur.Error)
+	}
+
+	// Also verify re-hydration of job reported by host that is missing from queue
+	missingID := "job-external-123"
+	extMissing, err := q.ExtendLeasesForHost(ctx, "docker1", []string{missingID})
+	if err != nil {
+		t.Fatalf("ExtendLeasesForHost missing failed: %v", err)
+	}
+	if len(extMissing) == 0 {
+		t.Fatalf("expected missing job to be rehydrated and extended")
+	}
+	mJob, ok := q.Get(missingID)
+	if !ok || mJob.Status != JobStatusRunning {
+		t.Fatalf("expected missing job to be rehydrated as RUNNING, got %+v", mJob)
+	}
+}
+
+func TestCompleteWithFencing_AcceptsCompletionOnReconcilableFailure(t *testing.T) {
+	q := NewInMemoryQueue()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
+	q.SetNowFunc(func() time.Time { return now })
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type:             JobTypePromptExecute,
+		Repo:             "leaf-01",
+		NormalizedPrompt: "update tools",
+		CreatedAt:        now,
+		Status:           JobStatusFailed,
+		Error:            "EXECUTION_TIMEOUT: job exceeded max execution duration",
+		FencingToken:     12,
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	// Agent finishes and reports completion with fencing token
+	res := json.RawMessage(`{"status":"success","exit_code":0}`)
+	err = q.CompleteWithFencing(ctx, job.ID, 12, res, "")
+	if err != nil {
+		t.Fatalf("CompleteWithFencing should accept completion for reconcilable failure, got: %v", err)
+	}
+
+	completed, ok := q.Get(job.ID)
+	if !ok || completed.Status != JobStatusCompleted {
+		t.Fatalf("expected job to be COMPLETED, got %+v", completed)
+	}
+	if completed.Error != "" {
+		t.Fatalf("expected error to be cleared, got %q", completed.Error)
+	}
+}
+
 
