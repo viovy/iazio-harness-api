@@ -2732,6 +2732,7 @@ func TestReapExpiredLocked_OrphanedHistoryReconciled(t *testing.T) {
 	}
 
 	row := detail.History[0]
+	t.Logf("row ErrorMessage: %q, Remediation: %q", row.ErrorMessage, row.Remediation)
 	if row.Status != "TIMED_OUT" {
 		t.Fatalf("expected history row to transition to TIMED_OUT, got %s", row.Status)
 	}
@@ -2772,6 +2773,7 @@ func TestReapExpiredLocked_GracePeriodProtectsRecentDispatches(t *testing.T) {
 	}
 
 	row := detail.History[0]
+	t.Logf("row ErrorMessage: %q, Remediation: %q", row.ErrorMessage, row.Remediation)
 	if row.Status != "RUNNING" {
 		t.Fatalf("expected recent history row to remain RUNNING within grace period, got %s", row.Status)
 	}
@@ -2818,8 +2820,72 @@ func TestReapExpiredLocked_ActiveHostLivenessProtectsRunningJob(t *testing.T) {
 	}
 
 	row := detail.History[0]
+	t.Logf("row ErrorMessage: %q, Remediation: %q", row.ErrorMessage, row.Remediation)
 	if row.Status != "RUNNING" {
 		t.Fatalf("expected active host process to protect history row, got %s", row.Status)
+	}
+}
+
+func TestReapExpiredLocked_AutoResumesOrphanedRun(t *testing.T) {
+	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return now })
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: "/work/meta-04",
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	key := repoKey("mac-mini", "/work/meta-04")
+	e.history[key] = []HistoryRow{
+		{
+			JobID:                "job-1500",
+			ScheduleID:           "sch-1500",
+			PromptTitle:          "orphaned run test",
+			Engine:               "mock-agy",
+			Status:               "RUNNING",
+			CreatedAt:            now.Add(-10 * time.Minute),
+			InitialConversationID: "conv-1500-init",
+		},
+	}
+
+	e.mu.Lock()
+	e.reapExpiredLocked()
+	e.mu.Unlock()
+
+	detail, ok := e.GetRepoDetail("mac-mini", "/work/meta-04")
+	if !ok || len(detail.History) == 0 {
+		t.Fatal("expected repo detail and history")
+	}
+
+	row := detail.History[0]
+	if row.Status != "TIMED_OUT" {
+		t.Fatalf("expected row to be TIMED_OUT, got %s", row.Status)
+	}
+	if row.Reason != "ORPHANED_RUN_EXPIRED" {
+		t.Fatalf("expected ORPHANED_RUN_EXPIRED, got %s", row.Reason)
+	}
+	if !row.Resumable {
+		t.Fatalf("expected row to be marked Resumable: true")
+	}
+	if !strings.Contains(row.ErrorMessage, "Auto-resumed via schedule") && !strings.Contains(row.Remediation, "In-place continuation scheduled") {
+		t.Fatalf("expected auto-resume confirmation in history row, got error=%q remediation=%q", row.ErrorMessage, row.Remediation)
+	}
+
+	// Verify that an auto-resume schedule was enqueued
+	foundResume := false
+	for _, sch := range e.schedules {
+		if sch.ParentJobID == "job-1500" && sch.ResumeFallbackReason == "ORPHANED_RUN_AUTO_RESUME" {
+			foundResume = true
+			if sch.InitialConversationID != "conv-1500-init" {
+				t.Fatalf("expected resumed schedule to preserve initial conversation, got %s", sch.InitialConversationID)
+			}
+			break
+		}
+	}
+	if !foundResume {
+		t.Fatalf("expected auto-resume schedule for job-1500 to be enqueued in engine")
 	}
 }
 

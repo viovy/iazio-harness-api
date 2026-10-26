@@ -3188,8 +3188,14 @@ func (e *Engine) reapExpiredLocked() {
 		repo := e.repos[key]
 		for i := range rows {
 			if rows[i].Status == "RUNNING" || rows[i].Status == "CLAIMED" || rows[i].Status == "CLAIMING" {
+				createdAge := 10 * time.Minute
+				if !rows[i].CreatedAt.IsZero() {
+					createdAge = now.Sub(rows[i].CreatedAt)
+				} else if j, ok := e.jobs[rows[i].JobID]; ok && !j.StartedAt.IsZero() {
+					createdAge = now.Sub(j.StartedAt)
+				}
 				// Startup and dispatch grace window: allow at least 3 minutes for agent spawn, lease ack, and first heartbeat
-				if !rows[i].CreatedAt.IsZero() && now.Sub(rows[i].CreatedAt) < 3*time.Minute {
+				if createdAge < 3*time.Minute {
 					continue
 				}
 
@@ -3210,13 +3216,20 @@ func (e *Engine) reapExpiredLocked() {
 				}
 				if !hasLiveJob {
 					if h, ok := e.hosts[hHost]; ok && h != nil {
-						for _, rstat := range h.RepoStatuses {
-							if rstat.RepoPath == hPath {
-								if (rows[i].StoryID != "" && rstat.ActiveStoryID == rows[i].StoryID) ||
-									(rows[i].ActiveConversationID != "" && rstat.ActiveConversationID == rows[i].ActiveConversationID) ||
-									(rstat.ToolLiveness == "RUNNING" || rstat.ActiveTool != "") {
+						if h.HarnessActive {
+							if rstat, exists := h.RepoStatuses[hPath]; exists {
+								if rstat.ToolLiveness == "RUNNING" || rstat.ActiveStoryID != "" || rstat.ActiveConversationID != "" {
 									hasLiveJob = true
-									break
+								}
+							}
+						} else {
+							for _, rstat := range h.RepoStatuses {
+								if rstat.RepoPath == hPath {
+									if (rows[i].StoryID != "" && rstat.ActiveStoryID == rows[i].StoryID) ||
+										(rows[i].ActiveConversationID != "" && rstat.ActiveConversationID == rows[i].ActiveConversationID) {
+										hasLiveJob = true
+										break
+									}
 								}
 							}
 						}
@@ -3235,7 +3248,7 @@ func (e *Engine) reapExpiredLocked() {
 				if h, ok := e.hosts[hHost]; ok && h != nil && (h.Presence == "ONLINE" || h.Presence == "ONLINE_UPDATING_TOOLS") && now.Sub(h.LastSeen) < EphemeralGrace {
 					hostOnline = true
 				}
-				if hostOnline && now.Sub(rows[i].CreatedAt) < 5*time.Minute {
+				if hostOnline && createdAge < 5*time.Minute {
 					continue
 				}
 
@@ -3245,14 +3258,20 @@ func (e *Engine) reapExpiredLocked() {
 				rows[i].DiagnosticCode = "EXECUTION_TIMEOUT"
 				rows[i].Remediation = "Review execution state and re-queue or resume in place."
 				rows[i].Resumable = true
-				e.notifyHistoryLocked(hHost, hPath, rows[i])
 
-				_, _ = e.resumeRepoInPlaceLocked(hHost, hPath, ResumeOptions{
+				resumedSch, resErr := e.resumeRepoInPlaceLocked(hHost, hPath, ResumeOptions{
 					JobID:                rows[i].JobID,
 					ParentJobID:          rows[i].JobID,
 					PromptTitle:          rows[i].PromptTitle,
 					ResumeFallbackReason: "ORPHANED_RUN_AUTO_RESUME",
 				})
+				if resErr != nil {
+					rows[i].ErrorMessage += fmt.Sprintf(" Auto-resume attempt error: %v.", resErr)
+				} else if resumedSch.ID != "" {
+					rows[i].ErrorMessage += fmt.Sprintf(" Auto-resumed via schedule %s.", resumedSch.ID)
+					rows[i].Remediation = fmt.Sprintf("In-place continuation scheduled (%s). Execution will resume automatically.", resumedSch.ID)
+				}
+				e.notifyHistoryLocked(hHost, hPath, rows[i])
 			}
 		}
 	}
@@ -5083,9 +5102,9 @@ func canonicalizeEngine(engine, convID string) string {
 func resolveResumeIdentity(parentEngine, requestedEngine, convID string, isQuotaExhausted bool, requestedResumeMode, requestedFallbackReason string) (finalEngine, resumeMode, resumeFallbackReason, resumeConvID string) {
 	resumeMode = "pending"
 	resumeConvID = convID
+	resumeFallbackReason = requestedFallbackReason
 	if requestedResumeMode == "fallback_new_conversation" {
 		resumeMode = "fallback_new_conversation"
-		resumeFallbackReason = requestedFallbackReason
 	}
 
 	engineName := requestedEngine
