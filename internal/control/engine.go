@@ -3158,15 +3158,37 @@ func (e *Engine) reapExpiredLocked() {
 		repo := e.repos[key]
 		for i := range rows {
 			if rows[i].Status == "RUNNING" || rows[i].Status == "CLAIMED" || rows[i].Status == "CLAIMING" {
+				// Startup grace window: Never expire a newly dispatched or starting job within 90 seconds
+				if !rows[i].CreatedAt.IsZero() && now.Sub(rows[i].CreatedAt) < 90*time.Second {
+					continue
+				}
+
 				hasLiveJob := false
 				if j, ok := e.jobs[rows[i].JobID]; ok && !j.ExitPosted && (j.Status == "RUNNING" || j.Status == "CANCEL_REQUESTED") {
-					hasLiveJob = true
+					if !j.LeaseExpiry.IsZero() && now.Before(j.LeaseExpiry) {
+						hasLiveJob = true
+					} else if !j.StartedAt.IsZero() && now.Sub(j.StartedAt) < 90*time.Second {
+						hasLiveJob = true
+					} else if !j.LastOutputAt.IsZero() && now.Sub(j.LastOutputAt) < 2*time.Minute {
+						hasLiveJob = true
+					} else if j.Status == "RUNNING" {
+						hasLiveJob = true
+					}
 				}
 				isStale := false
 				if !hasLiveJob {
-					isStale = true
+					if rows[i].CreatedAt.IsZero() || now.Sub(rows[i].CreatedAt) >= 90*time.Second {
+						isStale = true
+					}
 				} else if repo != nil && repo.Lock == LockIdle && repo.RunningJobID != rows[i].JobID {
-					isStale = true
+					if j, ok := e.jobs[rows[i].JobID]; ok {
+						if (!j.LeaseExpiry.IsZero() && now.After(j.LeaseExpiry)) ||
+							(!j.LastOutputAt.IsZero() && now.Sub(j.LastOutputAt) > 5*time.Minute) {
+							isStale = true
+						}
+					} else if rows[i].CreatedAt.IsZero() || now.Sub(rows[i].CreatedAt) >= 90*time.Second {
+						isStale = true
+					}
 				}
 				if isStale {
 					rows[i].Status = "TIMED_OUT"

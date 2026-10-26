@@ -442,3 +442,40 @@ func TestE2E_GlobalQueue_ZipkinTraceContinuity(t *testing.T) {
 		t.Fatalf("expected Zipkin URL %s, got %s", expectedZipkinURL, claimed.ZipkinTraceURL)
 	}
 }
+
+func TestE2E_GlobalQueue_OrphanedRunStartupGraceWindow(t *testing.T) {
+	eng := control.NewEngine(nil)
+	queue := dispatch.NewInMemoryQueue()
+	srv := &httpserver.Server{Engine: eng, Queue: queue}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. Host registers repo
+	eng.RegisterHost("host-1", "permanent")
+	_ = eng.UpsertRepo(control.Repo{HostID: "host-1", WorktreePath: "/work/sample-repo"})
+
+	// 2. Freshly dispatched job created 15 seconds ago
+	key := "host-1\x00/work/sample-repo"
+	eng.SetHistory(key, []control.HistoryRow{
+		{
+			JobID:       "job-1509",
+			ScheduleID:  "sch-1508",
+			PromptTitle: "dispatch run",
+			Engine:      "agy",
+			Status:      "RUNNING",
+			CreatedAt:   time.Now().UTC().Add(-15 * time.Second),
+		},
+	})
+
+	// 3. Query repo detail (which triggers reapExpiredLocked internally)
+	detail, ok := eng.GetRepoDetail("host-1", "/work/sample-repo")
+	if !ok || len(detail.History) == 0 {
+		t.Fatal("expected repo detail and history")
+	}
+
+	// 4. Verify job was NOT prematurely transitioned to TIMED_OUT / ORPHANED_RUN_EXPIRED
+	if detail.History[0].Status != "RUNNING" {
+		t.Fatalf("expected job to remain RUNNING within 90s grace window, got %s (reason: %s)",
+			detail.History[0].Status, detail.History[0].Reason)
+	}
+}
