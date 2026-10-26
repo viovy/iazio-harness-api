@@ -2732,6 +2732,7 @@ func TestReapExpiredLocked_OrphanedHistoryReconciled(t *testing.T) {
 	}
 
 	row := detail.History[0]
+	t.Logf("row ErrorMessage: %q, Remediation: %q", row.ErrorMessage, row.Remediation)
 	if row.Status != "TIMED_OUT" {
 		t.Fatalf("expected history row to transition to TIMED_OUT, got %s", row.Status)
 	}
@@ -2743,21 +2744,21 @@ func TestReapExpiredLocked_OrphanedHistoryReconciled(t *testing.T) {
 	}
 }
 
-func TestReapExpiredLocked_FreshJobNotReaped(t *testing.T) {
+func TestReapExpiredLocked_GracePeriodProtectsRecentDispatches(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("mac-mini", "permanent")
 	_ = e.UpsertRepo(Repo{HostID: "mac-mini", WorktreePath: "/work/meta-04"})
 
-	// Inject a freshly created RUNNING history row (created 10s ago, within 90s grace window)
+	// Inject a freshly dispatched RUNNING history row (created 30s ago)
 	key := repoKey("mac-mini", "/work/meta-04")
 	e.history[key] = []HistoryRow{
 		{
-			JobID:       "job-1509",
-			ScheduleID:  "sch-1508",
-			PromptTitle: "governance run",
-			Engine:      "agy",
+			JobID:       "job-1500",
+			ScheduleID:  "sch-1500",
+			PromptTitle: "dispatch test",
+			Engine:      "mock-agy",
 			Status:      "RUNNING",
-			CreatedAt:   time.Now().Add(-10 * time.Second),
+			CreatedAt:   time.Now().Add(-30 * time.Second),
 		},
 	}
 
@@ -2772,8 +2773,191 @@ func TestReapExpiredLocked_FreshJobNotReaped(t *testing.T) {
 	}
 
 	row := detail.History[0]
+	t.Logf("row ErrorMessage: %q, Remediation: %q", row.ErrorMessage, row.Remediation)
 	if row.Status != "RUNNING" {
-		t.Fatalf("expected fresh history row within 90s grace window to remain RUNNING, got %s (reason: %s)", row.Status, row.Reason)
+		t.Fatalf("expected recent history row to remain RUNNING within grace period, got %s", row.Status)
+	}
+}
+
+func TestReapExpiredLocked_ActiveHostLivenessProtectsRunningJob(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{HostID: "mac-mini", WorktreePath: "/work/meta-04"})
+
+	// Set host repo status showing active tool running
+	h := e.hosts["mac-mini"]
+	h.Presence = "ONLINE"
+	h.LastSeen = time.Now()
+	h.RepoStatuses = map[string]RepoRuntimeStatus{
+		"/work/meta-04": {
+			RepoPath:     "/work/meta-04",
+			ToolLiveness: "RUNNING",
+			ActiveTool:   "mock-agy",
+		},
+	}
+
+	// Inject an older RUNNING history row (> 3 min ago, but within 5 min host liveness window)
+	key := repoKey("mac-mini", "/work/meta-04")
+	e.history[key] = []HistoryRow{
+		{
+			JobID:       "job-1509",
+			ScheduleID:  "sch-1509",
+			PromptTitle: "liveness test",
+			Engine:      "mock-agy",
+			Status:      "RUNNING",
+			CreatedAt:   time.Now().Add(-200 * time.Second),
+		},
+	}
+
+	// Trigger reap
+	e.mu.Lock()
+	e.reapExpiredLocked()
+	e.mu.Unlock()
+
+	detail, ok := e.GetRepoDetail("mac-mini", "/work/meta-04")
+	if !ok || len(detail.History) == 0 {
+		t.Fatal("expected repo detail and history")
+	}
+
+	row := detail.History[0]
+	t.Logf("row ErrorMessage: %q, Remediation: %q", row.ErrorMessage, row.Remediation)
+	if row.Status != "RUNNING" {
+		t.Fatalf("expected active host process to protect history row, got %s", row.Status)
+	}
+}
+
+func TestReapExpiredLocked_ZeroCreatedAtTreatedWithGracePeriod(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{HostID: "mac-mini", WorktreePath: "/work/meta-04"})
+
+	key := repoKey("mac-mini", "/work/meta-04")
+	e.history[key] = []HistoryRow{
+		{
+			JobID:       "job-1500-zero-created",
+			ScheduleID:  "sch-1500",
+			PromptTitle: "dispatch test zero created",
+			Engine:      "mock-agy",
+			Status:      "RUNNING",
+			// CreatedAt is intentionally zero
+		},
+	}
+
+	e.mu.Lock()
+	e.reapExpiredLocked()
+	e.mu.Unlock()
+
+	detail, ok := e.GetRepoDetail("mac-mini", "/work/meta-04")
+	if !ok || len(detail.History) == 0 {
+		t.Fatal("expected repo detail and history")
+	}
+
+	row := detail.History[0]
+	if row.Status != "RUNNING" {
+		t.Fatalf("expected row with zero CreatedAt to remain RUNNING within grace period, got %s", row.Status)
+	}
+}
+
+func TestReapExpiredLocked_ActiveJobPIDProtectsJobFromExpiry(t *testing.T) {
+	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return now })
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{HostID: "mac-mini", WorktreePath: "/work/meta-04"})
+
+	// Agent heartbeats reporting ActiveJob with live OS PID
+	_ = e.HeartbeatDetailed("mac-mini", "ONLINE", nil, false, ActiveJob{
+		JobID:        "job-1509-live-pid",
+		WorktreePath: "/work/meta-04",
+		PID:          45678,
+	})
+
+	key := repoKey("mac-mini", "/work/meta-04")
+	e.history[key] = []HistoryRow{
+		{
+			JobID:       "job-1509-live-pid",
+			ScheduleID:  "sch-1509",
+			PromptTitle: "live pid test",
+			Engine:      "mock-agy",
+			Status:      "RUNNING",
+			CreatedAt:   now.Add(-15 * time.Minute), // older than 3m or 5m grace
+		},
+	}
+
+	e.mu.Lock()
+	e.reapExpiredLocked()
+	e.mu.Unlock()
+
+	detail, ok := e.GetRepoDetail("mac-mini", "/work/meta-04")
+	if !ok || len(detail.History) == 0 {
+		t.Fatal("expected repo detail and history")
+	}
+
+	row := detail.History[0]
+	if row.Status != "RUNNING" {
+		t.Fatalf("expected active PID to protect running job from expiry, got %s", row.Status)
+	}
+}
+
+func TestReapExpiredLocked_AutoResumesOrphanedRun(t *testing.T) {
+	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return now })
+	e.RegisterHost("mac-mini", "permanent")
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: "/work/meta-04",
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	key := repoKey("mac-mini", "/work/meta-04")
+	e.history[key] = []HistoryRow{
+		{
+			JobID:                "job-1500",
+			ScheduleID:           "sch-1500",
+			PromptTitle:          "orphaned run test",
+			Engine:               "mock-agy",
+			Status:               "RUNNING",
+			CreatedAt:            now.Add(-10 * time.Minute),
+			InitialConversationID: "conv-1500-init",
+		},
+	}
+
+	e.mu.Lock()
+	e.reapExpiredLocked()
+	e.mu.Unlock()
+
+	detail, ok := e.GetRepoDetail("mac-mini", "/work/meta-04")
+	if !ok || len(detail.History) == 0 {
+		t.Fatal("expected repo detail and history")
+	}
+
+	row := detail.History[0]
+	if row.Status != "TIMED_OUT" {
+		t.Fatalf("expected row to be TIMED_OUT, got %s", row.Status)
+	}
+	if row.Reason != "ORPHANED_RUN_EXPIRED" {
+		t.Fatalf("expected ORPHANED_RUN_EXPIRED, got %s", row.Reason)
+	}
+	if !row.Resumable {
+		t.Fatalf("expected row to be marked Resumable: true")
+	}
+	if !strings.Contains(row.ErrorMessage, "Auto-resumed via schedule") && !strings.Contains(row.Remediation, "In-place continuation scheduled") {
+		t.Fatalf("expected auto-resume confirmation in history row, got error=%q remediation=%q", row.ErrorMessage, row.Remediation)
+	}
+
+	// Verify that an auto-resume schedule was enqueued
+	foundResume := false
+	for _, sch := range e.schedules {
+		if sch.ParentJobID == "job-1500" && sch.ResumeFallbackReason == "ORPHANED_RUN_AUTO_RESUME" {
+			foundResume = true
+			if sch.InitialConversationID != "conv-1500-init" {
+				t.Fatalf("expected resumed schedule to preserve initial conversation, got %s", sch.InitialConversationID)
+			}
+			break
+		}
+	}
+	if !foundResume {
+		t.Fatalf("expected auto-resume schedule for job-1500 to be enqueued in engine")
 	}
 }
 
@@ -4649,6 +4833,44 @@ func TestReconcileHistoricalFailureTaxonomy_ReconcilesJob1506AndCompletedSuccess
 	defer savedMu.Unlock()
 	if len(savedRows) < 2 {
 		t.Fatalf("expected at least 2 saved history notifications for DB persistence, got %d", len(savedRows))
+	}
+}
+
+func TestReconcileHistoricalFailureTaxonomy_ReconcilesJob1500And1509(t *testing.T) {
+	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return now })
+
+	e.history["mac-mini\x00/work/repo"] = []HistoryRow{
+		{
+			JobID:         "job-1500",
+			Status:        "TIMED_OUT",
+			Reason:        "ORPHANED_RUN_EXPIRED",
+			ZipkinTraceID: "job15000000000000000000000000000", // invalid non-hex
+		},
+		{
+			JobID:         "job-1509",
+			Status:        "TIMED_OUT",
+			Reason:        "ORPHANED_RUN_EXPIRED",
+			ZipkinTraceID: "job15090000000000000000000000000", // invalid non-hex
+		},
+	}
+
+	count := e.ReconcileHistoricalFailureTaxonomy()
+	if count < 2 {
+		t.Fatalf("expected at least 2 reconciled records, got %d", count)
+	}
+
+	rows := e.history["mac-mini\x00/work/repo"]
+	for _, r := range rows {
+		if !r.Resumable {
+			t.Fatalf("expected row %s to be Resumable: true", r.JobID)
+		}
+		if len(r.ZipkinTraceID) != 32 || !isHexString(r.ZipkinTraceID) {
+			t.Fatalf("expected row %s ZipkinTraceID to be valid 32-hex, got %q", r.JobID, r.ZipkinTraceID)
+		}
+		if !strings.HasPrefix(r.Traceparent, "00-"+r.ZipkinTraceID) {
+			t.Fatalf("expected row %s Traceparent to match W3C format, got %q", r.JobID, r.Traceparent)
+		}
 	}
 }
 

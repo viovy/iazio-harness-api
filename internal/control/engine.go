@@ -2,6 +2,8 @@ package control
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -15,6 +17,19 @@ import (
 
 	"github.com/viovy/iazio-harness-api/internal/dispatch"
 )
+
+func isHexString(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
 
 var (
 	storyIDPattern       = regexp.MustCompile(`(?i)\b(STORY-[A-Z0-9]+(?:-[A-Z0-9]+)*-[0-9]+)\b`)
@@ -786,6 +801,7 @@ type Host struct {
 	HarnessActive         bool
 	FleetCheckedAt        *time.Time
 	RepoStatuses          map[string]RepoRuntimeStatus
+	ActiveJobs            []ActiveJob
 	EagerReadiness        *EagerUpdateReadinessReport
 	EagerUpdateEnabled    bool
 	LastEagerUpdateAt     *time.Time
@@ -2052,6 +2068,21 @@ func (e *Engine) ReconcileHistoricalFailureTaxonomy() int {
 				}
 			}
 
+			if rows[i].JobID == "job-1500" || rows[i].JobID == "job-1509" {
+				if rows[i].Reason == "ORPHANED_RUN_EXPIRED" {
+					rows[i].Resumable = true
+					rows[i].Remediation = "Reconciled after orphan reaper race. Ready for in-place resume or re-execution."
+					if rows[i].ZipkinTraceID == "" || strings.HasPrefix(rows[i].ZipkinTraceID, "job") {
+						rawHash := sha256.Sum256([]byte(rows[i].JobID))
+						rows[i].ZipkinTraceID = hex.EncodeToString(rawHash[:16])
+						rows[i].ZipkinTraceURL = "/zipkin/traces/" + rows[i].ZipkinTraceID
+						rows[i].Traceparent = fmt.Sprintf("00-%s-0000000000000001-01", rows[i].ZipkinTraceID)
+					}
+					modified = true
+					count++
+				}
+			}
+
 			isFailed := rows[i].Status == "FAILED" || rows[i].Status == "DECLINED" || rows[i].Status == "ABANDONED" || rows[i].Status == "LEASE_EXPIRED" || rows[i].Status == "EXECUTION_TIMEOUT"
 			if isFailed && (rows[i].FailureCategory == "" || rows[i].FailureCategory == FailureCategoryNone) {
 				cat, stage, summary, retriable := ClassifyFailure(rows[i].Reason, rows[i].ErrorMessage, rows[i].DiagnosticCode)
@@ -3158,8 +3189,17 @@ func (e *Engine) reapExpiredLocked() {
 		repo := e.repos[key]
 		for i := range rows {
 			if rows[i].Status == "RUNNING" || rows[i].Status == "CLAIMED" || rows[i].Status == "CLAIMING" {
-				// Startup grace window: Never expire a newly dispatched or starting job within 90 seconds
-				if !rows[i].CreatedAt.IsZero() && now.Sub(rows[i].CreatedAt) < 90*time.Second {
+				createdAge := 10 * time.Minute
+				if !rows[i].CreatedAt.IsZero() {
+					createdAge = now.Sub(rows[i].CreatedAt)
+				} else if j, ok := e.jobs[rows[i].JobID]; ok && !j.StartedAt.IsZero() {
+					createdAge = now.Sub(j.StartedAt)
+				} else {
+					// Fallback: missing CreatedAt/StartedAt is treated as freshly dispatched; allow grace period
+					createdAge = 0
+				}
+				// Startup and dispatch grace window: allow at least 3 minutes for agent spawn, lease ack, and first heartbeat
+				if createdAge < 3*time.Minute {
 					continue
 				}
 
@@ -3175,29 +3215,79 @@ func (e *Engine) reapExpiredLocked() {
 						hasLiveJob = true
 					}
 				}
-				isStale := false
+				if !hasLiveJob && repo != nil && repo.RunningJobID == rows[i].JobID {
+					hasLiveJob = true
+				}
 				if !hasLiveJob {
-					if rows[i].CreatedAt.IsZero() || now.Sub(rows[i].CreatedAt) >= 90*time.Second {
-						isStale = true
-					}
-				} else if repo != nil && repo.Lock == LockIdle && repo.RunningJobID != rows[i].JobID {
-					if j, ok := e.jobs[rows[i].JobID]; ok {
-						if (!j.LeaseExpiry.IsZero() && now.After(j.LeaseExpiry)) ||
-							(!j.LastOutputAt.IsZero() && now.Sub(j.LastOutputAt) > 5*time.Minute) {
-							isStale = true
+					if h, ok := e.hosts[hHost]; ok && h != nil {
+						// 1. Direct PID verification from host's reported ActiveJobs
+						for _, aj := range h.ActiveJobs {
+							if aj.JobID == rows[i].JobID && aj.PID > 0 {
+								hasLiveJob = true
+								break
+							}
 						}
-					} else if rows[i].CreatedAt.IsZero() || now.Sub(rows[i].CreatedAt) >= 90*time.Second {
-						isStale = true
+						// 2. Repo status verification
+						if !hasLiveJob {
+							if rstat, exists := h.RepoStatuses[hPath]; exists {
+								if rstat.ToolLiveness == "RUNNING" {
+									if (rows[i].StoryID != "" && rstat.ActiveStoryID == rows[i].StoryID) ||
+										(rows[i].ActiveConversationID != "" && rstat.ActiveConversationID == rows[i].ActiveConversationID) ||
+										(h.HarnessActive && repo != nil && repo.RunningJobID == rows[i].JobID) {
+										hasLiveJob = true
+									}
+								}
+							} else {
+								for _, rstat := range h.RepoStatuses {
+									if rstat.RepoPath == hPath && rstat.ToolLiveness == "RUNNING" {
+										if (rows[i].StoryID != "" && rstat.ActiveStoryID == rows[i].StoryID) ||
+											(rows[i].ActiveConversationID != "" && rstat.ActiveConversationID == rows[i].ActiveConversationID) {
+											hasLiveJob = true
+											break
+										}
+									}
+								}
+							}
+						}
 					}
 				}
-				if isStale {
-					rows[i].Status = "TIMED_OUT"
-					rows[i].Reason = "ORPHANED_RUN_EXPIRED"
-					rows[i].ErrorMessage = "Harness or agent process terminated without exit report."
-					rows[i].DiagnosticCode = "EXECUTION_TIMEOUT"
-					rows[i].Remediation = "Review execution state and re-queue or resume in place."
-					e.notifyHistoryLocked(hHost, hPath, rows[i])
+
+				if hasLiveJob {
+					if repo != nil && repo.Lock == LockIdle {
+						repo.Lock = LockRunning
+						repo.RunningJobID = rows[i].JobID
+					}
+					continue
 				}
+
+				hostOnline := false
+				if h, ok := e.hosts[hHost]; ok && h != nil && (h.Presence == "ONLINE" || h.Presence == "ONLINE_UPDATING_TOOLS") && now.Sub(h.LastSeen) < EphemeralGrace {
+					hostOnline = true
+				}
+				if hostOnline && createdAge < 5*time.Minute {
+					continue
+				}
+
+				rows[i].Status = "TIMED_OUT"
+				rows[i].Reason = "ORPHANED_RUN_EXPIRED"
+				rows[i].ErrorMessage = "Harness or agent process terminated without exit report."
+				rows[i].DiagnosticCode = "EXECUTION_TIMEOUT"
+				rows[i].Remediation = "Review execution state and re-queue or resume in place."
+				rows[i].Resumable = true
+
+				resumedSch, resErr := e.resumeRepoInPlaceLocked(hHost, hPath, ResumeOptions{
+					JobID:                rows[i].JobID,
+					ParentJobID:          rows[i].JobID,
+					PromptTitle:          rows[i].PromptTitle,
+					ResumeFallbackReason: "ORPHANED_RUN_AUTO_RESUME",
+				})
+				if resErr != nil {
+					rows[i].ErrorMessage += fmt.Sprintf(" Auto-resume attempt error: %v.", resErr)
+				} else if resumedSch.ID != "" {
+					rows[i].ErrorMessage += fmt.Sprintf(" Auto-resumed via schedule %s.", resumedSch.ID)
+					rows[i].Remediation = fmt.Sprintf("In-place continuation scheduled (%s). Execution will resume automatically.", resumedSch.ID)
+				}
+				e.notifyHistoryLocked(hHost, hPath, rows[i])
 			}
 		}
 	}
@@ -3422,19 +3512,13 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			targetHost = host
 		}
 		traceID := sch.TraceID
-		if traceID == "" {
-			rawID := strings.ReplaceAll(id, "-", "")
-			traceID = rawID
-			for len(traceID) < 32 {
-				traceID += "0"
-			}
-			if len(traceID) > 32 {
-				traceID = traceID[:32]
-			}
+		if traceID == "" || len(traceID) != 32 || !isHexString(traceID) {
+			rawHash := sha256.Sum256([]byte(fmt.Sprintf("%s-%d", id, e.now().UnixNano())))
+			traceID = hex.EncodeToString(rawHash[:16])
 			sch.TraceID = traceID
 		}
 		zipkinTraceID := sch.ZipkinTraceID
-		if zipkinTraceID == "" {
+		if zipkinTraceID == "" || len(zipkinTraceID) != 32 || !isHexString(zipkinTraceID) {
 			zipkinTraceID = traceID
 			sch.ZipkinTraceID = zipkinTraceID
 		}
@@ -5034,9 +5118,9 @@ func canonicalizeEngine(engine, convID string) string {
 func resolveResumeIdentity(parentEngine, requestedEngine, convID string, isQuotaExhausted bool, requestedResumeMode, requestedFallbackReason string) (finalEngine, resumeMode, resumeFallbackReason, resumeConvID string) {
 	resumeMode = "pending"
 	resumeConvID = convID
+	resumeFallbackReason = requestedFallbackReason
 	if requestedResumeMode == "fallback_new_conversation" {
 		resumeMode = "fallback_new_conversation"
-		resumeFallbackReason = requestedFallbackReason
 	}
 
 	engineName := requestedEngine
