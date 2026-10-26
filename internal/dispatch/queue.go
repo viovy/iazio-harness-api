@@ -693,18 +693,20 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 			continue
 		}
 
-		j.HeartbeatAt = &now
 		expires := now.Add(DefaultHeartbeatTimeout)
+		if q.store != nil {
+			if err := q.store.UpdateQueueJobLease(ctx, j.ID, hostID, j.FencingToken, now, expires); err != nil {
+				log.Printf("[dispatch-queue] ERROR: failed to persist lease update for %s: %v", j.ID, err)
+				continue
+			}
+		}
+
+		j.HeartbeatAt = &now
 		j.LeaseExpiresAt = &expires
 		j.LeaseOwner = hostID
 		j.LeaseVersion = j.FencingToken
 		if j.Status == JobStatusLeased || j.Status == JobStatusClaimed {
 			j.Status = JobStatusRunning
-		}
-		if q.store != nil {
-			if err := q.store.UpdateQueueJobLease(ctx, j.ID, hostID, j.FencingToken, now, expires); err != nil {
-				log.Printf("[dispatch-queue] WARN: failed to persist lease update for %s: %v", j.ID, err)
-			}
 		}
 		extended = append(extended, j.ID)
 	}
@@ -750,7 +752,9 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 			}
 			if q.store != nil {
 				if err := q.store.UpdateQueueJobLease(ctx, jobID, hostID, q.jobs[jobID].FencingToken, now, expires); err != nil {
-					log.Printf("[dispatch-queue] WARN: failed to persist rehydrated lease for %s: %v", jobID, err)
+					log.Printf("[dispatch-queue] ERROR: failed to persist rehydrated lease for %s: %v", jobID, err)
+					delete(q.jobs, jobID)
+					continue
 				}
 			}
 			extended = append(extended, jobID)

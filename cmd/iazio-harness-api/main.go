@@ -81,7 +81,7 @@ func run(ctx context.Context, args []string) error {
 		if srv.Queue != nil {
 			if inMem, ok := srv.Queue.(*dispatch.InMemoryQueue); ok {
 				if err := inMem.SetStore(store); err != nil {
-					log.Printf("warning: queue set store failed: %v", err)
+					return fmt.Errorf("queue set store: %w", err)
 				}
 			}
 		}

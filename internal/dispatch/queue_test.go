@@ -1072,10 +1072,11 @@ func TestCompleteWithFencing_AcceptsCompletionOnReconcilableFailure(t *testing.T
 }
 
 type mockQueueStore struct {
-	mu        sync.Mutex
-	saved     map[string]*Job
-	leases    map[string]int64
-	completed map[string]string
+	mu              sync.Mutex
+	saved           map[string]*Job
+	leases          map[string]int64
+	completed       map[string]string
+	failUpdateLease bool
 }
 
 func newMockQueueStore() *mockQueueStore {
@@ -1108,6 +1109,9 @@ func (m *mockQueueStore) LoadQueueJobs(ctx context.Context) ([]*Job, error) {
 func (m *mockQueueStore) UpdateQueueJobLease(ctx context.Context, jobID string, leaseOwner string, leaseVersion int64, heartbeatAt, expiresAt time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.failUpdateLease {
+		return errors.New("simulated store failure")
+	}
 	m.leases[jobID] = leaseVersion
 	if j, ok := m.saved[jobID]; ok {
 		j.LeaseOwner = leaseOwner
@@ -1196,6 +1200,56 @@ func TestQueue_DurableQueueStore_RestartRehydrationAndFencing(t *testing.T) {
 		t.Fatalf("expected store to record completed status, got %s", store.completed[job.ID])
 	}
 	store.mu.Unlock()
+}
+
+func TestExtendLeasesForHost_FailsClosedOnStoreError(t *testing.T) {
+	ctx := context.Background()
+	store := newMockQueueStore()
+	store.failUpdateLease = true
+
+	q := NewInMemoryQueue()
+	if err := q.SetStore(store); err != nil {
+		t.Fatalf("SetStore failed: %v", err)
+	}
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type: JobTypePromptExecute,
+		Repo: "leaf-failclosed",
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	claimed, err := q.Claim(ctx, "host-1", nil)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+
+	originalExpires := *claimed.LeaseExpiresAt
+
+	// Advance clock slightly (within lease window)
+	now := claimed.HeartbeatAt.Add(10 * time.Second)
+	q.SetNowFunc(func() time.Time { return now })
+
+	extended, err := q.ExtendLeasesForHost(ctx, "host-1", []string{job.ID})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(extended) != 0 {
+		t.Fatalf("expected 0 extended jobs when store fails, got %d", len(extended))
+	}
+
+	// Verify in-memory expiration was not extended to now + DefaultHeartbeatTimeout
+	j, ok := q.Get(job.ID)
+	if !ok || j == nil {
+		t.Fatalf("expected job %s to exist in queue", job.ID)
+	}
+	if j.LeaseExpiresAt == nil {
+		t.Fatalf("expected non-nil LeaseExpiresAt")
+	}
+	if !j.LeaseExpiresAt.Equal(originalExpires) {
+		t.Fatalf("expected lease expiration %v to remain unchanged on store failure, got %v", originalExpires, *j.LeaseExpiresAt)
+	}
 }
 
 
