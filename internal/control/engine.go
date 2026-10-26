@@ -526,6 +526,9 @@ type Tool struct {
 	Name             string   `json:"name"`
 	Path             string   `json:"path"`
 	Version          string   `json:"version"`
+	CommitSHA        string   `json:"commit_sha,omitempty"`
+	TargetVersion    string   `json:"target_version,omitempty"`
+	TargetCommitSHA  string   `json:"target_commit_sha,omitempty"`
 	Status           string   `json:"status"`
 	ServiceInstalled bool     `json:"service_installed,omitempty"`
 	ServiceType      string   `json:"service_type,omitempty"`
@@ -786,6 +789,7 @@ type Host struct {
 	EagerReadiness        *EagerUpdateReadinessReport
 	EagerUpdateEnabled    bool
 	LastEagerUpdateAt     *time.Time
+	DiscoveredDevBinaries []string
 }
 
 // PingAck is a live acknowledgment from an agent responding to a PING command.

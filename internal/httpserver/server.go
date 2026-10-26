@@ -336,9 +336,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/hosts/{id}/heartbeat", s.heartbeat)
 	mux.HandleFunc("POST /v1/hosts/{id}/tools/update", s.queueToolUpdate)
 	mux.HandleFunc("POST /v1/hosts/{id}/tools/{tool}/update", s.queueToolUpdate)
+	mux.HandleFunc("POST /v1/hosts/{id}/tools/force-update", s.queueToolUpdate)
 	mux.HandleFunc("POST /v1/fleet/agents/{id}/tools/{tool}/force-update", s.queueToolUpdate)
+	mux.HandleFunc("POST /api/v1/agents/{id}/tools/update", s.queueToolUpdate)
+	mux.HandleFunc("POST /api/v1/agents/{id}/tools/{tool}/update", s.queueToolUpdate)
+	mux.HandleFunc("POST /api/v1/agents/{id}/tools/force-update", s.queueToolUpdate)
 	mux.HandleFunc("POST /api/v1/agents/{id}/tools/{tool}/force-update", s.queueToolUpdate)
+	mux.HandleFunc("POST /api/agents/{id}/tools/update", s.queueToolUpdate)
+	mux.HandleFunc("POST /api/agents/{id}/tools/{tool}/update", s.queueToolUpdate)
+	mux.HandleFunc("POST /api/agents/{id}/tools/force-update", s.queueToolUpdate)
 	mux.HandleFunc("POST /api/agents/{id}/tools/{tool}/force-update", s.queueToolUpdate)
+	mux.HandleFunc("POST /v1/hosts/{id}/tools/cleanup-binaries", s.queueToolCleanupBinaries)
+	mux.HandleFunc("POST /v1/hosts/{id}/tools/{tool}/cleanup-binaries", s.queueToolCleanupBinaries)
+	mux.HandleFunc("POST /api/v1/agents/{id}/tools/cleanup-binaries", s.queueToolCleanupBinaries)
+	mux.HandleFunc("POST /api/v1/agents/{id}/tools/{tool}/cleanup-binaries", s.queueToolCleanupBinaries)
+	mux.HandleFunc("POST /api/agents/{id}/tools/cleanup-binaries", s.queueToolCleanupBinaries)
+	mux.HandleFunc("POST /api/agents/{id}/tools/{tool}/cleanup-binaries", s.queueToolCleanupBinaries)
 	mux.HandleFunc("POST /v1/hosts/{id}/poll", s.pollHost)
 	mux.HandleFunc("GET /v1/hosts/{host}/repos", s.repoDetail)
 	mux.HandleFunc("DELETE /v1/hosts/{host}/repos", s.unregisterRepo)
@@ -1717,12 +1730,16 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		SupportedCapabilities []string `json:"supported_capabilities"`
 		Version               string     `json:"version"`
 		CommitSHA             string     `json:"commit_sha"`
+		DiscoveredDevBinaries []string   `json:"discovered_dev_binaries"`
 		EagerUpdateEnabled    bool       `json:"eager_update_enabled"`
 		LastEagerUpdateAt     *time.Time `json:"last_eager_update_at"`
 		Tools                 []struct {
 			Name             string   `json:"name"`
 			Path             string   `json:"path"`
 			Version          string   `json:"version"`
+			CommitSHA        string   `json:"commit_sha"`
+			TargetVersion    string   `json:"target_version"`
+			TargetCommitSHA  string   `json:"target_commit_sha"`
 			Status           string   `json:"status"`
 			ServiceInstalled bool     `json:"service_installed"`
 			ServiceType      string   `json:"service_type"`
@@ -1750,6 +1767,9 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 			Name:             t.Name,
 			Path:             t.Path,
 			Version:          t.Version,
+			CommitSHA:        t.CommitSHA,
+			TargetVersion:    t.TargetVersion,
+			TargetCommitSHA:  t.TargetCommitSHA,
 			Status:           t.Status,
 			ServiceInstalled: t.ServiceInstalled,
 			ServiceType:      t.ServiceType,
@@ -1776,6 +1796,9 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Engine.SetHostEagerUpdate(hostID, raw.EagerUpdateEnabled, raw.LastEagerUpdateAt)
+	if len(raw.DiscoveredDevBinaries) > 0 {
+		s.Engine.SetHostDevBinaries(hostID, raw.DiscoveredDevBinaries)
+	}
 	if s.SaveHost != nil {
 		if detail, ok := s.Engine.GetHostDetail(hostID); ok {
 			s.SaveHost(detail.Host)
@@ -1909,6 +1932,7 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 
 	var body struct {
 		Tools         []string `json:"tools"`
+		Tool          string   `json:"tool,omitempty"`
 		Force         bool     `json:"force"`
 		TargetVersion string   `json:"target_version,omitempty"`
 		Version       string   `json:"version,omitempty"`
@@ -1920,6 +1944,9 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if body.Tool != "" && len(body.Tools) == 0 {
+		body.Tools = []string{body.Tool}
+	}
 	toolParam := strings.TrimSpace(r.PathValue("tool"))
 	if toolParam != "" {
 		body.Tools = []string{toolParam}
@@ -1927,6 +1954,8 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/force-update") {
 			body.Force = true
 		}
+	} else if strings.HasSuffix(r.URL.Path, "/force-update") {
+		body.Force = true
 	}
 	if body.TargetVersion == "" && body.Version != "" {
 		body.TargetVersion = body.Version
@@ -1949,6 +1978,19 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(os.Stderr, "[server] host %s profile %q not found, falling back to generic: %v\n", hostID, profileName, err)
 		}
 		p, _ = s.Engine.GetProfile("generic")
+	}
+
+	isWildcard := len(body.Tools) == 1 && (body.Tools[0] == "*" || strings.EqualFold(body.Tools[0], "all"))
+	if isWildcard || len(body.Tools) == 0 {
+		if p != nil && len(p.Tools) > 0 {
+			var allTools []string
+			for _, pt := range p.Tools {
+				allTools = append(allTools, pt.Name)
+			}
+			body.Tools = allTools
+		} else {
+			body.Tools = []string{"autopilot", "iazio-agent", "iazio-harvester", "iazio-mcp", "iazio-harness"}
+		}
 	}
 
 	// Validate tool existence across all requested tools (F6, N4-R, R4, H2)
@@ -2116,7 +2158,58 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 	if body.TargetVersion != "" {
 		resp["target_version"] = body.TargetVersion
 	}
+	if body.Force {
+		forcePayload, _ := json.Marshal(map[string]any{
+			"tools":          body.Tools,
+			"force":          true,
+			"target_version": body.TargetVersion,
+		})
+		_ = s.Engine.QueueCommand(hostID, control.CommandEnvelope{
+			ID:        fmt.Sprintf("force-update-%d", time.Now().UnixNano()),
+			Type:      "FORCE_TOOL_UPDATE",
+			Payload:   string(forcePayload),
+			CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		})
+	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) queueToolCleanupBinaries(w http.ResponseWriter, r *http.Request) {
+	hostID := r.PathValue("id")
+	if hostID == "" {
+		hostID = r.PathValue("host")
+	}
+	_, ok := s.Engine.GetHostDetail(hostID)
+	if !ok {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("host not found: %s", hostID))
+		return
+	}
+
+	var body struct {
+		DryRun bool `json:"dry_run"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
+
+	cmdPayload, _ := json.Marshal(map[string]any{
+		"action":  "cleanup-binaries",
+		"dry_run": body.DryRun,
+	})
+	_ = s.Engine.QueueCommand(hostID, control.CommandEnvelope{
+		ID:        fmt.Sprintf("cleanup-%d", time.Now().UnixNano()),
+		Type:      "CLEANUP_BINARIES",
+		Payload:   string(cmdPayload),
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "queued",
+		"host_id": hostID,
+		"action":  "cleanup-binaries",
+		"dry_run": body.DryRun,
+		"message": fmt.Sprintf("dev binary cleanup queued for agent host %s", hostID),
+	})
 }
 
 func (s *Server) queueAllToolsUpdate(w http.ResponseWriter, r *http.Request) {
