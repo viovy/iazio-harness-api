@@ -17,9 +17,11 @@ type ClaimJobRequest struct {
 
 // CompleteJobRequest is sent by an iazio-agent daemon to report job outcome.
 type CompleteJobRequest struct {
-	FencingToken int64           `json:"fencing_token,omitempty"`
-	Result       json.RawMessage `json:"result,omitempty"`
-	Error        string          `json:"error,omitempty"`
+	FencingToken          int64           `json:"fencing_token,omitempty"`
+	Result                json.RawMessage `json:"result,omitempty"`
+	Error                 string          `json:"error,omitempty"`
+	FinalTurnCount        int             `json:"final_turn_count,omitempty"`
+	FinalTranscriptSHA256 string          `json:"final_transcript_sha256,omitempty"`
 }
 
 // HeartbeatJobRequest is sent by an iazio-agent daemon to extend its execution lease.
@@ -124,6 +126,10 @@ func (h *AgentJobsHandler) CompleteHandler(w http.ResponseWriter, r *http.Reques
 		}
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+
+	if req.FinalTurnCount > 0 || req.FinalTranscriptSHA256 != "" {
+		h.queue.SetFinalHarvest(jobID, req.FinalTurnCount, req.FinalTranscriptSHA256)
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")

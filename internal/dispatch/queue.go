@@ -173,6 +173,8 @@ type Job struct {
 	FailureStage         string            `json:"failure_stage,omitempty"`
 	FailureReasonSummary string            `json:"failure_reason_summary,omitempty"`
 	Retriable            bool              `json:"retriable"`
+	FinalTurnCount        int               `json:"final_turn_count,omitempty"`
+	FinalTranscriptSHA256 string            `json:"final_transcript_sha256,omitempty"`
 	AttemptHistory       []AttemptFailure  `json:"attempt_history,omitempty"`
 	ZipkinTraceID        string            `json:"zipkin_trace_id,omitempty"`
 	ZipkinTraceURL       string            `json:"zipkin_trace_url,omitempty"`
@@ -215,6 +217,7 @@ type Queue interface {
 	AckLease(ctx context.Context, jobID, leaseToken string, agentPID int, activeConvID string) (*Job, error)
 	Failover(ctx context.Context, jobID string, req AttemptFailure) (*Job, error)
 	RetryRetriable(ctx context.Context) ([]*Job, error)
+	SetFinalHarvest(jobID string, turnCount int, sha string)
 }
 
 // JobAttributionResponse models the attribution of a job outcome to retrieval context.
@@ -643,6 +646,20 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 	}
 
 	return nil
+}
+
+// SetFinalHarvest records the final verified turn count and transcript SHA256 onto the job.
+func (q *InMemoryQueue) SetFinalHarvest(jobID string, turnCount int, sha string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if job, ok := q.jobs[jobID]; ok {
+		if turnCount > 0 {
+			job.FinalTurnCount = turnCount
+		}
+		if sha != "" {
+			job.FinalTranscriptSHA256 = sha
+		}
+	}
 }
 
 func (q *InMemoryQueue) dispatchAttribution(searchID, traceID string, promoted []string) {
