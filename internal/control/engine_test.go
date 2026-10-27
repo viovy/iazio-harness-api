@@ -5033,4 +5033,25 @@ func TestClassifyFailure_StoryNotFound(t *testing.T) {
 	}
 }
 
+func TestAbandonJob_CompletedJobNeverOverwrittenToFailed(t *testing.T) {
+	e := NewEngine(func() time.Time { return time.Now().UTC() })
+	jobID := "job-1539-test"
+	e.jobs[jobID] = &Job{
+		ID:                    jobID,
+		Status:                "RUN_FINISHED",
+		TerminationReasonCode: "COMPLETED_SUCCESS",
+	}
+
+	err := e.AbandonJob(jobID, "execution_timeout")
+	if err != nil {
+		t.Fatalf("expected nil error on late abandon, got %v", err)
+	}
+	if e.jobs[jobID].Status != "RUN_FINISHED" {
+		t.Fatalf("expected job to remain RUN_FINISHED, got %s", e.jobs[jobID].Status)
+	}
+	if e.jobs[jobID].Reason == "execution_timeout" {
+		t.Fatalf("expected reason NOT to be overwritten to execution_timeout")
+	}
+}
+
 

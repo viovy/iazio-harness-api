@@ -387,6 +387,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/hosts/{host}/docs-hub/discard", s.discardHub)
 	mux.HandleFunc("POST /v1/repos", s.upsertRepo)
 	mux.HandleFunc("POST /v1/repos/discard", s.discardRepo)
+	mux.HandleFunc("POST /v1/repos/discard-all", s.discardAllRepos)
+	mux.HandleFunc("POST /v1/hosts/{host}/repos/discard-all", s.discardAllRepos)
+	mux.HandleFunc("POST /api/v1/agents/{host}/repos/discard-all", s.discardAllRepos)
+	mux.HandleFunc("POST /api/v1/agents/{host}/{repo}/actions/discard-changes", s.discardRepo)
 	mux.HandleFunc("POST /v1/repos/intervention", s.intervention)
 	mux.HandleFunc("POST /v1/repos/{host}/lease", s.lease)
 	mux.HandleFunc("POST /v1/repos/{host}/release", s.releaseExternalLease)
@@ -3065,7 +3069,40 @@ func (s *Server) repoRequest(w http.ResponseWriter, r *http.Request) {
 func (s *Server) discardRepo(w http.ResponseWriter, r *http.Request) {
 	host := r.URL.Query().Get("host")
 	path := r.URL.Query().Get("path")
-	if err := s.Engine.RequestDiscard(host, path); err != nil {
+	if host == "" {
+		host = r.PathValue("host")
+	}
+	if path == "" {
+		path = r.PathValue("repo")
+	}
+	force := r.URL.Query().Get("force") == "true" || r.URL.Query().Get("force") == "1"
+	if r.Body != nil {
+		var raw struct {
+			Host  string `json:"host"`
+			Path  string `json:"path"`
+			Force bool   `json:"force"`
+		}
+		bodyBytes, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+		if len(bodyBytes) > 0 {
+			_ = json.Unmarshal(bodyBytes, &raw)
+			if host == "" && raw.Host != "" {
+				host = raw.Host
+			}
+			if path == "" && raw.Path != "" {
+				path = raw.Path
+			}
+			if raw.Force {
+				force = true
+			}
+		}
+	}
+
+	if host == "" || path == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("host and path are required"))
+		return
+	}
+
+	if err := s.Engine.RequestDiscard(host, path, force); err != nil {
 		code := http.StatusConflict
 		if errors.Is(err, control.ErrNotFound) {
 			code = http.StatusNotFound
@@ -3073,7 +3110,61 @@ func (s *Server) discardRepo(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, code, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "DISCARD_REQUESTED"})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "DISCARD_REQUESTED",
+		"host":   host,
+		"path":   path,
+		"force":  force,
+	})
+}
+
+func (s *Server) discardAllRepos(w http.ResponseWriter, r *http.Request) {
+	host := r.PathValue("host")
+	if host == "" {
+		host = r.URL.Query().Get("host")
+	}
+	force := r.URL.Query().Get("force") == "true" || r.URL.Query().Get("force") == "1"
+	if r.Body != nil {
+		var raw struct {
+			Host  string `json:"host"`
+			Force bool   `json:"force"`
+		}
+		bodyBytes, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+		if len(bodyBytes) > 0 {
+			_ = json.Unmarshal(bodyBytes, &raw)
+			if host == "" && raw.Host != "" {
+				host = raw.Host
+			}
+			if raw.Force {
+				force = true
+			}
+		}
+	}
+	if host == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("host is required"))
+		return
+	}
+
+	repos, err := s.Engine.RequestDiscardAll(host, force)
+	if err != nil {
+		code := http.StatusConflict
+		if errors.Is(err, control.ErrNotFound) {
+			code = http.StatusNotFound
+		}
+		writeErr(w, code, err)
+		return
+	}
+	repoPaths := make([]string, 0, len(repos))
+	for _, repo := range repos {
+		repoPaths = append(repoPaths, repo.WorktreePath)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":         "DISCARD_REQUESTED",
+		"host":           host,
+		"force":          force,
+		"count":          len(repos),
+		"affected_repos": repoPaths,
+	})
 }
 
 func (s *Server) discardHub(w http.ResponseWriter, r *http.Request) {

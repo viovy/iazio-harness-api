@@ -725,20 +725,162 @@ func (e *Engine) CheckoutRequests(host string) []RepoRequest {
 	return out
 }
 
-// RequestDiscard accepts discard only while the repo lock is idle.
-func (e *Engine) RequestDiscard(host, path string) error {
+// RequestDiscard accepts discard. If force is false, it requires the repo lock to be idle.
+// If force is true, it terminates active in-progress executions, resets the lock to idle,
+// clears porcelain/dirty states, and dispatches FORCE_CLEAN_GIT and KILL_BACKGROUND_TASKS commands.
+func (e *Engine) RequestDiscard(host, path string, force ...bool) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	isForce := len(force) > 0 && force[0]
+
 	repo := e.repos[repoKey(host, path)]
+	if repo == nil {
+		for _, candidate := range e.repos {
+			if candidate.HostID == host && (candidate.EffectiveAlias() == path || candidate.WorktreePath == path) {
+				repo = candidate
+				break
+			}
+		}
+	}
 	if repo == nil {
 		return ErrNotFound
 	}
 	if repo.Lock != LockIdle {
-		return ErrDiscardBusy
+		if !isForce {
+			return ErrDiscardBusy
+		}
+		// In-progress job termination & lock recovery
+		for _, job := range e.jobs {
+			if !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "CANCEL_REQUESTED") {
+				if s := e.schedules[job.ScheduleID]; s != nil && s.HostID == repo.HostID && s.WorktreePath == repo.WorktreePath {
+					job.Status = "CANCELLED"
+					job.ExitPosted = true
+					job.ExitCode = 137
+					e.updateHistoryStatusLocked(s.HostID, s.WorktreePath, job.ID, "CANCELLED")
+				}
+			}
+		}
+		if repo.RunningJobID != "" {
+			if j, ok := e.jobs[repo.RunningJobID]; ok {
+				j.Status = "CANCELLED"
+				j.ExitPosted = true
+				j.ExitCode = 137
+			}
+		}
+		repo.Lock = LockIdle
+		repo.RunningJobID = ""
+		repo.Queue = QueueOpen
+		repo.Reason = ""
+
+		if h, ok := e.hosts[host]; ok && h != nil {
+			h.PendingCommands = append(h.PendingCommands, CommandEnvelope{
+				ID:        fmt.Sprintf("kill-tasks-%d", e.now().UnixNano()),
+				Type:      "KILL_BACKGROUND_TASKS",
+				Payload:   repo.WorktreePath,
+				CreatedAt: e.now().UTC().Format(time.RFC3339),
+			})
+		}
 	}
+
+	repo.Porcelain = ""
+	repo.DirtyStoryID = ""
+	repo.DirtyReviewFile = ""
+	repo.DetectedConversationID = ""
+	repo.DetectedVerdict = ""
 	repo.DiscardPending = true
+
+	if h, ok := e.hosts[host]; ok && h != nil {
+		h.PendingCommands = append(h.PendingCommands, CommandEnvelope{
+			ID:        fmt.Sprintf("clean-git-%d", e.now().UnixNano()),
+			Type:      "FORCE_CLEAN_GIT",
+			Payload:   repo.WorktreePath,
+			CreatedAt: e.now().UTC().Format(time.RFC3339),
+		})
+	}
+
 	e.notifyRepoLocked(repo)
 	return nil
+}
+
+// RequestDiscardAll requests discard for all repositories registered on a host.
+// If force is true, it terminates active in-progress jobs and forces cleanups across all repos.
+func (e *Engine) RequestDiscardAll(host string, force bool) ([]*Repo, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	var matched []*Repo
+	for _, repo := range e.repos {
+		if repo.HostID == host {
+			matched = append(matched, repo)
+		}
+	}
+	if len(matched) == 0 {
+		if _, ok := e.hosts[host]; !ok {
+			return nil, ErrNotFound
+		}
+		return nil, nil
+	}
+
+	if !force {
+		for _, repo := range matched {
+			if repo.Lock != LockIdle {
+				return nil, ErrDiscardBusy
+			}
+		}
+	}
+
+	for _, repo := range matched {
+		if repo.Lock != LockIdle && force {
+			for _, job := range e.jobs {
+				if !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "CANCEL_REQUESTED") {
+					if s := e.schedules[job.ScheduleID]; s != nil && s.HostID == repo.HostID && s.WorktreePath == repo.WorktreePath {
+						job.Status = "CANCELLED"
+						job.ExitPosted = true
+						job.ExitCode = 137
+						e.updateHistoryStatusLocked(s.HostID, s.WorktreePath, job.ID, "CANCELLED")
+					}
+				}
+			}
+			if repo.RunningJobID != "" {
+				if j, ok := e.jobs[repo.RunningJobID]; ok {
+					j.Status = "CANCELLED"
+					j.ExitPosted = true
+					j.ExitCode = 137
+				}
+			}
+			repo.Lock = LockIdle
+			repo.RunningJobID = ""
+			repo.Queue = QueueOpen
+			repo.Reason = ""
+		}
+
+		repo.Porcelain = ""
+		repo.DirtyStoryID = ""
+		repo.DirtyReviewFile = ""
+		repo.DetectedConversationID = ""
+		repo.DetectedVerdict = ""
+		repo.DiscardPending = true
+
+		if h, ok := e.hosts[host]; ok && h != nil {
+			if force {
+				h.PendingCommands = append(h.PendingCommands, CommandEnvelope{
+					ID:        fmt.Sprintf("kill-tasks-%d", e.now().UnixNano()),
+					Type:      "KILL_BACKGROUND_TASKS",
+					Payload:   repo.WorktreePath,
+					CreatedAt: e.now().UTC().Format(time.RFC3339),
+				})
+			}
+			h.PendingCommands = append(h.PendingCommands, CommandEnvelope{
+				ID:        fmt.Sprintf("clean-git-%d", e.now().UnixNano()),
+				Type:      "FORCE_CLEAN_GIT",
+				Payload:   repo.WorktreePath,
+				CreatedAt: e.now().UTC().Format(time.RFC3339),
+			})
+		}
+		e.notifyRepoLocked(repo)
+	}
+
+	return matched, nil
 }
 
 // RequestDiscardHub moves every idle repo that shares the hub to CLEANING_HUB.
@@ -1056,6 +1198,8 @@ func (e *Engine) getOrSynthesizeLogsLocked(jobID string) []LogChunk {
 			asePhase = "IN_PROGRESS"
 		}
 		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] ASE State: story=%s, phase=%s, complete=%v\n", tsStr, storyID, asePhase, aseComplete))
+	} else {
+		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] ASE State: N/A (ordinary prompt execution)\n", tsStr))
 	}
 	if dirtyFilesCount > 0 {
 		sb.WriteString(fmt.Sprintf("[%s] [ASE-SUPERVISOR] Fleet Git State: %d dirty file(s) recorded\n", tsStr, dirtyFilesCount))
