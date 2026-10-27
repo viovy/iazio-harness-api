@@ -76,10 +76,16 @@ func (h *JobLifecycleHandler) isStoryAvailable(storyID, submodule string) bool {
 		return h.storyValidator.StoryExists(storyID, submodule)
 	}
 
+	if h.engine != nil {
+		if _, ok := h.engine.GetStory(storyID); ok {
+			return true
+		}
+	}
+
 	root := findStoriesRoot()
 	all := loadIndexStories(root)
 	for _, s := range all {
-		if strings.EqualFold(s.ID, storyID) {
+		if strings.EqualFold(s.ID, storyID) || strings.EqualFold(strings.TrimPrefix(s.ID, "STORY-"), strings.TrimPrefix(storyID, "STORY-")) {
 			return true
 		}
 	}
@@ -101,7 +107,10 @@ func (h *JobLifecycleHandler) isStoryAvailable(storyID, submodule string) bool {
 			continue
 		}
 		for _, e := range entries {
-			if strings.Contains(strings.ToUpper(e.Name()), strings.ToUpper(storyID)) && strings.HasSuffix(e.Name(), ".story.md") {
+			eName := strings.ToUpper(e.Name())
+			sID := strings.ToUpper(storyID)
+			cleanID := strings.TrimPrefix(sID, "STORY-")
+			if (strings.Contains(eName, sID) || (cleanID != "" && strings.Contains(eName, cleanID))) && (strings.HasSuffix(e.Name(), ".story.md") || strings.HasSuffix(e.Name(), ".md")) {
 				return true
 			}
 		}

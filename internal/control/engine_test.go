@@ -5017,4 +5017,20 @@ func TestEngine_ReapStalledRunningJob(t *testing.T) {
 	}
 }
 
+func TestClassifyFailure_StoryNotFound(t *testing.T) {
+	cat, stage, summary, retriable := ClassifyFailure("STORY_NOT_FOUND", "story STORY-ROOT-12288 was not found in backlog", "STORY_NOT_FOUND")
+	if cat != FailureCategoryStoryNotFound {
+		t.Errorf("expected FailureCategoryStoryNotFound, got %q", cat)
+	}
+	if stage != FailureStageStoryValidation {
+		t.Errorf("expected FailureStageStoryValidation, got %q", stage)
+	}
+	if retriable {
+		t.Errorf("expected retriable to be false for missing story")
+	}
+	if !strings.Contains(summary, "Story not found in backlog") {
+		t.Errorf("expected summary to mention story not found, got %q", summary)
+	}
+}
+
 

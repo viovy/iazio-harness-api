@@ -194,6 +194,18 @@ func TestJobLifecycleHandler_ExecuteStory(t *testing.T) {
 		t.Fatalf("expected guidance to create story in error, got: %s", rrNonExistent.Body.String())
 	}
 
+	// 1b. Non-existent story STORY-ROOT-12288 -> 404 Not Found with descriptive error message
+	bodyRoot12288 := bytes.NewReader([]byte(`{"submodule":".","story_id":"STORY-ROOT-12288"}`))
+	reqRoot12288 := httptest.NewRequest(http.MethodPost, "/api/v1/stories/STORY-ROOT-12288/execute", bodyRoot12288)
+	rrRoot12288 := httptest.NewRecorder()
+	mux.ServeHTTP(rrRoot12288, reqRoot12288)
+	if rrRoot12288.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found for STORY-ROOT-12288, got %d: %s", rrRoot12288.Code, rrRoot12288.Body.String())
+	}
+	if !strings.Contains(rrRoot12288.Body.String(), "STORY-ROOT-12288") {
+		t.Fatalf("expected error body to mention STORY-ROOT-12288, got: %s", rrRoot12288.Body.String())
+	}
+
 	// 2. Existing story with TraceID -> 201 Created and properly queued
 	body := bytes.NewReader([]byte(`{"submodule":".","target_agent":"autopilot","trace_id":"trace-zipkin-test-123"}`))
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/stories/STORY-GOV-9999/execute", body)

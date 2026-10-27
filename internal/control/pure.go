@@ -138,6 +138,7 @@ const (
 	FailureCategoryBackgroundDrainTimeout = dispatch.FailureCategoryBackgroundDrainTimeout
 	FailureCategoryASEGateIncomplete    = dispatch.FailureCategoryASEGateIncomplete
 	FailureCategoryCircuitBreakerTripped = dispatch.FailureCategoryCircuitBreakerTripped
+	FailureCategoryStoryNotFound        = dispatch.FailureCategoryStoryNotFound
 
 	FailureStageIngress         = dispatch.FailureStageIngress
 	FailureStageQueueDispatch   = dispatch.FailureStageQueueDispatch
@@ -145,6 +146,7 @@ const (
 	FailureStageToolExecution   = dispatch.FailureStageToolExecution
 	FailureStageBackgroundDrain = dispatch.FailureStageBackgroundDrain
 	FailureStageCompletionGate  = dispatch.FailureStageCompletionGate
+	FailureStageStoryValidation = dispatch.FailureStageStoryValidation
 )
 
 // AttemptFailure models one failed dispatch or execution attempt.
