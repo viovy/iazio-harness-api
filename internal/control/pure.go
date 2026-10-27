@@ -54,6 +54,7 @@ const (
 	KindRefinement   = "story_refinement"
 	KindIntervention = "intervention"
 	KindResume       = "resume"
+	KindDiscard      = "discard"
 
 	ReasonDirty       = "HALTED_DIRTY"
 	ReasonDetached    = "HALTED_DETACHED"
@@ -73,6 +74,18 @@ const (
 	HealingReasonOrphanedExecution = "ORPHANED_EXECUTION"
 	HealingReasonNonZeroExit       = "NON_ZERO_EXIT"
 )
+
+// IsPureCodeAction checks whether a given kind or action represents a pure code action
+// like workspace discard or git reset that does not require AI agent execution or conversation checkpoints.
+func IsPureCodeAction(kind string) bool {
+	k := strings.ToLower(strings.TrimSpace(kind))
+	switch k {
+	case KindDiscard, "clean", "git_clean", "git_reset", "reset_workspace", "heal_git", "force_clean_git":
+		return true
+	default:
+		return false
+	}
+}
 
 // AutoResumePolicy defines bounded auto-resume and circuit breaker rules.
 type AutoResumePolicy struct {

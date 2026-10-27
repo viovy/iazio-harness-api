@@ -3027,12 +3027,20 @@ func (e *Engine) reapExpiredLocked() {
 				job.FailureStage = stage
 				job.FailureReasonSummary = summary
 				job.Retriable = retriable
-				hasStory := (sch != nil && sch.StoryID != "") || (job.InterruptedASEState != nil && job.InterruptedASEState["story_id"] != nil)
-				job.Resumable = (len(job.ConversationIDs) > 0 || job.ResumeConversationID != "" || job.InitialConversationID != "" || job.ActiveConversationID != "" || hasStory)
-				if !job.Resumable {
-					job.NonResumableReason = "No conversation checkpoint was established before timeout"
+				if IsPureCodeAction(job.Kind) {
+					job.Resumable = false
+					job.NonResumableReason = "Pure code action (git reset/discard) does not use conversation checkpoints"
+					job.FailureCategory = FailureCategoryToolCrash
+					job.FailureStage = FailureStageToolExecution
+					job.FailureReasonSummary = fmt.Sprintf("Pure code action execution lease expired: %s", reason)
 				} else {
-					job.NonResumableReason = ""
+					hasStory := (sch != nil && sch.StoryID != "") || (job.InterruptedASEState != nil && job.InterruptedASEState["story_id"] != nil)
+					job.Resumable = (len(job.ConversationIDs) > 0 || job.ResumeConversationID != "" || job.InitialConversationID != "" || job.ActiveConversationID != "" || hasStory)
+					if !job.Resumable {
+						job.NonResumableReason = "No conversation checkpoint was established before timeout"
+					} else {
+						job.NonResumableReason = ""
+					}
 				}
 				if job.ResumeMode == "pending" {
 					job.ResumeMode = "same_conversation_unverified"
@@ -3045,13 +3053,19 @@ func (e *Engine) reapExpiredLocked() {
 					}
 				}
 				if sch != nil {
+					failCat := FailureCategoryBackgroundDrainTimeout
+					failStage := FailureStageBackgroundDrain
+					if IsPureCodeAction(job.Kind) {
+						failCat = FailureCategoryToolCrash
+						failStage = FailureStageToolExecution
+					}
 					attemptRec := AttemptFailure{
 						AttemptNumber:   sch.ExecutionAttempt,
 						Host:            sch.HostID,
 						Workspace:       sch.WorktreePath,
 						Tool:            sch.Engine,
-						FailureCategory: FailureCategoryBackgroundDrainTimeout,
-						FailureStage:    FailureStageBackgroundDrain,
+						FailureCategory: failCat,
+						FailureStage:    failStage,
 						Reason:          reason,
 						ExitCode:        0,
 						StderrTail:      job.TerminationReasonMessage,
@@ -3061,8 +3075,8 @@ func (e *Engine) reapExpiredLocked() {
 					}
 					job.AttemptHistory = append(job.AttemptHistory, attemptRec)
 					sch.AttemptHistory = append(sch.AttemptHistory, attemptRec)
-					sch.FailureCategory = FailureCategoryBackgroundDrainTimeout
-					sch.FailureStage = FailureStageBackgroundDrain
+					sch.FailureCategory = failCat
+					sch.FailureStage = failStage
 					sch.FailureReasonSummary = job.TerminationReasonMessage
 
 					consecutiveLeaseExpired := false

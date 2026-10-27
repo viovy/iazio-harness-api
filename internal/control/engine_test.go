@@ -5054,4 +5054,68 @@ func TestAbandonJob_CompletedJobNeverOverwrittenToFailed(t *testing.T) {
 	}
 }
 
+func TestReapExpired_PureCodeAction_NoFalseConversationCheckpointDiagnostic(t *testing.T) {
+	now := time.Now().UTC()
+	e := NewEngine(func() time.Time { return now })
+	_ = e.RegisterHost("mac-mini", "permanent", "generic")
+	e.repos[repoKey("mac-mini", "/Users/romeo/work/meta-repo-04")] = &Repo{
+		HostID:       "mac-mini",
+		WorktreePath: "/Users/romeo/work/meta-repo-04",
+		Lock:         LockRunning,
+		Queue:        QueueOpen,
+	}
+
+	// Schedule a pure code action job (KindDiscard)
+	schID := "sch-pure-discard-1"
+	jobID := "job-pure-discard-1"
+	sch := &Schedule{
+		ID:                  schID,
+		HostID:              "mac-mini",
+		WorktreePath:        "/Users/romeo/work/meta-repo-04",
+		Kind:                KindDiscard,
+		IterationsTotal:     1,
+		IterationsRemaining: 1,
+		Status:              "RUNNING",
+	}
+	e.schedules[schID] = sch
+
+	job := &Job{
+		ID:          jobID,
+		ScheduleID:  schID,
+		HostID:      "mac-mini",
+		Kind:        KindDiscard,
+		Status:      "RUNNING",
+		StartedAt:   now.Add(-60 * time.Second),
+		LeaseExpiry: now.Add(-10 * time.Second), // Lease is expired
+	}
+	e.jobs[jobID] = job
+
+	e.mu.Lock()
+	e.reapExpiredLocked()
+	e.mu.Unlock()
+
+	jAfter, ok := e.GetJob(jobID)
+	if !ok {
+		t.Fatalf("job not found")
+	}
+	if jAfter.Status != "FAILED" {
+		t.Fatalf("expected job status FAILED, got %s", jAfter.Status)
+	}
+
+	// Verify the diagnostic does NOT accuse missing conversation checkpoints!
+	if jAfter.NonResumableReason == "No conversation checkpoint was established before timeout" {
+		t.Errorf("expected NonResumableReason NOT to be 'No conversation checkpoint was established before timeout' for pure code action")
+	}
+	if !strings.Contains(jAfter.NonResumableReason, "Pure code action") {
+		t.Errorf("expected NonResumableReason to mention Pure code action, got %q", jAfter.NonResumableReason)
+	}
+	if jAfter.FailureCategory == FailureCategoryBackgroundDrainTimeout {
+		t.Errorf("pure code action must not be categorized as BACKGROUND_DRAIN_TIMEOUT")
+	}
+	if jAfter.FailureStage == FailureStageBackgroundDrain {
+		t.Errorf("pure code action must not be categorized in stage BACKGROUND_DRAIN")
+	}
+}
+
+
 
