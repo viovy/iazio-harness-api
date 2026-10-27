@@ -1818,6 +1818,8 @@ func ClassifyFailure(reason, errorMsg, diagCode string) (category, stage, summar
 		return FailureCategoryBackgroundDrainTimeout, FailureStageBackgroundDrain, "Post-turn background task drain timeout or heartbeat lease expiration", true
 	case strings.Contains(combined, "circuit") || strings.Contains(combined, "breaker"):
 		return FailureCategoryCircuitBreakerTripped, FailureStageQueueDispatch, "Circuit breaker tripped due to consecutive tool failures", true
+	case strings.Contains(combined, "story_not_found") || strings.Contains(combined, "not found in backlog") || strings.Contains(combined, "cannot execute nonexistent story"):
+		return FailureCategoryStoryNotFound, FailureStageStoryValidation, "Story not found in backlog or control plane: cannot execute nonexistent story", false
 	case strings.Contains(combined, "gate") || strings.Contains(combined, "dod") || strings.Contains(combined, "incomplete") || strings.Contains(combined, "ase_gate"):
 		return FailureCategoryASEGateIncomplete, FailureStageCompletionGate, "Autonomous Story Execution DoD or review scheme validation incomplete", false
 	default:

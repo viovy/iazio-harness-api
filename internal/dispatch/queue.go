@@ -52,6 +52,7 @@ const (
 	FailureCategoryBackgroundDrainTimeout = "BACKGROUND_DRAIN_TIMEOUT"
 	FailureCategoryASEGateIncomplete      = "ASE_GATE_INCOMPLETE"
 	FailureCategoryCircuitBreakerTripped  = "CIRCUIT_BREAKER_TRIPPED"
+	FailureCategoryStoryNotFound          = "STORY_NOT_FOUND"
 
 	FailureStageIngress         = "INGRESS"
 	FailureStageQueueDispatch   = "QUEUE_DISPATCH"
@@ -59,6 +60,7 @@ const (
 	FailureStageToolExecution   = "TOOL_EXECUTION"
 	FailureStageBackgroundDrain = "BACKGROUND_DRAIN"
 	FailureStageCompletionGate  = "COMPLETION_GATE"
+	FailureStageStoryValidation = "STORY_VALIDATION"
 )
 
 const (
