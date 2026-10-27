@@ -393,6 +393,7 @@ type Job struct {
 	CircuitBreakerTripped     bool
 	ASEGateStatus             map[string]any
 	StallTimeoutSec           int
+	IsStalled                 bool
 	LivenessPulseSeconds      int
 	TerminationReasonCode     string
 	TerminationReasonMessage  string
@@ -600,6 +601,7 @@ type HistoryRow struct {
 	CircuitBreakerTripped     bool
 	ASEGateStatus             map[string]any
 	StallTimeoutSec           int
+	IsStalled                 bool
 	LivenessPulseSeconds      int
 	TerminationReasonCode     string
 	TerminationReasonMessage  string
@@ -669,6 +671,7 @@ type HistoryItem struct {
 	CircuitBreakerTripped     bool
 	ASEGateStatus             map[string]any
 	StallTimeoutSec           int
+	IsStalled                 bool
 	LivenessPulseSeconds      int
 	TerminationReasonCode     string
 	TerminationReasonMessage  string
@@ -2988,7 +2991,7 @@ func (e *Engine) reapExpiredLocked() {
 			continue
 		}
 		if job.Status == "RUNNING" {
-			// No execution timeout on running jobs in iazio* components
+			// No execution timeout on running jobs in iazio* components unless stalled with dead tool PID
 			timedOut := false
 			hostOffline := false
 			if sch != nil {
@@ -2997,12 +3000,23 @@ func (e *Engine) reapExpiredLocked() {
 				}
 			}
 			leaseExpired := !job.LeaseExpiry.IsZero() && now.After(job.LeaseExpiry)
+			lastAct := job.StartedAt
+			if !job.LastOutputAt.IsZero() && job.LastOutputAt.After(lastAct) {
+				lastAct = job.LastOutputAt
+			}
+			silentSec := int(now.Sub(lastAct).Seconds())
+			if job.IsStalled && silentSec > 600 && job.ToolPID <= 0 {
+				timedOut = true
+			}
 			if timedOut || hostOffline || leaseExpired {
 				job.Status = "FAILED"
 				job.ExitPosted = true
 				reason := "LEASE_EXPIRED"
 				if hostOffline {
 					reason = "HOST_OFFLINE"
+				}
+				if timedOut {
+					reason = "EXECUTION_STALLED_TIMEOUT"
 				}
 				job.TerminationReasonCode = reason
 				job.TerminationReasonMessage = fmt.Sprintf("Job terminated: %s", reason)
@@ -3122,7 +3136,25 @@ func (e *Engine) reapExpiredLocked() {
 				if sch.IterationsRemaining > 0 && (sch.IterationsTotal <= 0 || sch.IterationsCompleted < sch.IterationsTotal) && sch.Status != "COMPLETED" && sch.Status != "FAILED" {
 					sch.Status = "QUEUED"
 				} else if sch.Status != "FAILED" {
-					sch.Status = "FINISHED"
+					anySuccess := false
+					allFailed := true
+					hasJobs := false
+					for _, j := range e.jobs {
+						if j.ScheduleID == sch.ID {
+							hasJobs = true
+							if j.Status == "COMPLETED" || (j.ExitPosted && j.ExitCode == 0) {
+								anySuccess = true
+							}
+							if j.Status != "FAILED" && (!j.ExitPosted || j.ExitCode == 0) {
+								allFailed = false
+							}
+						}
+					}
+					if hasJobs && allFailed && !anySuccess {
+						sch.Status = "FAILED"
+					} else {
+						sch.Status = "FINISHED"
+					}
 					sch.IterationsRemaining = 0
 				}
 				if sch.CloneURL != "" && sch.IterationsRemaining <= 0 {
@@ -4602,6 +4634,7 @@ func (e *Engine) buildJobDetailLocked(job *Job) JobDetail {
 		detail.SilentForSeconds = int(e.now().Sub(lastAct).Seconds())
 		if job.Status == "RUNNING" && detail.SilentForSeconds > 120 {
 			detail.IsStalled = true
+			job.IsStalled = true
 		}
 	}
 	sch := e.schedules[job.ScheduleID]
