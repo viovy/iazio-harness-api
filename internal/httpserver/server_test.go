@@ -2835,3 +2835,73 @@ func TestSyncAllProfiles_TotalFailureReturns502(t *testing.T) {
 		t.Fatalf("expected status 'error', got %v", resp["status"])
 	}
 }
+
+func TestServer_DiscardRepo_ForceAndDiscardAll(t *testing.T) {
+	s := &Server{Engine: control.NewEngine(nil)}
+	s.Engine.RegisterHost("mac-mini", "macos")
+
+	// Setup repos
+	_ = s.Engine.UpsertRepo(control.Repo{
+		HostID:       "mac-mini",
+		WorktreePath: "/work/repo-a",
+		RepoAlias:    "repo-a",
+	})
+	_ = s.Engine.UpsertRepo(control.Repo{
+		HostID:       "mac-mini",
+		WorktreePath: "/work/repo-b",
+		RepoAlias:    "repo-b",
+	})
+	p1 := s.Engine.PutPrompt(control.Prompt{Title: "Task 1", Body: "run task 1", Status: "READY"})
+	_, _ = s.Engine.ExecutePrompt(p1.ID, "mac-mini", "/work/repo-b", 1, nil)
+	_, _, _, _ = s.Engine.PollHost("mac-mini")
+
+	handler := s.Handler()
+
+	// 1. POST /v1/repos/discard on busy repo without force -> 409
+	req := httptest.NewRequest(http.MethodPost, "/v1/repos/discard?host=mac-mini&path=/work/repo-b", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// 2. POST /v1/repos/discard on busy repo with force=true -> 200
+	req = httptest.NewRequest(http.MethodPost, "/v1/repos/discard?host=mac-mini&path=/work/repo-b&force=true", nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// 3. POST /v1/hosts/mac-mini/repos/discard-all
+	// Re-dirty repoB with another executing prompt
+	p2 := s.Engine.PutPrompt(control.Prompt{Title: "Task 2", Body: "run task 2", Status: "READY"})
+	_, _ = s.Engine.ExecutePrompt(p2.ID, "mac-mini", "/work/repo-b", 1, nil)
+	_, _, _, _ = s.Engine.PollHost("mac-mini")
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/hosts/mac-mini/repos/discard-all?force=true", nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var discardAllResp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &discardAllResp); err != nil {
+		t.Fatalf("failed to parse discard-all response: %v", err)
+	}
+	if discardAllResp["status"] != "DISCARD_REQUESTED" {
+		t.Errorf("expected DISCARD_REQUESTED, got %v", discardAllResp["status"])
+	}
+	if int(discardAllResp["count"].(float64)) != 2 {
+		t.Errorf("expected count 2, got %v", discardAllResp["count"])
+	}
+
+	// 4. POST /api/v1/agents/mac-mini/repo-a/actions/discard-changes
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/agents/mac-mini/repo-a/actions/discard-changes", nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on actions/discard-changes, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+

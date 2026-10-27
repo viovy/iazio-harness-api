@@ -5082,6 +5082,10 @@ func (e *Engine) AbandonJob(jobID, reason string) error {
 	if !ok {
 		return ErrNotFound
 	}
+	// Guard against abandoning an already successfully completed job.
+	if job.Status == "RUN_FINISHED" || job.Status == "COMPLETED" || job.TerminationReasonCode == "COMPLETED_SUCCESS" {
+		return nil
+	}
 	if reason == "" {
 		reason = "MANUAL_ABANDON"
 	}

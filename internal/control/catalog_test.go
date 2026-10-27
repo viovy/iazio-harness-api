@@ -555,4 +555,106 @@ func TestCatalog_AppendLog_PreservesInitialHeadAndAttemptHeadersOnRingCap(t *tes
 	}
 }
 
+func TestRequestDiscard_ForceAndDiscardAll(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "macos")
+
+	// Setup repo 1: idle
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: "/work/repo-1",
+		RepoAlias:    "repo-1",
+	})
+
+	// Setup repo 2: busy with running job
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: "/work/repo-2",
+		RepoAlias:    "repo-2",
+	})
+	repo2 := e.repos[repoKey("mac-mini", "/work/repo-2")]
+	repo2.Lock = LockRunning
+	repo2.RunningJobID = "job-active-123"
+	e.jobs["job-active-123"] = &Job{
+		ID:     "job-active-123",
+		Status: "RUNNING",
+	}
+
+	// 1. Single repo discard without force on busy repo -> ErrDiscardBusy
+	err := e.RequestDiscard("mac-mini", "/work/repo-2", false)
+	if err != ErrDiscardBusy {
+		t.Fatalf("expected ErrDiscardBusy, got %v", err)
+	}
+
+	// 2. Single repo discard with force -> success, cancels job, sets DiscardPending
+	err = e.RequestDiscard("mac-mini", "/work/repo-2", true)
+	if err != nil {
+		t.Fatalf("expected success with force, got %v", err)
+	}
+	if !repo2.DiscardPending {
+		t.Errorf("expected repo2.DiscardPending == true")
+	}
+	if repo2.Lock != LockIdle {
+		t.Errorf("expected repo2.Lock == LockIdle, got %s", repo2.Lock)
+	}
+	if e.jobs["job-active-123"].Status != "CANCELLED" {
+		t.Errorf("expected job to be CANCELLED, got %s", e.jobs["job-active-123"].Status)
+	}
+
+	// Reset repo2 to busy for testing RequestDiscardAll
+	repo2.Lock = LockRunning
+	repo2.RunningJobID = "job-active-456"
+	repo2.DiscardPending = false
+	e.jobs["job-active-456"] = &Job{
+		ID:     "job-active-456",
+		Status: "RUNNING",
+	}
+	repo1 := e.repos[repoKey("mac-mini", "/work/repo-1")]
+	repo1.DiscardPending = false
+
+	// 3. Discard all without force when one repo is busy -> ErrDiscardBusy
+	_, err = e.RequestDiscardAll("mac-mini", false)
+	if err != ErrDiscardBusy {
+		t.Fatalf("expected ErrDiscardBusy on DiscardAll without force, got %v", err)
+	}
+
+	// 4. Discard all with force -> success for all repos
+	affected, err := e.RequestDiscardAll("mac-mini", true)
+	if err != nil {
+		t.Fatalf("expected success on DiscardAll with force, got %v", err)
+	}
+	if len(affected) != 2 {
+		t.Fatalf("expected 2 affected repos, got %d", len(affected))
+	}
+	if !repo1.DiscardPending || !repo2.DiscardPending {
+		t.Errorf("expected both repos to have DiscardPending == true")
+	}
+	if repo2.Lock != LockIdle {
+		t.Errorf("expected repo2.Lock == LockIdle, got %s", repo2.Lock)
+	}
+	if e.jobs["job-active-456"].Status != "CANCELLED" {
+		t.Errorf("expected job-active-456 to be CANCELLED, got %s", e.jobs["job-active-456"].Status)
+	}
+
+	// Verify commands queued for agent host
+	host := e.hosts["mac-mini"]
+	if len(host.PendingCommands) == 0 {
+		t.Fatalf("expected pending commands dispatched to host")
+	}
+	hasForceClean := false
+	hasKillTasks := false
+	for _, cmd := range host.PendingCommands {
+		if cmd.Type == "FORCE_CLEAN_GIT" {
+			hasForceClean = true
+		}
+		if cmd.Type == "KILL_BACKGROUND_TASKS" {
+			hasKillTasks = true
+		}
+	}
+	if !hasForceClean || !hasKillTasks {
+		t.Errorf("expected both FORCE_CLEAN_GIT and KILL_BACKGROUND_TASKS commands queued")
+	}
+}
+
+
 
