@@ -4948,3 +4948,73 @@ func TestScheduleLifecycle_TransitionsCleanlyAndCapsRetries(t *testing.T) {
 	}
 }
 
+func TestEngine_ReapStalledRunningJob(t *testing.T) {
+	e := NewEngine(nil)
+	fakeNow := time.Date(2026, 10, 27, 8, 0, 0, 0, time.UTC)
+	e.now = func() time.Time { return fakeNow }
+
+	e.RegisterHost("host-1", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "host-1", WorktreePath: "/work/meta-repo-02", CloneURL: "https://example.test/repo.git"}); err != nil {
+		t.Fatal(err)
+	}
+	p := e.PutPrompt(Prompt{Title: "Stalled task", Body: "do something", Status: "READY"})
+	sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/meta-repo-02", 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok || job.ScheduleID != sch.ID {
+		t.Fatalf("failed to lease job")
+	}
+
+	// Verify repo lock is RUNNING
+	detail, ok := e.GetRepoDetail("host-1", "/work/meta-repo-02")
+	if !ok || detail.Repo.Lock != LockRunning {
+		t.Fatalf("expected repo lock to be RUNNING, got: %v", detail.Repo.Lock)
+	}
+
+	// Fast forward 15 minutes, job becomes stalled and tool PID is dead (0)
+	fakeNow = fakeNow.Add(15 * time.Minute)
+	e.mu.Lock()
+	if j, exists := e.jobs[job.ID]; exists {
+		j.ToolPID = 0
+		j.IsStalled = true
+	}
+	e.reapExpiredLocked()
+	e.mu.Unlock()
+
+	// Verify job is marked FAILED with EXECUTION_STALLED_TIMEOUT
+	jobDetail, ok := e.GetJob(job.ID)
+	if !ok {
+		t.Fatalf("job not found")
+	}
+	if jobDetail.Status != "FAILED" {
+		t.Errorf("expected job status FAILED, got: %s", jobDetail.Status)
+	}
+	if jobDetail.TerminationReasonCode != "EXECUTION_STALLED_TIMEOUT" {
+		t.Errorf("expected TerminationReasonCode EXECUTION_STALLED_TIMEOUT, got: %s", jobDetail.TerminationReasonCode)
+	}
+	e.mu.Lock()
+	jAfter := e.jobs[job.ID]
+	e.mu.Unlock()
+	if !jAfter.ExitPosted {
+		t.Errorf("expected ExitPosted to be true")
+	}
+
+	// Verify schedule is reconciled to FAILED since iterationsRemaining == 0
+	e.mu.Lock()
+	schAfter := e.schedules[sch.ID]
+	e.mu.Unlock()
+	if schAfter.Status != "FAILED" {
+		t.Errorf("expected schedule status FAILED, got: %s", schAfter.Status)
+	}
+
+	// Verify repo lock is released to IDLE so subsequent tasks can execute
+	detailAfter, ok := e.GetRepoDetail("host-1", "/work/meta-repo-02")
+	if !ok || detailAfter.Repo.Lock != LockIdle {
+		t.Errorf("expected repo lock to be IDLE, got: %v", detailAfter.Repo.Lock)
+	}
+}
+
+
