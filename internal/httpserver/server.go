@@ -69,6 +69,8 @@ type Server struct {
 	Idempotency *handlers.IdempotencyStore
 	// StoryValidator validates story existence before execution.
 	StoryValidator handlers.StoryValidator
+	// StoryIDAllocator allocates canonical sequential story IDs when a database is configured.
+	StoryIDAllocator handlers.StoryIDAllocator
 
 	notificationsMu sync.RWMutex
 	notifications   []NotificationRecord
@@ -160,6 +162,9 @@ func (s *Server) Handler() http.Handler {
 	storiesHandler := handlers.NewStoriesHandler(codebaseStore, queue, idempotency, s.Engine)
 	if s.Engine != nil {
 		storiesHandler.SetEngine(s.Engine)
+	}
+	if s.StoryIDAllocator != nil {
+		storiesHandler.SetStoryIDAllocator(s.StoryIDAllocator)
 	}
 	mux.Handle("POST /api/v1/stories", storiesHandler)
 	mux.HandleFunc("GET /api/v1/stories", storiesHandler.ListStories)
@@ -1415,8 +1420,8 @@ func (s *Server) listSchedules(w http.ResponseWriter, r *http.Request) {
 			Repo: repoPath,
 		})
 		for _, qj := range qJobs {
-			if qj.Status == dispatch.JobStatusPending || qj.Status == dispatch.JobStatusClaimed {
-				if status != "" && !strings.EqualFold(status, qj.Status) && !strings.EqualFold(status, "QUEUED") && !strings.EqualFold(status, "RUNNING") && !strings.EqualFold(status, "PENDING_EXECUTION") {
+			if qj.Status == dispatch.JobStatusPending || qj.Status == dispatch.JobStatusClaimed || qj.Status == dispatch.JobStatusLeased || qj.Status == dispatch.JobStatusRunning {
+				if status != "" && !strings.EqualFold(status, qj.Status) && !strings.EqualFold(status, "QUEUED") && !strings.EqualFold(status, "RUNNING") && !strings.EqualFold(status, "LEASED") && !strings.EqualFold(status, "PENDING_EXECUTION") {
 					continue
 				}
 				out = append(out, dispatchScheduleView(qj))
@@ -1469,8 +1474,8 @@ func (s *Server) listHistory(w http.ResponseWriter, r *http.Request) {
 			Repo: repoPath,
 		})
 		for _, qj := range qJobs {
-			if qj.Status == dispatch.JobStatusCompleted || qj.Status == dispatch.JobStatusFailed || qj.Status == dispatch.JobStatusCanceled {
-				if status != "" && !strings.EqualFold(status, qj.Status) {
+			if qj.Status == dispatch.JobStatusCompleted || qj.Status == dispatch.JobStatusFailed || qj.Status == dispatch.JobStatusCanceled || qj.Status == dispatch.JobStatusRequeued {
+				if status != "" && !strings.EqualFold(status, qj.Status) && !(strings.EqualFold(status, "CANCELLED") && qj.Status == dispatch.JobStatusCanceled) && !(strings.EqualFold(status, "CANCELED") && qj.Status == dispatch.JobStatusCanceled) {
 					continue
 				}
 				out = append(out, dispatchHistoryView(qj))
@@ -2195,19 +2200,6 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.TargetVersion != "" {
 		resp["target_version"] = body.TargetVersion
-	}
-	if body.Force {
-		forcePayload, _ := json.Marshal(map[string]any{
-			"tools":          body.Tools,
-			"force":          true,
-			"target_version": body.TargetVersion,
-		})
-		_ = s.Engine.QueueCommand(hostID, control.CommandEnvelope{
-			ID:        fmt.Sprintf("force-update-%d", time.Now().UnixNano()),
-			Type:      "FORCE_TOOL_UPDATE",
-			Payload:   string(forcePayload),
-			CreatedAt: time.Now().UTC().Format(time.RFC3339),
-		})
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

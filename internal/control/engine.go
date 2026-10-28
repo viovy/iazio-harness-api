@@ -868,8 +868,9 @@ type Engine struct {
 	toolCooldowns   map[string]time.Time
 	OnRepoChange    func(Repo)
 	OnStoryChange   func(Story)
-	OnHistoryChange func(host, path string, row HistoryRow)
-	OnHistoryDelete func(host, path string, jobID string)
+	OnHistoryChange      func(host, path string, row HistoryRow)
+	OnHistoryDelete      func(host, path string, jobID string)
+	OnToolPriorityChange func(tools []string)
 }
 
 func (e *Engine) notifyRepoLocked(r *Repo) {
@@ -1237,7 +1238,7 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 	for i, candidateTool := range toolPriority {
 		candidateToolLower := strings.ToLower(candidateTool)
 		for _, h := range e.hosts {
-			if h.Presence != "online" && h.Presence != "idle" && time.Since(h.LastSeen) > 5*time.Minute {
+			if !strings.EqualFold(h.Presence, "online") && !strings.EqualFold(h.Presence, "idle") && e.now().Sub(h.LastSeen) > 5*time.Minute {
 				continue
 			}
 			if reqHost != "" && h.ID != reqHost {
@@ -1354,8 +1355,8 @@ func (e *Engine) GetToolPriority() []string {
 // SetToolPriority updates the ordered preferred execution tool priority list.
 func (e *Engine) SetToolPriority(tools []string) error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if len(tools) == 0 {
+		e.mu.Unlock()
 		return errors.New("tool priority list must not be empty")
 	}
 	cleaned := make([]string, 0, len(tools))
@@ -1368,9 +1369,17 @@ func (e *Engine) SetToolPriority(tools []string) error {
 		}
 	}
 	if len(cleaned) == 0 {
+		e.mu.Unlock()
 		return errors.New("no valid tools provided")
 	}
 	e.toolPriority = cleaned
+	cb := e.OnToolPriorityChange
+	e.mu.Unlock()
+	if cb != nil {
+		cp := make([]string, len(cleaned))
+		copy(cp, cleaned)
+		cb(cp)
+	}
 	return nil
 }
 
@@ -1904,6 +1913,25 @@ func (e *Engine) HeartbeatJob(jobID, leaseToken string) error {
 	job.LastOutputAt = now
 	job.LastChunkAt = now
 	job.LeaseExpiry = now.Add(LeaseInterval)
+	job.LeaseAckDeadlineAt = nil
+	if job.Status == "LEASED" {
+		job.Status = "RUNNING"
+		if sch := e.schedules[job.ScheduleID]; sch != nil {
+			sch.Status = "RUNNING"
+			sch.LeaseAckDeadlineAt = nil
+		}
+		for key, rows := range e.history {
+			for i := range rows {
+				if rows[i].JobID == jobID {
+					rows[i].Status = "RUNNING"
+					rows[i].LeaseAckDeadlineAt = nil
+				}
+			}
+			e.history[key] = rows
+		}
+	} else if sch := e.schedules[job.ScheduleID]; sch != nil && sch.LeaseAckDeadlineAt != nil {
+		sch.LeaseAckDeadlineAt = nil
+	}
 	return nil
 }
 
@@ -2937,9 +2965,12 @@ func (e *Engine) reapExpiredLocked() {
 			continue
 		}
 		sch := e.schedules[job.ScheduleID]
-		if job.Status == "LEASED" {
+		initialLeaseWindow := job.StartedAt.IsZero() || !job.LeaseExpiry.After(job.StartedAt.Add(LeaseInterval))
+		unackedRunning := job.Status == "RUNNING" && initialLeaseWindow && !job.LeaseExpiry.IsZero() && now.Before(job.LeaseExpiry) && job.HarnessPID == 0 && job.ToolPID == 0 && job.LastOutputAt.IsZero() && (job.LastChunkAt.IsZero() || job.LastChunkAt.Equal(job.StartedAt))
+		if job.Status == "LEASED" || unackedRunning {
 			if job.LeaseAckDeadlineAt != nil && !job.LeaseAckDeadlineAt.IsZero() && now.After(*job.LeaseAckDeadlineAt) {
 				// Unacknowledged lease expired: 2-phase handshake zero-penalty requeue
+				prevHostID := job.HostID
 				job.Status = "REQUEUED"
 				job.ExitPosted = true
 				job.InfraRequeueCount++
@@ -2948,24 +2979,49 @@ func (e *Engine) reapExpiredLocked() {
 				job.FailureReasonSummary = fmt.Sprintf("Unacknowledged lease %s on %s expired (20s TTL); rolled back to queued (infra_requeue_count=%d)", job.ID, job.HostID, job.InfraRequeueCount)
 				job.Retriable = true
 				if sch != nil {
+					if prevHostID == "" || prevHostID == "global" {
+						prevHostID = sch.HostID
+					}
 					sch.Status = "QUEUED"
 					sch.LeaseToken = ""
 					sch.LeaseAckDeadlineAt = nil
 					sch.InfraRequeueCount++
-					sch.HostID = "global"
+					if sch.IsGlobal {
+						sch.HostID = "global"
+					}
 					if sch.IterationsRemaining <= 0 {
 						sch.IterationsRemaining = 1
 					}
 					if sch.CloneURL != "" {
 						delete(e.cloneLease, sch.CloneURL)
 					}
-					if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
+					if repo := e.repos[repoKey(prevHostID, sch.WorktreePath)]; repo != nil {
 						if repo.Lock == LockRunning {
 							repo.Lock = LockIdle
 						}
 						repo.RunningJobID = ""
 						e.notifyRepoLocked(repo)
 					}
+					if job.HostID != "" && job.HostID != prevHostID {
+						if repo := e.repos[repoKey(job.HostID, sch.WorktreePath)]; repo != nil {
+							if repo.Lock == LockRunning {
+								repo.Lock = LockIdle
+							}
+							repo.RunningJobID = ""
+							e.notifyRepoLocked(repo)
+						}
+					}
+				}
+				for key, rows := range e.history {
+					for i := range rows {
+						if rows[i].JobID == job.ID {
+							rows[i].Status = "REQUEUED"
+							rows[i].Reason = "LEASE_ACK_TIMEOUT_REQUEUED"
+							rows[i].InfraRequeueCount = job.InfraRequeueCount
+							rows[i].LeaseAckDeadlineAt = nil
+						}
+					}
+					e.history[key] = rows
 				}
 				continue
 			}

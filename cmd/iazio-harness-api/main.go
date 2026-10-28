@@ -128,6 +128,16 @@ func run(ctx context.Context, args []string) error {
 			}
 			log.Printf("loaded %d stories from database", len(stories))
 		}
+		if tp, err := store.LoadToolPriority(ctx); err == nil && len(tp) > 0 {
+			_ = srv.Engine.SetToolPriority(tp)
+			log.Printf("loaded tool priority %v from database", tp)
+		}
+		srv.StoryIDAllocator = store
+		srv.Engine.OnToolPriorityChange = func(tools []string) {
+			if err := store.SaveToolPriority(context.Background(), tools); err != nil {
+				log.Printf("warn: save tool priority: %v", err)
+			}
+		}
 
 		srv.ReconcileLineage = func(ctx context.Context) error {
 			return store.ReconcileHistoricalLineage(ctx)

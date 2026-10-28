@@ -5117,5 +5117,101 @@ func TestReapExpired_PureCodeAction_NoFalseConversationCheckpointDiagnostic(t *t
 	}
 }
 
+func TestGov3782_HeartbeatTransitionsLeasedAndGlobalReapUnlocksRepo(t *testing.T) {
+	now := time.Date(2026, 10, 28, 22, 0, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return now })
+	_ = e.RegisterHost("host-1", "permanent", "generic")
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "host-1",
+		WorktreePath:                 "/work/app",
+		CloneURL:                     "https://example.test/app.git",
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	p := e.PutPrompt(Prompt{Title: "Global Task", Body: "do work", Status: "READY", Engine: "agy"})
+	sch, err := e.EnqueueGlobalSchedule(p.ID, 1, nil)
+	if err != nil {
+		t.Fatalf("EnqueueGlobalSchedule: %v", err)
+	}
+
+	// PollHost claims the global schedule onto host-1:/work/app
+	job1, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatalf("expected PollHost to lease global schedule")
+	}
+	rBefore, _ := e.GetRepo("host-1", "/work/app")
+	if rBefore.Lock != LockRunning {
+		t.Fatalf("expected repo LockRunning after PollHost, got %s", rBefore.Lock)
+	}
+
+	// Advance 25s past the 20s LeaseAckDeadlineAt without ack or heartbeat -> ReapExpired must unlock host-1:/work/app and reset schedule to global
+	now = now.Add(25 * time.Second)
+	e.ReapExpired()
+
+	rAfterReap, _ := e.GetRepo("host-1", "/work/app")
+	if rAfterReap.Lock != LockIdle {
+		t.Fatalf("expected repo LockIdle after global lease ack timeout reap, got %s", rAfterReap.Lock)
+	}
+	schAfter, ok := e.GetSchedule(sch.ID)
+	if !ok || schAfter.Status != "QUEUED" || schAfter.HostID != "global" {
+		t.Fatalf("expected schedule reset to QUEUED on global, got %+v", schAfter)
+	}
+	j1After, _ := e.GetJob(job1.ID)
+	if j1After.Status != "REQUEUED" {
+		t.Fatalf("expected job1 status REQUEUED, got %s", j1After.Status)
+	}
+
+	// Re-poll and simulate LEASED status + HeartbeatJob transition to RUNNING
+	job2, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatalf("expected PollHost to re-lease schedule after reap")
+	}
+	e.mu.Lock()
+	e.jobs[job2.ID].Status = "LEASED"
+	e.mu.Unlock()
+
+	if err := e.HeartbeatJob(job2.ID, job2.LeaseToken); err != nil {
+		t.Fatalf("HeartbeatJob failed: %v", err)
+	}
+	j2After, _ := e.GetJob(job2.ID)
+	if j2After.Status != "RUNNING" {
+		t.Fatalf("expected HeartbeatJob to transition LEASED -> RUNNING, got %s", j2After.Status)
+	}
+	if j2After.LeaseAckDeadlineAt != "" {
+		t.Fatalf("expected LeaseAckDeadlineAt cleared on HeartbeatJob, got %v", j2After.LeaseAckDeadlineAt)
+	}
+}
+
+func TestGov3782_ToolPriorityPersistenceAndAllocationCaseInsensitive(t *testing.T) {
+	now := time.Date(2026, 10, 28, 22, 0, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return now })
+	var savedPriority []string
+	e.OnToolPriorityChange = func(tools []string) {
+		savedPriority = append([]string(nil), tools...)
+	}
+	e.SetToolPriority([]string{"opencode", "agy"})
+	if len(savedPriority) != 2 || savedPriority[0] != "opencode" {
+		t.Fatalf("expected OnToolPriorityChange callback to receive [opencode agy], got %v", savedPriority)
+	}
+
+	_ = e.RegisterHost("host-upper", "permanent", "generic")
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "host-upper",
+		WorktreePath:                 "/work/root",
+		CloneURL:                     "https://example.test/root.git",
+		GlobalQueueAllocationEnabled: true,
+	})
+	e.Heartbeat("host-upper", []Tool{
+		{Name: "opencode", Installed: true},
+	}, false)
+	// Advance clock 10 minutes while Presence remains uppercase "ONLINE"
+	now = now.Add(10 * time.Minute)
+	alloc := e.ResolveToolPriorityAllocation("", "host-upper", "")
+	if alloc.TargetAgent != "opencode" {
+		t.Fatalf("expected TargetAgent opencode, got %s (source: %s)", alloc.TargetAgent, alloc.AllocationSource)
+	}
+}
+
+
 
 

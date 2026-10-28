@@ -459,3 +459,67 @@ func TestIntegration_StoryCreationAndExecutionDispatch(t *testing.T) {
 		t.Errorf("expected story ID %s, got: %s", resp.StoryID, claimedPayload.StoryID)
 	}
 }
+
+type mockStoryIDAllocator struct {
+	seq int
+}
+
+func (m *mockStoryIDAllocator) AllocateStoryID(_ context.Context, category string) (string, error) {
+	m.seq++
+	return "STORY-" + category + "-3782", nil
+}
+
+func TestGov3782_CanonicalStoryIDAllocatorAndCaseInsensitiveStatusFilter(t *testing.T) {
+	store := setupTestStore(t)
+	q := dispatch.NewInMemoryQueue()
+	engine := control.NewEngine(nil)
+	handler := NewStoriesHandler(store, q, nil)
+	handler.SetEngine(engine)
+	handler.SetStoryIDAllocator(&mockStoryIDAllocator{})
+
+	payload := validStoryPayload()
+	payload["category"] = "gov"
+	payload["enqueue"] = true
+	body, _ := json.Marshal(payload)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/stories", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp CreateStoryResponse
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+	if resp.StoryID != "STORY-MCP-3782" {
+		t.Fatalf("expected allocated StoryID STORY-MCP-3782, got %s", resp.StoryID)
+	}
+	if resp.IndexUpdated {
+		t.Fatalf("expected IndexUpdated=false when SyncState is PENDING_WORKSPACE_MATERIALIZATION")
+	}
+
+	// Verify ListStories with status=READY matches pending/PENDING_INDEX stories
+	reqList := httptest.NewRequest(http.MethodGet, "/api/v1/stories?status=READY", nil)
+	wList := httptest.NewRecorder()
+	handler.ListStories(wList, reqList)
+	if wList.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from ListStories, got %d", wList.Code)
+	}
+	var listResp struct {
+		Stories []StoryDetail `json:"items"`
+	}
+	_ = json.NewDecoder(wList.Body).Decode(&listResp)
+	found := false
+	for _, s := range listResp.Stories {
+		if s.ID == "STORY-MCP-3782" {
+			found = true
+			if s.Status != "READY" {
+				t.Errorf("expected canonical status READY for unmaterialized pending story, got %s", s.Status)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected STORY-MCP-3782 to match status=READY filter")
+	}
+}
+

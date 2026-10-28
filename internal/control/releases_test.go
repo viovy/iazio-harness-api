@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -1176,7 +1177,7 @@ func TestEngine_RepoRuntimeStatusTelemetryAndFleetCleanAggregation(t *testing.T)
 	if h.FleetCheckedAt == nil {
 		t.Fatalf("expected FleetCheckedAt to be set")
 	}
-	st2 := h.RepoStatuses["/workspace/repo-2"]
+	st2 := h.RepoStatuses[filepath.Clean("/workspace/repo-2")]
 	if st2.DirtyFilesCount != 3 || st2.UntrackedFilesCount != 1 || st2.Ahead != 2 {
 		t.Fatalf("expected repo-2 telemetry to be ingested, got %+v", st2)
 	}

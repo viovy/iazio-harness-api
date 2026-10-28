@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/viovy/iazio-harness-api/internal/codebase"
@@ -70,6 +72,67 @@ type GlobalScheduler interface {
 	EnqueueGlobalStorySchedule(storyID, submodule, targetAgent, promptText string) (control.Schedule, error)
 }
 
+// StoryIDAllocator allocates canonical sequential story IDs from the persistent sequence store.
+type StoryIDAllocator interface {
+	AllocateStoryID(ctx context.Context, category string) (string, error)
+}
+
+var fallbackStorySeq int64 = 3800
+
+func inferStoryCategory(submodule string) string {
+	sub := strings.ToLower(strings.TrimSpace(submodule))
+	switch {
+	case strings.Contains(sub, "harness"):
+		return "HAR"
+	case strings.Contains(sub, "mcp"):
+		return "MCP"
+	case strings.Contains(sub, "agent"):
+		return "AGT"
+	case strings.Contains(sub, "web"):
+		return "WEB"
+	case strings.Contains(sub, "api"):
+		return "API"
+	default:
+		return "GOV"
+	}
+}
+
+func normalizeCanonicalStoryStatus(status, syncState string) string {
+	s := strings.ToUpper(strings.TrimSpace(status))
+	switch s {
+	case "PENDING", "READY":
+		if strings.EqualFold(syncState, "PENDING_WORKSPACE_MATERIALIZATION") {
+			return "READY"
+		}
+		return "READY"
+	case "PENDING_INDEX":
+		return "PENDING_INDEX"
+	case "IN_PROGRESS", "RUNNING":
+		return "IN_PROGRESS"
+	case "DONE", "COMPLETED":
+		return "DONE"
+	case "":
+		return "READY"
+	default:
+		return s
+	}
+}
+
+func matchesStoryStatusFilter(storyStatus, syncState, filter string) bool {
+	if filter == "" {
+		return true
+	}
+	f := strings.ToUpper(strings.TrimSpace(filter))
+	norm := normalizeCanonicalStoryStatus(storyStatus, syncState)
+	if strings.EqualFold(storyStatus, f) || norm == f {
+		return true
+	}
+	if (f == "READY" || f == "PENDING" || f == "PENDING_INDEX") && (norm == "READY" || norm == "PENDING_INDEX" || strings.EqualFold(syncState, "PENDING_WORKSPACE_MATERIALIZATION")) {
+		return true
+	}
+	return false
+}
+
 // StoriesHandler handles semantic story validation and dispatch.
 type StoriesHandler struct {
 	store        codebase.Store
@@ -78,6 +141,12 @@ type StoriesHandler struct {
 	dispatchWait time.Duration
 	scheduler    GlobalScheduler
 	engine       *control.Engine
+	idAllocator  StoryIDAllocator
+}
+
+// SetStoryIDAllocator injects the canonical story ID sequence allocator.
+func (h *StoriesHandler) SetStoryIDAllocator(a StoryIDAllocator) {
+	h.idAllocator = a
 }
 
 // SetEngine injects the control plane engine for story persistence.
@@ -250,11 +319,16 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	storyID := strings.TrimSpace(req.ID)
 	if storyID == "" {
-		slug := strings.ToUpper(strings.ReplaceAll(req.Submodule, "-", "_"))
-		if slug == "" || slug == "." {
-			slug = "ROOT"
+		cat := inferStoryCategory(req.Submodule)
+		if h.idAllocator != nil {
+			if allocated, err := h.idAllocator.AllocateStoryID(r.Context(), cat); err == nil && allocated != "" {
+				storyID = allocated
+			}
 		}
-		storyID = fmt.Sprintf("STORY-%s-%d", slug, time.Now().Unix()%100000)
+		if storyID == "" {
+			seq := atomic.AddInt64(&fallbackStorySeq, 1)
+			storyID = fmt.Sprintf("STORY-%s-%04d", cat, seq)
+		}
 	}
 
 	body := req.Body
@@ -262,7 +336,7 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		body = renderStoryMarkdown(control.Story{
 			ID:                   storyID,
 			Title:                req.Title,
-			Status:               "pending",
+			Status:               "READY",
 			Priority:             req.Priority,
 			Submodule:            req.Submodule,
 			Problem:              req.Problem,
@@ -278,7 +352,7 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Submodule:            req.Submodule,
 		Title:                req.Title,
 		Priority:             req.Priority,
-		Status:               "pending",
+		Status:               "READY",
 		SyncState:            "PENDING_WORKSPACE_MATERIALIZATION",
 		Body:                 body,
 		Problem:              req.Problem,
@@ -321,6 +395,7 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				Type:        dispatch.JobTypePromptExecute,
 				Repo:        req.Submodule,
 				TargetAgent: targetAgent,
+				StoryID:     storyID,
 				Payload:     execPayload,
 				TraceID:     jobTraceID,
 				ParentID:    span.ID,
@@ -330,9 +405,12 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				execJobID = ej.ID
 				executionStatus = "pending"
 			}
-		}
-		if h.scheduler != nil {
-			_, _ = h.scheduler.EnqueueGlobalStorySchedule(storyID, req.Submodule, targetAgent, promptText)
+		} else if h.scheduler != nil {
+			sch, err := h.scheduler.EnqueueGlobalStorySchedule(storyID, req.Submodule, targetAgent, promptText)
+			if err == nil {
+				execJobID = sch.ID
+				executionStatus = "pending"
+			}
 		}
 	}
 
@@ -342,7 +420,7 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		StoryID:          storyID,
 		Submodule:        req.Submodule,
 		StoryPath:        fmt.Sprintf("docs/stories/%s.story.md", strings.ToLower(storyID)),
-		IndexUpdated:     true,
+		IndexUpdated:     false,
 		SyncState:        "PENDING_WORKSPACE_MATERIALIZATION",
 		ExecutionJobID:   execJobID,
 		ExecutionStatus:  executionStatus,
@@ -503,16 +581,18 @@ func (h *StoriesHandler) ListStories(w http.ResponseWriter, r *http.Request) {
 	seen := make(map[string]bool)
 
 	// 1. Database engine is authoritative:
+	syncStates := make(map[string]string)
 	if h.engine != nil {
 		for _, s := range h.engine.ListStories("") {
 			var subs []string
 			if s.Submodule != "" {
 				subs = []string{s.Submodule}
 			}
+			syncStates[strings.ToUpper(s.ID)] = s.SyncState
 			all = append(all, StoryDetail{
 				ID:         s.ID,
 				Title:      s.Title,
-				Status:     s.Status,
+				Status:     normalizeCanonicalStoryStatus(s.Status, s.SyncState),
 				Priority:   s.Priority,
 				Path:       fmt.Sprintf("docs/stories/%s.story.md", strings.ToLower(s.ID)),
 				Submodules: subs,
@@ -526,6 +606,7 @@ func (h *StoriesHandler) ListStories(w http.ResponseWriter, r *http.Request) {
 	root := findStoriesRoot()
 	for _, s := range loadIndexStories(root) {
 		if !seen[strings.ToUpper(s.ID)] {
+			s.Status = normalizeCanonicalStoryStatus(s.Status, "")
 			all = append(all, s)
 			seen[strings.ToUpper(s.ID)] = true
 		}
@@ -533,7 +614,7 @@ func (h *StoriesHandler) ListStories(w http.ResponseWriter, r *http.Request) {
 
 	var matched []StoryDetail
 	for _, s := range all {
-		if statusFilter != "" && strings.ToUpper(s.Status) != statusFilter {
+		if !matchesStoryStatusFilter(s.Status, syncStates[strings.ToUpper(s.ID)], statusFilter) {
 			continue
 		}
 		if categoryFilter != "" && !strings.Contains(strings.ToUpper(s.ID), categoryFilter) {
@@ -598,7 +679,7 @@ func (h *StoriesHandler) GetStory(w http.ResponseWriter, r *http.Request) {
 			found = &StoryDetail{
 				ID:         s.ID,
 				Title:      s.Title,
-				Status:     s.Status,
+				Status:     normalizeCanonicalStoryStatus(s.Status, s.SyncState),
 				Priority:   s.Priority,
 				Path:       fmt.Sprintf("docs/stories/%s.story.md", strings.ToLower(s.ID)),
 				Submodules: subs,
@@ -612,6 +693,7 @@ func (h *StoriesHandler) GetStory(w http.ResponseWriter, r *http.Request) {
 	if found == nil {
 		for _, s := range loadIndexStories(root) {
 			if strings.EqualFold(s.ID, id) {
+				s.Status = normalizeCanonicalStoryStatus(s.Status, "")
 				match := s
 				found = &match
 				break
