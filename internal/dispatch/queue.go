@@ -25,6 +25,7 @@ import (
 // Standard job types.
 const (
 	JobTypeStoryCreate   = "story.create"
+	JobTypeStoryExecute  = "story.execute"
 	JobTypePromptExecute = "prompt.execute"
 )
 
@@ -466,6 +467,14 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 		case <-ch:
 		default:
 			close(ch)
+		}
+	}
+
+	if q.store != nil && len(expiredIDs) > 0 {
+		for _, id := range expiredIDs {
+			if j, ok := q.jobs[id]; ok && j != nil {
+				_ = q.store.SaveQueueJob(context.Background(), j)
+			}
 		}
 	}
 
@@ -1047,6 +1056,9 @@ func (q *InMemoryQueue) Cancel(ctx context.Context, jobID string, reason string)
 	}
 	job.Error = reason
 	job.CompletedAt = &now
+	if q.store != nil {
+		_ = q.store.SaveQueueJob(ctx, job)
+	}
 	done := job.doneCh
 	q.mu.Unlock()
 
@@ -1083,6 +1095,9 @@ func (q *InMemoryQueue) Retry(ctx context.Context, jobID string) (*Job, error) {
 		doneCh:      make(chan struct{}),
 	}
 	q.jobs[newJob.ID] = newJob
+	if q.store != nil {
+		_ = q.store.SaveQueueJob(ctx, newJob)
+	}
 	q.mu.Unlock()
 
 	return newJob, nil
@@ -1121,6 +1136,7 @@ func (q *InMemoryQueue) AckLease(ctx context.Context, jobID, leaseToken string, 
 			log.Printf("[dispatch-queue] ERROR: failed to persist heartbeat lease for %s: %v", jobID, err)
 			return nil, fmt.Errorf("persist heartbeat lease: %w", err)
 		}
+		_ = q.store.SaveQueueJob(ctx, job)
 	}
 	return job, nil
 }
@@ -1174,6 +1190,9 @@ func (q *InMemoryQueue) Failover(ctx context.Context, jobID string, req AttemptF
 				close(job.doneCh)
 			}
 		}
+		if q.store != nil {
+			_ = q.store.SaveQueueJob(ctx, job)
+		}
 		return job, nil
 	}
 
@@ -1186,6 +1205,9 @@ func (q *InMemoryQueue) Failover(ctx context.Context, jobID string, req AttemptF
 	job.LeaseToken = ""
 	job.LeaseAckDeadlineAt = nil
 	job.Retriable = true
+	if q.store != nil {
+		_ = q.store.SaveQueueJob(ctx, job)
+	}
 
 	return job, nil
 }
@@ -1221,6 +1243,10 @@ func (q *InMemoryQueue) RetryRetriable(ctx context.Context) ([]*Job, error) {
 				doneCh:                  make(chan struct{}),
 			}
 			q.jobs[newJob.ID] = newJob
+			if q.store != nil {
+				_ = q.store.SaveQueueJob(ctx, job)
+				_ = q.store.SaveQueueJob(ctx, newJob)
+			}
 			retried = append(retried, newJob)
 		}
 	}
@@ -1357,6 +1383,9 @@ func (q *InMemoryQueue) ForceDispatch(ctx context.Context, jobID string) (*Job, 
 	}
 	job.DispatchDiagnostics.QueueState = "dispatching"
 	job.DispatchDiagnostics.LastDispatchEvaluationAt = now.Format(time.RFC3339)
+	if q.store != nil {
+		_ = q.store.SaveQueueJob(ctx, job)
+	}
 
 	return job, nil
 }
@@ -1415,6 +1444,9 @@ func (q *InMemoryQueue) ReconcileGlobalQueueSlots(now time.Time, staleGrace time
 							close(j.doneCh)
 						}
 					}
+				}
+				if q.store != nil {
+					_ = q.store.SaveQueueJob(context.Background(), j)
 				}
 			}
 		}

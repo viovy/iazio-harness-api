@@ -564,7 +564,7 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if h.scheduler != nil {
+	if h.queue == nil && h.scheduler != nil {
 		_, _ = h.scheduler.EnqueueGlobalStorySchedule(storyID, submodule, targetAgent, normalizedPrompt)
 	}
 

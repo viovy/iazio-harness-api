@@ -304,6 +304,19 @@ CREATE TABLE IF NOT EXISTS harness_dispatch_jobs (
 
 CREATE INDEX IF NOT EXISTS harness_dispatch_jobs_status_idx ON harness_dispatch_jobs (status);
 CREATE INDEX IF NOT EXISTS harness_dispatch_jobs_host_idx ON harness_dispatch_jobs (claimed_host, status);
+
+CREATE TABLE IF NOT EXISTS harness_settings (
+  key text PRIMARY KEY,
+  value jsonb NOT NULL,
+  updated_at timestamp with time zone NOT NULL DEFAULT now()
+);
+
+CREATE SEQUENCE IF NOT EXISTS story_seq_gov START WITH 3800;
+CREATE SEQUENCE IF NOT EXISTS story_seq_har START WITH 200;
+CREATE SEQUENCE IF NOT EXISTS story_seq_mcp START WITH 200;
+CREATE SEQUENCE IF NOT EXISTS story_seq_api START WITH 200;
+CREATE SEQUENCE IF NOT EXISTS story_seq_agt START WITH 200;
+CREATE SEQUENCE IF NOT EXISTS story_seq_web START WITH 200;
 `
 
 // Store is a Postgres connection for the control plane.
@@ -1334,3 +1347,79 @@ ORDER BY created_at ASC;
 	}
 	return jobs, rows.Err()
 }
+
+// SaveToolPriority persists the global tool priority list into harness_settings.
+func (s *Store) SaveToolPriority(ctx context.Context, tools []string) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	raw, err := json.Marshal(tools)
+	if err != nil {
+		return fmt.Errorf("marshal tool priority: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `
+INSERT INTO harness_settings (key, value, updated_at)
+VALUES ('tool_priority', $1::jsonb, now())
+ON CONFLICT (key) DO UPDATE SET
+  value = EXCLUDED.value,
+  updated_at = now()
+`, string(raw))
+	if err != nil {
+		return fmt.Errorf("save tool priority: %w", err)
+	}
+	return nil
+}
+
+// LoadToolPriority loads the persisted global tool priority list from harness_settings.
+func (s *Store) LoadToolPriority(ctx context.Context) ([]string, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	var raw []byte
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM harness_settings WHERE key = 'tool_priority'`).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load tool priority: %w", err)
+	}
+	var tools []string
+	if err := json.Unmarshal(raw, &tools); err != nil {
+		return nil, fmt.Errorf("unmarshal tool priority: %w", err)
+	}
+	return tools, nil
+}
+
+// AllocateStoryID allocates the next canonical story ID from the PostgreSQL sequence for the given category.
+func (s *Store) AllocateStoryID(ctx context.Context, category string) (string, error) {
+	if s == nil || s.db == nil {
+		return "", fmt.Errorf("database store not configured")
+	}
+	cat := strings.ToUpper(strings.TrimSpace(category))
+	seqName := "story_seq_gov"
+	switch cat {
+	case "GOV":
+		seqName = "story_seq_gov"
+	case "HAR", "HARNESS":
+		cat = "HAR"
+		seqName = "story_seq_har"
+	case "MCP":
+		seqName = "story_seq_mcp"
+	case "API":
+		seqName = "story_seq_api"
+	case "AGT", "AGENT":
+		cat = "AGT"
+		seqName = "story_seq_agt"
+	case "WEB":
+		seqName = "story_seq_web"
+	default:
+		cat = "GOV"
+		seqName = "story_seq_gov"
+	}
+	var seqVal int64
+	if err := s.db.QueryRowContext(ctx, fmt.Sprintf("SELECT nextval('%s')", seqName)).Scan(&seqVal); err != nil {
+		return "", fmt.Errorf("allocate story sequence %s: %w", seqName, err)
+	}
+	return fmt.Sprintf("STORY-%s-%04d", cat, seqVal), nil
+}
+

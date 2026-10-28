@@ -667,10 +667,19 @@ func dispatchScheduleView(j *dispatch.Job) map[string]any {
 		targetHost = hostID
 	}
 	status := strings.ToUpper(j.Status)
-	if status == "PENDING" {
+	switch status {
+	case "PENDING":
 		status = "QUEUED"
-	} else if status == "CLAIMED" {
+	case "CLAIMED":
 		status = "PENDING_EXECUTION"
+	case "LEASED":
+		status = "LEASED"
+	case "RUNNING":
+		status = "RUNNING"
+	case "CANCELED", "CANCELLED":
+		status = "CANCELLED"
+	case "REQUEUED", "RETRY_WAIT":
+		status = "REQUEUED"
 	}
 
 	return map[string]any{
@@ -732,6 +741,9 @@ func dispatchHistoryView(j *dispatch.Job) map[string]any {
 		targetHost = hostID
 	}
 	status := strings.ToUpper(j.Status)
+	if status == "CANCELED" {
+		status = "CANCELLED"
+	}
 	clean := status == "COMPLETED"
 
 	createdAtStr := ""
