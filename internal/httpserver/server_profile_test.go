@@ -25,10 +25,8 @@ fleet_distribution:
   install_root:
     unix:
       primary: ~/.local/bin
-      fallback: ~/.iazio/bin
     windows:
       primary: "%USERPROFILE%/bin"
-      fallback: "%USERPROFILE%/.iazio/bin"
   endpoints:
     harness_api: "https://example.com/iazio-harness-api"
     iazio_api: "https://example.com/iazio-api"
@@ -162,10 +160,8 @@ fleet_distribution:
   install_root:
     unix:
       primary: ~/.local/bin
-      fallback: ~/.iazio/bin
     windows:
       primary: "%USERPROFILE%/bin"
-      fallback: "%USERPROFILE%/.iazio/bin"
   endpoints:
     harness_api: "https://example.com/iazio-harness-api"
   tools:
