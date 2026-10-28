@@ -46,8 +46,7 @@ type ProfileInstallRoots struct {
 }
 
 type ProfileInstallRootPaths struct {
-	Primary  string `json:"primary" yaml:"primary"`
-	Fallback string `json:"fallback" yaml:"fallback"`
+	Primary string `json:"primary" yaml:"primary"`
 }
 
 type ProfileTool struct {
@@ -356,12 +355,10 @@ func parseFleetDistribution(raw []byte) (*DistributionProfile, error) {
 			SchemaVersion int `yaml:"schema_version" json:"schema_version"`
 			InstallRoot   struct {
 				Unix struct {
-					Primary  string `yaml:"primary" json:"primary"`
-					Fallback string `yaml:"fallback" json:"fallback"`
+					Primary string `yaml:"primary" json:"primary"`
 				} `yaml:"unix" json:"unix"`
 				Windows struct {
-					Primary  string `yaml:"primary" json:"primary"`
-					Fallback string `yaml:"fallback" json:"fallback"`
+					Primary string `yaml:"primary" json:"primary"`
 				} `yaml:"windows" json:"windows"`
 			} `yaml:"install_root" json:"install_root"`
 			Endpoints    map[string]string `yaml:"endpoints" json:"endpoints"`
@@ -397,12 +394,10 @@ func parseFleetDistribution(raw []byte) (*DistributionProfile, error) {
 		IsDefault:   true,
 		InstallRoots: ProfileInstallRoots{
 			Unix: ProfileInstallRootPaths{
-				Primary:  fd.InstallRoot.Unix.Primary,
-				Fallback: fd.InstallRoot.Unix.Fallback,
+				Primary: fd.InstallRoot.Unix.Primary,
 			},
 			Windows: ProfileInstallRootPaths{
-				Primary:  fd.InstallRoot.Windows.Primary,
-				Fallback: fd.InstallRoot.Windows.Fallback,
+				Primary: fd.InstallRoot.Windows.Primary,
 			},
 		},
 		Endpoints: fd.Endpoints,
