@@ -515,3 +515,58 @@ func TestGov3785_NoStoryIDAllocationOrFrontmatterHandlingAndCaseInsensitiveStatu
 	}
 }
 
+func TestStoriesHandlerCreateWithoutIDAlwaysEnqueuesASEPrompt(t *testing.T) {
+	store := setupTestStore(t)
+	q := dispatch.NewInMemoryQueue()
+	engine := control.NewEngine(nil)
+	engine.SetToolPriority([]string{"opencode", "agy"})
+	_ = engine.RegisterHost("mac-mini", "permanent", "generic")
+	_ = engine.UpsertRepo(control.Repo{
+		HostID:                       "mac-mini",
+		WorktreePath:                 "iazio-mcp",
+		CloneURL:                     "https://github.com/viovy/iazio-mcp.git",
+		GlobalQueueAllocationEnabled: true,
+	})
+	engine.Heartbeat("mac-mini", []control.Tool{
+		{Name: "opencode", Installed: true, Path: "/usr/local/bin/opencode", Status: "ok"},
+	}, false)
+
+	handler := NewStoriesHandler(store, q, nil)
+	handler.SetEngine(engine)
+
+	// Omit "id" and omit "enqueue": must still enqueue an ASE prompt_execute job (ADR-006 compliant)
+	payload := validStoryPayload()
+	body, _ := json.Marshal(payload)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/stories", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp CreateStoryResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.StoryID != "" {
+		t.Fatalf("expected StoryID to remain empty (resolved by Canonical AI/autopilot), got %q", resp.StoryID)
+	}
+	if resp.HarnessJobID == "" || resp.ExecutionJobID == "" {
+		t.Fatalf("expected non-empty HarnessJobID/ExecutionJobID when creating story without explicit id, got %+v", resp)
+	}
+
+	job, ok := q.Get(resp.HarnessJobID)
+	if !ok || job == nil {
+		t.Fatalf("expected enqueued job %s in queue", resp.HarnessJobID)
+	}
+	if job.TargetAgent != "opencode" {
+		t.Fatalf("expected ResolveToolPriorityAllocation to assign TargetAgent=opencode, got %s", job.TargetAgent)
+	}
+	if job.TargetHost != "mac-mini" {
+		t.Fatalf("expected ResolveToolPriorityAllocation to assign TargetHost=mac-mini, got %s", job.TargetHost)
+	}
+}
+
+

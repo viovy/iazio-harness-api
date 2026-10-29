@@ -238,9 +238,9 @@ func (h *JobLifecycleHandler) GetJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if job.DispatchDiagnostics == nil && h.engine != nil && (job.Status == dispatch.JobStatusPending || job.Status == dispatch.JobStatusClaimed) {
+	if job.DispatchDiagnostics == nil && h.engine != nil && (job.Status == dispatch.JobStatusPending || job.Status == dispatch.JobStatusClaimed || job.Status == dispatch.JobStatusLeased) {
 		diag := h.engine.EvaluateDispatchDiagnostics(job.TargetHost, job.TargetAgent)
-		if job.Status == dispatch.JobStatusClaimed {
+		if job.Status == dispatch.JobStatusClaimed || job.Status == dispatch.JobStatusLeased {
 			diag.QueueState = "running"
 		}
 		_ = h.queue.SetDispatchDiagnostics(jobID, diag)

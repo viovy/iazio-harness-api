@@ -438,9 +438,12 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 					j.Status = JobStatusPending
 					j.ClaimedHost = ""
 					j.HostID = ""
+					j.LeaseOwner = ""
+					j.LeaseToken = ""
 					j.ClaimedAt = nil
 					j.HeartbeatAt = nil
 					j.LeaseExpiresAt = nil
+					j.LeaseAckDeadlineAt = nil
 					expiredIDs = append(expiredIDs, j.ID)
 				} else {
 					j.Status = JobStatusFailed
@@ -1404,7 +1407,7 @@ func (q *InMemoryQueue) ReconcileGlobalQueueSlots(now time.Time, staleGrace time
 
 	reclaimedIDs := q.reapExpiredLocked(now)
 	for _, j := range q.jobs {
-		if j.Status == JobStatusClaimed {
+		if j.Status == JobStatusClaimed || j.Status == JobStatusLeased || j.Status == JobStatusRunning {
 			stale := false
 			if j.HeartbeatAt != nil && now.Sub(*j.HeartbeatAt) > staleGrace {
 				stale = true
@@ -1413,13 +1416,20 @@ func (q *InMemoryQueue) ReconcileGlobalQueueSlots(now time.Time, staleGrace time
 				stale = true
 			}
 			if stale {
+				prevHost := j.ClaimedHost
+				if prevHost == "" {
+					prevHost = j.HostID
+				}
 				if j.Attempts < DefaultMaxAttempts {
 					j.Status = JobStatusPending
 					j.ClaimedHost = ""
 					j.HostID = ""
+					j.LeaseOwner = ""
+					j.LeaseToken = ""
 					j.ClaimedAt = nil
 					j.HeartbeatAt = nil
 					j.LeaseExpiresAt = nil
+					j.LeaseAckDeadlineAt = nil
 					j.FencingToken = 0
 					if j.DispatchDiagnostics == nil {
 						j.DispatchDiagnostics = &DispatchDiagnostics{}
@@ -1429,7 +1439,7 @@ func (q *InMemoryQueue) ReconcileGlobalQueueSlots(now time.Time, staleGrace time
 					if j.DispatchDiagnostics.BlockedReasonsByHost == nil {
 						j.DispatchDiagnostics.BlockedReasonsByHost = make(map[string]string)
 					}
-					j.DispatchDiagnostics.BlockedReasonsByHost["lease"] = fmt.Sprintf("reclaimed from %s after heartbeat timeout > %v", j.ClaimedHost, staleGrace)
+					j.DispatchDiagnostics.BlockedReasonsByHost["lease"] = fmt.Sprintf("reclaimed from %s after heartbeat timeout > %v", prevHost, staleGrace)
 					reclaimedIDs = append(reclaimedIDs, j.ID)
 				} else {
 					j.Status = JobStatusFailed

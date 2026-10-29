@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-harness-api/internal/codebase"
+	"github.com/viovy/iazio-harness-api/internal/control"
 	"github.com/viovy/iazio-harness-api/internal/dispatch"
 	"github.com/viovy/iazio-harness-api/internal/telemetry"
 )
@@ -18,9 +19,11 @@ import (
 type CreatePromptRequest struct {
 	PromptID    string `json:"prompt_id,omitempty"`
 	Repo        string `json:"repo"`
+	Branch      string `json:"branch,omitempty"`
 	Title       string `json:"title"`
 	Prompt      string `json:"prompt"`
 	TargetAgent string `json:"target_agent,omitempty"`
+	TargetHost  string `json:"target_host,omitempty"`
 	Enqueue     bool   `json:"enqueue,omitempty"`
 	TraceID     string `json:"trace_id,omitempty"`
 	SearchID    string `json:"search_id,omitempty"`
@@ -41,6 +44,7 @@ type PromptsHandler struct {
 	store       codebase.Store
 	queue       dispatch.Queue
 	idempotency *IdempotencyStore
+	engine      *control.Engine
 }
 
 // NewPromptsHandler constructs a new PromptsHandler.
@@ -53,6 +57,11 @@ func NewPromptsHandler(store codebase.Store, queue dispatch.Queue, idempotency *
 		queue:       queue,
 		idempotency: idempotency,
 	}
+}
+
+// SetEngine binds the control-plane Engine for tool priority allocation and prompt persistence.
+func (h *PromptsHandler) SetEngine(engine *control.Engine) {
+	h.engine = engine
 }
 
 func (h *PromptsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -140,6 +149,30 @@ func (h *PromptsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		promptID = generateUUIDv4()
 	}
 	req.PromptID = promptID
+	req.Branch = strings.TrimSpace(req.Branch)
+	req.TargetAgent = strings.TrimSpace(req.TargetAgent)
+	req.TargetHost = strings.TrimSpace(req.TargetHost)
+
+	var alloc control.ToolPriorityAllocation
+	if h.engine != nil {
+		alloc = h.engine.ResolveToolPriorityAllocation(req.TargetAgent, req.TargetHost, req.Repo)
+		if alloc.TargetAgent != "" {
+			req.TargetAgent = alloc.TargetAgent
+		}
+		if alloc.TargetHost != "" && req.TargetHost == "" {
+			req.TargetHost = alloc.TargetHost
+		}
+		h.engine.PutPrompt(control.Prompt{
+			ID:     promptID,
+			Title:  req.Title,
+			Body:   req.Prompt,
+			Engine: req.TargetAgent,
+			Status: "READY",
+		})
+	} else if req.TargetAgent == "" || strings.EqualFold(req.TargetAgent, "auto") {
+		req.TargetAgent = "agy"
+	}
+
 	status := "created"
 	harnessJobID := ""
 
@@ -153,13 +186,17 @@ func (h *PromptsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			jobTraceID = span.TraceID
 		}
 		job, err := h.queue.Enqueue(r.Context(), &dispatch.Job{
-			Type:        dispatch.JobTypePromptExecute,
-			Repo:        req.Repo,
-			TargetAgent: req.TargetAgent,
-			Payload:     payloadBytes,
-			TraceID:     jobTraceID,
-			ParentID:    span.ID,
-			SearchID:    strings.TrimSpace(req.SearchID),
+			Type:                 dispatch.JobTypePromptExecute,
+			Repo:                 req.Repo,
+			TargetHost:           req.TargetHost,
+			TargetAgent:          req.TargetAgent,
+			NormalizedPrompt:     req.Prompt,
+			AllocationSource:     alloc.AllocationSource,
+			PriorityRankSelected: alloc.PriorityRankSelected,
+			Payload:              payloadBytes,
+			TraceID:              jobTraceID,
+			ParentID:             span.ID,
+			SearchID:             strings.TrimSpace(req.SearchID),
 		})
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to enqueue prompt: %v", err))

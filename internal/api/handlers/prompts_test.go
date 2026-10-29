@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-harness-api/internal/codebase"
+	"github.com/viovy/iazio-harness-api/internal/control"
 	"github.com/viovy/iazio-harness-api/internal/dispatch"
 )
 
@@ -157,3 +158,64 @@ func TestPromptsHandler_Idempotency(t *testing.T) {
 		t.Fatalf("expected 409 Conflict on payload mismatch, got %d", w3.Code)
 	}
 }
+
+func TestPromptsHandlerPreservesBranchAndAllocatesTool(t *testing.T) {
+	store := setupTestStore(t)
+	q := dispatch.NewInMemoryQueue()
+	engine := control.NewEngine(nil)
+	engine.SetToolPriority([]string{"claude", "agy"})
+	_ = engine.RegisterHost("mac-mini", "permanent", "generic")
+	_ = engine.UpsertRepo(control.Repo{
+		HostID:                       "mac-mini",
+		WorktreePath:                 "iazio-mcp",
+		CloneURL:                     "https://github.com/viovy/iazio-mcp.git",
+		GlobalQueueAllocationEnabled: true,
+	})
+	engine.Heartbeat("mac-mini", []control.Tool{
+		{Name: "claude", Installed: true, Path: "/usr/local/bin/claude", Status: "ok"},
+	}, false)
+
+	handler := NewPromptsHandler(store, q, nil)
+	handler.SetEngine(engine)
+
+	payload := map[string]any{
+		"repo":         "iazio-mcp",
+		"branch":       "feat/custom-branch",
+		"title":        "Branch-aware prompt",
+		"prompt":       "Run branch verification",
+		"target_agent": "auto",
+		"enqueue":      true,
+	}
+	body, _ := json.Marshal(payload)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/prompts", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp CreatePromptResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	job, ok := q.Get(resp.HarnessJobID)
+	if !ok || job == nil {
+		t.Fatalf("expected enqueued job %s", resp.HarnessJobID)
+	}
+	if job.TargetAgent != "claude" {
+		t.Fatalf("expected allocated TargetAgent claude, got %s", job.TargetAgent)
+	}
+	if job.TargetHost != "mac-mini" {
+		t.Fatalf("expected allocated TargetHost mac-mini, got %s", job.TargetHost)
+	}
+	var savedPayload CreatePromptRequest
+	if err := json.Unmarshal(job.Payload, &savedPayload); err != nil {
+		t.Fatalf("unmarshal job payload: %v", err)
+	}
+	if savedPayload.Branch != "feat/custom-branch" {
+		t.Fatalf("expected Branch feat/custom-branch in job payload, got %q", savedPayload.Branch)
+	}
+}
+

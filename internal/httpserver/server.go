@@ -167,6 +167,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/stories/{id}/materialize", storiesHandler.MaterializeStory)
 
 	promptsHandler := handlers.NewPromptsHandler(codebaseStore, queue, idempotency)
+	if s.Engine != nil {
+		promptsHandler.SetEngine(s.Engine)
+	}
 	mux.Handle("POST /api/v1/prompts", promptsHandler)
 
 	jobLifecycle := handlers.NewJobLifecycleHandler(queue, codebaseStore)
