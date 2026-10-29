@@ -5212,6 +5212,86 @@ func TestGov3782_ToolPriorityPersistenceAndAllocationCaseInsensitive(t *testing.
 	}
 }
 
+func TestPollHostTransitionsToLeasedUntilAckLease(t *testing.T) {
+	now := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return now })
+	_ = e.RegisterHost("host-leased", "permanent", "generic")
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "host-leased",
+		WorktreePath:                 "/work/app",
+		CloneURL:                     "https://example.test/app.git",
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	p := e.PutPrompt(Prompt{Title: "Leased Task", Body: "do work", Status: "READY", Engine: "agy"})
+	sch, err := e.EnqueueGlobalSchedule(p.ID, 1, nil)
+	if err != nil {
+		t.Fatalf("EnqueueGlobalSchedule: %v", err)
+	}
+
+	job, _, _, ok := e.PollHost("host-leased")
+	if !ok {
+		t.Fatalf("expected PollHost to lease global schedule")
+	}
+
+	// Simulate two-phase LEASED status before AckLease
+	e.mu.Lock()
+	e.jobs[job.ID].Status = "LEASED"
+	e.mu.Unlock()
+
+	// Within the 20s LeaseAckDeadlineAt window (e.g. +10s), ReapExpired must NOT unlock repo or reset schedule!
+	now = now.Add(10 * time.Second)
+	e.ReapExpired()
+
+	rDuringAckWindow, _ := e.GetRepo("host-leased", "/work/app")
+	if rDuringAckWindow.Lock != LockRunning {
+		t.Fatalf("expected repo LockRunning while LEASED job is within 20s ACK window, got %s", rDuringAckWindow.Lock)
+	}
+	schDuringAckWindow, _ := e.GetSchedule(sch.ID)
+	if schDuringAckWindow.Status != "RUNNING" {
+		t.Fatalf("expected schedule status RUNNING during ACK window, got %s", schDuringAckWindow.Status)
+	}
+
+	// AckLease transitions job to RUNNING and clears LeaseAckDeadlineAt
+	if err := e.AckLease(job.ID, job.LeaseToken, 9876, "/work/app"); err != nil {
+		t.Fatalf("AckLease failed: %v", err)
+	}
+	acked, _ := e.GetJob(job.ID)
+	if acked.Status != "RUNNING" || acked.LeaseAckDeadlineAt != "" {
+		t.Fatalf("expected AckLease to transition job to RUNNING and clear LeaseAckDeadlineAt, got %+v", acked)
+	}
+}
+
+func TestResolveToolPriorityAllocationMatchesDiagnosticsEligibility(t *testing.T) {
+	now := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return now })
+	e.SetToolPriority([]string{"agy", "opencode"})
+	_ = e.RegisterHost("host-diag", "permanent", "generic")
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "host-diag",
+		WorktreePath:                 "/work/repo",
+		CloneURL:                     "https://example.test/repo.git",
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	// agy is NOT installed/missing path (status missing); opencode is installed and usable
+	e.Heartbeat("host-diag", []Tool{
+		{Name: "agy", Installed: false, Path: "", Status: "missing"},
+		{Name: "opencode", Installed: true, Path: "/usr/local/bin/opencode", Status: "ok"},
+	}, false)
+
+	alloc := e.ResolveToolPriorityAllocation("auto", "host-diag", "/work/repo")
+	if alloc.TargetAgent != "opencode" {
+		t.Fatalf("expected ResolveToolPriorityAllocation to skip missing agy and select opencode, got %s", alloc.TargetAgent)
+	}
+
+	diag := e.EvaluateDispatchDiagnostics("host-diag", alloc.TargetAgent)
+	if len(diag.EligibleHosts) == 0 || diag.QueueState != "dispatching" {
+		t.Fatalf("expected EvaluateDispatchDiagnostics to agree that allocated tool %s is eligible on host-diag, got %+v", alloc.TargetAgent, diag)
+	}
+}
+
+
 
 
 

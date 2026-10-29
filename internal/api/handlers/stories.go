@@ -313,10 +313,19 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var execJobID string
 	var executionStatus string
-	if req.Enqueue {
+	if req.Enqueue || storyID == "" {
 		targetAgent := strings.TrimSpace(req.TargetAgent)
+		var alloc control.ToolPriorityAllocation
+		if h.engine != nil {
+			alloc = h.engine.ResolveToolPriorityAllocation(targetAgent, "", req.Submodule)
+			if alloc.TargetAgent != "" {
+				targetAgent = alloc.TargetAgent
+			}
+		} else if targetAgent == "" || strings.EqualFold(targetAgent, "auto") {
+			targetAgent = "agy"
+		}
 		if targetAgent == "" {
-			targetAgent = "autopilot"
+			targetAgent = "agy"
 		}
 		promptID := fmt.Sprintf("prompt_%d", time.Now().UnixNano())
 		if storyID != "" {
@@ -324,30 +333,53 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		promptText := strings.TrimSpace(req.Prompt)
 		if promptText == "" {
-			promptText = body
+			var sb strings.Builder
+			sb.WriteString(fmt.Sprintf("Title: %s\nSubmodule: %s\nPriority: %s\n\nProblem:\n%s\n", req.Title, req.Submodule, req.Priority, body))
+			if len(req.AcceptanceCriteria) > 0 {
+				sb.WriteString("\nAcceptance Criteria:\n- " + strings.Join(req.AcceptanceCriteria, "\n- ") + "\n")
+			}
+			if len(req.TargetFiles) > 0 {
+				sb.WriteString("\nTarget Files:\n- " + strings.Join(req.TargetFiles, "\n- ") + "\n")
+			}
+			if len(req.VerificationCommands) > 0 {
+				sb.WriteString("\nVerification Commands:\n- " + strings.Join(req.VerificationCommands, "\n- ") + "\n")
+			}
+			promptText = control.NormalizeASEPrompt(sb.String(), "/autonomous-story-execution")
 		}
+		normalizedPrompt := control.NormalizeASEPrompt(promptText, "/autonomous-story-execution")
 		title := req.Title
 		if storyID != "" {
 			title = fmt.Sprintf("Execute story %s: %s", storyID, req.Title)
 		}
 		execPayload, _ := json.Marshal(map[string]any{
-			"prompt_id":    promptID,
-			"repo":         req.Submodule,
-			"story_id":     storyID,
-			"title":        title,
-			"prompt":       promptText,
-			"target_agent": targetAgent,
+			"prompt_id":              promptID,
+			"repo":                   req.Submodule,
+			"story_id":               storyID,
+			"title":                  title,
+			"prompt":                 promptText,
+			"normalized_prompt":      normalizedPrompt,
+			"target_agent":           targetAgent,
+			"priority":               req.Priority,
+			"problem":                req.Problem,
+			"acceptance_criteria":    req.AcceptanceCriteria,
+			"target_files":           req.TargetFiles,
+			"depends_on":             req.DependsOn,
+			"verification_commands":  req.VerificationCommands,
 		})
 		if h.queue != nil {
 			ej, _ := h.queue.Enqueue(r.Context(), &dispatch.Job{
-				Type:        dispatch.JobTypePromptExecute,
-				Repo:        req.Submodule,
-				TargetAgent: targetAgent,
-				StoryID:     storyID,
-				Payload:     execPayload,
-				TraceID:     jobTraceID,
-				ParentID:    span.ID,
-				SearchID:    strings.TrimSpace(req.SearchID),
+				Type:                 dispatch.JobTypePromptExecute,
+				Repo:                 req.Submodule,
+				TargetHost:           alloc.TargetHost,
+				TargetAgent:          targetAgent,
+				StoryID:              storyID,
+				NormalizedPrompt:     normalizedPrompt,
+				AllocationSource:     alloc.AllocationSource,
+				PriorityRankSelected: alloc.PriorityRankSelected,
+				Payload:              execPayload,
+				TraceID:              jobTraceID,
+				ParentID:             span.ID,
+				SearchID:             strings.TrimSpace(req.SearchID),
 			})
 			if ej != nil {
 				execJobID = ej.ID

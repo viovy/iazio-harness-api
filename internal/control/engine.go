@@ -1207,6 +1207,20 @@ type ToolPriorityAllocation struct {
 	ImmediateClaimable   bool
 }
 
+// isToolUsableForDispatch determines whether a reported host tool entry is eligible for dispatch.
+// It harmonizes ResolveToolPriorityAllocation and EvaluateDispatchDiagnostics so installed tools
+// reporting UP_TO_DATE, BEHIND, ACTIVE, HEALTHY, OK, INSTALLED, or empty status are consistently accepted.
+func isToolUsableForDispatch(t Tool) bool {
+	st := strings.ToUpper(strings.TrimSpace(t.Status))
+	if st == "MISSING" || st == "BROKEN" || st == "UNINSTALLED" || st == "ERROR" {
+		return false
+	}
+	if t.Installed {
+		return true
+	}
+	return st == "HEALTHY" || st == "OK" || st == "INSTALLED" || st == "UP_TO_DATE" || st == "BEHIND" || st == "ACTIVE" || st == "READY"
+}
+
 // ResolveToolPriorityAllocation resolves the target agent, host, and workspace repo according to Global Queue Tool Priority.
 func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, requestedRepo string) ToolPriorityAllocation {
 	e.mu.Lock()
@@ -1249,7 +1263,7 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 			}
 			hasTool := false
 			for _, t := range h.Tools {
-				if strings.EqualFold(t.Name, candidateToolLower) && (t.Status == "HEALTHY" || t.Status == "OK" || t.Status == "INSTALLED" || t.Status == "") {
+				if strings.EqualFold(t.Name, candidateToolLower) && isToolUsableForDispatch(t) {
 					hasTool = true
 					break
 				}
@@ -3196,10 +3210,10 @@ func (e *Engine) reapExpiredLocked() {
 		}
 	}
 	for _, sch := range e.schedules {
-		if sch.Status == "RUNNING" || sch.Status == "COMPLETED" {
+		if sch.Status == "RUNNING" || sch.Status == "LEASED" || sch.Status == "COMPLETED" {
 			hasActive := false
 			for _, job := range e.jobs {
-				if job.ScheduleID == sch.ID && !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "CANCEL_REQUESTED") {
+				if job.ScheduleID == sch.ID && !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "LEASED" || job.Status == "CANCEL_REQUESTED") {
 					hasActive = true
 					break
 				}
@@ -3239,7 +3253,7 @@ func (e *Engine) reapExpiredLocked() {
 		if repo.Lock == LockRunning {
 			hasActive := false
 			for _, job := range e.jobs {
-				if !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "CANCEL_REQUESTED") {
+				if !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "LEASED" || job.Status == "CANCEL_REQUESTED") {
 					if job.ID == repo.RunningJobID {
 						hasActive = true
 						break
@@ -3268,7 +3282,7 @@ func (e *Engine) reapExpiredLocked() {
 		} else if repo.Lock == LockIdle && repo.RunningJobID != "" {
 			hasActive := false
 			for _, job := range e.jobs {
-				if !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "CANCEL_REQUESTED") && job.ID == repo.RunningJobID {
+				if !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "LEASED" || job.Status == "CANCEL_REQUESTED") && job.ID == repo.RunningJobID {
 					hasActive = true
 					break
 				}
@@ -4473,7 +4487,7 @@ func (e *Engine) CancelSchedule(scheduleID string) (Schedule, error) {
 	}
 
 	for _, job := range e.jobs {
-		if job.ScheduleID == scheduleID && !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "CANCEL_REQUESTED") {
+		if job.ScheduleID == scheduleID && !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "LEASED" || job.Status == "CANCEL_REQUESTED") {
 			job.Status = "CANCEL_REQUESTED"
 			job.FrozenUntil = e.now().Add(ReapFreeze)
 			e.updateHistoryStatusLocked(sch.HostID, sch.WorktreePath, job.ID, "CANCEL_REQUESTED")
@@ -4483,7 +4497,7 @@ func (e *Engine) CancelSchedule(scheduleID string) (Schedule, error) {
 	if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
 		hasActive := false
 		for _, job := range e.jobs {
-			if !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "CANCEL_REQUESTED") {
+			if !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "LEASED" || job.Status == "CANCEL_REQUESTED") {
 				if s := e.schedules[job.ScheduleID]; s != nil && s.HostID == repo.HostID && s.WorktreePath == repo.WorktreePath {
 					hasActive = true
 					break
@@ -6591,7 +6605,7 @@ func (e *Engine) EvaluateDispatchDiagnostics(targetHost, targetAgent string) *di
 				continue
 			}
 			for _, t := range host.Tools {
-				if strings.EqualFold(t.Name, toolName) && t.Installed {
+				if strings.EqualFold(t.Name, toolName) && isToolUsableForDispatch(t) {
 					selectedTool = toolName
 					break
 				}

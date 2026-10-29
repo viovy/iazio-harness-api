@@ -1310,4 +1310,62 @@ func TestInMemoryQueue_BindStoryWithFencing_And_HeartbeatWithStory(t *testing.T)
 	}
 }
 
+func TestReconcileGlobalQueueSlotsReclaimsStaleLeasedAndRunningJobs(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+
+	jLeased, err := q.Enqueue(ctx, &Job{
+		ID:          "job-leased-stale",
+		Type:        JobTypePromptExecute,
+		Repo:        "iazio-mcp",
+		TargetAgent: "agy",
+	})
+	if err != nil {
+		t.Fatalf("enqueue leased failed: %v", err)
+	}
+	claimedLeased, err := q.Claim(ctx, "mac-mini", []string{JobTypePromptExecute})
+	if err != nil || claimedLeased == nil {
+		t.Fatalf("claim leased failed: %v", err)
+	}
+	if claimedLeased.Status != JobStatusLeased {
+		t.Fatalf("expected status LEASED after Claim, got %s", claimedLeased.Status)
+	}
+
+	jRunning, err := q.Enqueue(ctx, &Job{
+		ID:          "job-running-stale",
+		Type:        JobTypePromptExecute,
+		Repo:        "iazio-web",
+		TargetAgent: "agy",
+	})
+	if err != nil {
+		t.Fatalf("enqueue running failed: %v", err)
+	}
+	claimedRunning, err := q.Claim(ctx, "mac-mini", []string{JobTypePromptExecute})
+	if err != nil || claimedRunning == nil {
+		t.Fatalf("claim running failed: %v", err)
+	}
+	if _, err := q.AckLease(ctx, claimedRunning.ID, claimedRunning.LeaseToken, 4321, ""); err != nil {
+		t.Fatalf("AckLease failed: %v", err)
+	}
+
+	// Advance clock past lease expiry and reconcile global queue slots
+	now = now.Add(DefaultHeartbeatTimeout + 5*time.Second)
+	reclaimedIDs := q.ReconcileGlobalQueueSlots(now, 45*time.Second)
+	if len(reclaimedIDs) != 2 {
+		t.Fatalf("expected ReconcileGlobalQueueSlots to reclaim 2 stale jobs (LEASED + RUNNING), got %d (%v)", len(reclaimedIDs), reclaimedIDs)
+	}
+
+	afterLeased, _ := q.Get(jLeased.ID)
+	if afterLeased.Status != JobStatusPending || afterLeased.ClaimedHost != "" || afterLeased.LeaseToken != "" {
+		t.Fatalf("expected reclaimed LEASED job to reset to pending with cleared host/token, got %+v", afterLeased)
+	}
+	afterRunning, _ := q.Get(jRunning.ID)
+	if afterRunning.Status != JobStatusPending || afterRunning.ClaimedHost != "" || afterRunning.LeaseToken != "" {
+		t.Fatalf("expected reclaimed RUNNING job to reset to pending with cleared host/token, got %+v", afterRunning)
+	}
+}
+
+
 

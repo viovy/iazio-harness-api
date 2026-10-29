@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -459,3 +460,28 @@ func TestLiveStoreIfConfigured(t *testing.T) {
 		t.Fatalf("UpdateStorySyncState: %v", err)
 	}
 }
+
+func TestSaveQueueJobConflictUpdatesAllMutableFields(t *testing.T) {
+	requiredUpdateClauses := []string{
+		"story_id = EXCLUDED.story_id",
+		"story_title = EXCLUDED.story_title",
+		"story_path = EXCLUDED.story_path",
+		"story_allocation_status = EXCLUDED.story_allocation_status",
+		"target_agent = EXCLUDED.target_agent",
+		"target_host = EXCLUDED.target_host",
+		"host_id = EXCLUDED.host_id",
+		"lease_token = EXCLUDED.lease_token",
+		"failure_category = EXCLUDED.failure_category",
+		"failure_stage = EXCLUDED.failure_stage",
+		"failure_reason_summary = EXCLUDED.failure_reason_summary",
+		"retriable = EXCLUDED.retriable",
+		"attempt_history = EXCLUDED.attempt_history",
+		"infra_requeue_count = EXCLUDED.infra_requeue_count",
+	}
+	for _, clause := range requiredUpdateClauses {
+		if !strings.Contains(SaveQueueJobUpsertSQL, clause) {
+			t.Errorf("expected SaveQueueJobUpsertSQL ON CONFLICT DO UPDATE to contain %q", clause)
+		}
+	}
+}
+

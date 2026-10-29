@@ -299,8 +299,27 @@ CREATE TABLE IF NOT EXISTS harness_dispatch_jobs (
   heartbeat_at timestamp with time zone,
   lease_expires_at timestamp with time zone,
   completed_at timestamp with time zone,
+  story_title text NOT NULL DEFAULT '',
+  story_path text NOT NULL DEFAULT '',
+  story_allocation_status text NOT NULL DEFAULT '',
+  failure_category text NOT NULL DEFAULT '',
+  failure_stage text NOT NULL DEFAULT '',
+  failure_reason_summary text NOT NULL DEFAULT '',
+  retriable boolean NOT NULL DEFAULT false,
+  attempt_history jsonb NOT NULL DEFAULT '[]'::jsonb,
+  infra_requeue_count integer NOT NULL DEFAULT 0,
   updated_at timestamp with time zone NOT NULL DEFAULT now()
 );
+
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS story_title text NOT NULL DEFAULT '';
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS story_path text NOT NULL DEFAULT '';
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS story_allocation_status text NOT NULL DEFAULT '';
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS failure_category text NOT NULL DEFAULT '';
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS failure_stage text NOT NULL DEFAULT '';
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS failure_reason_summary text NOT NULL DEFAULT '';
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS retriable boolean NOT NULL DEFAULT false;
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS attempt_history jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS infra_requeue_count integer NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS harness_dispatch_jobs_status_idx ON harness_dispatch_jobs (status);
 CREATE INDEX IF NOT EXISTS harness_dispatch_jobs_host_idx ON harness_dispatch_jobs (claimed_host, status);
@@ -1204,30 +1223,37 @@ WHERE job_id = 'job-1313' AND (parent_job_id = '' OR parent_job_id IS NULL OR in
 	return err
 }
 
-// SaveQueueJob persists or upserts a dispatch queue job into harness_dispatch_jobs.
-func (s *Store) SaveQueueJob(ctx context.Context, job *dispatch.Job) error {
-	if s == nil || s.db == nil || job == nil {
-		return nil
-	}
-	payloadBytes := job.Payload
-	if len(payloadBytes) == 0 {
-		payloadBytes = []byte("{}")
-	}
-	_, err := s.db.ExecContext(ctx, `
+// SaveQueueJobUpsertSQL is the canonical upsert query for harness_dispatch_jobs.
+// It updates all mutable job fields on conflict so dynamic story bindings, results,
+// target allocations, payloads, and failure taxonomy survive API restarts.
+const SaveQueueJobUpsertSQL = `
 INSERT INTO harness_dispatch_jobs (
   id, type, repo, target_host, claimed_host, host_id, target_agent, story_id,
-  normalized_prompt, payload, status, error, trace_id, fencing_token, lease_version,
-  lease_owner, lease_token, attempts, created_at, claimed_at, heartbeat_at, lease_expires_at, completed_at, updated_at
+  normalized_prompt, payload, status, result, error, trace_id, fencing_token, lease_version,
+  lease_owner, lease_token, attempts, created_at, claimed_at, heartbeat_at, lease_expires_at, completed_at,
+  story_title, story_path, story_allocation_status, failure_category, failure_stage,
+  failure_reason_summary, retriable, attempt_history, infra_requeue_count, updated_at
 ) VALUES (
   $1, $2, $3, $4, $5, $6, $7, $8,
-  $9, $10, $11, $12, $13, $14, $15,
-  $16, $17, $18, $19, $20, $21, $22, $23, now()
+  $9, $10, $11, $12, $13, $14, $15, $16,
+  $17, $18, $19, $20, $21, $22, $23, $24,
+  $25, $26, $27, $28, $29,
+  $30, $31, $32, $33, now()
 )
 ON CONFLICT (id) DO UPDATE SET
-  status = EXCLUDED.status,
+  type = EXCLUDED.type,
+  repo = EXCLUDED.repo,
+  target_host = EXCLUDED.target_host,
   claimed_host = EXCLUDED.claimed_host,
   host_id = EXCLUDED.host_id,
+  target_agent = EXCLUDED.target_agent,
+  story_id = EXCLUDED.story_id,
+  normalized_prompt = EXCLUDED.normalized_prompt,
+  payload = EXCLUDED.payload,
+  status = EXCLUDED.status,
+  result = COALESCE(EXCLUDED.result, harness_dispatch_jobs.result),
   error = EXCLUDED.error,
+  trace_id = EXCLUDED.trace_id,
   fencing_token = EXCLUDED.fencing_token,
   lease_version = EXCLUDED.lease_version,
   lease_owner = EXCLUDED.lease_owner,
@@ -1237,11 +1263,41 @@ ON CONFLICT (id) DO UPDATE SET
   heartbeat_at = EXCLUDED.heartbeat_at,
   lease_expires_at = EXCLUDED.lease_expires_at,
   completed_at = EXCLUDED.completed_at,
+  story_title = EXCLUDED.story_title,
+  story_path = EXCLUDED.story_path,
+  story_allocation_status = EXCLUDED.story_allocation_status,
+  failure_category = EXCLUDED.failure_category,
+  failure_stage = EXCLUDED.failure_stage,
+  failure_reason_summary = EXCLUDED.failure_reason_summary,
+  retriable = EXCLUDED.retriable,
+  attempt_history = EXCLUDED.attempt_history,
+  infra_requeue_count = EXCLUDED.infra_requeue_count,
   updated_at = now();
-`,
+`
+
+// SaveQueueJob persists or upserts a dispatch queue job into harness_dispatch_jobs.
+func (s *Store) SaveQueueJob(ctx context.Context, job *dispatch.Job) error {
+	if s == nil || s.db == nil || job == nil {
+		return nil
+	}
+	payloadBytes := job.Payload
+	if len(payloadBytes) == 0 {
+		payloadBytes = []byte("{}")
+	}
+	var resultBytes []byte = job.Result
+	if len(resultBytes) == 0 {
+		resultBytes = nil
+	}
+	attemptHistBytes, err := json.Marshal(job.AttemptHistory)
+	if err != nil || len(attemptHistBytes) == 0 || string(attemptHistBytes) == "null" {
+		attemptHistBytes = []byte("[]")
+	}
+	_, err = s.db.ExecContext(ctx, SaveQueueJobUpsertSQL,
 		job.ID, job.Type, job.Repo, job.TargetHost, job.ClaimedHost, job.HostID, job.TargetAgent, job.StoryID,
-		job.NormalizedPrompt, payloadBytes, job.Status, job.Error, job.TraceID, job.FencingToken, job.LeaseVersion,
+		job.NormalizedPrompt, payloadBytes, job.Status, resultBytes, job.Error, job.TraceID, job.FencingToken, job.LeaseVersion,
 		job.LeaseOwner, job.LeaseToken, job.Attempts, job.CreatedAt, job.ClaimedAt, job.HeartbeatAt, job.LeaseExpiresAt, job.CompletedAt,
+		job.StoryTitle, job.StoryPath, job.StoryAllocationStatus, job.FailureCategory, job.FailureStage,
+		job.FailureReasonSummary, job.Retriable, string(attemptHistBytes), job.InfraRequeueCount,
 	)
 	return err
 }
@@ -1308,7 +1364,9 @@ func (s *Store) LoadQueueJobs(ctx context.Context) ([]*dispatch.Job, error) {
 SELECT id, type, repo, target_host, claimed_host, host_id, target_agent, story_id,
        normalized_prompt, payload, status, result, error, trace_id, fencing_token,
        lease_version, lease_owner, lease_token, attempts, created_at, claimed_at,
-       heartbeat_at, lease_expires_at, completed_at
+       heartbeat_at, lease_expires_at, completed_at,
+       story_title, story_path, story_allocation_status, failure_category, failure_stage,
+       failure_reason_summary, retriable, attempt_history, infra_requeue_count
 FROM harness_dispatch_jobs
 ORDER BY created_at ASC;
 `)
@@ -1320,13 +1378,15 @@ ORDER BY created_at ASC;
 	var jobs []*dispatch.Job
 	for rows.Next() {
 		var j dispatch.Job
-		var payloadBytes, resultBytes []byte
+		var payloadBytes, resultBytes, attemptHistBytes []byte
 		var claimedAt, heartbeatAt, leaseExpiresAt, completedAt *time.Time
 		if err := rows.Scan(
 			&j.ID, &j.Type, &j.Repo, &j.TargetHost, &j.ClaimedHost, &j.HostID, &j.TargetAgent, &j.StoryID,
 			&j.NormalizedPrompt, &payloadBytes, &j.Status, &resultBytes, &j.Error, &j.TraceID, &j.FencingToken,
 			&j.LeaseVersion, &j.LeaseOwner, &j.LeaseToken, &j.Attempts, &j.CreatedAt, &claimedAt,
 			&heartbeatAt, &leaseExpiresAt, &completedAt,
+			&j.StoryTitle, &j.StoryPath, &j.StoryAllocationStatus, &j.FailureCategory, &j.FailureStage,
+			&j.FailureReasonSummary, &j.Retriable, &attemptHistBytes, &j.InfraRequeueCount,
 		); err != nil {
 			return nil, err
 		}
@@ -1336,6 +1396,9 @@ ORDER BY created_at ASC;
 		j.HeartbeatAt = heartbeatAt
 		j.LeaseExpiresAt = leaseExpiresAt
 		j.CompletedAt = completedAt
+		if len(attemptHistBytes) > 0 {
+			_ = json.Unmarshal(attemptHistBytes, &j.AttemptHistory)
+		}
 		jobs = append(jobs, &j)
 	}
 	return jobs, rows.Err()
