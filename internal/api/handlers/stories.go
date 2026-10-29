@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +11,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/viovy/iazio-harness-api/internal/codebase"
@@ -72,31 +70,6 @@ type GlobalScheduler interface {
 	EnqueueGlobalStorySchedule(storyID, submodule, targetAgent, promptText string) (control.Schedule, error)
 }
 
-// StoryIDAllocator allocates canonical sequential story IDs from the persistent sequence store.
-type StoryIDAllocator interface {
-	AllocateStoryID(ctx context.Context, category string) (string, error)
-}
-
-var fallbackStorySeq int64 = 3800
-
-func inferStoryCategory(submodule string) string {
-	sub := strings.ToLower(strings.TrimSpace(submodule))
-	switch {
-	case strings.Contains(sub, "harness"):
-		return "HAR"
-	case strings.Contains(sub, "mcp"):
-		return "MCP"
-	case strings.Contains(sub, "agent"):
-		return "AGT"
-	case strings.Contains(sub, "web"):
-		return "WEB"
-	case strings.Contains(sub, "api"):
-		return "API"
-	default:
-		return "GOV"
-	}
-}
-
 func normalizeCanonicalStoryStatus(status, syncState string) string {
 	s := strings.ToUpper(strings.TrimSpace(status))
 	switch s {
@@ -141,12 +114,6 @@ type StoriesHandler struct {
 	dispatchWait time.Duration
 	scheduler    GlobalScheduler
 	engine       *control.Engine
-	idAllocator  StoryIDAllocator
-}
-
-// SetStoryIDAllocator injects the canonical story ID sequence allocator.
-func (h *StoriesHandler) SetStoryIDAllocator(a StoryIDAllocator) {
-	h.idAllocator = a
 }
 
 // SetEngine injects the control plane engine for story persistence.
@@ -318,52 +285,29 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	storyID := strings.TrimSpace(req.ID)
-	if storyID == "" {
-		cat := inferStoryCategory(req.Submodule)
-		if h.idAllocator != nil {
-			if allocated, err := h.idAllocator.AllocateStoryID(r.Context(), cat); err == nil && allocated != "" {
-				storyID = allocated
-			}
-		}
-		if storyID == "" {
-			seq := atomic.AddInt64(&fallbackStorySeq, 1)
-			storyID = fmt.Sprintf("STORY-%s-%04d", cat, seq)
-		}
+	body := strings.TrimSpace(req.Body)
+	if body == "" {
+		body = strings.TrimSpace(req.Problem)
 	}
 
-	body := req.Body
-	if strings.TrimSpace(body) == "" {
-		body = renderStoryMarkdown(control.Story{
+	if h.engine != nil && storyID != "" {
+		st := control.Story{
 			ID:                   storyID,
-			Title:                req.Title,
-			Status:               "READY",
-			Priority:             req.Priority,
+			Repo:                 req.Repo,
 			Submodule:            req.Submodule,
+			Title:                req.Title,
+			Priority:             req.Priority,
+			Status:               "READY",
+			SyncState:            "PENDING_WORKSPACE_MATERIALIZATION",
+			Body:                 body,
 			Problem:              req.Problem,
 			AcceptanceCriteria:   req.AcceptanceCriteria,
 			TargetFiles:          req.TargetFiles,
+			DependsOn:            req.DependsOn,
 			VerificationCommands: req.VerificationCommands,
-		})
-	}
-
-	st := control.Story{
-		ID:                   storyID,
-		Repo:                 req.Repo,
-		Submodule:            req.Submodule,
-		Title:                req.Title,
-		Priority:             req.Priority,
-		Status:               "READY",
-		SyncState:            "PENDING_WORKSPACE_MATERIALIZATION",
-		Body:                 body,
-		Problem:              req.Problem,
-		AcceptanceCriteria:   req.AcceptanceCriteria,
-		TargetFiles:          req.TargetFiles,
-		DependsOn:            req.DependsOn,
-		VerificationCommands: req.VerificationCommands,
-		CreatedAt:            time.Now().UTC(),
-		UpdatedAt:            time.Now().UTC(),
-	}
-	if h.engine != nil {
+			CreatedAt:            time.Now().UTC(),
+			UpdatedAt:            time.Now().UTC(),
+		}
 		_ = h.engine.SaveStory(st)
 	}
 
@@ -374,19 +318,23 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if targetAgent == "" {
 			targetAgent = "autopilot"
 		}
-		promptID := fmt.Sprintf("prompt_%s_%d", storyID, time.Now().Unix())
+		promptID := fmt.Sprintf("prompt_%d", time.Now().UnixNano())
+		if storyID != "" {
+			promptID = fmt.Sprintf("prompt_%s_%d", storyID, time.Now().Unix())
+		}
 		promptText := strings.TrimSpace(req.Prompt)
 		if promptText == "" {
-			promptText = strings.TrimSpace(req.Body)
+			promptText = body
 		}
-		if promptText == "" {
-			promptText = fmt.Sprintf("# Execute Story %s\n\nRun autonomous story flow for %s in %s.", storyID, storyID, req.Submodule)
+		title := req.Title
+		if storyID != "" {
+			title = fmt.Sprintf("Execute story %s: %s", storyID, req.Title)
 		}
 		execPayload, _ := json.Marshal(map[string]any{
 			"prompt_id":    promptID,
 			"repo":         req.Submodule,
 			"story_id":     storyID,
-			"title":        fmt.Sprintf("Execute story %s: %s", storyID, req.Title),
+			"title":        title,
 			"prompt":       promptText,
 			"target_agent": targetAgent,
 		})
@@ -419,7 +367,7 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Status:           "created",
 		StoryID:          storyID,
 		Submodule:        req.Submodule,
-		StoryPath:        fmt.Sprintf("docs/stories/%s.story.md", strings.ToLower(storyID)),
+		StoryPath:        strings.TrimSpace(req.ContentPath),
 		IndexUpdated:     false,
 		SyncState:        "PENDING_WORKSPACE_MATERIALIZATION",
 		ExecutionJobID:   execJobID,
@@ -674,14 +622,13 @@ func (h *StoriesHandler) GetStory(w http.ResponseWriter, r *http.Request) {
 			}
 			content := s.Body
 			if strings.TrimSpace(content) == "" {
-				content = renderStoryMarkdown(s)
+				content = s.Problem
 			}
 			found = &StoryDetail{
 				ID:         s.ID,
 				Title:      s.Title,
 				Status:     normalizeCanonicalStoryStatus(s.Status, s.SyncState),
 				Priority:   s.Priority,
-				Path:       fmt.Sprintf("docs/stories/%s.story.md", strings.ToLower(s.ID)),
 				Submodules: subs,
 				Content:    content,
 			}
@@ -749,42 +696,3 @@ func (h *StoriesHandler) MaterializeStory(w http.ResponseWriter, r *http.Request
 	})
 }
 
-func renderStoryMarkdown(st control.Story) string {
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("# %s: %s\n\n", st.ID, st.Title))
-	sb.WriteString(fmt.Sprintf("Status: %s  \n", strings.ToUpper(st.Status)))
-	if st.Priority != "" {
-		sb.WriteString(fmt.Sprintf("Priority: %s  \n", st.Priority))
-	}
-	if st.Submodule != "" {
-		sb.WriteString(fmt.Sprintf("Submodule: %s  \n", st.Submodule))
-	}
-	sb.WriteString("\n## Problem\n\n")
-	if st.Problem != "" {
-		sb.WriteString(st.Problem + "\n\n")
-	} else {
-		sb.WriteString("Implement " + st.Title + ".\n\n")
-	}
-	if len(st.AcceptanceCriteria) > 0 {
-		sb.WriteString("## Acceptance Criteria\n\n")
-		for _, ac := range st.AcceptanceCriteria {
-			sb.WriteString(fmt.Sprintf("- [ ] %s\n", ac))
-		}
-		sb.WriteString("\n")
-	}
-	if len(st.TargetFiles) > 0 {
-		sb.WriteString("## Target Files\n\n")
-		for _, tf := range st.TargetFiles {
-			sb.WriteString(fmt.Sprintf("- `%s`\n", tf))
-		}
-		sb.WriteString("\n")
-	}
-	if len(st.VerificationCommands) > 0 {
-		sb.WriteString("## Verification Commands\n\n```bash\n")
-		for _, vc := range st.VerificationCommands {
-			sb.WriteString(vc + "\n")
-		}
-		sb.WriteString("```\n")
-	}
-	return sb.String()
-}

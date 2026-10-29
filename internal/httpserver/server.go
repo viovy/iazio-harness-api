@@ -69,8 +69,6 @@ type Server struct {
 	Idempotency *handlers.IdempotencyStore
 	// StoryValidator validates story existence before execution.
 	StoryValidator handlers.StoryValidator
-	// StoryIDAllocator allocates canonical sequential story IDs when a database is configured.
-	StoryIDAllocator handlers.StoryIDAllocator
 
 	notificationsMu sync.RWMutex
 	notifications   []NotificationRecord
@@ -162,9 +160,6 @@ func (s *Server) Handler() http.Handler {
 	storiesHandler := handlers.NewStoriesHandler(codebaseStore, queue, idempotency, s.Engine)
 	if s.Engine != nil {
 		storiesHandler.SetEngine(s.Engine)
-	}
-	if s.StoryIDAllocator != nil {
-		storiesHandler.SetStoryIDAllocator(s.StoryIDAllocator)
 	}
 	mux.Handle("POST /api/v1/stories", storiesHandler)
 	mux.HandleFunc("GET /api/v1/stories", storiesHandler.ListStories)
