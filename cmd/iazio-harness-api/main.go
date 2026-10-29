@@ -132,7 +132,6 @@ func run(ctx context.Context, args []string) error {
 			_ = srv.Engine.SetToolPriority(tp)
 			log.Printf("loaded tool priority %v from database", tp)
 		}
-		srv.StoryIDAllocator = store
 		srv.Engine.OnToolPriorityChange = func(tools []string) {
 			if err := store.SaveToolPriority(context.Background(), tools); err != nil {
 				log.Printf("warn: save tool priority: %v", err)

@@ -133,17 +133,11 @@ func TestStoriesHandler_ControlPlaneFirstCreation(t *testing.T) {
 	if resp.SyncState != "PENDING_WORKSPACE_MATERIALIZATION" {
 		t.Errorf("expected sync_state PENDING_WORKSPACE_MATERIALIZATION, got %s", resp.SyncState)
 	}
-	if resp.StoryID == "" {
-		t.Error("expected non-empty story_id")
+	if resp.StoryID != "" {
+		t.Errorf("expected empty story_id when id is not provided (resolved by Canonical AI/autopilot), got %s", resp.StoryID)
 	}
-
-	// Verify persistence in control engine
-	st, ok := engine.GetStory(resp.StoryID)
-	if !ok {
-		t.Fatalf("expected story %s to be stored in control engine", resp.StoryID)
-	}
-	if st.Title != payload["title"] {
-		t.Errorf("expected title %s, got %s", payload["title"], st.Title)
+	if resp.StoryPath != "" {
+		t.Errorf("expected empty story_path when id/content_path is not provided, got %s", resp.StoryPath)
 	}
 }
 
@@ -460,25 +454,14 @@ func TestIntegration_StoryCreationAndExecutionDispatch(t *testing.T) {
 	}
 }
 
-type mockStoryIDAllocator struct {
-	seq int
-}
-
-func (m *mockStoryIDAllocator) AllocateStoryID(_ context.Context, category string) (string, error) {
-	m.seq++
-	return "STORY-" + category + "-3782", nil
-}
-
-func TestGov3782_CanonicalStoryIDAllocatorAndCaseInsensitiveStatusFilter(t *testing.T) {
+func TestGov3785_NoStoryIDAllocationOrFrontmatterHandlingAndCaseInsensitiveStatusFilter(t *testing.T) {
 	store := setupTestStore(t)
 	q := dispatch.NewInMemoryQueue()
 	engine := control.NewEngine(nil)
 	handler := NewStoriesHandler(store, q, nil)
 	handler.SetEngine(engine)
-	handler.SetStoryIDAllocator(&mockStoryIDAllocator{})
 
 	payload := validStoryPayload()
-	payload["category"] = "gov"
 	payload["enqueue"] = true
 	body, _ := json.Marshal(payload)
 
@@ -491,14 +474,23 @@ func TestGov3782_CanonicalStoryIDAllocatorAndCaseInsensitiveStatusFilter(t *test
 	}
 	var resp CreateStoryResponse
 	_ = json.NewDecoder(w.Body).Decode(&resp)
-	if resp.StoryID != "STORY-MCP-3782" {
-		t.Fatalf("expected allocated StoryID STORY-MCP-3782, got %s", resp.StoryID)
+	if resp.StoryID != "" {
+		t.Fatalf("expected iazio-harness-api not to mint StoryID (resolved by Canonical AI/autopilot), got %s", resp.StoryID)
 	}
 	if resp.IndexUpdated {
 		t.Fatalf("expected IndexUpdated=false when SyncState is PENDING_WORKSPACE_MATERIALIZATION")
 	}
 
-	// Verify ListStories with status=READY matches pending/PENDING_INDEX stories
+	// Seed an indexed story to verify ListStories with status=READY matches pending/PENDING_INDEX stories
+	_ = engine.SaveStory(control.Story{
+		ID:        "STORY-MCP-3782",
+		Title:     "Indexed Story",
+		Submodule: "iazio-mcp",
+		Status:    "pending",
+		SyncState: "PENDING_WORKSPACE_MATERIALIZATION",
+		Problem:   "Raw problem statement without synthesized frontmatter",
+	})
+
 	reqList := httptest.NewRequest(http.MethodGet, "/api/v1/stories?status=READY", nil)
 	wList := httptest.NewRecorder()
 	handler.ListStories(wList, reqList)
