@@ -304,10 +304,10 @@ func (e *Engine) HeartbeatWithCapabilities(id, presence string, tools []Tool, fe
 		if j.LeaseHolder == id && j.Status == "RUNNING" {
 			if len(activeJobs) > 0 {
 				if activeMap[j.ID] {
-					j.LeaseExpiry = e.now().Add(5 * time.Minute)
+					extendLeaseExpiry(j, e.now(), ActiveLeaseDuration)
 				}
 			} else {
-				j.LeaseExpiry = e.now().Add(5 * time.Minute)
+				extendLeaseExpiry(j, e.now(), ActiveLeaseDuration)
 			}
 		}
 	}
@@ -989,7 +989,7 @@ func (e *Engine) AppendLog(jobID string, chunk LogChunk) {
 		}
 	}
 	if job, ok := e.jobs[jobID]; ok {
-		job.LeaseExpiry = e.now().Add(5 * time.Minute)
+		extendLeaseExpiry(job, e.now(), ActiveLeaseDuration)
 		job.LastChunkAt = e.now()
 		if chunk.Type != "OUTPUT_TICK" {
 			job.LastOutputAt = e.now()

@@ -99,6 +99,8 @@ const (
 	RingCap = 500
 	// LeaseInterval is the heartbeat the agent must renew.
 	LeaseInterval = 30 * time.Second
+	// ActiveLeaseDuration is the active lease window granted once a job is acknowledged or actively reporting.
+	ActiveLeaseDuration = 5 * time.Minute
 	// ReapFreeze keeps a cancel from looking like a missed heartbeat.
 	ReapFreeze = 30 * time.Second
 	// CorrelationWindow is how long a missing transcript waits.
@@ -1850,6 +1852,16 @@ func ClassifyFailure(reason, errorMsg, diagCode string) (category, stage, summar
 	}
 }
 
+func extendLeaseExpiry(job *Job, now time.Time, dur time.Duration) {
+	if job == nil {
+		return
+	}
+	exp := now.Add(dur)
+	if exp.After(job.LeaseExpiry) {
+		job.LeaseExpiry = exp
+	}
+}
+
 // AckLease completes Phase 2 of the two-phase lease handshake, transitioning the job to RUNNING.
 func (e *Engine) AckLease(jobID, leaseToken string, agentPID int, activeConvID string) error {
 	e.mu.Lock()
@@ -1868,7 +1880,7 @@ func (e *Engine) AckLease(jobID, leaseToken string, agentPID int, activeConvID s
 
 	job.Status = "RUNNING"
 	job.LeaseAckDeadlineAt = nil
-	job.LeaseExpiry = e.now().Add(LeaseInterval)
+	extendLeaseExpiry(job, e.now(), ActiveLeaseDuration)
 	if agentPID > 0 {
 		job.HarnessPID = agentPID
 	}
@@ -1926,7 +1938,7 @@ func (e *Engine) HeartbeatJob(jobID, leaseToken string) error {
 	now := e.now()
 	job.LastOutputAt = now
 	job.LastChunkAt = now
-	job.LeaseExpiry = now.Add(LeaseInterval)
+	extendLeaseExpiry(job, now, ActiveLeaseDuration)
 	job.LeaseAckDeadlineAt = nil
 	if job.Status == "LEASED" {
 		job.Status = "RUNNING"
@@ -1943,8 +1955,18 @@ func (e *Engine) HeartbeatJob(jobID, leaseToken string) error {
 			}
 			e.history[key] = rows
 		}
-	} else if sch := e.schedules[job.ScheduleID]; sch != nil && sch.LeaseAckDeadlineAt != nil {
-		sch.LeaseAckDeadlineAt = nil
+	} else {
+		if sch := e.schedules[job.ScheduleID]; sch != nil && sch.LeaseAckDeadlineAt != nil {
+			sch.LeaseAckDeadlineAt = nil
+		}
+		for key, rows := range e.history {
+			for i := range rows {
+				if rows[i].JobID == jobID && rows[i].LeaseAckDeadlineAt != nil {
+					rows[i].LeaseAckDeadlineAt = nil
+				}
+			}
+			e.history[key] = rows
+		}
 	}
 	return nil
 }
@@ -5075,16 +5097,22 @@ func (e *Engine) AddJobConversationWithOptions(jobID, convID string, opts ...Con
 	if opt.RehydrationStatus != nil {
 		job.RehydrationStatus = opt.RehydrationStatus
 	}
+	extendLeaseExpiry(job, e.now(), ActiveLeaseDuration)
+	job.LeaseAckDeadlineAt = nil
 
 	sch, okSch := e.schedules[job.ScheduleID]
-	if okSch && sch != nil && opt.RehydrationStatus != nil {
-		sch.RehydrationStatus = opt.RehydrationStatus
+	if okSch && sch != nil {
+		sch.LeaseAckDeadlineAt = nil
+		if opt.RehydrationStatus != nil {
+			sch.RehydrationStatus = opt.RehydrationStatus
+		}
 	}
 	if okSch {
 		key := repoKey(sch.HostID, sch.WorktreePath)
 		rows := e.history[key]
 		for i := len(rows) - 1; i >= 0; i-- {
 			if rows[i].JobID == jobID {
+				rows[i].LeaseAckDeadlineAt = nil
 				rows[i].ActiveConversationID = job.ActiveConversationID
 				rows[i].InitialConversationID = job.InitialConversationID
 				rows[i].ResumeMode = job.ResumeMode
@@ -5118,6 +5146,10 @@ func (e *Engine) SetJobReadiness(jobID string, reapResult, manifest, rehydration
 	if !ok {
 		return fmt.Errorf("job %s not found", jobID)
 	}
+	now := e.now()
+	extendLeaseExpiry(j, now, ActiveLeaseDuration)
+	j.LeaseAckDeadlineAt = nil
+	j.LastOutputAt = now
 	if reapResult != nil {
 		j.ReapResult = reapResult
 	}
@@ -5128,6 +5160,7 @@ func (e *Engine) SetJobReadiness(jobID string, reapResult, manifest, rehydration
 		j.RehydrationStatus = rehydrationStatus
 	}
 	if sch := e.schedules[j.ScheduleID]; sch != nil {
+		sch.LeaseAckDeadlineAt = nil
 		if reapResult != nil {
 			sch.ReapResult = reapResult
 		}
@@ -5141,6 +5174,7 @@ func (e *Engine) SetJobReadiness(jobID string, reapResult, manifest, rehydration
 		rows := e.history[key]
 		for i := len(rows) - 1; i >= 0; i-- {
 			if rows[i].JobID == jobID {
+				rows[i].LeaseAckDeadlineAt = nil
 				if reapResult != nil {
 					rows[i].ReapResult = reapResult
 				}
