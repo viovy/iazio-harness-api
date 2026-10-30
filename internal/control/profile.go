@@ -259,15 +259,28 @@ func (e *Engine) UpsertProfile(p DistributionProfile) (*DistributionProfile, err
 		if name == "generic" {
 			p.IsDefault = true
 		}
-		// F1: Preserve existing tool TrackLatest and telemetry fields if incoming value is nil or empty
+		// F1: Preserve existing tool TrackLatest and telemetry fields if incoming value is nil or empty,
+		// and propagate resolved release metadata across sibling tools sharing the same repository.
 		existingToolsByName := make(map[string]ProfileTool, len(existing.Tools))
+		existingToolsByRepo := make(map[string]ProfileTool, len(existing.Tools))
 		for _, t := range existing.Tools {
 			existingToolsByName[t.Name] = t
+			if t.Repository != "" && t.LatestAvailableVersion != "" {
+				existingToolsByRepo[t.Repository] = t
+			}
 		}
 		for i := range p.Tools {
-			if exTool, found := existingToolsByName[p.Tools[i].Name]; found {
+			exTool, found := existingToolsByName[p.Tools[i].Name]
+			if !found && p.Tools[i].Repository != "" {
+				exTool, found = existingToolsByRepo[p.Tools[i].Repository]
+			}
+			if found {
 				if p.Tools[i].TrackLatest == nil {
 					p.Tools[i].TrackLatest = exTool.TrackLatest
+				}
+				trackLatest := p.Tools[i].TrackLatest == nil || *p.Tools[i].TrackLatest
+				if trackLatest && (p.Tools[i].TargetVersion == "" || p.Tools[i].TargetVersion == "latest") && exTool.LatestAvailableVersion != "" {
+					p.Tools[i].TargetVersion = exTool.LatestAvailableVersion
 				}
 				if p.Tools[i].LatestAvailableVersion == "" {
 					p.Tools[i].LatestAvailableVersion = exTool.LatestAvailableVersion
@@ -430,7 +443,16 @@ func (e *Engine) SyncGenericProfile(raw []byte) (*DistributionProfile, error) {
 	if err != nil {
 		return nil, err
 	}
-	return e.UpsertProfile(*p)
+	upserted, err := e.UpsertProfile(*p)
+	if err != nil {
+		return nil, err
+	}
+	if e.Releases != nil {
+		go func() {
+			_, _ = e.Releases.SyncProfile(context.Background(), e, upserted.Name, nil)
+		}()
+	}
+	return upserted, nil
 }
 
 // ScanRepoProfile inspects a configured repository on a host, reads its metadata.yml,
