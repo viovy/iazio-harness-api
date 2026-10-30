@@ -910,11 +910,17 @@ func (q *InMemoryQueue) SetFinalHarvest(jobID string, turnCount int, sha string)
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if job, ok := q.jobs[jobID]; ok {
+		updated := false
 		if turnCount > 0 {
 			job.FinalTurnCount = turnCount
+			updated = true
 		}
 		if sha != "" {
 			job.FinalTranscriptSHA256 = sha
+			updated = true
+		}
+		if updated && q.store != nil {
+			_ = q.store.SaveQueueJob(context.Background(), job)
 		}
 	}
 }
@@ -1084,21 +1090,35 @@ func (q *InMemoryQueue) Retry(ctx context.Context, jobID string) (*Job, error) {
 		return nil, ErrJobNotFound
 	}
 
+	orig.Status = JobStatusRequeued
 	newJob := &Job{
-		ID:          generateJobID(),
-		Type:        orig.Type,
-		Repo:        orig.Repo,
-		TargetHost:  orig.TargetHost,
-		TargetAgent: orig.TargetAgent,
-		Payload:     orig.Payload,
-		TraceID:     orig.TraceID,
-		SearchID:    orig.SearchID,
-		Status:      JobStatusPending,
-		CreatedAt:   q.now(),
-		doneCh:      make(chan struct{}),
+		ID:                      generateJobID(),
+		Type:                    orig.Type,
+		Repo:                    orig.Repo,
+		TargetHost:              orig.TargetHost,
+		TargetAgent:             orig.TargetAgent,
+		StoryID:                 orig.StoryID,
+		StoryTitle:              orig.StoryTitle,
+		StoryPath:               orig.StoryPath,
+		StoryAllocationStatus:   orig.StoryAllocationStatus,
+		AllocationSource:        orig.AllocationSource,
+		PriorityRankSelected:    orig.PriorityRankSelected,
+		SourceConversationTitle: orig.SourceConversationTitle,
+		NormalizedPrompt:        orig.NormalizedPrompt,
+		EffectiveAction:         orig.EffectiveAction,
+		AgentAffinity:           orig.AgentAffinity,
+		Payload:                 orig.Payload,
+		TraceID:                 orig.TraceID,
+		SearchID:                orig.SearchID,
+		ParentID:                orig.ID,
+		Retriable:               orig.Retriable,
+		Status:                  JobStatusPending,
+		CreatedAt:               q.now(),
+		doneCh:                  make(chan struct{}),
 	}
 	q.jobs[newJob.ID] = newJob
 	if q.store != nil {
+		_ = q.store.SaveQueueJob(ctx, orig)
 		_ = q.store.SaveQueueJob(ctx, newJob)
 	}
 	q.mu.Unlock()

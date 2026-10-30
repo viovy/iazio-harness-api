@@ -536,3 +536,99 @@ func TestJobLifecycleHandler_ForceDispatch_Cancel_Retry(t *testing.T) {
 		t.Fatalf("expected 201 Created for Retry, got %d: %s", rRr.Code, rRr.Body.String())
 	}
 }
+
+func TestJobLifecycleHandler_GetJob_ClaimedHostAndFailureDetails(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	h := NewJobLifecycleHandler(q)
+
+	job, err := q.Enqueue(context.Background(), &dispatch.Job{
+		Type:        dispatch.JobTypePromptExecute,
+		Repo:        "iazio-mcp",
+		TargetHost:  "",
+		TargetAgent: "agy",
+	})
+	if err != nil {
+		t.Fatalf("failed to enqueue: %v", err)
+	}
+
+	claimed, err := q.Claim(context.Background(), "mac-mini", []string{dispatch.JobTypePromptExecute})
+	if err != nil || claimed == nil {
+		t.Fatalf("failed to claim: %v", err)
+	}
+	claimed.FailureCategory = "git_conflict"
+	claimed.FailureStage = "git_push"
+	claimed.FailureReasonSummary = "non-fast-forward"
+	claimed.Retriable = true
+	if err := q.Complete(context.Background(), claimed.ID, nil, "git push error"); err != nil {
+		t.Fatalf("Complete failed: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/jobs/{id}", h.GetJob)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/"+job.ID, nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var detail JobDetailResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if detail.ClaimedHost != "mac-mini" || detail.TargetHost != "mac-mini" {
+		t.Fatalf("expected ClaimedHost and fallback TargetHost to be mac-mini, got ClaimedHost=%q TargetHost=%q", detail.ClaimedHost, detail.TargetHost)
+	}
+	if !strings.Contains(detail.LiveURL, "/agents/mac-mini/iazio-mcp/live?job="+job.ID) {
+		t.Fatalf("expected LiveURL to use claimed host mac-mini, got %q", detail.LiveURL)
+	}
+	if detail.FailureCategory != "git_conflict" || detail.FailureStage != "git_push" || !detail.Retriable {
+		t.Fatalf("expected failure classification fields in JobDetailResponse, got %+v", detail)
+	}
+}
+
+func TestStoriesHandler_AsyncCreatePopulatesJobMetadata(t *testing.T) {
+	store := setupTestStore(t)
+	q := dispatch.NewInMemoryQueue()
+	sh := NewStoriesHandler(store, q, nil)
+
+	body := bytes.NewReader([]byte(`{
+		"submodule": "iazio-mcp",
+		"title": "Harden Story Metadata on Enqueue",
+		"priority": "P0",
+		"problem": "Missing StoryTitle and StoryAllocationStatus on enqueued job",
+		"acceptance_criteria": ["StoryTitle populated", "StoryAllocationStatus populated"],
+		"target_files": ["internal/api/handlers/stories.go"]
+	}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/stories", body)
+	rr := httptest.NewRecorder()
+	sh.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusCreated && rr.Code != http.StatusAccepted {
+		t.Fatalf("expected 201 or 202, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp CreateStoryResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if resp.HarnessJobID == "" {
+		t.Fatal("expected non-empty HarnessJobID")
+	}
+
+	enqJob, ok := q.Get(resp.HarnessJobID)
+	if !ok || enqJob == nil {
+		t.Fatalf("expected job %s in queue", resp.HarnessJobID)
+	}
+	if enqJob.StoryTitle != "Harden Story Metadata on Enqueue" {
+		t.Fatalf("expected StoryTitle 'Harden Story Metadata on Enqueue', got %q", enqJob.StoryTitle)
+	}
+	if enqJob.StoryAllocationStatus != "pending_harness_creation" {
+		t.Fatalf("expected StoryAllocationStatus 'pending_harness_creation', got %q", enqJob.StoryAllocationStatus)
+	}
+	if enqJob.EffectiveAction != "story.create_and_execute" {
+		t.Fatalf("expected EffectiveAction 'story.create_and_execute', got %q", enqJob.EffectiveAction)
+	}
+}

@@ -2242,24 +2242,62 @@ func (s *Server) queueToolCleanupBinaries(w http.ResponseWriter, r *http.Request
 
 func (s *Server) queueAllToolsUpdate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Tools []string `json:"tools"`
-		Force bool     `json:"force"`
+		Tool          string   `json:"tool"`
+		Tools         []string `json:"tools"`
+		TargetVersion string   `json:"target_version"`
+		Version       string   `json:"version"`
+		Force         bool     `json:"force"`
 	}
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 	}
 
+	requestedTools := body.Tools
+	if len(requestedTools) == 0 && strings.TrimSpace(body.Tool) != "" {
+		requestedTools = []string{strings.TrimSpace(body.Tool)}
+	}
+	targetVer := strings.TrimSpace(body.TargetVersion)
+	if targetVer == "" {
+		targetVer = strings.TrimSpace(body.Version)
+	}
+
 	hosts := s.Engine.ListHosts()
 	queuedHosts := make([]string, 0, len(hosts))
+	var resolvedTools []string
 	for _, h := range hosts {
 		hostID := h.Host.ID
-		_ = s.Engine.QueueToolUpdate(hostID, body.Tools, body.Force)
+		hostTools := requestedTools
+		isWildcard := len(hostTools) == 1 && (hostTools[0] == "*" || strings.EqualFold(hostTools[0], "all"))
+		if isWildcard || len(hostTools) == 0 {
+			profName := h.Host.DistributionProfile
+			if profName == "" {
+				profName = "generic"
+			}
+			p, err := s.Engine.GetProfile(profName)
+			if err != nil || p == nil {
+				p, _ = s.Engine.GetProfile("generic")
+			}
+			if p != nil && len(p.Tools) > 0 {
+				var allTools []string
+				for _, pt := range p.Tools {
+					allTools = append(allTools, pt.Name)
+				}
+				hostTools = allTools
+			} else {
+				hostTools = []string{"autopilot", "iazio-agent", "iazio-harvester", "iazio-mcp", "iazio-harness"}
+			}
+		}
+		if len(resolvedTools) == 0 && len(hostTools) > 0 {
+			resolvedTools = hostTools
+		}
+		_ = s.Engine.QueueToolUpdate(hostID, hostTools, body.Force)
 		var jobID string
 		if s.Queue != nil {
 			payload, _ := json.Marshal(map[string]any{
-				"host_id": hostID,
-				"tools":   body.Tools,
-				"force":   body.Force,
+				"host_id":        hostID,
+				"tools":          hostTools,
+				"target_version": targetVer,
+				"force":          body.Force,
 			})
 			job := &dispatch.Job{
 				Type:       "agent.tools.update",
@@ -2287,24 +2325,30 @@ func (s *Server) queueAllToolsUpdate(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	if len(resolvedTools) == 0 {
+		resolvedTools = requestedTools
+	}
+
 	s.RecordNotification(NotificationRecord{
 		Title:    "Fleet Tool Update Initiated",
 		Message:  fmt.Sprintf("Enqueued tool updates across %d hosts", len(queuedHosts)),
 		Category: "userAction",
 		Source:   "harness-api",
 		Metadata: map[string]any{
-			"hosts": queuedHosts,
-			"tools": body.Tools,
-			"force": body.Force,
+			"hosts":          queuedHosts,
+			"tools":          resolvedTools,
+			"target_version": targetVer,
+			"force":          body.Force,
 		},
 	})
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status": "queued",
-		"hosts":  queuedHosts,
-		"count":  len(queuedHosts),
-		"tools":  body.Tools,
-		"force":  body.Force,
+		"status":         "queued",
+		"hosts":          queuedHosts,
+		"count":          len(queuedHosts),
+		"tools":          resolvedTools,
+		"target_version": targetVer,
+		"force":          body.Force,
 	})
 }
 
