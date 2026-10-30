@@ -485,3 +485,25 @@ func TestSaveQueueJobConflictUpdatesAllMutableFields(t *testing.T) {
 	}
 }
 
+func TestSaveQueueJobUpsertSQL_IncludesAllColumns(t *testing.T) {
+	requiredColumns := []string{
+		"parent_id = EXCLUDED.parent_id",
+		"final_turn_count = EXCLUDED.final_turn_count",
+		"final_transcript_sha256 = EXCLUDED.final_transcript_sha256",
+		"allocation_source = EXCLUDED.allocation_source",
+		"priority_rank_selected = EXCLUDED.priority_rank_selected",
+		"effective_action = EXCLUDED.effective_action",
+		"source_conversation_title = EXCLUDED.source_conversation_title",
+		"agent_affinity = EXCLUDED.agent_affinity",
+		"agent_pid = EXCLUDED.agent_pid",
+		"active_conversation_id = EXCLUDED.active_conversation_id",
+		"lease_ack_deadline_at = EXCLUDED.lease_ack_deadline_at",
+	}
+	for _, col := range requiredColumns {
+		if !strings.Contains(SaveQueueJobUpsertSQL, col) {
+			t.Errorf("expected SaveQueueJobUpsertSQL to include %q", col)
+		}
+	}
+}
+
+

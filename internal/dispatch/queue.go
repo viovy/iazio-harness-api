@@ -1219,12 +1219,55 @@ func (q *InMemoryQueue) Failover(ctx context.Context, jobID string, req AttemptF
 		return job, nil
 	}
 
+	failedTool := strings.ToLower(strings.TrimSpace(req.Tool))
+	if failedTool == "" {
+		failedTool = strings.ToLower(strings.TrimSpace(job.TargetAgent))
+	}
+	if failedTool != "" && req.FailureCategory != "WORKSPACE_PREP_ERROR" {
+		priorityTools := []string{"agy", "opencode", "claude", "cursor"}
+		failedSet := make(map[string]bool)
+		for _, att := range job.AttemptHistory {
+			if t := strings.ToLower(strings.TrimSpace(att.Tool)); t != "" {
+				failedSet[t] = true
+			}
+		}
+		failedSet[failedTool] = true
+		nextTool := ""
+		for _, cand := range priorityTools {
+			if !failedSet[cand] {
+				nextTool = cand
+				break
+			}
+		}
+		if nextTool == "" {
+			for _, cand := range priorityTools {
+				if cand != failedTool {
+					nextTool = cand
+					break
+				}
+			}
+		}
+		if nextTool != "" {
+			job.TargetAgent = nextTool
+			if len(job.Payload) > 0 {
+				var payloadMap map[string]any
+				if err := json.Unmarshal(job.Payload, &payloadMap); err == nil && payloadMap != nil {
+					payloadMap["target_agent"] = nextTool
+					if updated, err := json.Marshal(payloadMap); err == nil {
+						job.Payload = updated
+					}
+				}
+			}
+		}
+	}
+
 	job.Status = JobStatusPending
 	job.ClaimedHost = ""
 	job.HostID = ""
 	job.ClaimedAt = nil
 	job.HeartbeatAt = nil
 	job.LeaseExpiresAt = nil
+	job.LeaseOwner = ""
 	job.LeaseToken = ""
 	job.LeaseAckDeadlineAt = nil
 	job.Retriable = true
@@ -1248,6 +1291,8 @@ func (q *InMemoryQueue) RetryRetriable(ctx context.Context) ([]*Job, error) {
 				ID:                      generateJobID(),
 				Type:                    job.Type,
 				Repo:                    job.Repo,
+				TargetHost:              job.TargetHost,
+				TargetAgent:             job.TargetAgent,
 				StoryID:                 job.StoryID,
 				StoryTitle:              job.StoryTitle,
 				StoryPath:               job.StoryPath,
@@ -1257,10 +1302,15 @@ func (q *InMemoryQueue) RetryRetriable(ctx context.Context) ([]*Job, error) {
 				SourceConversationTitle: job.SourceConversationTitle,
 				NormalizedPrompt:        job.NormalizedPrompt,
 				EffectiveAction:         job.EffectiveAction,
-				Payload:                 job.Payload,
+				AgentAffinity:           job.AgentAffinity,
+				Payload:                 append(json.RawMessage(nil), job.Payload...),
 				Status:                  JobStatusPending,
 				CreatedAt:               q.now(),
 				TraceID:                 job.TraceID,
+				Traceparent:             job.Traceparent,
+				ZipkinTraceID:           job.ZipkinTraceID,
+				ZipkinTraceURL:          job.ZipkinTraceURL,
+				SearchID:                job.SearchID,
 				ParentID:                job.ID,
 				Retriable:               true,
 				doneCh:                  make(chan struct{}),
@@ -1400,7 +1450,12 @@ func (q *InMemoryQueue) ForceDispatch(ctx context.Context, jobID string) (*Job, 
 	job.ClaimedAt = nil
 	job.HeartbeatAt = nil
 	job.LeaseExpiresAt = nil
+	job.LeaseOwner = ""
+	job.LeaseToken = ""
+	job.LeaseAckDeadlineAt = nil
 	job.FencingToken = 0
+	job.LeaseVersion = 0
+	job.Error = ""
 	if job.DispatchDiagnostics == nil {
 		job.DispatchDiagnostics = &DispatchDiagnostics{}
 	}

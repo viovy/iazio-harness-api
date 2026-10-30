@@ -1485,5 +1485,116 @@ func TestQueue_SetFinalHarvestPersistsToStore(t *testing.T) {
 	}
 }
 
+func TestQueue_RetryRetriablePreservesRoutingAndAffinity(t *testing.T) {
+	ctx := context.Background()
+	q := NewInMemoryQueue()
+
+	orig, err := q.Enqueue(ctx, &Job{
+		Type:          JobTypePromptExecute,
+		Repo:          "iazio-harness-api",
+		TargetHost:    "mac-mini",
+		TargetAgent:   "opencode",
+		AgentAffinity: &AgentAffinity{HostID: "mac-mini", AgentName: "opencode"},
+		SearchID:      "search-v3-001",
+		TraceID:       "0123456789abcdef0123456789abcdef",
+		Traceparent:   "00-0123456789abcdef0123456789abcdef-0000000000000001-01",
+		ZipkinTraceID: "0123456789abcdef0123456789abcdef",
+		Retriable:     true,
+		Payload:       json.RawMessage(`{"prompt":"fix v3","target_agent":"opencode"}`),
+	})
+	if err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
+	_ = q.Complete(ctx, orig.ID, nil, "transient timeout")
+	origJob, _ := q.Get(orig.ID)
+	origJob.Retriable = true
+
+	retried, err := q.RetryRetriable(ctx)
+	if err != nil {
+		t.Fatalf("RetryRetriable failed: %v", err)
+	}
+	if len(retried) != 1 {
+		t.Fatalf("expected 1 retried job, got %d", len(retried))
+	}
+	r := retried[0]
+	if r.TargetHost != "mac-mini" || r.TargetAgent != "opencode" {
+		t.Fatalf("expected TargetHost=mac-mini and TargetAgent=opencode preserved, got host=%q agent=%q", r.TargetHost, r.TargetAgent)
+	}
+	if r.AgentAffinity == nil || r.AgentAffinity.HostID != "mac-mini" || r.AgentAffinity.AgentName != "opencode" {
+		t.Fatalf("expected AgentAffinity preserved on RetryRetriable, got %+v", r.AgentAffinity)
+	}
+	if r.SearchID != "search-v3-001" || r.Traceparent == "" || r.ZipkinTraceID == "" {
+		t.Fatalf("expected SearchID and trace fields preserved on RetryRetriable, got %+v", r)
+	}
+}
+
+func TestQueue_ForceDispatchClearsLeaseStateAndVersion(t *testing.T) {
+	ctx := context.Background()
+	store := &fakeQueueStore{}
+	q := NewInMemoryQueue()
+	_ = q.SetStore(store)
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type: JobTypePromptExecute,
+		Repo: "iazio-mcp",
+	})
+	if err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
+	claimed, err := q.Claim(ctx, "host-a", []string{JobTypePromptExecute})
+	if err != nil || claimed == nil {
+		t.Fatalf("Claim failed: %v", err)
+	}
+	if claimed.LeaseToken == "" || claimed.FencingToken == 0 {
+		t.Fatalf("expected non-empty LeaseToken and FencingToken on claim, got %+v", claimed)
+	}
+
+	forced, err := q.ForceDispatch(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("ForceDispatch failed: %v", err)
+	}
+	if forced.LeaseToken != "" || forced.LeaseOwner != "" || forced.LeaseAckDeadlineAt != nil || forced.FencingToken != 0 || forced.LeaseVersion != 0 {
+		t.Fatalf("expected ForceDispatch to clear LeaseToken, LeaseOwner, LeaseAckDeadlineAt, FencingToken, and LeaseVersion, got %+v", forced)
+	}
+}
+
+func TestQueue_RecordAttemptAndFailoverUpdatesPayloadTargetAgent(t *testing.T) {
+	ctx := context.Background()
+	q := NewInMemoryQueue()
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type:        JobTypePromptExecute,
+		Repo:        "iazio-harness-api",
+		TargetAgent: "agy",
+		Payload:     json.RawMessage(`{"repo":"iazio-harness-api","prompt":"run audit","target_agent":"agy"}`),
+	})
+	if err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
+
+	updated, err := q.Failover(ctx, job.ID, AttemptFailure{
+		Host:            "mac-mini",
+		Tool:            "agy",
+		ExitCode:        1,
+		StderrTail:      "HTTP 429 quota exhausted",
+		FailureCategory: "TOOL_QUOTA_OR_AUTH",
+		Reason:          "PREFLIGHT_OR_EARLY_TOOL_EXIT",
+	})
+	if err != nil {
+		t.Fatalf("Failover failed: %v", err)
+	}
+	if updated.TargetAgent != "opencode" {
+		t.Fatalf("expected Failover to rotate TargetAgent from agy to opencode, got %q", updated.TargetAgent)
+	}
+	var payloadMap map[string]any
+	if err := json.Unmarshal(updated.Payload, &payloadMap); err != nil {
+		t.Fatalf("failed to unmarshal updated payload: %v", err)
+	}
+	if payloadMap["target_agent"] != "opencode" {
+		t.Fatalf("expected payload target_agent to be synchronized to opencode after failover, got %v", payloadMap["target_agent"])
+	}
+}
+
+
 
 

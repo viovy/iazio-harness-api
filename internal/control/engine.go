@@ -6748,6 +6748,38 @@ func (e *Engine) UpdateStorySyncState(id, syncState string) error {
 	return nil
 }
 
+// UpdateStoryStatus updates the lifecycle status of a story in memory and triggers OnStoryChange.
+func (e *Engine) UpdateStoryStatus(id, status string) (Story, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cleanID := strings.TrimSpace(id)
+	cleanStatus := strings.ToUpper(strings.TrimSpace(status))
+	if cleanID == "" || cleanStatus == "" {
+		return Story{}, errors.New("story id and status are required")
+	}
+	var target *Story
+	if s, ok := e.stories[cleanID]; ok && s != nil {
+		target = s
+	} else {
+		for k, s := range e.stories {
+			if s != nil && strings.EqualFold(k, cleanID) {
+				target = s
+				break
+			}
+		}
+	}
+	if target == nil {
+		return Story{}, errors.New("story not found")
+	}
+	target.Status = cleanStatus
+	target.UpdatedAt = e.now().UTC()
+	cp := *target
+	if e.OnStoryChange != nil {
+		go e.OnStoryChange(cp)
+	}
+	return cp, nil
+}
+
 // ReconcileHistoricalLineage performs an idempotent repair of historical split-brain job lineages,
 // specifically reconciling job-1311 and job-1313 on mac-mini/target-workspace-03 and propagating canonical
 // root initial conversation IDs and classifying legacy unpinned secondary sessions.

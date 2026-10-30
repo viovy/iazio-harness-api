@@ -738,3 +738,134 @@ func (h *StoriesHandler) MaterializeStory(w http.ResponseWriter, r *http.Request
 	})
 }
 
+// UpdateStoryStatusRequest represents a request to mutate story lifecycle status.
+type UpdateStoryStatusRequest struct {
+	Status string `json:"status"`
+}
+
+// UpdateStoryStatus handles PATCH /api/v1/stories/{id} and POST /api/v1/stories/{id}/status.
+func (h *StoriesHandler) UpdateStoryStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPatch && r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		path := r.URL.Path
+		for _, prefix := range []string{"/api/v1/stories/", "/v1/stories/"} {
+			if strings.HasPrefix(path, prefix) {
+				id = strings.TrimPrefix(path, prefix)
+				break
+			}
+		}
+		id = strings.TrimSuffix(id, "/status")
+		id = strings.TrimSpace(strings.TrimSuffix(id, "/"))
+	}
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "story id is required")
+		return
+	}
+
+	var req UpdateStoryStatusRequest
+	if r.Body != nil {
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 1<<18))
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "failed to read request body")
+			return
+		}
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, &req); err != nil {
+				writeJSONError(w, http.StatusBadRequest, "malformed JSON request body")
+				return
+			}
+		}
+	}
+
+	normStatus := strings.ToUpper(strings.TrimSpace(req.Status))
+	switch normStatus {
+	case "READY", "IN_PROGRESS", "DONE", "BLOCKED":
+	default:
+		writeJSONError(w, http.StatusUnprocessableEntity, fmt.Sprintf("invalid status %q (must be READY, IN_PROGRESS, DONE, or BLOCKED)", req.Status))
+		return
+	}
+
+	updatedInEngine := false
+	if h.engine != nil {
+		if _, err := h.engine.UpdateStoryStatus(id, normStatus); err == nil {
+			updatedInEngine = true
+		}
+	}
+
+	root := findStoriesRoot()
+	updatedInIndex := updateIndexStoryStatus(root, id, normStatus)
+	if !updatedInEngine && updatedInIndex && h.engine != nil {
+		for _, s := range loadIndexStories(root) {
+			if strings.EqualFold(s.ID, id) {
+				sub := ""
+				if len(s.Submodules) > 0 {
+					sub = s.Submodules[0]
+				}
+				_ = h.engine.SaveStory(control.Story{
+					ID:        s.ID,
+					Repo:      sub,
+					Submodule: sub,
+					Title:     s.Title,
+					Priority:  s.Priority,
+					Status:    normStatus,
+					SyncState: "MATERIALIZED",
+				})
+				updatedInEngine = true
+				break
+			}
+		}
+	}
+
+	if !updatedInEngine && !updatedInIndex {
+		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("story %q not found", id))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"story_id":   id,
+		"status":     normStatus,
+		"updated":    true,
+		"updated_at": time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+func updateIndexStoryStatus(root, storyID, newStatus string) bool {
+	indexPath := filepath.Join(root, "docs", "stories", "index.yml")
+	data, err := os.ReadFile(indexPath)
+	if err != nil {
+		return false
+	}
+	lines := strings.Split(string(data), "\n")
+	inTarget := false
+	updated := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "- id:") {
+			currID := strings.TrimSpace(strings.TrimPrefix(trimmed, "- id:"))
+			inTarget = strings.EqualFold(currID, storyID)
+			continue
+		}
+		if inTarget && strings.HasPrefix(trimmed, "status:") {
+			idx := strings.Index(line, "status:")
+			if idx >= 0 {
+				lines[i] = line[:idx] + "status: " + newStatus
+				updated = true
+				break
+			}
+		}
+	}
+	if !updated {
+		return false
+	}
+	_ = os.WriteFile(indexPath, []byte(strings.Join(lines, "\n")), 0644)
+	return true
+}
+
+
