@@ -2905,3 +2905,51 @@ func TestServer_DiscardRepo_ForceAndDiscardAll(t *testing.T) {
 	}
 }
 
+func TestServer_QueueAllToolsUpdateDefaultProfileTools(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	s := &Server{
+		Engine: control.NewEngine(nil),
+		Queue:  q,
+	}
+	s.Engine.RegisterHost("mac-mini", "permanent")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/fleet/tools/update-all", bytes.NewBufferString(`{"target_version":"1.2.3","force":true}`))
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		Status        string   `json:"status"`
+		Tools         []string `json:"tools"`
+		TargetVersion string   `json:"target_version"`
+		Count         int      `json:"count"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response failed: %v", err)
+	}
+	if len(resp.Tools) == 0 {
+		t.Fatal("expected default profile tools to be resolved when tools is omitted, got empty")
+	}
+	if resp.TargetVersion != "1.2.3" {
+		t.Fatalf("expected target_version 1.2.3, got %q", resp.TargetVersion)
+	}
+
+	jobs, err := q.List(context.Background(), dispatch.JobFilter{Type: "agent.tools.update"})
+	if err != nil || len(jobs) == 0 {
+		t.Fatalf("expected agent.tools.update job in queue, got len=%d err=%v", len(jobs), err)
+	}
+	var payload struct {
+		Tools         []string `json:"tools"`
+		TargetVersion string   `json:"target_version"`
+	}
+	if err := json.Unmarshal(jobs[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal job payload: %v", err)
+	}
+	if len(payload.Tools) == 0 || payload.TargetVersion != "1.2.3" {
+		t.Fatalf("expected non-empty tools and target_version=1.2.3 in job payload, got %+v", payload)
+	}
+}
+

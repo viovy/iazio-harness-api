@@ -121,38 +121,47 @@ func (h *JobLifecycleHandler) isStoryAvailable(storyID, submodule string) bool {
 
 // JobDetailResponse is the detailed JSON representation of a dispatch job.
 type JobDetailResponse struct {
-	ID                      string                  `json:"id"`
-	Type                    string                  `json:"type"`
-	Repo                    string                  `json:"repo"`
-	TargetHost              string                  `json:"target_host,omitempty"`
-	TargetAgent             string                  `json:"target_agent,omitempty"`
-	StoryID                 string                  `json:"story_id,omitempty"`
-	StoryTitle              string                  `json:"story_title,omitempty"`
-	StoryPath               string                  `json:"story_path,omitempty"`
-	StoryAllocationStatus   string                  `json:"story_allocation_status,omitempty"`
-	AllocationSource        string                  `json:"allocation_source,omitempty"`
-	PriorityRankSelected    int                     `json:"priority_rank_selected,omitempty"`
-	NormalizedPrompt        string                  `json:"normalized_prompt,omitempty"`
-	EffectiveAction         string                  `json:"effective_action,omitempty"`
-	SourceConversationTitle string                  `json:"source_conversation_title,omitempty"`
-	LiveURL                 string                  `json:"live_url,omitempty"`
-	Status                  string                  `json:"status"`
-	Result                  json.RawMessage         `json:"result,omitempty"`
-	Error                   string                  `json:"error,omitempty"`
-	TraceID                 string                  `json:"trace_id,omitempty"`
-	SearchID                string                  `json:"search_id,omitempty"`
-	RelevanceEmitted        bool                    `json:"relevance_emitted"`
-	PromotedMemories        []string                `json:"promoted_memories,omitempty"`
-	FencingToken            int64                   `json:"fencing_token,omitempty"`
-	Attempts                int                     `json:"attempts,omitempty"`
-	HeartbeatAt             string                  `json:"heartbeat_at,omitempty"`
-	LeaseExpiresAt          string                  `json:"lease_expires_at,omitempty"`
-	AgentAffinity           *dispatch.AgentAffinity `json:"agent_affinity,omitempty"`
+	ID                      string                        `json:"id"`
+	Type                    string                        `json:"type"`
+	Repo                    string                        `json:"repo"`
+	TargetHost              string                        `json:"target_host,omitempty"`
+	ClaimedHost             string                        `json:"claimed_host,omitempty"`
+	HostID                  string                        `json:"host_id,omitempty"`
+	TargetAgent             string                        `json:"target_agent,omitempty"`
+	StoryID                 string                        `json:"story_id,omitempty"`
+	StoryTitle              string                        `json:"story_title,omitempty"`
+	StoryPath               string                        `json:"story_path,omitempty"`
+	StoryAllocationStatus   string                        `json:"story_allocation_status,omitempty"`
+	AllocationSource        string                        `json:"allocation_source,omitempty"`
+	PriorityRankSelected    int                           `json:"priority_rank_selected,omitempty"`
+	NormalizedPrompt        string                        `json:"normalized_prompt,omitempty"`
+	EffectiveAction         string                        `json:"effective_action,omitempty"`
+	SourceConversationTitle string                        `json:"source_conversation_title,omitempty"`
+	LiveURL                 string                        `json:"live_url,omitempty"`
+	Status                  string                        `json:"status"`
+	Result                  json.RawMessage               `json:"result,omitempty"`
+	Error                   string                        `json:"error,omitempty"`
+	FailureCategory         string                        `json:"failure_category,omitempty"`
+	FailureStage            string                        `json:"failure_stage,omitempty"`
+	FailureReasonSummary    string                        `json:"failure_reason_summary,omitempty"`
+	Retriable               bool                          `json:"retriable,omitempty"`
+	ParentID                string                        `json:"parent_id,omitempty"`
+	InfraRequeueCount       int                           `json:"infra_requeue_count,omitempty"`
+	AttemptHistory          []dispatch.AttemptFailure     `json:"attempt_history,omitempty"`
+	TraceID                 string                        `json:"trace_id,omitempty"`
+	SearchID                string                        `json:"search_id,omitempty"`
+	RelevanceEmitted        bool                          `json:"relevance_emitted"`
+	PromotedMemories        []string                      `json:"promoted_memories,omitempty"`
+	FencingToken            int64                         `json:"fencing_token,omitempty"`
+	Attempts                int                           `json:"attempts,omitempty"`
+	HeartbeatAt             string                        `json:"heartbeat_at,omitempty"`
+	LeaseExpiresAt          string                        `json:"lease_expires_at,omitempty"`
+	AgentAffinity           *dispatch.AgentAffinity       `json:"agent_affinity,omitempty"`
 	DispatchDiagnostics     *dispatch.DispatchDiagnostics `json:"dispatch_diagnostics,omitempty"`
-	CreatedAt               string                  `json:"created_at"`
-	ClaimedAt               string                  `json:"claimed_at,omitempty"`
-	CompletedAt             string                  `json:"completed_at,omitempty"`
-	DurationMs              int64                   `json:"duration_ms,omitempty"`
+	CreatedAt               string                        `json:"created_at"`
+	ClaimedAt               string                        `json:"claimed_at,omitempty"`
+	CompletedAt             string                        `json:"completed_at,omitempty"`
+	DurationMs              int64                         `json:"duration_ms,omitempty"`
 }
 
 // ListQueueResponse contains the list of jobs matching a filter.
@@ -689,11 +698,22 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		promoted = []string{}
 	}
 
+	effectiveHost := strings.TrimSpace(j.TargetHost)
+	if effectiveHost == "" || strings.EqualFold(effectiveHost, "auto") {
+		if strings.TrimSpace(j.ClaimedHost) != "" {
+			effectiveHost = strings.TrimSpace(j.ClaimedHost)
+		} else if strings.TrimSpace(j.HostID) != "" {
+			effectiveHost = strings.TrimSpace(j.HostID)
+		}
+	}
+
 	resp := JobDetailResponse{
 		ID:                      j.ID,
 		Type:                    j.Type,
 		Repo:                    j.Repo,
-		TargetHost:              j.TargetHost,
+		TargetHost:              effectiveHost,
+		ClaimedHost:             j.ClaimedHost,
+		HostID:                  j.HostID,
 		TargetAgent:             j.TargetAgent,
 		StoryID:                 j.StoryID,
 		StoryTitle:              j.StoryTitle,
@@ -707,6 +727,13 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		Status:                  j.Status,
 		Result:                  j.Result,
 		Error:                   j.Error,
+		FailureCategory:         j.FailureCategory,
+		FailureStage:            j.FailureStage,
+		FailureReasonSummary:    j.FailureReasonSummary,
+		Retriable:               j.Retriable,
+		ParentID:                j.ParentID,
+		InfraRequeueCount:       j.InfraRequeueCount,
+		AttemptHistory:          j.AttemptHistory,
 		TraceID:                 j.TraceID,
 		SearchID:                j.SearchID,
 		RelevanceEmitted:        j.RelevanceEmitted,
@@ -718,7 +745,7 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		CreatedAt:               j.CreatedAt.Format(time.RFC3339),
 	}
 
-	if j.TargetHost != "" {
+	if effectiveHost != "" && !strings.EqualFold(effectiveHost, "auto") {
 		liveRepo := j.Repo
 		if liveRepo == "" || liveRepo == "." {
 			liveRepo = "root"
@@ -727,7 +754,7 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		if webBase == "" {
 			webBase = "https://example.com/iazio-web"
 		}
-		resp.LiveURL = fmt.Sprintf("%s/agents/%s/%s/live?job=%s", strings.TrimRight(webBase, "/"), j.TargetHost, liveRepo, j.ID)
+		resp.LiveURL = fmt.Sprintf("%s/agents/%s/%s/live?job=%s", strings.TrimRight(webBase, "/"), effectiveHost, liveRepo, j.ID)
 	}
 
 	if j.HeartbeatAt != nil {

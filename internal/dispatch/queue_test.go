@@ -1367,5 +1367,123 @@ func TestReconcileGlobalQueueSlotsReclaimsStaleLeasedAndRunningJobs(t *testing.T
 	}
 }
 
+type fakeQueueStore struct {
+	mu    sync.Mutex
+	saved map[string]*Job
+}
+
+func (f *fakeQueueStore) SaveQueueJob(_ context.Context, j *Job) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.saved == nil {
+		f.saved = make(map[string]*Job)
+	}
+	cp := *j
+	f.saved[j.ID] = &cp
+	return nil
+}
+
+func (f *fakeQueueStore) LoadQueueJobs(_ context.Context) ([]*Job, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*Job
+	for _, j := range f.saved {
+		cp := *j
+		out = append(out, &cp)
+	}
+	return out, nil
+}
+
+func (f *fakeQueueStore) UpdateQueueJobLease(_ context.Context, _ string, _ string, _ int64, _, _ time.Time) error {
+	return nil
+}
+
+func (f *fakeQueueStore) CompleteQueueJob(_ context.Context, _ string, _ string, _ json.RawMessage, _ string, _ time.Time) error {
+	return nil
+}
+
+func TestQueue_RetryPreservesMetadataAndMarksRequeued(t *testing.T) {
+	ctx := context.Background()
+	store := &fakeQueueStore{}
+	q := NewInMemoryQueue()
+	if err := q.SetStore(store); err != nil {
+		t.Fatalf("SetStore failed: %v", err)
+	}
+
+	orig, err := q.Enqueue(ctx, &Job{
+		Type:                    JobTypePromptExecute,
+		Repo:                    "iazio-mcp",
+		TargetHost:              "mac-mini",
+		TargetAgent:             "agy",
+		StoryID:                 "STORY-GOV-3797",
+		StoryTitle:              "Forensic v2 Remediation",
+		StoryPath:               "docs/stories/2026-10-30-gov-3797.story.md",
+		StoryAllocationStatus:   "allocated",
+		AllocationSource:        "explicit",
+		PriorityRankSelected:    1,
+		SourceConversationTitle: "Audit Conversation",
+		NormalizedPrompt:        "/autonomous-story-execution STORY-GOV-3797",
+		EffectiveAction:         "/autonomous-story-execution",
+		AgentAffinity:           &AgentAffinity{HostID: "mac-mini", AgentName: "agy"},
+		Payload:                 json.RawMessage(`{"story_id":"STORY-GOV-3797"}`),
+		TraceID:                 "trace-v2-001",
+		SearchID:                "search-v2-001",
+		Retriable:               true,
+	})
+	if err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
+	_ = q.Complete(ctx, orig.ID, nil, "transient network failure")
+
+	retried, err := q.Retry(ctx, orig.ID)
+	if err != nil {
+		t.Fatalf("Retry failed: %v", err)
+	}
+	if retried.StoryID != "STORY-GOV-3797" || retried.StoryTitle != "Forensic v2 Remediation" || retried.StoryPath != "docs/stories/2026-10-30-gov-3797.story.md" {
+		t.Fatalf("expected Story metadata preserved on Retry, got %+v", retried)
+	}
+	if retried.NormalizedPrompt != "/autonomous-story-execution STORY-GOV-3797" || retried.EffectiveAction != "/autonomous-story-execution" {
+		t.Fatalf("expected NormalizedPrompt and EffectiveAction preserved on Retry, got %+v", retried)
+	}
+	if retried.ParentID != orig.ID || !retried.Retriable || retried.AgentAffinity == nil || retried.AgentAffinity.HostID != "mac-mini" {
+		t.Fatalf("expected ParentID=%s, Retriable=true, AgentAffinity preserved, got %+v", orig.ID, retried)
+	}
+
+	origAfter, _ := q.Get(orig.ID)
+	if origAfter.Status != JobStatusRequeued {
+		t.Fatalf("expected original job status %s after Retry, got %s", JobStatusRequeued, origAfter.Status)
+	}
+}
+
+func TestQueue_SetFinalHarvestPersistsToStore(t *testing.T) {
+	ctx := context.Background()
+	store := &fakeQueueStore{}
+	q := NewInMemoryQueue()
+	if err := q.SetStore(store); err != nil {
+		t.Fatalf("SetStore failed: %v", err)
+	}
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type: JobTypePromptExecute,
+		Repo: "iazio-harness-api",
+	})
+	if err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
+	_ = q.Complete(ctx, job.ID, json.RawMessage(`{"status":"ok"}`), "")
+	q.SetFinalHarvest(job.ID, 14, "sha256-final-transcript-abc123")
+
+	store.mu.Lock()
+	persisted := store.saved[job.ID]
+	store.mu.Unlock()
+	if persisted == nil {
+		t.Fatal("expected job to be persisted in QueueStore")
+	}
+	if persisted.FinalTurnCount != 14 || persisted.FinalTranscriptSHA256 != "sha256-final-transcript-abc123" {
+		t.Fatalf("expected FinalTurnCount=14 and FinalTranscriptSHA256 persisted in store, got turnCount=%d sha=%s",
+			persisted.FinalTurnCount, persisted.FinalTranscriptSHA256)
+	}
+}
+
 
 

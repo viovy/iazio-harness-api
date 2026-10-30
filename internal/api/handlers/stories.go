@@ -367,19 +367,29 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"verification_commands":  req.VerificationCommands,
 		})
 		if h.queue != nil {
+			storyAllocStatus := "allocated"
+			effectiveAction := "/autonomous-story-execution"
+			if storyID == "" {
+				storyAllocStatus = "pending_harness_creation"
+				effectiveAction = "story.create_and_execute"
+			}
 			ej, _ := h.queue.Enqueue(r.Context(), &dispatch.Job{
-				Type:                 dispatch.JobTypePromptExecute,
-				Repo:                 req.Submodule,
-				TargetHost:           alloc.TargetHost,
-				TargetAgent:          targetAgent,
-				StoryID:              storyID,
-				NormalizedPrompt:     normalizedPrompt,
-				AllocationSource:     alloc.AllocationSource,
-				PriorityRankSelected: alloc.PriorityRankSelected,
-				Payload:              execPayload,
-				TraceID:              jobTraceID,
-				ParentID:             span.ID,
-				SearchID:             strings.TrimSpace(req.SearchID),
+				Type:                  dispatch.JobTypePromptExecute,
+				Repo:                  req.Submodule,
+				TargetHost:            alloc.TargetHost,
+				TargetAgent:           targetAgent,
+				StoryID:               storyID,
+				StoryTitle:            req.Title,
+				StoryPath:             strings.TrimSpace(req.ContentPath),
+				StoryAllocationStatus: storyAllocStatus,
+				EffectiveAction:       effectiveAction,
+				NormalizedPrompt:      normalizedPrompt,
+				AllocationSource:      alloc.AllocationSource,
+				PriorityRankSelected:  alloc.PriorityRankSelected,
+				Payload:               execPayload,
+				TraceID:               jobTraceID,
+				ParentID:              span.ID,
+				SearchID:              strings.TrimSpace(req.SearchID),
 			})
 			if ej != nil {
 				execJobID = ej.ID
