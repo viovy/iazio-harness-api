@@ -165,6 +165,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/stories", storiesHandler.ListStories)
 	mux.HandleFunc("GET /api/v1/stories/", storiesHandler.GetStory)
 	mux.HandleFunc("POST /api/v1/stories/{id}/materialize", storiesHandler.MaterializeStory)
+	mux.HandleFunc("PATCH /api/v1/stories/{id}", storiesHandler.UpdateStoryStatus)
+	mux.HandleFunc("POST /api/v1/stories/{id}/status", storiesHandler.UpdateStoryStatus)
+	mux.HandleFunc("PATCH /v1/stories/{id}", storiesHandler.UpdateStoryStatus)
+	mux.HandleFunc("POST /v1/stories/{id}/status", storiesHandler.UpdateStoryStatus)
 
 	promptsHandler := handlers.NewPromptsHandler(codebaseStore, queue, idempotency)
 	if s.Engine != nil {
@@ -2290,7 +2294,7 @@ func (s *Server) queueAllToolsUpdate(w http.ResponseWriter, r *http.Request) {
 		if len(resolvedTools) == 0 && len(hostTools) > 0 {
 			resolvedTools = hostTools
 		}
-		_ = s.Engine.QueueToolUpdate(hostID, hostTools, body.Force)
+		_ = s.Engine.QueueToolUpdate(hostID, hostTools, body.Force, targetVer)
 		var jobID string
 		if s.Queue != nil {
 			payload, _ := json.Marshal(map[string]any{

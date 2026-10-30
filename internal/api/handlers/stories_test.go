@@ -569,4 +569,36 @@ func TestStoriesHandlerCreateWithoutIDAlwaysEnqueuesASEPrompt(t *testing.T) {
 	}
 }
 
+func TestStoriesHandler_UpdateStoryStatus(t *testing.T) {
+	store := setupTestStore(t)
+	q := dispatch.NewInMemoryQueue()
+	engine := control.NewEngine(nil)
+	_ = engine.SaveStory(control.Story{
+		ID:        "STORY-GOV-3799",
+		Repo:      "meta-repo",
+		Submodule: "iazio-harness-api",
+		Title:     "Forensic v3 Remediation",
+		Priority:  "P0",
+		Status:    "IN_PROGRESS",
+		SyncState: "MATERIALIZED",
+	})
+
+	handler := NewStoriesHandler(store, q, nil)
+	handler.SetEngine(engine)
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/stories/STORY-GOV-3799", bytes.NewBufferString(`{"status":"DONE"}`))
+	w := httptest.NewRecorder()
+	handler.UpdateStoryStatus(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	updated, ok := engine.GetStory("STORY-GOV-3799")
+	if !ok || updated.Status != "DONE" {
+		t.Fatalf("expected story status updated to DONE in engine, got ok=%v status=%q", ok, updated.Status)
+	}
+}
+
+
 

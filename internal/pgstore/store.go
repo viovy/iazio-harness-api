@@ -308,6 +308,17 @@ CREATE TABLE IF NOT EXISTS harness_dispatch_jobs (
   retriable boolean NOT NULL DEFAULT false,
   attempt_history jsonb NOT NULL DEFAULT '[]'::jsonb,
   infra_requeue_count integer NOT NULL DEFAULT 0,
+  parent_id text NOT NULL DEFAULT '',
+  final_turn_count integer NOT NULL DEFAULT 0,
+  final_transcript_sha256 text NOT NULL DEFAULT '',
+  allocation_source text NOT NULL DEFAULT '',
+  priority_rank_selected integer NOT NULL DEFAULT 0,
+  effective_action text NOT NULL DEFAULT '',
+  source_conversation_title text NOT NULL DEFAULT '',
+  agent_affinity text NOT NULL DEFAULT '',
+  agent_pid integer NOT NULL DEFAULT 0,
+  active_conversation_id text NOT NULL DEFAULT '',
+  lease_ack_deadline_at timestamp with time zone,
   updated_at timestamp with time zone NOT NULL DEFAULT now()
 );
 
@@ -320,6 +331,17 @@ ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS failure_reason_summar
 ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS retriable boolean NOT NULL DEFAULT false;
 ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS attempt_history jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS infra_requeue_count integer NOT NULL DEFAULT 0;
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS parent_id text NOT NULL DEFAULT '';
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS final_turn_count integer NOT NULL DEFAULT 0;
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS final_transcript_sha256 text NOT NULL DEFAULT '';
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS allocation_source text NOT NULL DEFAULT '';
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS priority_rank_selected integer NOT NULL DEFAULT 0;
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS effective_action text NOT NULL DEFAULT '';
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS source_conversation_title text NOT NULL DEFAULT '';
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS agent_affinity text NOT NULL DEFAULT '';
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS agent_pid integer NOT NULL DEFAULT 0;
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS active_conversation_id text NOT NULL DEFAULT '';
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS lease_ack_deadline_at timestamp with time zone;
 
 CREATE INDEX IF NOT EXISTS harness_dispatch_jobs_status_idx ON harness_dispatch_jobs (status);
 CREATE INDEX IF NOT EXISTS harness_dispatch_jobs_host_idx ON harness_dispatch_jobs (claimed_host, status);
@@ -1225,20 +1247,26 @@ WHERE job_id = 'job-1313' AND (parent_job_id = '' OR parent_job_id IS NULL OR in
 
 // SaveQueueJobUpsertSQL is the canonical upsert query for harness_dispatch_jobs.
 // It updates all mutable job fields on conflict so dynamic story bindings, results,
-// target allocations, payloads, and failure taxonomy survive API restarts.
+// target allocations, payloads, harvest metrics, active conversations, and failure taxonomy survive API restarts.
 const SaveQueueJobUpsertSQL = `
 INSERT INTO harness_dispatch_jobs (
   id, type, repo, target_host, claimed_host, host_id, target_agent, story_id,
   normalized_prompt, payload, status, result, error, trace_id, fencing_token, lease_version,
   lease_owner, lease_token, attempts, created_at, claimed_at, heartbeat_at, lease_expires_at, completed_at,
   story_title, story_path, story_allocation_status, failure_category, failure_stage,
-  failure_reason_summary, retriable, attempt_history, infra_requeue_count, updated_at
+  failure_reason_summary, retriable, attempt_history, infra_requeue_count,
+  parent_id, final_turn_count, final_transcript_sha256, allocation_source,
+  priority_rank_selected, effective_action, source_conversation_title,
+  agent_affinity, agent_pid, active_conversation_id, lease_ack_deadline_at, updated_at
 ) VALUES (
   $1, $2, $3, $4, $5, $6, $7, $8,
   $9, $10, $11, $12, $13, $14, $15, $16,
   $17, $18, $19, $20, $21, $22, $23, $24,
   $25, $26, $27, $28, $29,
-  $30, $31, $32, $33, now()
+  $30, $31, $32, $33,
+  $34, $35, $36, $37,
+  $38, $39, $40,
+  $41, $42, $43, $44, now()
 )
 ON CONFLICT (id) DO UPDATE SET
   type = EXCLUDED.type,
@@ -1272,6 +1300,17 @@ ON CONFLICT (id) DO UPDATE SET
   retriable = EXCLUDED.retriable,
   attempt_history = EXCLUDED.attempt_history,
   infra_requeue_count = EXCLUDED.infra_requeue_count,
+  parent_id = EXCLUDED.parent_id,
+  final_turn_count = EXCLUDED.final_turn_count,
+  final_transcript_sha256 = EXCLUDED.final_transcript_sha256,
+  allocation_source = EXCLUDED.allocation_source,
+  priority_rank_selected = EXCLUDED.priority_rank_selected,
+  effective_action = EXCLUDED.effective_action,
+  source_conversation_title = EXCLUDED.source_conversation_title,
+  agent_affinity = EXCLUDED.agent_affinity,
+  agent_pid = EXCLUDED.agent_pid,
+  active_conversation_id = EXCLUDED.active_conversation_id,
+  lease_ack_deadline_at = EXCLUDED.lease_ack_deadline_at,
   updated_at = now();
 `
 
@@ -1292,12 +1331,21 @@ func (s *Store) SaveQueueJob(ctx context.Context, job *dispatch.Job) error {
 	if err != nil || len(attemptHistBytes) == 0 || string(attemptHistBytes) == "null" {
 		attemptHistBytes = []byte("[]")
 	}
+	affinityJSON := ""
+	if job.AgentAffinity != nil {
+		if b, mErr := json.Marshal(job.AgentAffinity); mErr == nil && string(b) != "null" {
+			affinityJSON = string(b)
+		}
+	}
 	_, err = s.db.ExecContext(ctx, SaveQueueJobUpsertSQL,
 		job.ID, job.Type, job.Repo, job.TargetHost, job.ClaimedHost, job.HostID, job.TargetAgent, job.StoryID,
 		job.NormalizedPrompt, payloadBytes, job.Status, resultBytes, job.Error, job.TraceID, job.FencingToken, job.LeaseVersion,
 		job.LeaseOwner, job.LeaseToken, job.Attempts, job.CreatedAt, job.ClaimedAt, job.HeartbeatAt, job.LeaseExpiresAt, job.CompletedAt,
 		job.StoryTitle, job.StoryPath, job.StoryAllocationStatus, job.FailureCategory, job.FailureStage,
 		job.FailureReasonSummary, job.Retriable, string(attemptHistBytes), job.InfraRequeueCount,
+		job.ParentID, job.FinalTurnCount, job.FinalTranscriptSHA256, job.AllocationSource,
+		job.PriorityRankSelected, job.EffectiveAction, job.SourceConversationTitle,
+		affinityJSON, job.AgentPID, job.ActiveConversationID, job.LeaseAckDeadlineAt,
 	)
 	return err
 }
@@ -1366,7 +1414,10 @@ SELECT id, type, repo, target_host, claimed_host, host_id, target_agent, story_i
        lease_version, lease_owner, lease_token, attempts, created_at, claimed_at,
        heartbeat_at, lease_expires_at, completed_at,
        story_title, story_path, story_allocation_status, failure_category, failure_stage,
-       failure_reason_summary, retriable, attempt_history, infra_requeue_count
+       failure_reason_summary, retriable, attempt_history, infra_requeue_count,
+       parent_id, final_turn_count, final_transcript_sha256, allocation_source,
+       priority_rank_selected, effective_action, source_conversation_title,
+       agent_affinity, agent_pid, active_conversation_id, lease_ack_deadline_at
 FROM harness_dispatch_jobs
 ORDER BY created_at ASC;
 `)
@@ -1379,7 +1430,8 @@ ORDER BY created_at ASC;
 	for rows.Next() {
 		var j dispatch.Job
 		var payloadBytes, resultBytes, attemptHistBytes []byte
-		var claimedAt, heartbeatAt, leaseExpiresAt, completedAt *time.Time
+		var affinityJSON string
+		var claimedAt, heartbeatAt, leaseExpiresAt, completedAt, leaseAckDeadlineAt *time.Time
 		if err := rows.Scan(
 			&j.ID, &j.Type, &j.Repo, &j.TargetHost, &j.ClaimedHost, &j.HostID, &j.TargetAgent, &j.StoryID,
 			&j.NormalizedPrompt, &payloadBytes, &j.Status, &resultBytes, &j.Error, &j.TraceID, &j.FencingToken,
@@ -1387,6 +1439,9 @@ ORDER BY created_at ASC;
 			&heartbeatAt, &leaseExpiresAt, &completedAt,
 			&j.StoryTitle, &j.StoryPath, &j.StoryAllocationStatus, &j.FailureCategory, &j.FailureStage,
 			&j.FailureReasonSummary, &j.Retriable, &attemptHistBytes, &j.InfraRequeueCount,
+			&j.ParentID, &j.FinalTurnCount, &j.FinalTranscriptSHA256, &j.AllocationSource,
+			&j.PriorityRankSelected, &j.EffectiveAction, &j.SourceConversationTitle,
+			&affinityJSON, &j.AgentPID, &j.ActiveConversationID, &leaseAckDeadlineAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1396,6 +1451,13 @@ ORDER BY created_at ASC;
 		j.HeartbeatAt = heartbeatAt
 		j.LeaseExpiresAt = leaseExpiresAt
 		j.CompletedAt = completedAt
+		j.LeaseAckDeadlineAt = leaseAckDeadlineAt
+		if strings.TrimSpace(affinityJSON) != "" {
+			var aff dispatch.AgentAffinity
+			if json.Unmarshal([]byte(affinityJSON), &aff) == nil {
+				j.AgentAffinity = &aff
+			}
+		}
 		if len(attemptHistBytes) > 0 {
 			_ = json.Unmarshal(attemptHistBytes, &j.AttemptHistory)
 		}

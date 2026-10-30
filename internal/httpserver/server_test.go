@@ -2953,3 +2953,30 @@ func TestServer_QueueAllToolsUpdateDefaultProfileTools(t *testing.T) {
 	}
 }
 
+func TestQueueAllToolsUpdate_PropagatesTargetVersionToEngine(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	eng := control.NewEngine(nil)
+	s := &Server{
+		Engine: eng,
+		Queue:  q,
+	}
+	eng.RegisterHost("mac-mini", "permanent")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/fleet/tools/update-all", bytes.NewBufferString(`{"tools":["iazio-agent","iazio-mcp"],"target_version":"2.4.0","force":true}`))
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	pending := eng.ConsumePendingToolUpdate("mac-mini")
+	if pending == nil {
+		t.Fatal("expected PendingToolUpdate queued on Engine for mac-mini")
+	}
+	if pending.TargetVersion != "2.4.0" {
+		t.Fatalf("expected PendingToolUpdate.TargetVersion=2.4.0, got %q", pending.TargetVersion)
+	}
+}
+
+
