@@ -1507,4 +1507,3 @@ func (s *Store) LoadToolPriority(ctx context.Context) ([]string, error) {
 	}
 	return tools, nil
 }
-

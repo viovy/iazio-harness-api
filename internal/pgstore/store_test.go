@@ -505,5 +505,3 @@ func TestSaveQueueJobUpsertSQL_IncludesAllColumns(t *testing.T) {
 		}
 	}
 }
-
-

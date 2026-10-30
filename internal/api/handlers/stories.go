@@ -114,11 +114,17 @@ type StoriesHandler struct {
 	dispatchWait time.Duration
 	scheduler    GlobalScheduler
 	engine       *control.Engine
+	repoRoot     string
 }
 
 // SetEngine injects the control plane engine for story persistence.
 func (h *StoriesHandler) SetEngine(e *control.Engine) {
 	h.engine = e
+}
+
+// SetRepoRoot overrides the repository root directory used for docs/stories/index.yml resolution.
+func (h *StoriesHandler) SetRepoRoot(root string) {
+	h.repoRoot = root
 }
 
 // NewStoriesHandler constructs a new StoriesHandler.
@@ -352,19 +358,19 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			title = fmt.Sprintf("Execute story %s: %s", storyID, req.Title)
 		}
 		execPayload, _ := json.Marshal(map[string]any{
-			"prompt_id":              promptID,
-			"repo":                   req.Submodule,
-			"story_id":               storyID,
-			"title":                  title,
-			"prompt":                 promptText,
-			"normalized_prompt":      normalizedPrompt,
-			"target_agent":           targetAgent,
-			"priority":               req.Priority,
-			"problem":                req.Problem,
-			"acceptance_criteria":    req.AcceptanceCriteria,
-			"target_files":           req.TargetFiles,
-			"depends_on":             req.DependsOn,
-			"verification_commands":  req.VerificationCommands,
+			"prompt_id":             promptID,
+			"repo":                  req.Submodule,
+			"story_id":              storyID,
+			"title":                 title,
+			"prompt":                promptText,
+			"normalized_prompt":     normalizedPrompt,
+			"target_agent":          targetAgent,
+			"priority":              req.Priority,
+			"problem":               req.Problem,
+			"acceptance_criteria":   req.AcceptanceCriteria,
+			"target_files":          req.TargetFiles,
+			"depends_on":            req.DependsOn,
+			"verification_commands": req.VerificationCommands,
 		})
 		if h.queue != nil {
 			storyAllocStatus := "allocated"
@@ -445,15 +451,128 @@ func validatePath(p string) error {
 
 // StoryDetail describes a story for GET /api/v1/stories and GET /api/v1/stories/{id}.
 type StoryDetail struct {
-	ID          string   `json:"id"`
-	Title       string   `json:"title"`
-	Status      string   `json:"status"`
-	Priority    string   `json:"priority"`
-	Path        string   `json:"path"`
-	Submodules  []string `json:"submodules,omitempty"`
-	CompletedAt string   `json:"completed_at,omitempty"`
-	UpdatedAt   string   `json:"updated_at,omitempty"`
-	Content     string   `json:"content,omitempty"`
+	ID                   string   `json:"id"`
+	Title                string   `json:"title"`
+	Status               string   `json:"status"`
+	Priority             string   `json:"priority"`
+	Path                 string   `json:"path"`
+	Submodules           []string `json:"submodules,omitempty"`
+	AcceptanceCriteria   []string `json:"acceptance_criteria,omitempty"`
+	TargetFiles          []string `json:"target_files,omitempty"`
+	DependsOn            []string `json:"depends_on,omitempty"`
+	VerificationCommands []string `json:"verification_commands,omitempty"`
+	CompletedAt          string   `json:"completed_at,omitempty"`
+	UpdatedAt            string   `json:"updated_at,omitempty"`
+	Content              string   `json:"content,omitempty"`
+}
+
+func resolveStoriesRoot(repoRoot string) string {
+	if trimmed := strings.TrimSpace(repoRoot); trimmed != "" {
+		return trimmed
+	}
+	if envRoot := strings.TrimSpace(os.Getenv("IAZIO_REPO_ROOT")); envRoot != "" {
+		return envRoot
+	}
+	return findStoriesRoot()
+}
+
+func resolveStoriesRootForWrite(repoRoot string) string {
+	if trimmed := strings.TrimSpace(repoRoot); trimmed != "" {
+		return trimmed
+	}
+	if envRoot := strings.TrimSpace(os.Getenv("IAZIO_REPO_ROOT")); envRoot != "" {
+		return envRoot
+	}
+	if len(os.Args) > 0 {
+		exe := strings.ToLower(os.Args[0])
+		if strings.HasSuffix(exe, ".test") || strings.HasSuffix(exe, ".test.exe") || strings.Contains(exe, "_test") {
+			return ""
+		}
+	}
+	return findStoriesRoot()
+}
+
+func normalizePriorityFilter(p string) string {
+	norm := strings.ToUpper(strings.TrimSpace(p))
+	switch norm {
+	case "CRITICAL":
+		return "P0"
+	case "HIGH":
+		return "P1"
+	case "MEDIUM":
+		return "P2"
+	case "LOW":
+		return "P3"
+	default:
+		return norm
+	}
+}
+
+func synthesizeCanonicalStoryMarkdown(s control.Story, status string) string {
+	trimmed := strings.TrimSpace(s.Body)
+	if strings.HasPrefix(trimmed, "---") {
+		return s.Body
+	}
+	if trimmed != "" && strings.HasPrefix(trimmed, "#") && strings.TrimSpace(s.Problem) == "" && len(s.AcceptanceCriteria) == 0 && len(s.TargetFiles) == 0 && len(s.VerificationCommands) == 0 {
+		return s.Body
+	}
+	if trimmed == "" {
+		trimmed = strings.TrimSpace(s.Problem)
+	}
+	priority := strings.TrimSpace(s.Priority)
+	if priority == "" {
+		priority = "P2"
+	}
+	category := "GOV"
+	parts := strings.Split(strings.ToUpper(s.ID), "-")
+	if len(parts) >= 2 && parts[0] == "STORY" {
+		category = parts[1]
+	} else if len(parts) >= 1 && parts[0] != "" {
+		category = parts[0]
+	}
+	submodule := strings.TrimSpace(s.Submodule)
+	if submodule == "" {
+		submodule = strings.TrimSpace(s.Repo)
+	}
+	if submodule == "" {
+		submodule = "."
+	}
+	var sb strings.Builder
+	sb.WriteString("---\n")
+	sb.WriteString(fmt.Sprintf("id: %s\n", s.ID))
+	sb.WriteString(fmt.Sprintf("title: %q\n", s.Title))
+	sb.WriteString(fmt.Sprintf("status: %s\n", status))
+	sb.WriteString(fmt.Sprintf("priority: %s\n", priority))
+	sb.WriteString(fmt.Sprintf("category: %s\n", category))
+	sb.WriteString(fmt.Sprintf("submodule: %s\n", submodule))
+	sb.WriteString("---\n\n")
+	sb.WriteString(fmt.Sprintf("# %s: %s\n\n", s.ID, s.Title))
+	if trimmed != "" {
+		sb.WriteString("## Problem\n\n")
+		sb.WriteString(trimmed + "\n\n")
+	}
+	if len(s.AcceptanceCriteria) > 0 {
+		sb.WriteString("## Acceptance Criteria\n\n")
+		for _, ac := range s.AcceptanceCriteria {
+			sb.WriteString("- " + ac + "\n")
+		}
+		sb.WriteString("\n")
+	}
+	if len(s.TargetFiles) > 0 {
+		sb.WriteString("## Target Files\n\n")
+		for _, tf := range s.TargetFiles {
+			sb.WriteString("- " + tf + "\n")
+		}
+		sb.WriteString("\n")
+	}
+	if len(s.VerificationCommands) > 0 {
+		sb.WriteString("## Verification Commands\n\n")
+		for _, vc := range s.VerificationCommands {
+			sb.WriteString("- " + vc + "\n")
+		}
+		sb.WriteString("\n")
+	}
+	return sb.String()
 }
 
 func findStoriesRoot() string {
@@ -557,6 +676,7 @@ func (h *StoriesHandler) ListStories(w http.ResponseWriter, r *http.Request) {
 	statusFilter := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("status")))
 	categoryFilter := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("category")))
 	submoduleFilter := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("submodule")))
+	priorityFilter := normalizePriorityFilter(r.URL.Query().Get("priority"))
 	limit := 20
 	if lStr := r.URL.Query().Get("limit"); lStr != "" {
 		if l, err := strconv.Atoi(lStr); err == nil && l > 0 {
@@ -565,6 +685,13 @@ func (h *StoriesHandler) ListStories(w http.ResponseWriter, r *http.Request) {
 	}
 	if limit > 100 {
 		limit = 100
+	}
+
+	root := resolveStoriesRoot(h.repoRoot)
+	indexStories := loadIndexStories(root)
+	indexByID := make(map[string]StoryDetail, len(indexStories))
+	for _, idxS := range indexStories {
+		indexByID[strings.ToUpper(idxS.ID)] = idxS
 	}
 
 	var all []StoryDetail
@@ -578,24 +705,48 @@ func (h *StoriesHandler) ListStories(w http.ResponseWriter, r *http.Request) {
 			if s.Submodule != "" {
 				subs = []string{s.Submodule}
 			}
+			storyPath := fmt.Sprintf("docs/stories/%s.story.md", strings.ToLower(s.ID))
+			prio := s.Priority
+			if idxS, ok := indexByID[strings.ToUpper(s.ID)]; ok {
+				if idxS.Path != "" {
+					storyPath = idxS.Path
+				}
+				if prio == "" && idxS.Priority != "" {
+					prio = idxS.Priority
+				}
+				if len(subs) == 0 && len(idxS.Submodules) > 0 {
+					subs = idxS.Submodules
+				}
+			}
+			if priorityFilter != "" && !strings.EqualFold(prio, priorityFilter) {
+				seen[strings.ToUpper(s.ID)] = true
+				continue
+			}
 			syncStates[strings.ToUpper(s.ID)] = s.SyncState
 			all = append(all, StoryDetail{
-				ID:         s.ID,
-				Title:      s.Title,
-				Status:     normalizeCanonicalStoryStatus(s.Status, s.SyncState),
-				Priority:   s.Priority,
-				Path:       fmt.Sprintf("docs/stories/%s.story.md", strings.ToLower(s.ID)),
-				Submodules: subs,
-				Content:    s.Body,
+				ID:                   s.ID,
+				Title:                s.Title,
+				Status:               normalizeCanonicalStoryStatus(s.Status, s.SyncState),
+				Priority:             prio,
+				Path:                 storyPath,
+				Submodules:           subs,
+				AcceptanceCriteria:   s.AcceptanceCriteria,
+				TargetFiles:          s.TargetFiles,
+				DependsOn:            s.DependsOn,
+				VerificationCommands: s.VerificationCommands,
+				Content:              s.Body,
 			})
 			seen[strings.ToUpper(s.ID)] = true
 		}
 	}
 
 	// 2. Load disk index as fallback for legacy stories not yet in DB:
-	root := findStoriesRoot()
-	for _, s := range loadIndexStories(root) {
+	for _, s := range indexStories {
 		if !seen[strings.ToUpper(s.ID)] {
+			if priorityFilter != "" && !strings.EqualFold(s.Priority, priorityFilter) {
+				seen[strings.ToUpper(s.ID)] = true
+				continue
+			}
 			s.Status = normalizeCanonicalStoryStatus(s.Status, "")
 			all = append(all, s)
 			seen[strings.ToUpper(s.ID)] = true
@@ -605,6 +756,9 @@ func (h *StoriesHandler) ListStories(w http.ResponseWriter, r *http.Request) {
 	var matched []StoryDetail
 	for _, s := range all {
 		if !matchesStoryStatusFilter(s.Status, syncStates[strings.ToUpper(s.ID)], statusFilter) {
+			continue
+		}
+		if priorityFilter != "" && !strings.EqualFold(s.Priority, priorityFilter) {
 			continue
 		}
 		if categoryFilter != "" && !strings.Contains(strings.ToUpper(s.ID), categoryFilter) {
@@ -654,6 +808,8 @@ func (h *StoriesHandler) GetStory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var found *StoryDetail
+	root := resolveStoriesRoot(h.repoRoot)
+	indexStories := loadIndexStories(root)
 
 	// 1. Database engine is authoritative:
 	if h.engine != nil {
@@ -662,27 +818,52 @@ func (h *StoriesHandler) GetStory(w http.ResponseWriter, r *http.Request) {
 			if s.Submodule != "" {
 				subs = []string{s.Submodule}
 			}
-			content := s.Body
-			if strings.TrimSpace(content) == "" {
-				content = s.Problem
+			storyPath := ""
+			prio := s.Priority
+			for _, idxS := range indexStories {
+				if strings.EqualFold(idxS.ID, s.ID) || strings.EqualFold(idxS.ID, id) {
+					if idxS.Path != "" {
+						storyPath = idxS.Path
+					}
+					if prio == "" && idxS.Priority != "" {
+						prio = idxS.Priority
+					}
+					if len(subs) == 0 && len(idxS.Submodules) > 0 {
+						subs = idxS.Submodules
+					}
+					break
+				}
 			}
+			if storyPath == "" {
+				storyPath = fmt.Sprintf("docs/stories/%s.story.md", strings.ToLower(s.ID))
+			}
+			normStatus := normalizeCanonicalStoryStatus(s.Status, s.SyncState)
+			s.Priority = prio
+			content := synthesizeCanonicalStoryMarkdown(s, normStatus)
 			found = &StoryDetail{
-				ID:         s.ID,
-				Title:      s.Title,
-				Status:     normalizeCanonicalStoryStatus(s.Status, s.SyncState),
-				Priority:   s.Priority,
-				Submodules: subs,
-				Content:    content,
+				ID:                   s.ID,
+				Title:                s.Title,
+				Status:               normStatus,
+				Priority:             prio,
+				Path:                 storyPath,
+				Submodules:           subs,
+				AcceptanceCriteria:   s.AcceptanceCriteria,
+				TargetFiles:          s.TargetFiles,
+				DependsOn:            s.DependsOn,
+				VerificationCommands: s.VerificationCommands,
+				Content:              content,
 			}
 		}
 	}
 
 	// 2. Fallback to disk index:
-	root := findStoriesRoot()
 	if found == nil {
-		for _, s := range loadIndexStories(root) {
+		for _, s := range indexStories {
 			if strings.EqualFold(s.ID, id) {
 				s.Status = normalizeCanonicalStoryStatus(s.Status, "")
+				if s.Path == "" {
+					s.Path = fmt.Sprintf("docs/stories/%s.story.md", strings.ToLower(s.ID))
+				}
 				match := s
 				found = &match
 				break
@@ -784,9 +965,9 @@ func (h *StoriesHandler) UpdateStoryStatus(w http.ResponseWriter, r *http.Reques
 
 	normStatus := strings.ToUpper(strings.TrimSpace(req.Status))
 	switch normStatus {
-	case "READY", "IN_PROGRESS", "DONE", "BLOCKED":
+	case "READY", "IN_PROGRESS", "DONE", "BLOCKED", "DEFERRED", "PENDING_INDEX", "BACKLOG":
 	default:
-		writeJSONError(w, http.StatusUnprocessableEntity, fmt.Sprintf("invalid status %q (must be READY, IN_PROGRESS, DONE, or BLOCKED)", req.Status))
+		writeJSONError(w, http.StatusUnprocessableEntity, fmt.Sprintf("invalid status %q (must be READY, IN_PROGRESS, DONE, BLOCKED, DEFERRED, PENDING_INDEX, or BACKLOG)", req.Status))
 		return
 	}
 
@@ -797,8 +978,8 @@ func (h *StoriesHandler) UpdateStoryStatus(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	root := findStoriesRoot()
-	updatedInIndex := updateIndexStoryStatus(root, id, normStatus)
+	root := resolveStoriesRoot(h.repoRoot)
+	updatedInIndex := updateIndexStoryStatus(resolveStoriesRootForWrite(h.repoRoot), id, normStatus)
 	if !updatedInEngine && updatedInIndex && h.engine != nil {
 		for _, s := range loadIndexStories(root) {
 			if strings.EqualFold(s.ID, id) {
@@ -837,6 +1018,9 @@ func (h *StoriesHandler) UpdateStoryStatus(w http.ResponseWriter, r *http.Reques
 }
 
 func updateIndexStoryStatus(root, storyID, newStatus string) bool {
+	if strings.TrimSpace(root) == "" {
+		return false
+	}
 	indexPath := filepath.Join(root, "docs", "stories", "index.yml")
 	data, err := os.ReadFile(indexPath)
 	if err != nil {
@@ -867,5 +1051,3 @@ func updateIndexStoryStatus(root, storyID, newStatus string) bool {
 	_ = os.WriteFile(indexPath, []byte(strings.Join(lines, "\n")), 0644)
 	return true
 }
-
-

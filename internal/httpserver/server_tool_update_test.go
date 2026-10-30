@@ -602,7 +602,6 @@ func TestServer_EagerUpdateTelemetry(t *testing.T) {
 	}
 }
 
-
 func TestServer_DeleteAgentTool(t *testing.T) {
 	e := control.NewEngine(time.Now)
 	savedHosts := 0

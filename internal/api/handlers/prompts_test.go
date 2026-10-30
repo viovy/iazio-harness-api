@@ -218,4 +218,3 @@ func TestPromptsHandlerPreservesBranchAndAllocatesTool(t *testing.T) {
 		t.Fatalf("expected Branch feat/custom-branch in job payload, got %q", savedPayload.Branch)
 	}
 }
-

@@ -6,7 +6,9 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/viovy/iazio-harness-api/internal/control"
 	"github.com/viovy/iazio-harness-api/internal/dispatch"
 )
 
@@ -34,12 +36,24 @@ type HeartbeatJobRequest struct {
 
 // AgentJobsHandler manages agent job claims and completion reports.
 type AgentJobsHandler struct {
-	queue dispatch.Queue
+	queue    dispatch.Queue
+	engine   *control.Engine
+	repoRoot string
 }
 
 // NewAgentJobsHandler constructs a new AgentJobsHandler.
 func NewAgentJobsHandler(queue dispatch.Queue) *AgentJobsHandler {
 	return &AgentJobsHandler{queue: queue}
+}
+
+// SetEngine binds the control engine so story lifecycle transitions are synchronized.
+func (h *AgentJobsHandler) SetEngine(e *control.Engine) {
+	h.engine = e
+}
+
+// SetRepoRoot overrides the workspace root directory used for story index resolution.
+func (h *AgentJobsHandler) SetRepoRoot(root string) {
+	h.repoRoot = root
 }
 
 // ClaimHandler handles POST /api/v1/agent/jobs/claim.
@@ -68,6 +82,13 @@ func (h *AgentJobsHandler) ClaimHandler(w http.ResponseWriter, r *http.Request) 
 	if job == nil {
 		w.WriteHeader(http.StatusNoContent)
 		return
+	}
+
+	if sID := strings.TrimSpace(job.StoryID); sID != "" && sID != "pending-allocation" && sID != "pending" {
+		if h.engine != nil {
+			_ = h.engine.BindStoryToJob(job.ID, sID, job.StoryTitle, job.StoryPath)
+		}
+		updateIndexStoryStatus(resolveStoriesRootForWrite(h.repoRoot), sID, "IN_PROGRESS")
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -135,6 +156,48 @@ func (h *AgentJobsHandler) CompleteHandler(w http.ResponseWriter, r *http.Reques
 		h.queue.SetFinalHarvest(jobID, req.FinalTurnCount, req.FinalTranscriptSHA256)
 	}
 
+	job, _ := h.queue.Get(jobID)
+	storyID := ""
+	storyTitle := ""
+	storySubmodule := ""
+	if job != nil {
+		storyID = strings.TrimSpace(job.StoryID)
+		storyTitle = job.StoryTitle
+		storySubmodule = job.Repo
+	}
+	if storyID == "" && len(req.Result) > 0 {
+		var resMap map[string]any
+		if json.Unmarshal(req.Result, &resMap) == nil {
+			if rawID, ok := resMap["story_id"].(string); ok {
+				storyID = strings.TrimSpace(rawID)
+			}
+		}
+	}
+	if storyID != "" && storyID != "pending-allocation" && storyID != "pending" {
+		targetStatus := "DONE"
+		if strings.TrimSpace(req.Error) != "" {
+			targetStatus = "BLOCKED"
+		}
+		if h.engine != nil {
+			existing, ok := h.engine.GetStory(storyID)
+			if !ok {
+				existing = control.Story{
+					ID:        storyID,
+					Title:     storyTitle,
+					Submodule: storySubmodule,
+					CreatedAt: time.Now().UTC(),
+				}
+			}
+			existing.Status = targetStatus
+			if targetStatus == "DONE" {
+				existing.SyncState = "MATERIALIZED"
+			}
+			existing.UpdatedAt = time.Now().UTC()
+			_ = h.engine.SaveStory(existing)
+		}
+		updateIndexStoryStatus(resolveStoriesRootForWrite(h.repoRoot), storyID, targetStatus)
+	}
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -197,6 +260,22 @@ func (h *AgentJobsHandler) HeartbeatHandler(w http.ResponseWriter, r *http.Reque
 		}
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+
+	boundStoryID := strings.TrimSpace(req.StoryID)
+	if boundStoryID == "" && job != nil {
+		boundStoryID = strings.TrimSpace(job.StoryID)
+	}
+	if boundStoryID != "" && boundStoryID != "pending-allocation" && boundStoryID != "pending" {
+		var sTitle, sPath string
+		if job != nil {
+			sTitle = job.StoryTitle
+			sPath = job.StoryPath
+		}
+		if h.engine != nil {
+			_ = h.engine.BindStoryToJob(job.ID, boundStoryID, sTitle, sPath)
+		}
+		updateIndexStoryStatus(resolveStoriesRootForWrite(h.repoRoot), boundStoryID, "IN_PROGRESS")
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")

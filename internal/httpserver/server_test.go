@@ -778,7 +778,6 @@ func TestAppendChunk_FilterRootAgentIdle(t *testing.T) {
 	}
 }
 
-
 func TestAbandonResumeAndRemediateEndpoints(t *testing.T) {
 	s := &Server{Engine: control.NewEngine(nil)}
 	handler := s.Handler()
@@ -2913,7 +2912,7 @@ func TestServer_QueueAllToolsUpdateDefaultProfileTools(t *testing.T) {
 	}
 	s.Engine.RegisterHost("mac-mini", "permanent")
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/fleet/tools/update-all", bytes.NewBufferString(`{"target_version":"1.2.3","force":true}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/fleet/tools/update-all", bytes.NewBufferString(`{"force":true}`))
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, req)
 
@@ -2933,9 +2932,6 @@ func TestServer_QueueAllToolsUpdateDefaultProfileTools(t *testing.T) {
 	if len(resp.Tools) == 0 {
 		t.Fatal("expected default profile tools to be resolved when tools is omitted, got empty")
 	}
-	if resp.TargetVersion != "1.2.3" {
-		t.Fatalf("expected target_version 1.2.3, got %q", resp.TargetVersion)
-	}
 
 	jobs, err := q.List(context.Background(), dispatch.JobFilter{Type: "agent.tools.update"})
 	if err != nil || len(jobs) == 0 {
@@ -2948,8 +2944,8 @@ func TestServer_QueueAllToolsUpdateDefaultProfileTools(t *testing.T) {
 	if err := json.Unmarshal(jobs[0].Payload, &payload); err != nil {
 		t.Fatalf("unmarshal job payload: %v", err)
 	}
-	if len(payload.Tools) == 0 || payload.TargetVersion != "1.2.3" {
-		t.Fatalf("expected non-empty tools and target_version=1.2.3 in job payload, got %+v", payload)
+	if len(payload.Tools) == 0 {
+		t.Fatalf("expected non-empty tools in job payload, got %+v", payload)
 	}
 }
 
@@ -2962,7 +2958,7 @@ func TestQueueAllToolsUpdate_PropagatesTargetVersionToEngine(t *testing.T) {
 	}
 	eng.RegisterHost("mac-mini", "permanent")
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/fleet/tools/update-all", bytes.NewBufferString(`{"tools":["iazio-agent","iazio-mcp"],"target_version":"2.4.0","force":true}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/fleet/tools/update-all", bytes.NewBufferString(`{"tools":["iazio-agent"],"target_version":"2.4.0","force":true}`))
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, req)
 
@@ -2979,4 +2975,37 @@ func TestQueueAllToolsUpdate_PropagatesTargetVersionToEngine(t *testing.T) {
 	}
 }
 
+func TestV4_UpdateAllRoutesAndSingleToolTargetVersionGuard(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	eng := control.NewEngine(nil)
+	s := &Server{
+		Engine: eng,
+		Queue:  q,
+	}
+	eng.RegisterHost("mac-mini", "permanent")
+	handler := s.Handler()
 
+	// 1. Wildcard or multi-tool update-all with target_version must be rejected with 400 Bad Request
+	for _, body := range []string{
+		`{"tool":"*","target_version":"1.2.3"}`,
+		`{"tools":["iazio-agent","iazio-mcp"],"target_version":"1.2.3"}`,
+		`{"target_version":"1.2.3"}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/tools/update-all", bytes.NewBufferString(body))
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request for body %s on /api/v1/tools/update-all, got %d: %s", body, rr.Code, rr.Body.String())
+		}
+	}
+
+	// 2. Single explicit tool_name with target_version succeeds on /api/v1/tools/update-all and /api/v1/control/tools/update-all
+	for _, route := range []string{"/api/v1/tools/update-all", "/api/v1/control/tools/update-all"} {
+		req := httptest.NewRequest(http.MethodPost, route, bytes.NewBufferString(`{"tool_name":"iazio-agent","target_version":"1.5.0","force":true}`))
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK on %s with single tool_name, got %d: %s", route, rr.Code, rr.Body.String())
+		}
+	}
+}

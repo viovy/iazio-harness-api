@@ -632,3 +632,109 @@ func TestStoriesHandler_AsyncCreatePopulatesJobMetadata(t *testing.T) {
 		t.Fatalf("expected EffectiveAction 'story.create_and_execute', got %q", enqJob.EffectiveAction)
 	}
 }
+
+func TestV4_StoryLifecycleTransitionsAndListQueueTotalAndFinalHarvest(t *testing.T) {
+	ctx := context.Background()
+	q := dispatch.NewInMemoryQueue()
+	engine := control.NewEngine(nil)
+	tmpDir := t.TempDir()
+
+	_ = engine.SaveStory(control.Story{
+		ID:        "STORY-GOV-3806",
+		Title:     "Enterprise V4 Remediation",
+		Submodule: "iazio-harness-api",
+		Priority:  "P0",
+		Status:    "READY",
+		SyncState: "PENDING_WORKSPACE_MATERIALIZATION",
+	})
+
+	jl := NewJobLifecycleHandler(q)
+	jl.SetEngine(engine)
+	jl.SetRepoRoot(tmpDir)
+
+	aj := NewAgentJobsHandler(q)
+	aj.SetEngine(engine)
+	aj.SetRepoRoot(tmpDir)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/stories/{id}/execute", jl.ExecuteStory)
+	mux.HandleFunc("GET /api/v1/queue", jl.ListQueue)
+	mux.HandleFunc("GET /api/v1/jobs/{id}", jl.GetJob)
+	mux.HandleFunc("POST /api/v1/agent/jobs/claim", aj.ClaimHandler)
+	mux.HandleFunc("POST /api/v1/agent/jobs/{id}/heartbeat", aj.HeartbeatHandler)
+	mux.HandleFunc("POST /api/v1/agent/jobs/{id}/complete", aj.CompleteHandler)
+
+	// 1. ExecuteStory resolves StoryTitle, StoryPath, Submodule from Engine and transitions story to IN_PROGRESS
+	execReq := httptest.NewRequest(http.MethodPost, "/api/v1/stories/STORY-GOV-3806/execute", bytes.NewBufferString(`{"target_agent":"agy"}`))
+	execRr := httptest.NewRecorder()
+	mux.ServeHTTP(execRr, execReq)
+	if execRr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created from ExecuteStory, got %d: %s", execRr.Code, execRr.Body.String())
+	}
+	var execResp ExecuteStoryResponse
+	_ = json.Unmarshal(execRr.Body.Bytes(), &execResp)
+	if execResp.Submodule != "iazio-harness-api" {
+		t.Fatalf("expected ExecuteStory to resolve Submodule=iazio-harness-api from story, got %q", execResp.Submodule)
+	}
+	enqJob, _ := q.Get(execResp.JobID)
+	if enqJob.StoryTitle != "Enterprise V4 Remediation" || enqJob.StoryPath == "" {
+		t.Fatalf("expected StoryTitle and StoryPath populated on job, got title=%q path=%q", enqJob.StoryTitle, enqJob.StoryPath)
+	}
+	stAfterExec, _ := engine.GetStory("STORY-GOV-3806")
+	if stAfterExec.Status != "IN_PROGRESS" {
+		t.Fatalf("expected story status IN_PROGRESS after ExecuteStory, got %q", stAfterExec.Status)
+	}
+
+	// 2. Claim job via AgentJobsHandler -> status leased
+	claimReq := httptest.NewRequest(http.MethodPost, "/api/v1/agent/jobs/claim", bytes.NewBufferString(`{"host_id":"host-1"}`))
+	claimRr := httptest.NewRecorder()
+	mux.ServeHTTP(claimRr, claimReq)
+	if claimRr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from ClaimHandler, got %d", claimRr.Code)
+	}
+	var claimedJob dispatch.Job
+	_ = json.Unmarshal(claimRr.Body.Bytes(), &claimedJob)
+
+	// Enqueue two more jobs to test ListQueue pre-limit Total
+	_, _ = q.Enqueue(ctx, &dispatch.Job{Type: dispatch.JobTypePromptExecute, Repo: "iazio-harness-api"})
+	_, _ = q.Enqueue(ctx, &dispatch.Job{Type: dispatch.JobTypePromptExecute, Repo: "iazio-harness-api"})
+	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/queue?status=queued&limit=1", nil)
+	listRr := httptest.NewRecorder()
+	mux.ServeHTTP(listRr, listReq)
+	var listResp ListQueueResponse
+	_ = json.Unmarshal(listRr.Body.Bytes(), &listResp)
+	if len(listResp.Items) != 1 || listResp.Total != 2 {
+		t.Fatalf("expected ListQueue limit=1 to return 1 item with Total=2, got items=%d total=%d", len(listResp.Items), listResp.Total)
+	}
+
+	// 3. Complete job via AgentJobsHandler with FinalTurnCount and FinalTranscriptSHA256 -> story transitions to DONE + MATERIALIZED
+	compBody, _ := json.Marshal(CompleteJobRequest{
+		FencingToken:          claimedJob.FencingToken,
+		Result:                json.RawMessage(`{"status":"ok"}`),
+		FinalTurnCount:        9,
+		FinalTranscriptSHA256: "sha256-v4-verified",
+	})
+	compReq := httptest.NewRequest(http.MethodPost, "/api/v1/agent/jobs/"+claimedJob.ID+"/complete", bytes.NewReader(compBody))
+	compRr := httptest.NewRecorder()
+	mux.ServeHTTP(compRr, compReq)
+	if compRr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from CompleteHandler, got %d: %s", compRr.Code, compRr.Body.String())
+	}
+
+	stAfterComp, _ := engine.GetStory("STORY-GOV-3806")
+	if stAfterComp.Status != "DONE" || stAfterComp.SyncState != "MATERIALIZED" {
+		t.Fatalf("expected story status DONE and SyncState MATERIALIZED after CompleteHandler, got status=%q sync=%q",
+			stAfterComp.Status, stAfterComp.SyncState)
+	}
+
+	// 4. GetJob returns FinalTurnCount and FinalTranscriptSHA256
+	getReq := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/"+claimedJob.ID, nil)
+	getRr := httptest.NewRecorder()
+	mux.ServeHTTP(getRr, getReq)
+	var jobDetail JobDetailResponse
+	_ = json.Unmarshal(getRr.Body.Bytes(), &jobDetail)
+	if jobDetail.FinalTurnCount != 9 || jobDetail.FinalTranscriptSHA256 != "sha256-v4-verified" {
+		t.Fatalf("expected FinalTurnCount=9 and FinalTranscriptSHA256=sha256-v4-verified in JobDetailResponse, got turns=%d sha=%q",
+			jobDetail.FinalTurnCount, jobDetail.FinalTranscriptSHA256)
+	}
+}

@@ -228,6 +228,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/jobs/{id}/story-binding", jobLifecycle.BindStory)
 
 	agentJobsHandler := handlers.NewAgentJobsHandler(queue)
+	if s.Engine != nil {
+		agentJobsHandler.SetEngine(s.Engine)
+	}
 	mux.HandleFunc("POST /api/v1/agent/jobs/claim", agentJobsHandler.ClaimHandler)
 	mux.HandleFunc("POST /v1/agent/jobs/claim", agentJobsHandler.ClaimHandler)
 	mux.HandleFunc("POST /api/v1/agent/jobs/{id}/complete", agentJobsHandler.CompleteHandler)
@@ -239,7 +242,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/notifications", s.createNotification)
 	mux.HandleFunc("POST /api/v1/notifications", s.createNotification)
 	mux.HandleFunc("POST /v1/fleet/tools/update-all", s.queueAllToolsUpdate)
+	mux.HandleFunc("POST /api/v1/fleet/tools/update-all", s.queueAllToolsUpdate)
+	mux.HandleFunc("POST /v1/tools/update-all", s.queueAllToolsUpdate)
+	mux.HandleFunc("POST /api/v1/tools/update-all", s.queueAllToolsUpdate)
+	mux.HandleFunc("POST /v1/control/tools/update-all", s.queueAllToolsUpdate)
+	mux.HandleFunc("POST /api/v1/control/tools/update-all", s.queueAllToolsUpdate)
 	mux.HandleFunc("POST /v1/hosts/all/tools/update", s.queueAllToolsUpdate)
+	mux.HandleFunc("POST /api/v1/hosts/all/tools/update", s.queueAllToolsUpdate)
 
 	// Periodic 15s Global Queue Slot & Lease Reconciler (STORY-GOV-3690)
 	go func() {
@@ -1761,9 +1770,9 @@ func (s *Server) pollHost(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	var raw struct {
-		Presence              string   `json:"presence"`
-		FetchFailed           bool     `json:"fetch_failed"`
-		SupportedCapabilities []string `json:"supported_capabilities"`
+		Presence              string     `json:"presence"`
+		FetchFailed           bool       `json:"fetch_failed"`
+		SupportedCapabilities []string   `json:"supported_capabilities"`
 		Version               string     `json:"version"`
 		CommitSHA             string     `json:"commit_sha"`
 		DiscoveredDevBinaries []string   `json:"discovered_dev_binaries"`
@@ -2247,6 +2256,7 @@ func (s *Server) queueToolCleanupBinaries(w http.ResponseWriter, r *http.Request
 func (s *Server) queueAllToolsUpdate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Tool          string   `json:"tool"`
+		ToolName      string   `json:"tool_name"`
 		Tools         []string `json:"tools"`
 		TargetVersion string   `json:"target_version"`
 		Version       string   `json:"version"`
@@ -2260,9 +2270,18 @@ func (s *Server) queueAllToolsUpdate(w http.ResponseWriter, r *http.Request) {
 	if len(requestedTools) == 0 && strings.TrimSpace(body.Tool) != "" {
 		requestedTools = []string{strings.TrimSpace(body.Tool)}
 	}
+	if len(requestedTools) == 0 && strings.TrimSpace(body.ToolName) != "" {
+		requestedTools = []string{strings.TrimSpace(body.ToolName)}
+	}
 	targetVer := strings.TrimSpace(body.TargetVersion)
 	if targetVer == "" {
 		targetVer = strings.TrimSpace(body.Version)
+	}
+
+	isWildcard := len(requestedTools) == 1 && (requestedTools[0] == "*" || strings.EqualFold(requestedTools[0], "all"))
+	if targetVer != "" && (isWildcard || len(requestedTools) != 1) {
+		writeErr(w, http.StatusBadRequest, errors.New("target_version requires exactly one explicit tool_name"))
+		return
 	}
 
 	hosts := s.Engine.ListHosts()

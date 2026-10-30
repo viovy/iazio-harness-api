@@ -1041,13 +1041,13 @@ func (e *Engine) getOrSynthesizeLogsLocked(jobID string) []LogChunk {
 	job, ok := e.jobs[jobID]
 	var (
 		convID, worktree, engine, storyID, reason, promptText, status, hostID string
-		harnessPID, toolPID, exitCode, resumeCount int
-		elapsedSec int64
-		asePhase string
-		aseComplete, resumable bool
-		dirtyFilesCount int
-		ts time.Time
-		kind, parentJobID, rootJobID string
+		harnessPID, toolPID, exitCode, resumeCount                            int
+		elapsedSec                                                            int64
+		asePhase                                                              string
+		aseComplete, resumable                                                bool
+		dirtyFilesCount                                                       int
+		ts                                                                    time.Time
+		kind, parentJobID, rootJobID                                          string
 	)
 	engine = "agy"
 
