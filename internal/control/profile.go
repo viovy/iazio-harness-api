@@ -105,13 +105,14 @@ type ManifestResponse struct {
 }
 
 type ManifestToolItem struct {
-	Name          string       `json:"name"`
-	Repository    string       `json:"repository"`
-	BinaryName    string       `json:"binary_name"`
-	Description   string       `json:"description"`
-	Tier          string       `json:"tier"`
-	TargetVersion string       `json:"target_version,omitempty"`
-	Service       *ToolService `json:"service,omitempty"`
+	Name                   string       `json:"name"`
+	Repository             string       `json:"repository"`
+	BinaryName             string       `json:"binary_name"`
+	Description            string       `json:"description"`
+	Tier                   string       `json:"tier"`
+	TargetVersion          string       `json:"target_version,omitempty"`
+	LatestAvailableVersion string       `json:"latest_available_version,omitempty"`
+	Service                *ToolService `json:"service,omitempty"`
 }
 
 // ListProfiles returns all distribution profiles sorted by name with deep-copied Tools.
@@ -713,13 +714,14 @@ func (e *Engine) GetManifest(profileName, targetOS, targetArch string) (*Manifes
 			bin += ".exe"
 		}
 		tools = append(tools, ManifestToolItem{
-			Name:          t.Name,
-			Repository:    t.Repository,
-			BinaryName:    bin,
-			Description:   t.Description,
-			Tier:          t.Tier,
-			TargetVersion: t.TargetVersion,
-			Service:       t.Service,
+			Name:                   t.Name,
+			Repository:             t.Repository,
+			BinaryName:             bin,
+			Description:            t.Description,
+			Tier:                   t.Tier,
+			TargetVersion:          t.TargetVersion,
+			LatestAvailableVersion: t.LatestAvailableVersion,
+			Service:                t.Service,
 		})
 	}
 

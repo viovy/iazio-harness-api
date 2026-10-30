@@ -655,6 +655,3 @@ func TestRequestDiscard_ForceAndDiscardAll(t *testing.T) {
 		t.Errorf("expected both FORCE_CLEAN_GIT and KILL_BACKGROUND_TASKS commands queued")
 	}
 }
-
-
-

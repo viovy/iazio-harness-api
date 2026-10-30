@@ -1595,6 +1595,241 @@ func TestQueue_RecordAttemptAndFailoverUpdatesPayloadTargetAgent(t *testing.T) {
 	}
 }
 
+func TestV4_SetStoreRestoresFencingSeqFromPersistedJobs(t *testing.T) {
+	ctx := context.Background()
+	store := &fakeQueueStore{}
+	_ = store.SaveQueueJob(ctx, &Job{
+		ID:           "job-persisted-1",
+		Type:         JobTypePromptExecute,
+		Status:       JobStatusPending,
+		FencingToken: 42,
+		LeaseVersion: 55,
+		CreatedAt:    time.Now().UTC(),
+	})
 
+	q := NewInMemoryQueue()
+	if err := q.SetStore(store); err != nil {
+		t.Fatalf("SetStore failed: %v", err)
+	}
 
+	claimed, err := q.Claim(ctx, "host-1", []string{JobTypePromptExecute})
+	if err != nil || claimed == nil {
+		t.Fatalf("Claim failed: %v", err)
+	}
+	if claimed.FencingToken <= 55 {
+		t.Fatalf("expected Claim FencingToken > 55 after SetStore hydration, got %d", claimed.FencingToken)
+	}
+}
 
+func TestV4_HeartbeatWithStoryTransitionsLeasedToRunningAndClearsAckDeadline(t *testing.T) {
+	ctx := context.Background()
+	store := &fakeQueueStore{}
+	now := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+	_ = q.SetStore(store)
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type: JobTypePromptExecute,
+		Repo: "iazio-agent",
+	})
+	if err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
+
+	claimed, err := q.Claim(ctx, "host-1", []string{JobTypePromptExecute})
+	if err != nil || claimed == nil {
+		t.Fatalf("Claim failed: %v", err)
+	}
+	if claimed.Status != JobStatusLeased || claimed.LeaseAckDeadlineAt == nil {
+		t.Fatalf("expected initial Claim to be leased with LeaseAckDeadlineAt, got status=%s ackDeadline=%v", claimed.Status, claimed.LeaseAckDeadlineAt)
+	}
+
+	// Simulate transient AckLease failure followed by valid 10s HeartbeatWithStory
+	now = now.Add(10 * time.Second)
+	hbJob, err := q.HeartbeatWithStory(ctx, claimed.ID, claimed.FencingToken, "STORY-GOV-3806")
+	if err != nil {
+		t.Fatalf("HeartbeatWithStory failed: %v", err)
+	}
+	if hbJob.Status != JobStatusRunning {
+		t.Fatalf("expected HeartbeatWithStory to transition status to running, got %s", hbJob.Status)
+	}
+	if hbJob.LeaseAckDeadlineAt != nil {
+		t.Fatalf("expected HeartbeatWithStory to clear LeaseAckDeadlineAt, got %v", hbJob.LeaseAckDeadlineAt)
+	}
+	if hbJob.AckedAt == nil {
+		t.Fatal("expected HeartbeatWithStory to populate AckedAt")
+	}
+
+	// Advance past original 20s ack deadline -> ReapExpired must NOT preempt the running job
+	now = now.Add(15 * time.Second)
+	reaped := q.ReapExpired(now)
+	if len(reaped) != 0 {
+		t.Fatalf("expected 0 reaped jobs for actively heartbeating running job, got %v", reaped)
+	}
+	after, _ := q.Get(job.ID)
+	if after.Status != JobStatusRunning {
+		t.Fatalf("expected job to remain running at t=25s, got %s", after.Status)
+	}
+}
+
+func TestV4_UnackedLeasedRollbackDecrementsAttemptsAndClearsOwner(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 31, 1, 0, 0, 0, time.UTC)
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type: JobTypePromptExecute,
+		Repo: "iazio-mcp",
+	})
+	if err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
+
+	claimed, err := q.Claim(ctx, "host-dead", []string{JobTypePromptExecute})
+	if err != nil || claimed == nil {
+		t.Fatalf("Claim failed: %v", err)
+	}
+	if claimed.Attempts != 1 || claimed.LeaseOwner != "host-dead" {
+		t.Fatalf("expected Attempts=1 and LeaseOwner=host-dead, got attempts=%d owner=%q", claimed.Attempts, claimed.LeaseOwner)
+	}
+
+	// Advance 25s (past 20s LeaseAckDeadlineAt, within 2m LeaseExpiresAt)
+	now = now.Add(25 * time.Second)
+	reaped := q.ReapExpired(now)
+	if len(reaped) != 1 || reaped[0] != job.ID {
+		t.Fatalf("expected job %s reaped on unacked lease deadline, got %v", job.ID, reaped)
+	}
+
+	rolledBack, _ := q.Get(job.ID)
+	if rolledBack.Status != JobStatusPending {
+		t.Fatalf("expected status pending after unacked rollback, got %s", rolledBack.Status)
+	}
+	if rolledBack.Attempts != 0 {
+		t.Fatalf("expected Attempts decremented back to 0 on unacked rollback, got %d", rolledBack.Attempts)
+	}
+	if rolledBack.LeaseOwner != "" || rolledBack.ClaimedHost != "" || rolledBack.LeaseToken != "" {
+		t.Fatalf("expected LeaseOwner, ClaimedHost, and LeaseToken cleared, got owner=%q host=%q token=%q",
+			rolledBack.LeaseOwner, rolledBack.ClaimedHost, rolledBack.LeaseToken)
+	}
+}
+
+func TestV4_CompleteWithFencingAndReconcilePopulateFailureTaxonomyAndResetLeaseVersion(t *testing.T) {
+	ctx := context.Background()
+	store := &fakeQueueStore{}
+	now := time.Date(2026, 10, 31, 2, 0, 0, 0, time.UTC)
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+	_ = q.SetStore(store)
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type: JobTypePromptExecute,
+		Repo: "iazio-harness",
+	})
+	if err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
+	claimed, _ := q.Claim(ctx, "host-1", []string{JobTypePromptExecute})
+	if err := q.CompleteWithFencing(ctx, claimed.ID, claimed.FencingToken, nil, "HTTP 429 resource_exhausted quota limit"); err != nil {
+		t.Fatalf("CompleteWithFencing failed: %v", err)
+	}
+
+	failedJob, _ := q.Get(job.ID)
+	if failedJob.FailureCategory != FailureCategoryToolQuotaOrAuth || !failedJob.Retriable {
+		t.Fatalf("expected CompleteWithFencing to classify FailureCategory=%s and Retriable=true, got cat=%q stage=%q retriable=%v",
+			FailureCategoryToolQuotaOrAuth, failedJob.FailureCategory, failedJob.FailureStage, failedJob.Retriable)
+	}
+
+	store.mu.Lock()
+	persisted := store.saved[job.ID]
+	store.mu.Unlock()
+	if persisted == nil || persisted.FailureCategory != FailureCategoryToolQuotaOrAuth || !persisted.Retriable {
+		t.Fatalf("expected failure taxonomy persisted to store via SaveQueueJob, got %+v", persisted)
+	}
+
+	// RetryRetriable must now pick up the worker-failed job automatically
+	retried, err := q.RetryRetriable(ctx)
+	if err != nil || len(retried) != 1 {
+		t.Fatalf("expected RetryRetriable to retry 1 job, got len=%d err=%v", len(retried), err)
+	}
+
+	// Claim and ack the retried job, advance past 45s staleGrace, and verify ReconcileGlobalQueueSlots resets LeaseVersion=0 alongside FencingToken=0
+	claimed2, _ := q.Claim(ctx, "host-1", []string{JobTypePromptExecute})
+	_, _ = q.AckLease(ctx, claimed2.ID, claimed2.LeaseToken, 1234, "/work/repo")
+	now = now.Add(50 * time.Second)
+	reclaimed := q.ReconcileGlobalQueueSlots(now, 45*time.Second)
+	if len(reclaimed) != 1 {
+		t.Fatalf("expected 1 reclaimed job, got %v", reclaimed)
+	}
+	reclaimedJob, _ := q.Get(claimed2.ID)
+	if reclaimedJob.FencingToken != 0 || reclaimedJob.LeaseVersion != 0 {
+		t.Fatalf("expected both FencingToken=0 and LeaseVersion=0 after ReconcileGlobalQueueSlots, got token=%d version=%d",
+			reclaimedJob.FencingToken, reclaimedJob.LeaseVersion)
+	}
+}
+
+func TestV4_ListCaseInsensitiveAliasesAndCountAndFailoverClearsHost(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 31, 3, 0, 0, 0, time.UTC)
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+
+	j1, _ := q.Enqueue(ctx, &Job{Type: JobTypePromptExecute, Repo: "r1"})
+	now = now.Add(1 * time.Second)
+	j2, _ := q.Enqueue(ctx, &Job{
+		Type:        JobTypePromptExecute,
+		Repo:        "r1",
+		TargetHost:  "host-a",
+		TargetAgent: "agy",
+		Payload:     json.RawMessage(`{"prompt":"test","target_agent":"agy","target_host":"host-a"}`),
+	})
+	now = now.Add(1 * time.Second)
+	j3, _ := q.Enqueue(ctx, &Job{Type: JobTypePromptExecute, Repo: "r1"})
+
+	_, _ = q.Claim(ctx, "host-a", []string{JobTypePromptExecute}) // claims j1 -> status "leased"
+	_, _ = q.Cancel(ctx, j3.ID, "abort")                          // cancels j3 -> status "canceled"
+
+	// 1. "queued" and "PENDING" match j2
+	queuedList, _ := q.List(ctx, JobFilter{Status: "QUEUED"})
+	if len(queuedList) != 1 || queuedList[0].ID != j2.ID {
+		t.Fatalf("expected status=QUEUED to match pending job %s, got %+v", j2.ID, queuedList)
+	}
+
+	// 2. "claimed" matches leased j1
+	claimedList, _ := q.List(ctx, JobFilter{Status: "claimed"})
+	if len(claimedList) != 1 || claimedList[0].ID != j1.ID {
+		t.Fatalf("expected status=claimed to match leased job %s, got %+v", j1.ID, claimedList)
+	}
+
+	// 3. "cancelled" matches canceled j3
+	cancelledList, _ := q.List(ctx, JobFilter{Status: "CANCELLED"})
+	if len(cancelledList) != 1 || cancelledList[0].ID != j3.ID {
+		t.Fatalf("expected status=CANCELLED to match canceled job %s, got %+v", j3.ID, cancelledList)
+	}
+
+	// 4. Count returns total matching before Limit truncation
+	totalAll, err := q.Count(ctx, JobFilter{Repo: "r1", Limit: 1})
+	if err != nil || totalAll != 3 {
+		t.Fatalf("expected Count=3 before limit=1 truncation, got %d (err=%v)", totalAll, err)
+	}
+
+	// 5. Failover on j2 clears TargetHost and payload["target_host"]
+	failedOver, err := q.Failover(ctx, j2.ID, AttemptFailure{
+		Host:            "host-a",
+		Tool:            "agy",
+		FailureCategory: FailureCategoryToolQuotaOrAuth,
+		Reason:          "QUOTA",
+	})
+	if err != nil {
+		t.Fatalf("Failover failed: %v", err)
+	}
+	if failedOver.TargetHost != "" {
+		t.Fatalf("expected Failover to clear TargetHost, got %q", failedOver.TargetHost)
+	}
+	var payloadMap map[string]any
+	_ = json.Unmarshal(failedOver.Payload, &payloadMap)
+	if th, _ := payloadMap["target_host"].(string); th != "" {
+		t.Fatalf("expected Failover to clear payload target_host, got %q", th)
+	}
+}

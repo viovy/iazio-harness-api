@@ -37,6 +37,7 @@ type JobLifecycleHandler struct {
 	historyFinder  HistoryFinder
 	storyValidator StoryValidator
 	engine         *control.Engine
+	repoRoot       string
 }
 
 // NewJobLifecycleHandler constructs a new JobLifecycleHandler.
@@ -49,6 +50,11 @@ func NewJobLifecycleHandler(queue dispatch.Queue, store ...codebase.Store) *JobL
 		queue: queue,
 		store: s,
 	}
+}
+
+// SetRepoRoot overrides the workspace root directory used for story index resolution.
+func (h *JobLifecycleHandler) SetRepoRoot(root string) {
+	h.repoRoot = root
 }
 
 // SetEngine sets the control engine for dynamic tool priority allocation and story binding.
@@ -82,7 +88,7 @@ func (h *JobLifecycleHandler) isStoryAvailable(storyID, submodule string) bool {
 		}
 	}
 
-	root := findStoriesRoot()
+	root := resolveStoriesRoot(h.repoRoot)
 	all := loadIndexStories(root)
 	for _, s := range all {
 		if strings.EqualFold(s.ID, storyID) || strings.EqualFold(strings.TrimPrefix(s.ID, "STORY-"), strings.TrimPrefix(storyID, "STORY-")) {
@@ -154,6 +160,8 @@ type JobDetailResponse struct {
 	PromotedMemories        []string                      `json:"promoted_memories,omitempty"`
 	FencingToken            int64                         `json:"fencing_token,omitempty"`
 	Attempts                int                           `json:"attempts,omitempty"`
+	FinalTurnCount          int                           `json:"final_turn_count,omitempty"`
+	FinalTranscriptSHA256   string                        `json:"final_transcript_sha256,omitempty"`
 	HeartbeatAt             string                        `json:"heartbeat_at,omitempty"`
 	LeaseExpiresAt          string                        `json:"lease_expires_at,omitempty"`
 	AgentAffinity           *dispatch.AgentAffinity       `json:"agent_affinity,omitempty"`
@@ -328,12 +336,13 @@ func (h *JobLifecycleHandler) ListQueue(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	jobs, err := h.queue.List(r.Context(), dispatch.JobFilter{
+	filter := dispatch.JobFilter{
 		Repo:   repo,
 		Status: status,
 		Type:   jobType,
 		Limit:  limit,
-	})
+	}
+	jobs, err := h.queue.List(r.Context(), filter)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to list queue: %v", err))
 		return
@@ -344,9 +353,18 @@ func (h *JobLifecycleHandler) ListQueue(w http.ResponseWriter, r *http.Request) 
 		items = append(items, formatJobDetail(j))
 	}
 
+	total := len(items)
+	if counter, ok := h.queue.(interface {
+		Count(ctx context.Context, filter dispatch.JobFilter) (int, error)
+	}); ok {
+		if c, err := counter.Count(r.Context(), filter); err == nil {
+			total = c
+		}
+	}
+
 	resp := ListQueueResponse{
 		Items: items,
-		Total: len(items),
+		Total: total,
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -462,6 +480,38 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 	if submodule == "" {
 		submodule = strings.TrimSpace(req.Repo)
 	}
+
+	var storyTitle, storyPath string
+	root := resolveStoriesRoot(h.repoRoot)
+	if storyID != "" {
+		if h.engine != nil {
+			if st, ok := h.engine.GetStory(storyID); ok {
+				storyID = st.ID
+				storyTitle = st.Title
+				if submodule == "" && st.Submodule != "" {
+					submodule = st.Submodule
+				}
+			}
+		}
+		for _, idxSt := range loadIndexStories(root) {
+			if strings.EqualFold(idxSt.ID, storyID) || strings.EqualFold(strings.TrimPrefix(idxSt.ID, "STORY-"), strings.TrimPrefix(storyID, "STORY-")) {
+				if storyTitle == "" {
+					storyTitle = idxSt.Title
+				}
+				if idxSt.Path != "" {
+					storyPath = idxSt.Path
+				}
+				if submodule == "" && len(idxSt.Submodules) > 0 && idxSt.Submodules[0] != "" {
+					submodule = idxSt.Submodules[0]
+				}
+				break
+			}
+		}
+		if storyPath == "" {
+			storyPath = fmt.Sprintf("docs/stories/%s.story.md", strings.ToLower(storyID))
+		}
+	}
+
 	if submodule == "" {
 		submodule = "."
 	}
@@ -535,6 +585,8 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		"prompt_id":                 promptID,
 		"repo":                      submodule,
 		"story_id":                  storyID,
+		"story_title":               storyTitle,
+		"story_path":                storyPath,
 		"story_allocation_status":   storyAllocationStatus,
 		"allocation_source":         allocationSource,
 		"priority_rank_selected":    priorityRankSelected,
@@ -557,6 +609,8 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		TargetHost:              targetHost,
 		TargetAgent:             targetAgent,
 		StoryID:                 storyID,
+		StoryTitle:              storyTitle,
+		StoryPath:               storyPath,
 		StoryAllocationStatus:   storyAllocationStatus,
 		AllocationSource:        allocationSource,
 		PriorityRankSelected:    priorityRankSelected,
@@ -571,6 +625,13 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to enqueue story execution: %v", err))
 		return
+	}
+
+	if storyID != "" {
+		if h.engine != nil {
+			_ = h.engine.BindStoryToJob(job.ID, storyID, storyTitle, storyPath)
+		}
+		updateIndexStoryStatus(resolveStoriesRootForWrite(h.repoRoot), storyID, "IN_PROGRESS")
 	}
 
 	if h.queue == nil && h.scheduler != nil {
@@ -664,6 +725,7 @@ func (h *JobLifecycleHandler) BindStory(w http.ResponseWriter, r *http.Request) 
 	if h.engine != nil {
 		_ = h.engine.BindStoryToJob(jobID, storyID, req.StoryTitle, req.StoryPath)
 	}
+	updateIndexStoryStatus(resolveStoriesRootForWrite(h.repoRoot), storyID, "IN_PROGRESS")
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -740,6 +802,8 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		PromotedMemories:        promoted,
 		FencingToken:            j.FencingToken,
 		Attempts:                j.Attempts,
+		FinalTurnCount:          j.FinalTurnCount,
+		FinalTranscriptSHA256:   j.FinalTranscriptSHA256,
 		AgentAffinity:           j.AgentAffinity,
 		DispatchDiagnostics:     j.DispatchDiagnostics,
 		CreatedAt:               j.CreatedAt.Format(time.RFC3339),

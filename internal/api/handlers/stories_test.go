@@ -600,5 +600,85 @@ func TestStoriesHandler_UpdateStoryStatus(t *testing.T) {
 	}
 }
 
+func TestV4_StoriesHandler_PriorityFilterGetStoryFrontmatterAndDeferredStatus(t *testing.T) {
+	store := setupTestStore(t)
+	q := dispatch.NewInMemoryQueue()
+	engine := control.NewEngine(nil)
+	tmpDir := t.TempDir()
 
+	_ = engine.SaveStory(control.Story{
+		ID:                   "STORY-GOV-3806",
+		Repo:                 "meta-repo",
+		Submodule:            "iazio-harness-api",
+		Title:                "Forensic v4 Remediation",
+		Priority:             "P0",
+		Status:               "READY",
+		SyncState:            "PENDING_WORKSPACE_MATERIALIZATION",
+		Problem:              "Stories lack canonical frontmatter and metadata in GetStory.",
+		AcceptanceCriteria:   []string{"GetStory returns frontmatter", "ListStories filters by priority"},
+		TargetFiles:          []string{"internal/api/handlers/stories.go"},
+		DependsOn:            []string{"STORY-GOV-3799"},
+		VerificationCommands: []string{"go test ./..."},
+	})
+	_ = engine.SaveStory(control.Story{
+		ID:        "STORY-GOV-3807",
+		Repo:      "meta-repo",
+		Submodule: "iazio-harness-api",
+		Title:     "Low Priority Cleanup",
+		Priority:  "P2",
+		Status:    "READY",
+	})
 
+	handler := NewStoriesHandler(store, q, nil)
+	handler.SetEngine(engine)
+	handler.SetRepoRoot(tmpDir)
+
+	// 1. ListStories with priority=P0
+	reqList := httptest.NewRequest(http.MethodGet, "/api/v1/stories?priority=P0", nil)
+	wList := httptest.NewRecorder()
+	handler.ListStories(wList, reqList)
+	if wList.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", wList.Code, wList.Body.String())
+	}
+	var listResp struct {
+		Items []StoryDetail `json:"items"`
+		Total int           `json:"total"`
+	}
+	_ = json.NewDecoder(wList.Body).Decode(&listResp)
+	if listResp.Total != 1 || len(listResp.Items) != 1 || listResp.Items[0].ID != "STORY-GOV-3806" {
+		t.Fatalf("expected priority=P0 filter to return only STORY-GOV-3806, got %+v", listResp)
+	}
+
+	// 2. GetStory returns Path, AcceptanceCriteria, TargetFiles, DependsOn, VerificationCommands, and YAML frontmatter Content
+	reqGet := httptest.NewRequest(http.MethodGet, "/api/v1/stories/STORY-GOV-3806", nil)
+	wGet := httptest.NewRecorder()
+	handler.GetStory(wGet, reqGet)
+	if wGet.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from GetStory, got %d: %s", wGet.Code, wGet.Body.String())
+	}
+	var detail StoryDetail
+	_ = json.NewDecoder(wGet.Body).Decode(&detail)
+	if detail.Path != "docs/stories/story-gov-3806.story.md" {
+		t.Fatalf("expected fallback Path docs/stories/story-gov-3806.story.md, got %q", detail.Path)
+	}
+	if len(detail.AcceptanceCriteria) != 2 || len(detail.TargetFiles) != 1 || len(detail.VerificationCommands) != 1 {
+		t.Fatalf("expected metadata slices populated on StoryDetail, got %+v", detail)
+	}
+	if len(detail.Content) == 0 || detail.Content[:3] != "---" {
+		t.Fatalf("expected synthesized Content to start with YAML frontmatter '---', got %q", detail.Content)
+	}
+
+	// 3. UpdateStoryStatus accepts DEFERRED, PENDING_INDEX, and BACKLOG
+	for _, status := range []string{"DEFERRED", "PENDING_INDEX", "BACKLOG"} {
+		reqPatch := httptest.NewRequest(http.MethodPatch, "/api/v1/stories/STORY-GOV-3806", bytes.NewBufferString(`{"status":"`+status+`"}`))
+		wPatch := httptest.NewRecorder()
+		handler.UpdateStoryStatus(wPatch, reqPatch)
+		if wPatch.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK for status %s, got %d: %s", status, wPatch.Code, wPatch.Body.String())
+		}
+		st, _ := engine.GetStory("STORY-GOV-3806")
+		if st.Status != status {
+			t.Fatalf("expected engine story status %s, got %s", status, st.Status)
+		}
+	}
+}

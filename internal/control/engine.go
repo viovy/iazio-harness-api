@@ -841,35 +841,35 @@ type Story struct {
 }
 
 type Engine struct {
-	mu              sync.Mutex
-	now             func() time.Time
-	seq             int
-	extracting      bool
-	ideas           map[string]*Idea
-	prompts         map[string]*Prompt
-	schedules       map[string]*Schedule
-	jobs            map[string]*Job
-	repos           map[string]*Repo
-	hosts           map[string]*Host
-	stories         map[string]*Story
-	pingWaiters     map[string]chan PingAck
-	repoWaiters     map[string]chan RepoRuntimeStatus
-	profiles        map[string]*DistributionProfile
-	profileLocksMu  sync.Mutex
-	profileLocks    map[string]*sync.Mutex
-	OnSaveProfile   func(p DistributionProfile) error
-	cloneLease      map[string]string
-	hubLease        string
-	runningRev      map[string]bool
-	history         map[string][]HistoryRow
-	requests        []RepoRequest
-	logs            map[string][]LogChunk
-	subs            map[string][]chan LogChunk
-	Releases        *ReleaseService
-	toolPriority    []string
-	toolCooldowns   map[string]time.Time
-	OnRepoChange    func(Repo)
-	OnStoryChange   func(Story)
+	mu                   sync.Mutex
+	now                  func() time.Time
+	seq                  int
+	extracting           bool
+	ideas                map[string]*Idea
+	prompts              map[string]*Prompt
+	schedules            map[string]*Schedule
+	jobs                 map[string]*Job
+	repos                map[string]*Repo
+	hosts                map[string]*Host
+	stories              map[string]*Story
+	pingWaiters          map[string]chan PingAck
+	repoWaiters          map[string]chan RepoRuntimeStatus
+	profiles             map[string]*DistributionProfile
+	profileLocksMu       sync.Mutex
+	profileLocks         map[string]*sync.Mutex
+	OnSaveProfile        func(p DistributionProfile) error
+	cloneLease           map[string]string
+	hubLease             string
+	runningRev           map[string]bool
+	history              map[string][]HistoryRow
+	requests             []RepoRequest
+	logs                 map[string][]LogChunk
+	subs                 map[string][]chan LogChunk
+	Releases             *ReleaseService
+	toolPriority         []string
+	toolCooldowns        map[string]time.Time
+	OnRepoChange         func(Repo)
+	OnStoryChange        func(Story)
 	OnHistoryChange      func(host, path string, row HistoryRow)
 	OnHistoryDelete      func(host, path string, jobID string)
 	OnToolPriorityChange func(tools []string)
@@ -922,25 +922,25 @@ func NewEngine(now func() time.Time) *Engine {
 		now = time.Now
 	}
 	return &Engine{
-		now:          now,
-		ideas:        map[string]*Idea{},
-		prompts:      map[string]*Prompt{},
-		schedules:    map[string]*Schedule{},
-		jobs:         map[string]*Job{},
-		repos:        map[string]*Repo{},
-		hosts:        map[string]*Host{},
-		stories:      map[string]*Story{},
-		pingWaiters:  map[string]chan PingAck{},
-		repoWaiters:  map[string]chan RepoRuntimeStatus{},
-		profiles:     map[string]*DistributionProfile{},
-		profileLocks: make(map[string]*sync.Mutex),
-		cloneLease:   map[string]string{},
-		runningRev:   map[string]bool{},
-		history:      map[string][]HistoryRow{},
-		logs:         map[string][]LogChunk{},
-		subs:         map[string][]chan LogChunk{},
-		Releases:     NewReleaseService(),
-		toolPriority: []string{"agy", "agent", "copilot", "opencode"},
+		now:           now,
+		ideas:         map[string]*Idea{},
+		prompts:       map[string]*Prompt{},
+		schedules:     map[string]*Schedule{},
+		jobs:          map[string]*Job{},
+		repos:         map[string]*Repo{},
+		hosts:         map[string]*Host{},
+		stories:       map[string]*Story{},
+		pingWaiters:   map[string]chan PingAck{},
+		repoWaiters:   map[string]chan RepoRuntimeStatus{},
+		profiles:      map[string]*DistributionProfile{},
+		profileLocks:  make(map[string]*sync.Mutex),
+		cloneLease:    map[string]string{},
+		runningRev:    map[string]bool{},
+		history:       map[string][]HistoryRow{},
+		logs:          map[string][]LogChunk{},
+		subs:          map[string][]chan LogChunk{},
+		Releases:      NewReleaseService(),
+		toolPriority:  []string{"agy", "opencode", "claude", "cursor"},
 		toolCooldowns: make(map[string]time.Time),
 	}
 }
@@ -1209,6 +1209,53 @@ type ToolPriorityAllocation struct {
 	ImmediateClaimable   bool
 }
 
+func normalizeToolAlias(name string) string {
+	n := strings.ToLower(strings.TrimSpace(name))
+	switch n {
+	case "antigravity", "antigravity-cli", "agy":
+		return "agy"
+	case "cursor", "cursor-agent", "agent":
+		return "cursor"
+	case "claude", "claude-code":
+		return "claude"
+	case "opencode":
+		return "opencode"
+	default:
+		return n
+	}
+}
+
+func toolNamesMatch(a, b string) bool {
+	na := normalizeToolAlias(a)
+	nb := normalizeToolAlias(b)
+	return na != "" && na == nb
+}
+
+func (e *Engine) isToolOnCooldownLocked(hostID, tool string) bool {
+	if hostID == "" || tool == "" {
+		return false
+	}
+	now := e.now()
+	raw := strings.ToLower(strings.TrimSpace(tool))
+	norm := normalizeToolAlias(raw)
+	candidates := []string{raw}
+	if norm != "" && norm != raw {
+		candidates = append(candidates, norm)
+	}
+	switch norm {
+	case "agy":
+		candidates = append(candidates, "antigravity")
+	case "cursor":
+		candidates = append(candidates, "agent")
+	}
+	for _, c := range candidates {
+		if cd, ok := e.toolCooldowns[hostID+":"+c]; ok && now.Before(cd) {
+			return true
+		}
+	}
+	return false
+}
+
 // isToolUsableForDispatch determines whether a reported host tool entry is eligible for dispatch.
 // It harmonizes ResolveToolPriorityAllocation and EvaluateDispatchDiagnostics so installed tools
 // reporting UP_TO_DATE, BEHIND, ACTIVE, HEALTHY, OK, INSTALLED, or empty status are consistently accepted.
@@ -1251,21 +1298,32 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 		toolPriority = []string{"agy", "opencode", "claude", "cursor"}
 	}
 
+	hostIDs := make([]string, 0, len(e.hosts))
+	for id := range e.hosts {
+		hostIDs = append(hostIDs, id)
+	}
+	sort.Strings(hostIDs)
+
 	for i, candidateTool := range toolPriority {
 		candidateToolLower := strings.ToLower(candidateTool)
-		for _, h := range e.hosts {
-			if !strings.EqualFold(h.Presence, "online") && !strings.EqualFold(h.Presence, "idle") && e.now().Sub(h.LastSeen) > 5*time.Minute {
+		firstEligibleHost := ""
+		for _, hostID := range hostIDs {
+			h := e.hosts[hostID]
+			if h == nil {
+				continue
+			}
+			if (!strings.EqualFold(h.Presence, "online") && !strings.EqualFold(h.Presence, "idle")) || (!h.LastSeen.IsZero() && e.now().Sub(h.LastSeen) > 5*time.Minute) {
 				continue
 			}
 			if reqHost != "" && h.ID != reqHost {
 				continue
 			}
-			if cd, ok := e.toolCooldowns[h.ID+":"+candidateToolLower]; ok && e.now().Before(cd) {
+			if e.isToolOnCooldownLocked(h.ID, candidateToolLower) {
 				continue
 			}
 			hasTool := false
 			for _, t := range h.Tools {
-				if strings.EqualFold(t.Name, candidateToolLower) && isToolUsableForDispatch(t) {
+				if toolNamesMatch(t.Name, candidateToolLower) && isToolUsableForDispatch(t) {
 					hasTool = true
 					break
 				}
@@ -1273,11 +1331,24 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 			if !hasTool && len(h.Tools) > 0 {
 				continue
 			}
+			if firstEligibleHost == "" {
+				firstEligibleHost = h.ID
+			}
 
-			// Check for idle workspace slot
+			// Check for idle workspace slot on this host
+			var hostRepos []*Repo
 			for _, r := range e.repos {
-				if r.HostID == h.ID && (r.GlobalQueueAllocationEnabled || r.WorktreePath == reqRepo || strings.Contains(r.WorktreePath, reqRepo)) {
-					if r.RunningJobID == "" && r.LockHolder == "" {
+				if r != nil && r.HostID == h.ID {
+					hostRepos = append(hostRepos, r)
+				}
+			}
+			sort.Slice(hostRepos, func(a, b int) bool {
+				return hostRepos[a].WorktreePath < hostRepos[b].WorktreePath
+			})
+			for _, r := range hostRepos {
+				repoMatches := r.GlobalQueueAllocationEnabled && (reqRepo == "" || reqRepo == "root" || r.WorktreePath == reqRepo || r.EffectiveAlias() == reqRepo || strings.Contains(r.WorktreePath, reqRepo))
+				if repoMatches {
+					if r.RunningJobID == "" && r.LockHolder == "" && r.Lock != LockRunning {
 						return ToolPriorityAllocation{
 							TargetAgent:          candidateToolLower,
 							TargetHost:           h.ID,
@@ -1289,10 +1360,12 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 					}
 				}
 			}
+		}
 
+		if firstEligibleHost != "" {
 			return ToolPriorityAllocation{
 				TargetAgent:          candidateToolLower,
-				TargetHost:           h.ID,
+				TargetHost:           firstEligibleHost,
 				TargetRepo:           reqRepo,
 				PriorityRankSelected: i + 1,
 				AllocationSource:     "global_queue_tool_priority",
@@ -1318,10 +1391,10 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 // BindStoryToJob updates the story ID and metadata on an active job, schedule, and history record.
 func (e *Engine) BindStoryToJob(jobID, storyID, storyTitle, storyPath string) error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 
 	cleanStoryID := strings.TrimSpace(storyID)
 	if cleanStoryID == "" {
+		e.mu.Unlock()
 		return errors.New("story_id is required")
 	}
 
@@ -1351,6 +1424,42 @@ func (e *Engine) BindStoryToJob(jobID, storyID, storyTitle, storyPath string) er
 			}
 		}
 		e.history[k] = rows
+	}
+
+	var targetStory *Story
+	if st, ok := e.stories[cleanStoryID]; ok && st != nil {
+		targetStory = st
+	} else {
+		for k, st := range e.stories {
+			if st != nil && strings.EqualFold(k, cleanStoryID) {
+				targetStory = st
+				break
+			}
+		}
+	}
+	now := e.now().UTC()
+	if targetStory == nil {
+		targetStory = &Story{
+			ID:        cleanStoryID,
+			Title:     storyTitle,
+			Status:    "IN_PROGRESS",
+			SyncState: "MATERIALIZED",
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		e.stories[cleanStoryID] = targetStory
+	} else {
+		targetStory.Status = "IN_PROGRESS"
+		if storyTitle != "" && targetStory.Title == "" {
+			targetStory.Title = storyTitle
+		}
+		targetStory.UpdatedAt = now
+	}
+	cp := *targetStory
+	cb := e.OnStoryChange
+	e.mu.Unlock()
+	if cb != nil {
+		cb(cp)
 	}
 
 	return nil
@@ -2030,14 +2139,34 @@ func (e *Engine) FailoverJob(jobID string, req AttemptFailure) (*Schedule, error
 
 	// 3. Select next eligible tool from toolPriority
 	if sch != nil {
+		failedSet := make(map[string]bool)
+		markFailed := func(t string) {
+			raw := strings.ToLower(strings.TrimSpace(t))
+			if raw != "" {
+				failedSet[raw] = true
+			}
+			norm := normalizeToolAlias(raw)
+			if norm != "" {
+				failedSet[norm] = true
+			}
+		}
+		for _, att := range sch.AttemptHistory {
+			markFailed(att.Tool)
+		}
+		if job != nil {
+			for _, att := range job.AttemptHistory {
+				markFailed(att.Tool)
+			}
+		}
+		markFailed(req.Tool)
+
 		nextTool := ""
 		for _, candidateTool := range e.toolPriority {
 			candLower := strings.ToLower(candidateTool)
-			if candLower == strings.ToLower(req.Tool) {
+			if failedSet[candLower] || failedSet[normalizeToolAlias(candLower)] {
 				continue
 			}
-			cd, hasCd := e.toolCooldowns[req.Host+":"+candLower]
-			if !hasCd || e.now().After(cd) {
+			if !e.isToolOnCooldownLocked(req.Host, candLower) {
 				nextTool = candLower
 				break
 			}
@@ -2045,7 +2174,16 @@ func (e *Engine) FailoverJob(jobID string, req AttemptFailure) (*Schedule, error
 		if nextTool == "" {
 			for _, candidateTool := range e.toolPriority {
 				candLower := strings.ToLower(candidateTool)
-				if candLower != strings.ToLower(req.Tool) {
+				if !failedSet[candLower] && !failedSet[normalizeToolAlias(candLower)] {
+					nextTool = candLower
+					break
+				}
+			}
+		}
+		if nextTool == "" {
+			for _, candidateTool := range e.toolPriority {
+				candLower := strings.ToLower(candidateTool)
+				if !toolNamesMatch(candLower, req.Tool) {
 					nextTool = candLower
 					break
 				}
@@ -3002,9 +3140,9 @@ func (e *Engine) reapExpiredLocked() {
 		}
 		sch := e.schedules[job.ScheduleID]
 		initialLeaseWindow := job.StartedAt.IsZero() || !job.LeaseExpiry.After(job.StartedAt.Add(LeaseInterval))
-		unackedRunning := job.Status == "RUNNING" && initialLeaseWindow && !job.LeaseExpiry.IsZero() && now.Before(job.LeaseExpiry) && job.HarnessPID == 0 && job.ToolPID == 0 && job.LastOutputAt.IsZero() && (job.LastChunkAt.IsZero() || job.LastChunkAt.Equal(job.StartedAt))
+		unackedRunning := job.Status == "RUNNING" && !job.IsStalled && initialLeaseWindow && (now.Before(job.LeaseExpiry) || (sch != nil && sch.IsGlobal)) && job.HarnessPID == 0 && job.ToolPID == 0 && job.LastOutputAt.IsZero() && (job.LastChunkAt.IsZero() || job.LastChunkAt.Equal(job.StartedAt))
 		if job.Status == "LEASED" || unackedRunning {
-			if job.LeaseAckDeadlineAt != nil && !job.LeaseAckDeadlineAt.IsZero() && now.After(*job.LeaseAckDeadlineAt) {
+			if job.LeaseAckDeadlineAt != nil && !job.LeaseAckDeadlineAt.IsZero() && (now.Equal(*job.LeaseAckDeadlineAt) || now.After(*job.LeaseAckDeadlineAt)) {
 				// Unacknowledged lease expired: 2-phase handshake zero-penalty requeue
 				prevHostID := job.HostID
 				job.Status = "REQUEUED"
@@ -3809,37 +3947,37 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			e.notifyRepoLocked(repo)
 		}
 		row := HistoryRow{
-			JobID:                 id,
-			ScheduleID:            sch.ID,
-			PromptTitle:           sch.PromptTitle,
-			Engine:                sch.Engine,
-			Status:                "RUNNING",
-			Clean:                 false,
-			ASEComplete:           false,
-			ConversationIDs:       append([]string(nil), job.ConversationIDs...),
-			TraceID:               traceID,
-			CreatedAt:             e.now(),
-			ParentJobID:           job.ParentJobID,
-			RootJobID:             job.RootJobID,
-			ExecutionAttempt:      job.ExecutionAttempt,
-			ExecutionChain:        append([]string(nil), job.ExecutionChain...),
-			InitialConversationID: job.InitialConversationID,
-			ActiveConversationID:  job.ActiveConversationID,
-			ResumeMode:            job.ResumeMode,
-			ResumeFallbackReason:  job.ResumeFallbackReason,
-			InterruptedASEState:   job.InterruptedASEState,
+			JobID:                  id,
+			ScheduleID:             sch.ID,
+			PromptTitle:            sch.PromptTitle,
+			Engine:                 sch.Engine,
+			Status:                 "RUNNING",
+			Clean:                  false,
+			ASEComplete:            false,
+			ConversationIDs:        append([]string(nil), job.ConversationIDs...),
+			TraceID:                traceID,
+			CreatedAt:              e.now(),
+			ParentJobID:            job.ParentJobID,
+			RootJobID:              job.RootJobID,
+			ExecutionAttempt:       job.ExecutionAttempt,
+			ExecutionChain:         append([]string(nil), job.ExecutionChain...),
+			InitialConversationID:  job.InitialConversationID,
+			ActiveConversationID:   job.ActiveConversationID,
+			ResumeMode:             job.ResumeMode,
+			ResumeFallbackReason:   job.ResumeFallbackReason,
+			InterruptedASEState:    job.InterruptedASEState,
 			WorkspaceStateManifest: job.WorkspaceStateManifest,
 			ReapResult:             job.ReapResult,
 			RehydrationStatus:      job.RehydrationStatus,
-			ConversationLineage:   append([]ConversationLineage(nil), job.ConversationLineage...),
-			HarnessPID:            job.HarnessPID,
-			ToolPID:               job.ToolPID,
-			LeaseToken:            leaseToken,
-			LeaseAckDeadlineAt:    &leaseDeadline,
-			ZipkinTraceID:         zipkinTraceID,
-			ZipkinTraceURL:        zipkinTraceURL,
-			Traceparent:           traceparent,
-			InfraRequeueCount:     sch.InfraRequeueCount,
+			ConversationLineage:    append([]ConversationLineage(nil), job.ConversationLineage...),
+			HarnessPID:             job.HarnessPID,
+			ToolPID:                job.ToolPID,
+			LeaseToken:             leaseToken,
+			LeaseAckDeadlineAt:     &leaseDeadline,
+			ZipkinTraceID:          zipkinTraceID,
+			ZipkinTraceURL:         zipkinTraceURL,
+			Traceparent:            traceparent,
+			InfraRequeueCount:      sch.InfraRequeueCount,
 		}
 		e.history[repoKey(host, sch.WorktreePath)] = append(e.history[repoKey(host, sch.WorktreePath)], row)
 		e.notifyHistoryLocked(host, sch.WorktreePath, row)
@@ -6635,11 +6773,11 @@ func (e *Engine) EvaluateDispatchDiagnostics(targetHost, targetAgent string) *di
 		// Check supported tool from tool priority
 		selectedTool := ""
 		for _, toolName := range toolsPriority {
-			if targetAgent != "" && !strings.EqualFold(targetAgent, toolName) {
+			if targetAgent != "" && !toolNamesMatch(targetAgent, toolName) {
 				continue
 			}
 			for _, t := range host.Tools {
-				if strings.EqualFold(t.Name, toolName) && isToolUsableForDispatch(t) {
+				if toolNamesMatch(t.Name, toolName) && isToolUsableForDispatch(t) {
 					selectedTool = toolName
 					break
 				}
@@ -6739,11 +6877,16 @@ func (e *Engine) SaveStory(s Story) error {
 func (e *Engine) GetStory(id string) (Story, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	s, ok := e.stories[id]
-	if !ok || s == nil {
-		return Story{}, false
+	cleanID := strings.TrimSpace(id)
+	if s, ok := e.stories[cleanID]; ok && s != nil {
+		return *s, true
 	}
-	return *s, true
+	for k, s := range e.stories {
+		if s != nil && strings.EqualFold(k, cleanID) {
+			return *s, true
+		}
+	}
+	return Story{}, false
 }
 
 // ListStories retrieves all stories, optionally filtered by repo.
@@ -6769,14 +6912,25 @@ func (e *Engine) ListStories(repo string) []Story {
 func (e *Engine) UpdateStorySyncState(id, syncState string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	s, ok := e.stories[id]
-	if !ok || s == nil {
+	cleanID := strings.TrimSpace(id)
+	var target *Story
+	if s, ok := e.stories[cleanID]; ok && s != nil {
+		target = s
+	} else {
+		for k, s := range e.stories {
+			if s != nil && strings.EqualFold(k, cleanID) {
+				target = s
+				break
+			}
+		}
+	}
+	if target == nil {
 		return errors.New("story not found")
 	}
-	s.SyncState = syncState
-	s.UpdatedAt = e.now().UTC()
+	target.SyncState = syncState
+	target.UpdatedAt = e.now().UTC()
 	if e.OnStoryChange != nil {
-		cp := *s
+		cp := *target
 		go e.OnStoryChange(cp)
 	}
 	return nil

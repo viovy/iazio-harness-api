@@ -136,57 +136,58 @@ type AgentAffinity struct {
 
 // Job represents an asynchronous task dispatched to an iazio-agent daemon.
 type Job struct {
-	ID               string          `json:"id"`
-	Type             string          `json:"type"`
-	Repo             string          `json:"repo"`
-	TargetHost       string          `json:"target_host,omitempty"`
-	ClaimedHost      string          `json:"claimed_host,omitempty"`
-	HostID           string          `json:"host_id,omitempty"`
-	TargetAgent             string          `json:"target_agent,omitempty"`
-	StoryID                 string          `json:"story_id,omitempty"`
-	StoryTitle              string          `json:"story_title,omitempty"`
-	StoryPath               string          `json:"story_path,omitempty"`
-	StoryAllocationStatus   string          `json:"story_allocation_status,omitempty"`
-	AllocationSource        string          `json:"allocation_source,omitempty"`
-	PriorityRankSelected    int             `json:"priority_rank_selected,omitempty"`
-	SourceConversationTitle string          `json:"source_conversation_title,omitempty"`
-	NormalizedPrompt        string          `json:"normalized_prompt,omitempty"`
-	EffectiveAction         string          `json:"effective_action,omitempty"`
-	AgentAffinity           *AgentAffinity  `json:"agent_affinity,omitempty"`
-	Payload          json.RawMessage `json:"payload"`
-	Status           string          `json:"status"`
-	Result           json.RawMessage `json:"result,omitempty"`
-	Error            string          `json:"error,omitempty"`
-	TraceID          string          `json:"trace_id,omitempty"`
-	ParentID         string          `json:"parent_id,omitempty"`
-	SearchID         string          `json:"search_id,omitempty"`
-	RelevanceEmitted bool            `json:"relevance_emitted"`
-	PromotedMemories []string        `json:"promoted_memories,omitempty"`
-	FencingToken     int64           `json:"fencing_token"`
-	Attempts         int             `json:"attempts"`
-	CreatedAt        time.Time       `json:"created_at"`
-	ClaimedAt        *time.Time      `json:"claimed_at,omitempty"`
-	HeartbeatAt      *time.Time      `json:"heartbeat_at,omitempty"`
-	LeaseExpiresAt   *time.Time      `json:"lease_expires_at,omitempty"`
-	CompletedAt      *time.Time      `json:"completed_at,omitempty"`
-	DispatchDiagnostics *DispatchDiagnostics `json:"dispatch_diagnostics,omitempty"`
-	LeaseToken           string            `json:"lease_token,omitempty"`
-	LeaseAckDeadlineAt   *time.Time        `json:"lease_ack_deadline_at,omitempty"`
-	LeaseOwner           string            `json:"lease_owner,omitempty"`
-	LeaseVersion         int64             `json:"lease_version,omitempty"`
-	FailureCategory      string            `json:"failure_category,omitempty"`
-	FailureStage         string            `json:"failure_stage,omitempty"`
-	FailureReasonSummary string            `json:"failure_reason_summary,omitempty"`
-	Retriable            bool              `json:"retriable"`
-	FinalTurnCount        int               `json:"final_turn_count,omitempty"`
-	FinalTranscriptSHA256 string            `json:"final_transcript_sha256,omitempty"`
-	AttemptHistory       []AttemptFailure  `json:"attempt_history,omitempty"`
-	ZipkinTraceID        string            `json:"zipkin_trace_id,omitempty"`
-	ZipkinTraceURL       string            `json:"zipkin_trace_url,omitempty"`
-	Traceparent          string            `json:"traceparent,omitempty"`
-	InfraRequeueCount    int               `json:"infra_requeue_count,omitempty"`
-	AgentPID             int               `json:"agent_pid,omitempty"`
-	ActiveConversationID string            `json:"active_conversation_id,omitempty"`
+	ID                      string               `json:"id"`
+	Type                    string               `json:"type"`
+	Repo                    string               `json:"repo"`
+	TargetHost              string               `json:"target_host,omitempty"`
+	ClaimedHost             string               `json:"claimed_host,omitempty"`
+	HostID                  string               `json:"host_id,omitempty"`
+	TargetAgent             string               `json:"target_agent,omitempty"`
+	StoryID                 string               `json:"story_id,omitempty"`
+	StoryTitle              string               `json:"story_title,omitempty"`
+	StoryPath               string               `json:"story_path,omitempty"`
+	StoryAllocationStatus   string               `json:"story_allocation_status,omitempty"`
+	AllocationSource        string               `json:"allocation_source,omitempty"`
+	PriorityRankSelected    int                  `json:"priority_rank_selected,omitempty"`
+	SourceConversationTitle string               `json:"source_conversation_title,omitempty"`
+	NormalizedPrompt        string               `json:"normalized_prompt,omitempty"`
+	EffectiveAction         string               `json:"effective_action,omitempty"`
+	AgentAffinity           *AgentAffinity       `json:"agent_affinity,omitempty"`
+	Payload                 json.RawMessage      `json:"payload"`
+	Status                  string               `json:"status"`
+	Result                  json.RawMessage      `json:"result,omitempty"`
+	Error                   string               `json:"error,omitempty"`
+	TraceID                 string               `json:"trace_id,omitempty"`
+	ParentID                string               `json:"parent_id,omitempty"`
+	SearchID                string               `json:"search_id,omitempty"`
+	RelevanceEmitted        bool                 `json:"relevance_emitted"`
+	PromotedMemories        []string             `json:"promoted_memories,omitempty"`
+	FencingToken            int64                `json:"fencing_token"`
+	Attempts                int                  `json:"attempts"`
+	CreatedAt               time.Time            `json:"created_at"`
+	ClaimedAt               *time.Time           `json:"claimed_at,omitempty"`
+	AckedAt                 *time.Time           `json:"acked_at,omitempty"`
+	HeartbeatAt             *time.Time           `json:"heartbeat_at,omitempty"`
+	LeaseExpiresAt          *time.Time           `json:"lease_expires_at,omitempty"`
+	CompletedAt             *time.Time           `json:"completed_at,omitempty"`
+	DispatchDiagnostics     *DispatchDiagnostics `json:"dispatch_diagnostics,omitempty"`
+	LeaseToken              string               `json:"lease_token,omitempty"`
+	LeaseAckDeadlineAt      *time.Time           `json:"lease_ack_deadline_at,omitempty"`
+	LeaseOwner              string               `json:"lease_owner,omitempty"`
+	LeaseVersion            int64                `json:"lease_version,omitempty"`
+	FailureCategory         string               `json:"failure_category,omitempty"`
+	FailureStage            string               `json:"failure_stage,omitempty"`
+	FailureReasonSummary    string               `json:"failure_reason_summary,omitempty"`
+	Retriable               bool                 `json:"retriable"`
+	FinalTurnCount          int                  `json:"final_turn_count,omitempty"`
+	FinalTranscriptSHA256   string               `json:"final_transcript_sha256,omitempty"`
+	AttemptHistory          []AttemptFailure     `json:"attempt_history,omitempty"`
+	ZipkinTraceID           string               `json:"zipkin_trace_id,omitempty"`
+	ZipkinTraceURL          string               `json:"zipkin_trace_url,omitempty"`
+	Traceparent             string               `json:"traceparent,omitempty"`
+	InfraRequeueCount       int                  `json:"infra_requeue_count,omitempty"`
+	AgentPID                int                  `json:"agent_pid,omitempty"`
+	ActiveConversationID    string               `json:"active_conversation_id,omitempty"`
 
 	// doneCh signals when the job has been completed or failed.
 	doneCh chan struct{}
@@ -276,6 +277,12 @@ func (q *InMemoryQueue) SetStore(s QueueStore) error {
 		q.mu.Lock()
 		defer q.mu.Unlock()
 		for _, j := range persisted {
+			if j.FencingToken > q.fencingSeq {
+				q.fencingSeq = j.FencingToken
+			}
+			if j.LeaseVersion > q.fencingSeq {
+				q.fencingSeq = j.LeaseVersion
+			}
 			if existing, ok := q.jobs[j.ID]; !ok || existing.CreatedAt.Before(j.CreatedAt) {
 				if j.doneCh == nil {
 					j.doneCh = make(chan struct{})
@@ -360,6 +367,10 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 		if !isStory && q.jobTimeout > 0 && !j.CreatedAt.IsZero() && now.Sub(j.CreatedAt) > q.jobTimeout {
 			j.Status = JobStatusFailed
 			j.Error = "EXECUTION_TIMEOUT: job exceeded max execution duration"
+			j.FailureCategory = FailureCategoryBackgroundDrainTimeout
+			j.FailureStage = FailureStageBackgroundDrain
+			j.FailureReasonSummary = j.Error
+			j.Retriable = j.Attempts < DefaultMaxAttempts
 			completedAt := now
 			j.CompletedAt = &completedAt
 			expiredIDs = append(expiredIDs, j.ID)
@@ -372,9 +383,13 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 		// 1b. Unacknowledged lease expiration (Two-Phase Lease Handshake):
 		if j.Status == JobStatusLeased {
 			if j.LeaseAckDeadlineAt != nil && !j.LeaseAckDeadlineAt.IsZero() && now.After(*j.LeaseAckDeadlineAt) {
-				// Revert to pending without consuming story retry budget
+				// Revert to pending without consuming story retry budget when reaped within handshake window
 				j.Status = JobStatusPending
+				if j.Attempts > 0 && (j.LeaseExpiresAt == nil || !now.After(*j.LeaseExpiresAt)) {
+					j.Attempts--
+				}
 				j.InfraRequeueCount++
+				j.LeaseOwner = ""
 				j.LeaseToken = ""
 				j.LeaseAckDeadlineAt = nil
 				j.ClaimedHost = ""
@@ -395,6 +410,10 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 			if q.claimTimeout > 0 && j.ClaimedAt != nil && !j.ClaimedAt.IsZero() && now.Sub(*j.ClaimedAt) > q.claimTimeout {
 				j.Status = JobStatusFailed
 				j.Error = "LEASE_EXPIRED: execution lease expired without completion"
+				j.FailureCategory = FailureCategoryBackgroundDrainTimeout
+				j.FailureStage = FailureStageBackgroundDrain
+				j.FailureReasonSummary = j.Error
+				j.Retriable = j.Attempts < DefaultMaxAttempts
 				completedAt := now
 				j.CompletedAt = &completedAt
 				expiredIDs = append(expiredIDs, j.ID)
@@ -453,6 +472,9 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 					} else {
 						j.Error = "HEARTBEAT_TIMEOUT: runner heartbeat stopped, max retry attempts exceeded"
 					}
+					j.FailureCategory = FailureCategoryBackgroundDrainTimeout
+					j.FailureStage = FailureStageBackgroundDrain
+					j.FailureReasonSummary = j.Error
 					completedAt := now
 					j.CompletedAt = &completedAt
 					expiredIDs = append(expiredIDs, j.ID)
@@ -653,10 +675,26 @@ func (q *InMemoryQueue) HeartbeatWithStory(ctx context.Context, jobID string, fe
 		return nil, ErrLeaseFenced
 	}
 
+	now := q.now()
+	statusTransitioned := false
+	if job.Status == JobStatusLeased || job.Status == JobStatusClaimed {
+		job.Status = JobStatusRunning
+		job.LeaseAckDeadlineAt = nil
+		if job.AckedAt == nil {
+			job.AckedAt = &now
+		}
+		statusTransitioned = true
+	} else if job.LeaseAckDeadlineAt != nil {
+		job.LeaseAckDeadlineAt = nil
+		statusTransitioned = true
+	}
+
+	storyUpdated := false
 	cleanStoryID := strings.TrimSpace(storyID)
 	if cleanStoryID != "" && cleanStoryID != "pending-allocation" && cleanStoryID != "pending" {
 		job.StoryID = cleanStoryID
 		job.StoryAllocationStatus = "allocated"
+		storyUpdated = true
 		if len(job.Payload) > 0 {
 			var payloadMap map[string]any
 			if err := json.Unmarshal(job.Payload, &payloadMap); err == nil {
@@ -668,7 +706,6 @@ func (q *InMemoryQueue) HeartbeatWithStory(ctx context.Context, jobID string, fe
 		}
 	}
 
-	now := q.now()
 	job.HeartbeatAt = &now
 	expires := now.Add(DefaultHeartbeatTimeout)
 	job.LeaseExpiresAt = &expires
@@ -677,7 +714,7 @@ func (q *InMemoryQueue) HeartbeatWithStory(ctx context.Context, jobID string, fe
 			log.Printf("[dispatch-queue] ERROR: failed to persist heartbeat lease for %s: %v", jobID, err)
 			return nil, fmt.Errorf("persist heartbeat lease: %w", err)
 		}
-		if cleanStoryID != "" && cleanStoryID != "pending-allocation" && cleanStoryID != "pending" {
+		if statusTransitioned || storyUpdated {
 			_ = q.store.SaveQueueJob(ctx, job)
 		}
 	}
@@ -815,6 +852,33 @@ func (q *InMemoryQueue) Complete(ctx context.Context, jobID string, result json.
 	return q.CompleteWithFencing(ctx, jobID, fencingToken, result, errStr)
 }
 
+// ClassifyDispatchFailure maps an error string to canonical failure taxonomy.
+func ClassifyDispatchFailure(errStr string) (category, stage, summary string, retriable bool) {
+	lower := strings.ToLower(strings.TrimSpace(errStr))
+	switch {
+	case strings.Contains(lower, "claim") || strings.Contains(lower, "startup_heartbeat") || strings.Contains(lower, "unacknowledged lease"):
+		return FailureCategoryDispatchClaimTimeout, FailureStageQueueDispatch, "Agent lease claim timed out or lost before initial acknowledgement", true
+	case strings.Contains(lower, "429") || strings.Contains(lower, "resource_exhausted") || strings.Contains(lower, "quota") || strings.Contains(lower, "auth") || strings.Contains(lower, "token limit") || strings.Contains(lower, "unauthorized") || strings.Contains(lower, "preflight_or_early_tool_exit"):
+		return FailureCategoryToolQuotaOrAuth, FailureStageToolExecution, "Tool startup failed due to quota exhaustion, rate limit, or auth expiration", true
+	case strings.Contains(lower, "crash") || strings.Contains(lower, "exit status") || strings.Contains(lower, "sigsegv") || strings.Contains(lower, "binary"):
+		return FailureCategoryToolCrash, FailureStageToolExecution, "AI agent tool process crashed or exited non-zero during early execution", true
+	case strings.Contains(lower, "dirty_worktree_post_exit") || strings.Contains(lower, "post_exit"):
+		return FailureCategoryASEGateIncomplete, FailureStageCompletionGate, "Post-execution gate: child engine exited but left uncommitted worktree changes", true
+	case strings.Contains(lower, "worktree") || strings.Contains(lower, "workspace_prep") || strings.Contains(lower, "lock") || strings.Contains(lower, "porcelain") || strings.Contains(lower, "submodule") || strings.Contains(lower, "dirty"):
+		return FailureCategoryWorkspacePrepError, FailureStageWorkspacePrep, "Workspace preparation conflict: dirty worktree or stale git locks", true
+	case strings.Contains(lower, "1h0m0s") || strings.Contains(lower, "background task") || strings.Contains(lower, "drain") || strings.Contains(lower, "lease_expired") || strings.Contains(lower, "heartbeat_timeout") || strings.Contains(lower, "execution_timeout") || strings.Contains(lower, "lease expired"):
+		return FailureCategoryBackgroundDrainTimeout, FailureStageBackgroundDrain, errStr, true
+	case strings.Contains(lower, "circuit") || strings.Contains(lower, "breaker") || strings.Contains(lower, "retry_capped"):
+		return FailureCategoryCircuitBreakerTripped, FailureStageQueueDispatch, errStr, false
+	case strings.Contains(lower, "story_not_found") || strings.Contains(lower, "not found in backlog") || strings.Contains(lower, "cannot execute nonexistent story"):
+		return FailureCategoryStoryNotFound, FailureStageStoryValidation, "Story not found in backlog or control plane: cannot execute nonexistent story", false
+	case strings.Contains(lower, "gate") || strings.Contains(lower, "dod") || strings.Contains(lower, "incomplete") || strings.Contains(lower, "ase_gate"):
+		return FailureCategoryASEGateIncomplete, FailureStageCompletionGate, "Autonomous Story Execution DoD or review scheme validation incomplete", false
+	default:
+		return FailureCategoryToolCrash, FailureStageToolExecution, "Execution error: " + errStr, true
+	}
+}
+
 // isReconcilableFailure checks whether a failure reason was caused by lease/heartbeat/reaper timeout.
 func isReconcilableFailure(errStr string) bool {
 	lower := strings.ToLower(errStr)
@@ -854,6 +918,17 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 	if errStr != "" {
 		job.Status = JobStatusFailed
 		job.Error = errStr
+		cat, stage, summary, retriable := ClassifyDispatchFailure(errStr)
+		if job.FailureCategory == "" || job.FailureCategory == FailureCategoryNone {
+			job.FailureCategory = cat
+		}
+		if job.FailureStage == "" {
+			job.FailureStage = stage
+		}
+		if job.FailureReasonSummary == "" {
+			job.FailureReasonSummary = summary
+		}
+		job.Retriable = retriable
 	} else {
 		job.Status = JobStatusCompleted
 		job.Result = result
@@ -889,6 +964,9 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 	job.PromotedMemories = promoted
 	if searchID != "" && job.Status == JobStatusCompleted {
 		job.RelevanceEmitted = true
+	}
+	if q.store != nil {
+		_ = q.store.SaveQueueJob(ctx, job)
 	}
 
 	done := job.doneCh
@@ -1009,6 +1087,47 @@ func (q *InMemoryQueue) Get(jobID string) (*Job, bool) {
 	return j, ok
 }
 
+func matchesJobStatusFilter(jobStatus, filterStatus string) bool {
+	f := strings.ToLower(strings.TrimSpace(filterStatus))
+	if f == "" || f == "all" {
+		return true
+	}
+	s := strings.ToLower(strings.TrimSpace(jobStatus))
+	switch f {
+	case "queued", "pending":
+		return s == JobStatusPending || s == "queued"
+	case "claimed":
+		return s == JobStatusClaimed || s == JobStatusLeased || s == JobStatusRunning
+	case "cancelled", "canceled":
+		return s == JobStatusCanceled || s == "cancelled"
+	default:
+		return strings.EqualFold(s, f)
+	}
+}
+
+// Count returns the total number of jobs matching the filter before limit truncation.
+func (q *InMemoryQueue) Count(ctx context.Context, filter JobFilter) (int, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	q.reapExpiredLocked(q.now())
+
+	count := 0
+	for _, j := range q.jobs {
+		if filter.Repo != "" && j.Repo != filter.Repo {
+			continue
+		}
+		if !matchesJobStatusFilter(j.Status, filter.Status) {
+			continue
+		}
+		if filter.Type != "" && j.Type != filter.Type {
+			continue
+		}
+		count++
+	}
+	return count, nil
+}
+
 // List returns jobs matching the filter, sorted by CreatedAt descending, lazily reaping expired jobs.
 func (q *InMemoryQueue) List(ctx context.Context, filter JobFilter) ([]*Job, error) {
 	q.mu.Lock()
@@ -1026,7 +1145,7 @@ func (q *InMemoryQueue) List(ctx context.Context, filter JobFilter) ([]*Job, err
 		if filter.Repo != "" && j.Repo != filter.Repo {
 			continue
 		}
-		if filter.Status != "" && filter.Status != "all" && j.Status != filter.Status {
+		if !matchesJobStatusFilter(j.Status, filter.Status) {
 			continue
 		}
 		if filter.Type != "" && j.Type != filter.Type {
@@ -1142,15 +1261,18 @@ func (q *InMemoryQueue) AckLease(ctx context.Context, jobID, leaseToken string, 
 		return nil, errors.New("invalid or missing lease token")
 	}
 
+	now := q.now()
 	job.Status = JobStatusRunning
 	job.LeaseAckDeadlineAt = nil
+	if job.AckedAt == nil {
+		job.AckedAt = &now
+	}
 	if agentPID > 0 {
 		job.AgentPID = agentPID
 	}
 	if activeConvID != "" {
 		job.ActiveConversationID = activeConvID
 	}
-	now := q.now()
 	job.HeartbeatAt = &now
 	expires := now.Add(DefaultHeartbeatTimeout)
 	job.LeaseExpiresAt = &expires
@@ -1249,10 +1371,12 @@ func (q *InMemoryQueue) Failover(ctx context.Context, jobID string, req AttemptF
 		}
 		if nextTool != "" {
 			job.TargetAgent = nextTool
+			job.TargetHost = ""
 			if len(job.Payload) > 0 {
 				var payloadMap map[string]any
 				if err := json.Unmarshal(job.Payload, &payloadMap); err == nil && payloadMap != nil {
 					payloadMap["target_agent"] = nextTool
+					payloadMap["target_host"] = ""
 					if updated, err := json.Marshal(payloadMap); err == nil {
 						job.Payload = updated
 					}
@@ -1261,6 +1385,7 @@ func (q *InMemoryQueue) Failover(ctx context.Context, jobID string, req AttemptF
 		}
 	}
 
+	job.TargetHost = ""
 	job.Status = JobStatusPending
 	job.ClaimedHost = ""
 	job.HostID = ""
@@ -1506,6 +1631,7 @@ func (q *InMemoryQueue) ReconcileGlobalQueueSlots(now time.Time, staleGrace time
 					j.LeaseExpiresAt = nil
 					j.LeaseAckDeadlineAt = nil
 					j.FencingToken = 0
+					j.LeaseVersion = 0
 					if j.DispatchDiagnostics == nil {
 						j.DispatchDiagnostics = &DispatchDiagnostics{}
 					}
@@ -1519,6 +1645,10 @@ func (q *InMemoryQueue) ReconcileGlobalQueueSlots(now time.Time, staleGrace time
 				} else {
 					j.Status = JobStatusFailed
 					j.Error = "HEARTBEAT_TIMEOUT: runner heartbeat stopped, max retry attempts exceeded"
+					j.FailureCategory = FailureCategoryBackgroundDrainTimeout
+					j.FailureStage = FailureStageBackgroundDrain
+					j.FailureReasonSummary = j.Error
+					j.Retriable = j.Attempts < DefaultMaxAttempts
 					completedAt := now
 					j.CompletedAt = &completedAt
 					reclaimedIDs = append(reclaimedIDs, j.ID)

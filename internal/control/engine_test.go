@@ -526,7 +526,6 @@ func TestReapExpired_StoryJobDoesNotTimeoutOnWallClock(t *testing.T) {
 	}
 }
 
-
 func TestForcePauseClearsActiveJobAndSchedule(t *testing.T) {
 	e := NewEngine(nil)
 	e.RegisterHost("host-1", "permanent")
@@ -2912,12 +2911,12 @@ func TestReapExpiredLocked_AutoResumesOrphanedRun(t *testing.T) {
 	key := repoKey("mac-mini", "/work/meta-04")
 	e.history[key] = []HistoryRow{
 		{
-			JobID:                "job-1500",
-			ScheduleID:           "sch-1500",
-			PromptTitle:          "orphaned run test",
-			Engine:               "mock-agy",
-			Status:               "RUNNING",
-			CreatedAt:            now.Add(-10 * time.Minute),
+			JobID:                 "job-1500",
+			ScheduleID:            "sch-1500",
+			PromptTitle:           "orphaned run test",
+			Engine:                "mock-agy",
+			Status:                "RUNNING",
+			CreatedAt:             now.Add(-10 * time.Minute),
 			InitialConversationID: "conv-1500-init",
 		},
 	}
@@ -5374,8 +5373,162 @@ func TestGov3799_AckLeaseAndHeartbeatExtendToActiveLeaseDuration(t *testing.T) {
 	}
 }
 
+func TestV4_NewEngineDefaultToolPriorityAndManifestLatestAvailableVersion(t *testing.T) {
+	e := NewEngine(nil)
+	tp := e.GetToolPriority()
+	want := []string{"agy", "opencode", "claude", "cursor"}
+	if len(tp) != len(want) {
+		t.Fatalf("expected default tool priority %v, got %v", want, tp)
+	}
+	for i := range want {
+		if tp[i] != want[i] {
+			t.Fatalf("expected default tool priority[%d]=%q, got %q", i, want[i], tp[i])
+		}
+	}
 
+	e.LoadProfile(DistributionProfile{
+		Name: "v4-profile",
+		Tools: []ProfileTool{
+			{
+				Name:                   "iazio-agent",
+				BinaryName:             "iazio-agent",
+				TargetVersion:          "latest",
+				LatestAvailableVersion: "1.4.2",
+			},
+		},
+	})
+	manifest, err := e.GetManifest("v4-profile", "linux", "amd64")
+	if err != nil {
+		t.Fatalf("GetManifest failed: %v", err)
+	}
+	if len(manifest.Tools) != 1 || manifest.Tools[0].LatestAvailableVersion != "1.4.2" {
+		t.Fatalf("expected ManifestToolItem.LatestAvailableVersion=1.4.2, got %+v", manifest.Tools)
+	}
+}
 
+func TestV4_ResolveToolPriorityAllocation_StaleHostBusyHostRepoMatchAndAliases(t *testing.T) {
+	now := time.Date(2026, 10, 31, 10, 0, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return now })
+	e.SetToolPriority([]string{"agy", "cursor"})
 
+	// host-a: online, has antigravity (alias for agy), but repo slot is BUSY
+	_ = e.RegisterHost("host-a", "permanent", "generic")
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "host-a",
+		WorktreePath:                 "/work/iazio-mcp",
+		CloneURL:                     "https://example.test/iazio-mcp.git",
+		GlobalQueueAllocationEnabled: true,
+		Lock:                         LockRunning,
+		RunningJobID:                 "job-busy-1",
+	})
+	_ = e.Heartbeat("host-a", []Tool{
+		{Name: "antigravity", Installed: true, Path: "/usr/bin/agy", Status: "ok"},
+	}, false)
 
+	// host-b: online, has antigravity (alias for agy), and repo slot is IDLE
+	_ = e.RegisterHost("host-b", "permanent", "generic")
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "host-b",
+		WorktreePath:                 "/work/iazio-mcp",
+		CloneURL:                     "https://example.test/iazio-mcp.git",
+		GlobalQueueAllocationEnabled: true,
+		Lock:                         LockIdle,
+	})
+	_ = e.Heartbeat("host-b", []Tool{
+		{Name: "antigravity", Installed: true, Path: "/usr/bin/agy", Status: "ok"},
+	}, false)
 
+	// host-stale: Presence is ONLINE but LastSeen is 10 minutes ago -> must be skipped
+	_ = e.RegisterHost("host-stale", "permanent", "generic")
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "host-stale",
+		WorktreePath:                 "/work/iazio-mcp",
+		CloneURL:                     "https://example.test/iazio-mcp.git",
+		GlobalQueueAllocationEnabled: true,
+		Lock:                         LockIdle,
+	})
+	e.mu.Lock()
+	e.hosts["host-stale"].Presence = "ONLINE"
+	e.hosts["host-stale"].LastSeen = now.Add(-10 * time.Minute)
+	e.hosts["host-stale"].Tools = []Tool{{Name: "agy", Installed: true, Path: "/usr/bin/agy", Status: "ok"}}
+	e.mu.Unlock()
+
+	alloc := e.ResolveToolPriorityAllocation("auto", "", "iazio-mcp")
+	if alloc.TargetAgent != "agy" {
+		t.Fatalf("expected TargetAgent=agy via antigravity alias, got %q", alloc.TargetAgent)
+	}
+	if alloc.TargetHost != "host-b" || !alloc.ImmediateClaimable {
+		t.Fatalf("expected allocation to skip busy host-a and stale host-stale and pick idle host-b with ImmediateClaimable=true, got %+v", alloc)
+	}
+}
+
+func TestV4_BindStoryToJobAndFailoverJobSkipAttemptHistory(t *testing.T) {
+	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return now })
+	e.SetToolPriority([]string{"agy", "opencode", "claude", "cursor"})
+
+	var persistedStory Story
+	e.OnStoryChange = func(s Story) {
+		persistedStory = s
+	}
+
+	_ = e.SaveStory(Story{
+		ID:        "STORY-GOV-3806",
+		Title:     "Enterprise V4 Audit Remediation",
+		Submodule: "iazio-harness-api",
+		Priority:  "P0",
+		Status:    "READY",
+	})
+
+	_ = e.RegisterHost("host-1", "permanent", "generic")
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "host-1",
+		WorktreePath:                 "/work/app",
+		CloneURL:                     "https://example.test/app.git",
+		GlobalQueueAllocationEnabled: true,
+	})
+	p := e.PutPrompt(Prompt{Title: "V4 Task", Body: "do work", Status: "READY", Engine: "agy"})
+	sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/app", 1, nil)
+	if err != nil {
+		t.Fatalf("ExecutePrompt: %v", err)
+	}
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok {
+		t.Fatal("PollHost failed")
+	}
+
+	if err := e.BindStoryToJob(job.ID, "STORY-GOV-3806", "Enterprise V4 Audit Remediation", "docs/stories/story-gov-3806.story.md"); err != nil {
+		t.Fatalf("BindStoryToJob failed: %v", err)
+	}
+
+	st, ok := e.GetStory("STORY-GOV-3806")
+	if !ok || st.Status != "IN_PROGRESS" {
+		t.Fatalf("expected BindStoryToJob to transition story status to IN_PROGRESS, got ok=%v status=%q", ok, st.Status)
+	}
+	if persistedStory.ID != "STORY-GOV-3806" || persistedStory.Status != "IN_PROGRESS" {
+		t.Fatalf("expected OnStoryChange callback with IN_PROGRESS story, got %+v", persistedStory)
+	}
+
+	// Simulate prior failure on opencode in sch.AttemptHistory, then failover from agy -> must skip both agy and opencode and select claude
+	e.mu.Lock()
+	e.schedules[sch.ID].AttemptHistory = append(e.schedules[sch.ID].AttemptHistory, AttemptFailure{
+		AttemptNumber: 1,
+		Host:          "host-1",
+		Tool:          "opencode",
+		Reason:        "QUOTA",
+	})
+	e.mu.Unlock()
+
+	resp, err := e.FailoverJob(job.ID, AttemptFailure{
+		Host:            "host-1",
+		Tool:            "antigravity",
+		FailureCategory: FailureCategoryToolQuotaOrAuth,
+		Reason:          "QUOTA_EXHAUSTED",
+	})
+	if err != nil {
+		t.Fatalf("FailoverJob failed: %v", err)
+	}
+	if resp.Engine != "claude" {
+		t.Fatalf("expected FailoverJob to skip antigravity/agy and previously failed opencode and select claude, got %q", resp.Engine)
+	}
+}

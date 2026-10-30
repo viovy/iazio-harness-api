@@ -36,12 +36,12 @@ const (
 	IdeaRefining = "REFINING"
 	IdeaRefined  = "REFINED"
 
-	QueueOpen     = "OPEN"
-	QueueHealing  = "HEALING"
+	QueueOpen       = "OPEN"
+	QueueHealing    = "HEALING"
 	QueueHealFailed = "HEAL_FAILED"
-	QueuePaused   = "PAUSED"
-	QueueBlocked  = "BLOCKED_AWAITING_CORRELATION"
-	QueueCleaning = "CLEANING_HUB"
+	QueuePaused     = "PAUSED"
+	QueueBlocked    = "BLOCKED_AWAITING_CORRELATION"
+	QueueCleaning   = "CLEANING_HUB"
 
 	LockIdle      = "IDLE"
 	LockRunning   = "RUNNING_HARNESS"
@@ -143,15 +143,15 @@ type BackgroundTaskInfo struct {
 
 // Failure taxonomy categories and stages aliases.
 const (
-	FailureCategoryNone                 = dispatch.FailureCategoryNone
-	FailureCategoryDispatchClaimTimeout = dispatch.FailureCategoryDispatchClaimTimeout
-	FailureCategoryToolQuotaOrAuth      = dispatch.FailureCategoryToolQuotaOrAuth
-	FailureCategoryToolCrash            = dispatch.FailureCategoryToolCrash
-	FailureCategoryWorkspacePrepError   = dispatch.FailureCategoryWorkspacePrepError
+	FailureCategoryNone                   = dispatch.FailureCategoryNone
+	FailureCategoryDispatchClaimTimeout   = dispatch.FailureCategoryDispatchClaimTimeout
+	FailureCategoryToolQuotaOrAuth        = dispatch.FailureCategoryToolQuotaOrAuth
+	FailureCategoryToolCrash              = dispatch.FailureCategoryToolCrash
+	FailureCategoryWorkspacePrepError     = dispatch.FailureCategoryWorkspacePrepError
 	FailureCategoryBackgroundDrainTimeout = dispatch.FailureCategoryBackgroundDrainTimeout
-	FailureCategoryASEGateIncomplete    = dispatch.FailureCategoryASEGateIncomplete
-	FailureCategoryCircuitBreakerTripped = dispatch.FailureCategoryCircuitBreakerTripped
-	FailureCategoryStoryNotFound        = dispatch.FailureCategoryStoryNotFound
+	FailureCategoryASEGateIncomplete      = dispatch.FailureCategoryASEGateIncomplete
+	FailureCategoryCircuitBreakerTripped  = dispatch.FailureCategoryCircuitBreakerTripped
+	FailureCategoryStoryNotFound          = dispatch.FailureCategoryStoryNotFound
 
 	FailureStageIngress         = dispatch.FailureStageIngress
 	FailureStageQueueDispatch   = dispatch.FailureStageQueueDispatch
