@@ -5291,6 +5291,90 @@ func TestResolveToolPriorityAllocationMatchesDiagnosticsEligibility(t *testing.T
 	}
 }
 
+func TestGov3799_AckLeaseAndHeartbeatExtendToActiveLeaseDuration(t *testing.T) {
+	now := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return now })
+	_ = e.RegisterHost("host-1", "permanent", "generic")
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "host-1",
+		WorktreePath:                 "/work/meta-repo-01",
+		CloneURL:                     "https://example.test/meta-repo-01.git",
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	p := e.PutPrompt(Prompt{Title: "ASE Flow", Body: "run ase", Status: "READY", Engine: "agy"})
+	sch, err := e.ExecutePrompt(p.ID, "host-1", "/work/meta-repo-01", 1, nil)
+	if err != nil {
+		t.Fatalf("ExecutePrompt: %v", err)
+	}
+
+	job, _, _, ok := e.PollHost("host-1")
+	if !ok || job.ScheduleID != sch.ID {
+		t.Fatalf("expected PollHost to lease job")
+	}
+
+	// Initially PollHost sets 30s LeaseInterval
+	expInitial, ok := e.GetJobLeaseExpiry(job.ID)
+	if !ok || !expInitial.Equal(now.Add(LeaseInterval)) {
+		t.Fatalf("expected initial LeaseExpiry %v, got %v", now.Add(LeaseInterval), expInitial)
+	}
+
+	// 1. AckLease extends LeaseExpiry to ActiveLeaseDuration (5m) and clears LeaseAckDeadlineAt
+	now = now.Add(2 * time.Second)
+	if err := e.AckLease(job.ID, job.LeaseToken, 12345, ""); err != nil {
+		t.Fatalf("AckLease: %v", err)
+	}
+	expAfterAck, _ := e.GetJobLeaseExpiry(job.ID)
+	if !expAfterAck.Equal(now.Add(ActiveLeaseDuration)) {
+		t.Fatalf("expected AckLease to extend LeaseExpiry to %v (5m), got %v", now.Add(ActiveLeaseDuration), expAfterAck)
+	}
+
+	// Simulate 90s workspace sanitization across 30+ submodules without output chunks yet
+	now = now.Add(90 * time.Second)
+	e.ReapExpired()
+	jMidSanitize, ok := e.GetJob(job.ID)
+	if !ok || jMidSanitize.Status != "RUNNING" {
+		t.Fatalf("expected job to remain RUNNING during 90s workspace sanitization after AckLease, got %+v", jMidSanitize)
+	}
+
+	// 2. SetJobReadiness extends LeaseExpiry by ActiveLeaseDuration (5m) and updates LastOutputAt
+	if err := e.SetJobReadiness(job.ID, map[string]any{"reaped": 0}, map[string]any{"clean": true}, nil); err != nil {
+		t.Fatalf("SetJobReadiness: %v", err)
+	}
+	expAfterReadiness, _ := e.GetJobLeaseExpiry(job.ID)
+	if !expAfterReadiness.Equal(now.Add(ActiveLeaseDuration)) {
+		t.Fatalf("expected SetJobReadiness to extend LeaseExpiry to %v, got %v", now.Add(ActiveLeaseDuration), expAfterReadiness)
+	}
+
+	// 3. AddJobConversationWithOptions extends LeaseExpiry by ActiveLeaseDuration (5m)
+	now = now.Add(30 * time.Second)
+	if err := e.AddJobConversationWithOptions(job.ID, "conv-3799-abcd", ConversationAttachOptions{Role: "initial_active"}); err != nil {
+		t.Fatalf("AddJobConversationWithOptions: %v", err)
+	}
+	expAfterConv, _ := e.GetJobLeaseExpiry(job.ID)
+	if !expAfterConv.Equal(now.Add(ActiveLeaseDuration)) {
+		t.Fatalf("expected AddJobConversationWithOptions to extend LeaseExpiry to %v, got %v", now.Add(ActiveLeaseDuration), expAfterConv)
+	}
+
+	// 4. AppendLog sets 5m lease, and subsequent HeartbeatJob NEVER shrinks a longer lease and extends by 5m
+	now = now.Add(10 * time.Second)
+	e.AppendLog(job.ID, LogChunk{Text: "hello", Type: "OUTPUT_CHUNK"})
+	expAfterLog, _ := e.GetJobLeaseExpiry(job.ID)
+	if !expAfterLog.Equal(now.Add(ActiveLeaseDuration)) {
+		t.Fatalf("expected AppendLog LeaseExpiry %v, got %v", now.Add(ActiveLeaseDuration), expAfterLog)
+	}
+
+	now = now.Add(10 * time.Second)
+	if err := e.HeartbeatJob(job.ID, job.LeaseToken); err != nil {
+		t.Fatalf("HeartbeatJob: %v", err)
+	}
+	expAfterHb, _ := e.GetJobLeaseExpiry(job.ID)
+	if expAfterHb.Before(expAfterLog) || !expAfterHb.Equal(now.Add(ActiveLeaseDuration)) {
+		t.Fatalf("expected HeartbeatJob to extend LeaseExpiry to %v without shrinking, got %v", now.Add(ActiveLeaseDuration), expAfterHb)
+	}
+}
+
+
 
 
 
