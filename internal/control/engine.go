@@ -2477,7 +2477,12 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 			}
 			job.AttemptHistory = append(job.AttemptHistory, attemptRec)
 
-			isDirtyWorktreeAutoHeal := (opt.DiagnosticCode == "INCOMPLETE_DIRTY_WORKTREE" || opt.Reason == "INCOMPLETE_DIRTY_WORKTREE")
+			isDirtyWorktreeAutoHeal := (opt.DiagnosticCode == "INCOMPLETE_DIRTY_WORKTREE" ||
+				opt.Reason == "INCOMPLETE_DIRTY_WORKTREE" ||
+				opt.DiagnosticCode == "DIRTY_WORKTREE_POST_EXIT" ||
+				opt.Reason == "DIRTY_WORKTREE_POST_EXIT" ||
+				opt.DiagnosticCode == "incomplete_ase_flow" ||
+				opt.Reason == "incomplete_ase_flow")
 			if sch, ok := e.schedules[job.ScheduleID]; ok {
 				sch.AttemptHistory = append(sch.AttemptHistory, attemptRec)
 				sch.FailureCategory = job.FailureCategory
@@ -5338,8 +5343,11 @@ func (e *Engine) AbandonJob(jobID, reason string) error {
 	if !ok {
 		return ErrNotFound
 	}
-	// Guard against abandoning an already successfully completed job.
+	// Guard against abandoning an already successfully completed job, or overwriting an already-posted exit with process_died.
 	if job.Status == "RUN_FINISHED" || job.Status == "COMPLETED" || job.TerminationReasonCode == "COMPLETED_SUCCESS" {
+		return nil
+	}
+	if job.ExitPosted && strings.EqualFold(reason, "process_died") {
 		return nil
 	}
 	if reason == "" {

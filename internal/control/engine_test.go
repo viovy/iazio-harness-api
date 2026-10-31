@@ -5532,3 +5532,63 @@ func TestV4_BindStoryToJobAndFailoverJobSkipAttemptHistory(t *testing.T) {
 		t.Fatalf("expected FailoverJob to skip antigravity/agy and previously failed opencode and select claude, got %q", resp.Engine)
 	}
 }
+
+func TestGov3838_DirtyWorktreePostExitAutoHealAndNoProcessDiedOverwrite(t *testing.T) {
+	e := NewEngine(time.Now)
+	_ = e.RegisterHost("pc1-wsl", "permanent", "generic")
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "pc1-wsl",
+		WorktreePath:                 "/home/romeo/work/meta-repo",
+		CloneURL:                     "https://github.com/viovy/meta-repo.git",
+		GlobalQueueAllocationEnabled: true,
+	})
+	p := e.PutPrompt(Prompt{
+		Title:  "STORY-ROOT-245",
+		Body:   "Execute story STORY-ROOT-245",
+		Status: "READY",
+		Engine: "autopilot",
+	})
+	sch, err := e.ExecutePrompt(p.ID, "pc1-wsl", "/home/romeo/work/meta-repo", 1, nil)
+	if err != nil {
+		t.Fatalf("ExecutePrompt failed: %v", err)
+	}
+
+	job, _, _, ok := e.PollHost("pc1-wsl")
+	if !ok {
+		t.Fatal("expected leased job")
+	}
+
+	// 1. Harness posts exit with DIRTY_WORKTREE_POST_EXIT on first attempt -> schedule should auto-heal to QUEUED (KindResume)
+	if err := e.PostExit(job.ID, 1, ExitOptions{
+		Reason:         "DIRTY_WORKTREE_POST_EXIT",
+		DiagnosticCode: "DIRTY_WORKTREE_POST_EXIT",
+		ErrorMessage:   "Child engine exited with code 0 but left 4 modified/untracked files in worktree without completing story.",
+	}); err != nil {
+		t.Fatalf("PostExit failed: %v", err)
+	}
+
+	schAfter, ok := e.GetSchedule(sch.ID)
+	if !ok {
+		t.Fatal("expected schedule to exist")
+	}
+	if schAfter.Status != "QUEUED" || schAfter.Kind != KindResume {
+		t.Fatalf("expected schedule to auto-heal to QUEUED with KindResume, got status=%q kind=%q", schAfter.Status, schAfter.Kind)
+	}
+
+	// 2. Subsequent AbandonJob(job.ID, "process_died") from agent supervisor must NOT overwrite job or schedule status
+	if err := e.AbandonJob(job.ID, "process_died"); err != nil {
+		t.Fatalf("AbandonJob failed: %v", err)
+	}
+
+	jobAfter, ok := e.GetJob(job.ID)
+	if !ok {
+		t.Fatal("expected job to exist")
+	}
+	if jobAfter.Reason != "DIRTY_WORKTREE_POST_EXIT" {
+		t.Fatalf("expected job reason to remain DIRTY_WORKTREE_POST_EXIT, got %q", jobAfter.Reason)
+	}
+	schAfterAbandon, _ := e.GetSchedule(sch.ID)
+	if schAfterAbandon.Status != "QUEUED" {
+		t.Fatalf("expected schedule status to remain QUEUED after ignored process_died abandon, got %q", schAfterAbandon.Status)
+	}
+}
