@@ -411,7 +411,9 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 
 		// 2. Claim lease & heartbeat timeout:
 		if j.Status == JobStatusClaimed || j.Status == JobStatusRunning {
-			if q.claimTimeout > 0 && j.ClaimedAt != nil && !j.ClaimedAt.IsZero() && now.Sub(*j.ClaimedAt) > q.claimTimeout {
+			hasActiveHeartbeatOrTool := (j.LeaseExpiresAt != nil && !j.LeaseExpiresAt.IsZero() && !now.After(*j.LeaseExpiresAt)) &&
+				((j.HeartbeatAt != nil && j.ClaimedAt != nil && j.HeartbeatAt.After(*j.ClaimedAt)) || j.ToolPID > 0 || j.ActiveConversationID != "")
+			if q.claimTimeout > 0 && j.ClaimedAt != nil && !j.ClaimedAt.IsZero() && now.Sub(*j.ClaimedAt) > q.claimTimeout && !hasActiveHeartbeatOrTool {
 				j.Status = JobStatusFailed
 				j.Error = "LEASE_EXPIRED: execution lease expired without completion"
 				j.FailureCategory = FailureCategoryBackgroundDrainTimeout
@@ -759,6 +761,10 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 		if j.Status == JobStatusFailed && activeSet[j.ID] && isReconcilableFailure(j.Error) {
 			j.Status = JobStatusRunning
 			j.Error = ""
+			j.FailureCategory = ""
+			j.FailureStage = ""
+			j.FailureReasonSummary = ""
+			j.Retriable = false
 			j.CompletedAt = nil
 		}
 
@@ -919,8 +925,71 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 
 	now := q.now()
 	job.CompletedAt = &now
+
+	var resMap map[string]any
+	if len(result) > 0 {
+		_ = json.Unmarshal(result, &resMap)
+	}
+	if resMap != nil {
+		if cid, ok := resMap["active_conversation_id"].(string); ok && strings.TrimSpace(cid) != "" && job.ActiveConversationID == "" {
+			job.ActiveConversationID = strings.TrimSpace(cid)
+		} else if cid, ok := resMap["conversation_id"].(string); ok && strings.TrimSpace(cid) != "" && job.ActiveConversationID == "" {
+			job.ActiveConversationID = strings.TrimSpace(cid)
+		}
+		if job.ActiveConversationID != "" {
+			hasConv := false
+			for _, existing := range job.ConversationIDs {
+				if existing == job.ActiveConversationID {
+					hasConv = true
+					break
+				}
+			}
+			if !hasConv {
+				job.ConversationIDs = append(job.ConversationIDs, job.ActiveConversationID)
+			}
+		}
+		if hp, ok := resMap["harness_pid"].(float64); ok && int(hp) > 0 && job.HarnessPID == 0 {
+			job.HarnessPID = int(hp)
+		}
+		if tp, ok := resMap["tool_pid"].(float64); ok && int(tp) > 0 && job.ToolPID == 0 {
+			job.ToolPID = int(tp)
+		}
+		if el, ok := resMap["elapsed_seconds"].(float64); ok && int64(el) > 0 && job.ElapsedSeconds == 0 {
+			job.ElapsedSeconds = int64(el)
+		}
+		if sid, ok := resMap["story_id"].(string); ok && strings.TrimSpace(sid) != "" && job.StoryID == "" {
+			job.StoryID = strings.TrimSpace(sid)
+		}
+		if stitle, ok := resMap["story_title"].(string); ok && strings.TrimSpace(stitle) != "" && job.StoryTitle == "" {
+			job.StoryTitle = strings.TrimSpace(stitle)
+		}
+		if spath, ok := resMap["story_path"].(string); ok && strings.TrimSpace(spath) != "" && job.StoryPath == "" {
+			job.StoryPath = strings.TrimSpace(spath)
+		}
+		if errStr == "" {
+			resStatus, _ := resMap["status"].(string)
+			resFailCat, _ := resMap["failure_category"].(string)
+			resFailStage, _ := resMap["failure_stage"].(string)
+			if strings.EqualFold(resStatus, "timed_out") || strings.EqualFold(resStatus, "failed") ||
+				(resFailCat != "" && !strings.EqualFold(resFailCat, FailureCategoryNone)) {
+				if resFailCat != "" {
+					job.FailureCategory = resFailCat
+				}
+				if resFailStage != "" {
+					job.FailureStage = resFailStage
+				}
+				if job.FailureCategory == FailureCategoryBackgroundDrainTimeout || strings.EqualFold(resStatus, "timed_out") {
+					errStr = "BACKGROUND_DRAIN_TIMEOUT: execution interrupted during background drain before completion"
+				} else {
+					errStr = fmt.Sprintf("execution returned non-completed status %q", resStatus)
+				}
+			}
+		}
+	}
+
 	if errStr != "" {
 		job.Status = JobStatusFailed
+		job.Result = result
 		job.Error = errStr
 		cat, stage, summary, retriable := ClassifyDispatchFailure(errStr)
 		if job.FailureCategory == "" || job.FailureCategory == FailureCategoryNone {
@@ -937,6 +1006,10 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 		job.Status = JobStatusCompleted
 		job.Result = result
 		job.Error = ""
+		job.FailureCategory = ""
+		job.FailureStage = ""
+		job.FailureReasonSummary = ""
+		job.Retriable = false
 	}
 
 	if q.store != nil && job.CompletedAt != nil {
@@ -1140,8 +1213,10 @@ func (q *InMemoryQueue) List(ctx context.Context, filter JobFilter) ([]*Job, err
 	q.reapExpiredLocked(q.now())
 
 	limit := filter.Limit
-	if limit <= 0 || limit > 100 {
+	if limit <= 0 {
 		limit = 50
+	} else if limit > 1000 {
+		limit = 1000
 	}
 
 	var matched []*Job

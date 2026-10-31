@@ -419,12 +419,16 @@ func populateJobResumptionFields(
 
 func historyRowView(h control.HistoryRow) map[string]any {
 	ids := h.ConversationIDs
+	if len(ids) == 0 && h.ActiveConversationID != "" {
+		ids = []string{h.ActiveConversationID}
+	}
 	if ids == nil {
 		ids = []string{}
 	}
 	m := map[string]any{
 		"job_id":                    h.JobID,
 		"schedule_id":               h.ScheduleID,
+		"story_id":                  h.StoryID,
 		"prompt_title":              h.PromptTitle,
 		"engine":                    h.Engine,
 		"status":                    h.Status,
@@ -732,6 +736,81 @@ func dispatchScheduleView(j *dispatch.Job) map[string]any {
 	}
 }
 
+func dispatchJobToHistoryRow(j *dispatch.Job) control.HistoryRow {
+	if j == nil {
+		return control.HistoryRow{}
+	}
+	title, _, storyID := parseDispatchPayload(j.Payload)
+	if j.StoryID != "" {
+		storyID = j.StoryID
+	}
+	if title == "" && j.StoryTitle != "" {
+		title = j.StoryTitle
+	}
+	if title == "" && storyID != "" {
+		title = storyID
+	}
+	if title == "" {
+		title = fmt.Sprintf("Dispatch Job %s (%s)", j.ID, j.Type)
+	}
+	engine := j.TargetAgent
+	if engine == "" {
+		engine = "auto"
+	}
+	status := strings.ToUpper(j.Status)
+	if status == "CANCELED" {
+		status = "CANCELLED"
+	}
+	clean := status == "COMPLETED"
+	convIDs := j.ConversationIDs
+	if len(convIDs) == 0 && j.ActiveConversationID != "" {
+		convIDs = []string{j.ActiveConversationID}
+	}
+	harnessPID := j.HarnessPID
+	if harnessPID == 0 {
+		harnessPID = j.AgentPID
+	}
+	attempts := j.Attempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	return control.HistoryRow{
+		JobID:                 j.ID,
+		StoryID:               storyID,
+		StoryAllocationStatus: j.StoryAllocationStatus,
+		AllocationSource:      j.AllocationSource,
+		PriorityRankSelected:  j.PriorityRankSelected,
+		PromptTitle:           title,
+		Engine:                engine,
+		Status:                status,
+		Clean:                 clean,
+		ASEComplete:           clean,
+		ConversationIDs:       convIDs,
+		ActiveConversationID:  j.ActiveConversationID,
+		InitialConversationID: j.ActiveConversationID,
+		Reason:                j.Error,
+		ErrorMessage:          j.Error,
+		TraceID:               j.TraceID,
+		CreatedAt:             j.CreatedAt,
+		ParentJobID:           j.ParentID,
+		ExecutionAttempt:      attempts,
+		Resumable:             j.ActiveConversationID != "" || len(convIDs) > 0,
+		HarnessPID:            harnessPID,
+		ToolPID:               j.ToolPID,
+		LeaseToken:            j.LeaseToken,
+		LeaseAckDeadlineAt:    j.LeaseAckDeadlineAt,
+		FailureCategory:       j.FailureCategory,
+		FailureStage:          j.FailureStage,
+		FailureReasonSummary:  j.FailureReasonSummary,
+		Retriable:             j.Retriable,
+		AttemptHistory:        j.AttemptHistory,
+		ZipkinTraceID:         j.ZipkinTraceID,
+		ZipkinTraceURL:        j.ZipkinTraceURL,
+		Traceparent:           j.Traceparent,
+		InfraRequeueCount:     j.InfraRequeueCount,
+	}
+}
+
 func dispatchHistoryView(j *dispatch.Job) map[string]any {
 	if j == nil {
 		return map[string]any{}
@@ -859,14 +938,20 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 		harnessPID = j.AgentPID
 	}
 	elapsedSec := j.ElapsedSeconds
-	if elapsedSec <= 0 && j.ClaimedAt != nil {
-		if j.CompletedAt != nil {
-			elapsedSec = int64(j.CompletedAt.Sub(*j.ClaimedAt).Seconds())
-		} else {
-			elapsedSec = int64(time.Since(*j.ClaimedAt).Seconds())
+	if elapsedSec <= 0 {
+		startRef := j.CreatedAt
+		if j.ClaimedAt != nil && !j.ClaimedAt.IsZero() {
+			startRef = *j.ClaimedAt
 		}
-		if elapsedSec < 0 {
-			elapsedSec = 0
+		if !startRef.IsZero() {
+			if j.CompletedAt != nil {
+				elapsedSec = int64(j.CompletedAt.Sub(startRef).Seconds())
+			} else if strings.EqualFold(j.Status, dispatch.JobStatusRunning) || strings.EqualFold(j.Status, dispatch.JobStatusClaimed) || strings.EqualFold(j.Status, dispatch.JobStatusLeased) {
+				elapsedSec = int64(time.Since(startRef).Seconds())
+			}
+			if elapsedSec < 0 {
+				elapsedSec = 0
+			}
 		}
 	}
 	diag := j.DispatchDiagnostics

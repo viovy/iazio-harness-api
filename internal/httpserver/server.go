@@ -1480,20 +1480,46 @@ func (s *Server) listHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	items := s.Engine.ListHistory(hostID, repoPath, status, limit)
 	out := make([]map[string]any, 0, len(items))
+	seenJobIDs := make(map[string]bool, len(items))
 	for _, h := range items {
 		out = append(out, historyItemView(h))
+		if h.JobID != "" {
+			seenJobIDs[h.JobID] = true
+		}
 	}
 	if s.Queue != nil {
-		qJobs, _ := s.Queue.List(r.Context(), dispatch.JobFilter{
-			Repo: repoPath,
-		})
+		qJobs, _ := s.Queue.List(r.Context(), dispatch.JobFilter{Limit: 250})
+		normRepoFilter := strings.TrimRight(strings.TrimSpace(repoPath), "/")
 		for _, qj := range qJobs {
-			if qj.Status == dispatch.JobStatusCompleted || qj.Status == dispatch.JobStatusFailed || qj.Status == dispatch.JobStatusCanceled || qj.Status == dispatch.JobStatusRequeued {
-				if status != "" && !strings.EqualFold(status, qj.Status) && !(strings.EqualFold(status, "CANCELLED") && qj.Status == dispatch.JobStatusCanceled) && !(strings.EqualFold(status, "CANCELED") && qj.Status == dispatch.JobStatusCanceled) {
+			if qj == nil || seenJobIDs[qj.ID] {
+				continue
+			}
+			if qj.Status != dispatch.JobStatusCompleted && qj.Status != dispatch.JobStatusFailed && qj.Status != dispatch.JobStatusCanceled && qj.Status != dispatch.JobStatusRequeued {
+				continue
+			}
+			if hostID != "" {
+				qHost := qj.ClaimedHost
+				if qHost == "" {
+					qHost = qj.HostID
+				}
+				if qHost == "" {
+					qHost = qj.TargetHost
+				}
+				if !strings.EqualFold(hostID, qHost) {
 					continue
 				}
-				out = append(out, dispatchHistoryView(qj))
 			}
+			if normRepoFilter != "" {
+				qRepo := strings.TrimRight(strings.TrimSpace(qj.Repo), "/")
+				if qRepo != normRepoFilter && !strings.HasSuffix(qRepo, "/"+normRepoFilter) && !strings.HasSuffix(normRepoFilter, "/"+qRepo) {
+					continue
+				}
+			}
+			if status != "" && !strings.EqualFold(status, qj.Status) && !(strings.EqualFold(status, "CANCELLED") && qj.Status == dispatch.JobStatusCanceled) && !(strings.EqualFold(status, "CANCELED") && qj.Status == dispatch.JobStatusCanceled) {
+				continue
+			}
+			seenJobIDs[qj.ID] = true
+			out = append(out, dispatchHistoryView(qj))
 		}
 	}
 
@@ -3181,70 +3207,124 @@ func (s *Server) enrichRepoWithDispatch(repo *control.Repo) *dispatch.Job {
 }
 
 func (s *Server) enrichRepoDetailWithDispatch(detail *control.RepoDetail) {
-	if detail == nil || detail.Running != nil {
+	if detail == nil {
 		return
 	}
-	qJob := s.enrichRepoWithDispatch(&detail.Repo)
-	if qJob == nil {
-		return
-	}
-	engine := qJob.TargetAgent
-	if engine == "" {
-		engine = "auto"
-	}
-	hostID := qJob.ClaimedHost
-	if hostID == "" {
-		hostID = qJob.HostID
-	}
-	if hostID == "" {
-		hostID = detail.Repo.HostID
-	}
-	harnessPID := qJob.HarnessPID
-	if harnessPID == 0 {
-		harnessPID = qJob.AgentPID
-	}
-	convIDs := qJob.ConversationIDs
-	if len(convIDs) == 0 && qJob.ActiveConversationID != "" {
-		convIDs = []string{qJob.ActiveConversationID}
-	}
-	startedAt := qJob.CreatedAt
-	if qJob.ClaimedAt != nil && !qJob.ClaimedAt.IsZero() {
-		startedAt = *qJob.ClaimedAt
-	}
-	elapsedSec := qJob.ElapsedSeconds
-	if elapsedSec <= 0 && !startedAt.IsZero() {
-		elapsedSec = int64(time.Since(startedAt).Seconds())
-		if elapsedSec < 0 {
-			elapsedSec = 0
+	if detail.Running == nil {
+		if qJob := s.enrichRepoWithDispatch(&detail.Repo); qJob != nil {
+			engine := qJob.TargetAgent
+			if engine == "" {
+				engine = "auto"
+			}
+			hostID := qJob.ClaimedHost
+			if hostID == "" {
+				hostID = qJob.HostID
+			}
+			if hostID == "" {
+				hostID = detail.Repo.HostID
+			}
+			harnessPID := qJob.HarnessPID
+			if harnessPID == 0 {
+				harnessPID = qJob.AgentPID
+			}
+			convIDs := qJob.ConversationIDs
+			if len(convIDs) == 0 && qJob.ActiveConversationID != "" {
+				convIDs = []string{qJob.ActiveConversationID}
+			}
+			startedAt := qJob.CreatedAt
+			if qJob.ClaimedAt != nil && !qJob.ClaimedAt.IsZero() {
+				startedAt = *qJob.ClaimedAt
+			}
+			elapsedSec := qJob.ElapsedSeconds
+			if elapsedSec <= 0 && !startedAt.IsZero() {
+				elapsedSec = int64(time.Since(startedAt).Seconds())
+				if elapsedSec < 0 {
+					elapsedSec = 0
+				}
+			}
+			title := qJob.StoryID
+			if title == "" {
+				title = qJob.StoryTitle
+			}
+			if title == "" {
+				title = qJob.ID
+			}
+			attempts := qJob.Attempts
+			if attempts < 1 {
+				attempts = 1
+			}
+			detail.Running = &control.Job{
+				ID:                   qJob.ID,
+				Status:               strings.ToUpper(qJob.Status),
+				HostID:               hostID,
+				TargetHost:           qJob.TargetHost,
+				ConversationIDs:      convIDs,
+				ActiveConversationID: qJob.ActiveConversationID,
+				HarnessPID:           harnessPID,
+				ToolPID:              qJob.ToolPID,
+				ElapsedSeconds:       elapsedSec,
+				ExecutionAttempt:     attempts,
+				TraceID:              qJob.TraceID,
+			}
+			detail.RunningTitle = title
+			detail.RunningEngine = engine
+			detail.RunningStartedAt = startedAt
 		}
 	}
-	title := qJob.StoryID
-	if title == "" {
-		title = qJob.StoryTitle
+
+	if s.Queue == nil {
+		return
 	}
-	if title == "" {
-		title = qJob.ID
+	qJobs, err := s.Queue.List(context.Background(), dispatch.JobFilter{Limit: 250})
+	if err != nil || len(qJobs) == 0 {
+		return
 	}
-	attempts := qJob.Attempts
-	if attempts < 1 {
-		attempts = 1
+	seenIDs := make(map[string]bool, len(detail.History))
+	for _, h := range detail.History {
+		if h.JobID != "" {
+			seenIDs[h.JobID] = true
+		}
 	}
-	detail.Running = &control.Job{
-		ID:                   qJob.ID,
-		Status:               strings.ToUpper(qJob.Status),
-		HostID:               hostID,
-		TargetHost:           qJob.TargetHost,
-		ConversationIDs:      convIDs,
-		ActiveConversationID: qJob.ActiveConversationID,
-		HarnessPID:           harnessPID,
-		ToolPID:              qJob.ToolPID,
-		ElapsedSeconds:       elapsedSec,
-		ExecutionAttempt:     attempts,
-		TraceID:              qJob.TraceID,
+	repoPath := strings.TrimRight(strings.TrimSpace(detail.Repo.WorktreePath), "/")
+	repoAlias := strings.TrimSpace(detail.Repo.EffectiveAlias())
+	var addedAny bool
+	for _, qJob := range qJobs {
+		if qJob == nil || seenIDs[qJob.ID] {
+			continue
+		}
+		st := strings.ToLower(strings.TrimSpace(qJob.Status))
+		if st != dispatch.JobStatusCompleted && st != dispatch.JobStatusFailed && st != dispatch.JobStatusCanceled && st != dispatch.JobStatusRequeued {
+			continue
+		}
+		jobHost := qJob.ClaimedHost
+		if jobHost == "" {
+			jobHost = qJob.HostID
+		}
+		if jobHost == "" {
+			jobHost = qJob.TargetHost
+		}
+		if detail.Repo.HostID != "" && jobHost != "" && !strings.EqualFold(detail.Repo.HostID, jobHost) {
+			continue
+		}
+		qRepo := strings.TrimRight(strings.TrimSpace(qJob.Repo), "/")
+		if qRepo == "" {
+			continue
+		}
+		matchesRepo := qRepo == repoPath ||
+			(repoAlias != "" && (qRepo == repoAlias || strings.HasSuffix(qRepo, "/"+repoAlias))) ||
+			(repoPath != "" && strings.HasSuffix(repoPath, "/"+qRepo))
+		if !matchesRepo {
+			continue
+		}
+		seenIDs[qJob.ID] = true
+		detail.History = append(detail.History, dispatchJobToHistoryRow(qJob))
+		addedAny = true
 	}
-	detail.RunningTitle = title
-	detail.RunningEngine = engine
-	detail.RunningStartedAt = startedAt
+	if addedAny {
+		sort.SliceStable(detail.History, func(i, j int) bool {
+			return detail.History[i].CreatedAt.After(detail.History[j].CreatedAt)
+		})
+	}
 }
 
 func (s *Server) unregisterRepo(w http.ResponseWriter, r *http.Request) {
@@ -3662,6 +3742,23 @@ func synthesizeDispatchJobFallbackChunk(qJob *dispatch.Job) control.LogChunk {
 	if harnessPID == 0 {
 		harnessPID = qJob.AgentPID
 	}
+	elapsedSec := qJob.ElapsedSeconds
+	if elapsedSec <= 0 {
+		startRef := qJob.CreatedAt
+		if qJob.ClaimedAt != nil && !qJob.ClaimedAt.IsZero() {
+			startRef = *qJob.ClaimedAt
+		}
+		if !startRef.IsZero() {
+			if qJob.CompletedAt != nil {
+				elapsedSec = int64(qJob.CompletedAt.Sub(startRef).Seconds())
+			} else if strings.EqualFold(qJob.Status, dispatch.JobStatusRunning) || strings.EqualFold(qJob.Status, dispatch.JobStatusClaimed) || strings.EqualFold(qJob.Status, dispatch.JobStatusLeased) {
+				elapsedSec = int64(time.Since(startRef).Seconds())
+			}
+			if elapsedSec < 0 {
+				elapsedSec = 0
+			}
+		}
+	}
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "[ASE-SUPERVISOR] Job %s (%s) on host=%s repo=%s engine=%s\n",
 		qJob.ID, strings.ToUpper(qJob.Status), host, qJob.Repo, engine)
@@ -3671,12 +3768,22 @@ func synthesizeDispatchJobFallbackChunk(qJob *dispatch.Job) control.LogChunk {
 	if qJob.ActiveConversationID != "" {
 		fmt.Fprintf(&sb, "[ASE-SUPERVISOR] Active Conversation: %s\n", qJob.ActiveConversationID)
 	}
-	if harnessPID > 0 || qJob.ToolPID > 0 || qJob.ElapsedSeconds > 0 {
+	if qJob.FailureCategory != "" && !strings.EqualFold(qJob.FailureCategory, dispatch.FailureCategoryNone) {
+		fmt.Fprintf(&sb, "[ASE-SUPERVISOR] Failure Category: %s (stage=%s)\n", qJob.FailureCategory, qJob.FailureStage)
+	}
+	if harnessPID > 0 || qJob.ToolPID > 0 || elapsedSec > 0 {
 		fmt.Fprintf(&sb, "[ASE-SUPERVISOR] Runtime Telemetry: harness_pid=%d tool_pid=%d elapsed=%ds\n",
-			harnessPID, qJob.ToolPID, qJob.ElapsedSeconds)
+			harnessPID, qJob.ToolPID, elapsedSec)
 	}
 	if strings.EqualFold(qJob.Status, dispatch.JobStatusRunning) {
 		sb.WriteString("[ASE-SUPERVISOR] Active CLI tool process is running (streaming output chunks as they arrive)...\n")
+	} else if len(qJob.Result) > 0 {
+		var resMap map[string]any
+		if json.Unmarshal(qJob.Result, &resMap) == nil {
+			if summary, ok := resMap["summary"].(string); ok && strings.TrimSpace(summary) != "" {
+				sb.WriteString(strings.TrimSpace(summary) + "\n")
+			}
+		}
 	}
 	return control.LogChunk{
 		Seq:            0,
@@ -3685,7 +3792,7 @@ func synthesizeDispatchJobFallbackChunk(qJob *dispatch.Job) control.LogChunk {
 		Text:           sb.String(),
 		HarnessPID:     harnessPID,
 		ToolPID:        qJob.ToolPID,
-		ElapsedSeconds: qJob.ElapsedSeconds,
+		ElapsedSeconds: elapsedSec,
 	}
 }
 
