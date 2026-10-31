@@ -35,11 +35,9 @@ const (
 	JobStatusLeased    = "leased"
 	JobStatusClaimed   = "claimed"
 	JobStatusRunning   = "running"
-	JobStatusVerifying = "verifying"
 	JobStatusCompleted = "completed"
 	JobStatusFailed    = "failed"
 	JobStatusCanceled  = "canceled"
-	JobStatusStalled   = "stalled"
 	JobStatusRequeued  = "requeued"
 )
 
