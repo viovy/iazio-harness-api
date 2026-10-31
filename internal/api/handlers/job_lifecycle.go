@@ -29,6 +29,13 @@ type StoryValidator interface {
 	StoryExists(storyID, submodule string) bool
 }
 
+const (
+	modeStoryCreate           = "story.create"
+	modeStoryExecute          = "story.execute"
+	modeStoryCreateAndExecute = "story.create_and_execute"
+	defaultASECommand         = "/autonomous-story-execution"
+)
+
 // JobLifecycleHandler manages querying, listing, canceling, and retrying agent jobs.
 type JobLifecycleHandler struct {
 	queue          dispatch.Queue
@@ -96,15 +103,26 @@ func (h *JobLifecycleHandler) isStoryAvailable(storyID, submodule string) bool {
 		}
 	}
 
-	// Also check if any .story.md file matches this storyID in docs/stories or submodule/docs/stories
+	// Also check if any .story.md file matches this storyID in docs/stories, family hubs, or submodule/docs/stories
 	storyCandidates := []string{
 		filepath.Join(root, "docs", "stories"),
+		filepath.Join(root, "iazio-infra", "docs", "stories"),
+		filepath.Join(root, "autopilot-umbrella", "docs", "stories"),
+		filepath.Join(root, "vigo", "docs", "stories"),
+		filepath.Join(root, "eye-habit", "docs", "stories"),
 	}
 	if submodule != "" && submodule != "." {
 		storyCandidates = append(storyCandidates,
 			filepath.Join(root, submodule, "docs", "stories"),
 			filepath.Join(submodule, "docs", "stories"),
 		)
+	}
+	for _, hubDir := range []string{"iazio-infra", "autopilot-umbrella", "vigo", "eye-habit"} {
+		for _, s := range loadIndexStories(filepath.Join(root, hubDir)) {
+			if strings.EqualFold(s.ID, storyID) || strings.EqualFold(strings.TrimPrefix(s.ID, "STORY-"), strings.TrimPrefix(storyID, "STORY-")) {
+				return true
+			}
+		}
 	}
 
 	for _, dir := range storyCandidates {
@@ -187,6 +205,7 @@ type CancelJobRequest struct {
 type ExecuteStoryRequest struct {
 	Submodule               string `json:"submodule,omitempty"`
 	Repo                    string `json:"repo,omitempty"`
+	Backlog                 string `json:"backlog,omitempty"`
 	StoryID                 string `json:"story_id,omitempty"`
 	TargetAgent             string `json:"target_agent,omitempty"`
 	Host                    string `json:"host,omitempty"`
@@ -195,6 +214,8 @@ type ExecuteStoryRequest struct {
 	Specification           string `json:"specification,omitempty"`
 	Description             string `json:"description,omitempty"`
 	Action                  string `json:"action,omitempty"`
+	Command                 string `json:"command,omitempty"`
+	Mode                    string `json:"mode,omitempty"`
 	SourceConversationTitle string `json:"source_conversation_title,omitempty"`
 	SourceContext           string `json:"source_context,omitempty"`
 	TraceID                 string `json:"trace_id,omitempty"`
@@ -206,6 +227,8 @@ type ExecuteStoryResponse struct {
 	JobID                 string `json:"job_id"`
 	StoryID               string `json:"story_id,omitempty"`
 	Submodule             string `json:"submodule"`
+	Backlog               string `json:"backlog,omitempty"`
+	Mode                  string `json:"mode,omitempty"`
 	TargetAgent           string `json:"target_agent"`
 	TargetHost            string `json:"target_host,omitempty"`
 	TargetRepo            string `json:"target_repo,omitempty"`
@@ -476,13 +499,32 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		storyID = strings.TrimSpace(req.StoryID)
 	}
 
+	mode := strings.TrimSpace(req.Mode)
+	switch mode {
+	case modeStoryCreateAndExecute, modeStoryCreate:
+		// Modes 1 and 3 never mock or accept a pre-assigned story ID.
+		storyID = ""
+	case modeStoryExecute:
+		if storyID == "" {
+			writeJSONError(w, http.StatusUnprocessableEntity, "story_id is mandatory for story.execute")
+			return
+		}
+	default:
+		if storyID != "" {
+			mode = modeStoryExecute
+		} else {
+			mode = modeStoryCreateAndExecute
+		}
+	}
+
+	backlog := strings.TrimSpace(req.Backlog)
 	submodule := strings.TrimSpace(req.Submodule)
 	if submodule == "" {
 		submodule = strings.TrimSpace(req.Repo)
 	}
 
 	var storyTitle, storyPath string
-	root := resolveStoriesRoot(h.repoRoot)
+	root := resolveBacklogStoriesRoot(h.repoRoot, backlog, submodule)
 	if storyID != "" {
 		if h.engine != nil {
 			if st, ok := h.engine.GetStory(storyID); ok {
@@ -536,22 +578,50 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 	if promptText == "" {
 		promptText = strings.TrimSpace(req.Description)
 	}
-	if promptText == "" {
-		if storyID != "" {
-			promptText = fmt.Sprintf("Execute autonomous story flow for %s in %s.", storyID, submodule)
+
+	action := strings.TrimSpace(req.Command)
+	if action == "" {
+		action = strings.TrimSpace(req.Action)
+	}
+	if action == "" {
+		if mode == modeStoryCreate {
+			action = "/story-create"
 		} else {
-			promptText = fmt.Sprintf("Execute autonomous story flow in %s.", submodule)
+			action = defaultASECommand
 		}
 	}
-
-	action := strings.TrimSpace(req.Action)
-	if action == "" {
-		action = "/autonomous-story-execution"
+	if !strings.HasPrefix(action, "/") {
+		action = "/" + action
 	}
-	normalizedPrompt := control.NormalizeASEPrompt(promptText, action)
+
+	var normalizedPrompt string
+	if mode == modeStoryExecute && storyID != "" {
+		// Mode 2: concatenation of command ("/autonomous-story-execution") followed by story_id (and optional prompt)
+		if strings.HasPrefix(promptText, action+" "+storyID) || strings.HasPrefix(promptText, action+"\n"+storyID) {
+			normalizedPrompt = promptText
+		} else {
+			extra := strings.TrimSpace(strings.TrimPrefix(promptText, action))
+			extra = strings.TrimSpace(strings.TrimPrefix(extra, storyID))
+			if extra != "" {
+				normalizedPrompt = action + " " + storyID + " " + extra
+			} else {
+				normalizedPrompt = action + " " + storyID
+			}
+		}
+	} else {
+		if promptText == "" {
+			if mode == modeStoryCreate {
+				promptText = fmt.Sprintf("Create story in backlog for %s.", submodule)
+			} else {
+				promptText = fmt.Sprintf("Execute autonomous story flow in %s.", submodule)
+			}
+		}
+		normalizedPrompt = control.NormalizeASEPrompt(promptText, action)
+	}
 
 	targetAgent := strings.TrimSpace(req.TargetAgent)
 	targetHost := strings.TrimSpace(req.Host)
+	targetRepo := submodule
 	allocationSource := "explicit_target"
 	priorityRankSelected := 0
 
@@ -559,6 +629,9 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		alloc := h.engine.ResolveToolPriorityAllocation(targetAgent, targetHost, submodule)
 		targetAgent = alloc.TargetAgent
 		targetHost = alloc.TargetHost
+		if alloc.TargetRepo != "" && alloc.TargetRepo != "root" && (submodule == "" || submodule == "." || submodule == "root") {
+			targetRepo = alloc.TargetRepo
+		}
 		allocationSource = alloc.AllocationSource
 		priorityRankSelected = alloc.PriorityRankSelected
 	} else if targetAgent == "" {
@@ -583,7 +656,12 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 
 	execPayload, err := json.Marshal(map[string]any{
 		"prompt_id":                 promptID,
-		"repo":                      submodule,
+		"repo":                      targetRepo,
+		"submodule":                 submodule,
+		"backlog":                   backlog,
+		"mode":                      mode,
+		"command":                   action,
+		"worktree_path":             targetRepo,
 		"story_id":                  storyID,
 		"story_title":               storyTitle,
 		"story_path":                storyPath,
@@ -593,6 +671,7 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		"source_conversation_title": req.SourceConversationTitle,
 		"title":                     execTitle,
 		"prompt":                    normalizedPrompt,
+		"normalized_prompt":         normalizedPrompt,
 		"effective_action":          action,
 		"target_agent":              targetAgent,
 		"target_host":               targetHost,
@@ -605,7 +684,7 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 
 	job, err := h.queue.Enqueue(r.Context(), &dispatch.Job{
 		Type:                    dispatch.JobTypePromptExecute,
-		Repo:                    submodule,
+		Repo:                    targetRepo,
 		TargetHost:              targetHost,
 		TargetAgent:             targetAgent,
 		StoryID:                 storyID,
@@ -655,6 +734,8 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		JobID:                 job.ID,
 		StoryID:               storyID,
 		Submodule:             submodule,
+		Backlog:               backlog,
+		Mode:                  mode,
 		TargetAgent:           targetAgent,
 		TargetHost:            targetHost,
 		TargetRepo:            submodule,
@@ -872,7 +953,10 @@ func (h *JobLifecycleHandler) GetJobAttribution(w http.ResponseWriter, r *http.R
 type AckLeaseRequest struct {
 	LeaseToken           string `json:"lease_token"`
 	AgentPID             int    `json:"agent_pid"`
+	ToolPID              int    `json:"tool_pid,omitempty"`
 	ActiveConversationID string `json:"active_conversation_id"`
+	WorktreePath         string `json:"worktree_path,omitempty"`
+	Repo                 string `json:"repo,omitempty"`
 }
 
 // AckLease serves POST /api/v1/global-queue/jobs/{id}/ack-lease and POST /api/v1/jobs/{id}/ack-lease.
@@ -896,9 +980,10 @@ func (h *JobLifecycleHandler) AckLease(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var qJob *dispatch.Job
 	var errQueue error
 	if h.queue != nil {
-		_, errQueue = h.queue.AckLease(r.Context(), jobID, req.LeaseToken, req.AgentPID, req.ActiveConversationID)
+		qJob, errQueue = h.queue.AckLease(r.Context(), jobID, req.LeaseToken, req.AgentPID, req.ActiveConversationID)
 	}
 
 	var errEngine error
@@ -911,12 +996,38 @@ func (h *JobLifecycleHandler) AckLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	effectiveWT := strings.TrimSpace(req.WorktreePath)
+	if effectiveWT == "" {
+		effectiveWT = strings.TrimSpace(req.Repo)
+	}
+	if qJob != nil {
+		if effectiveWT == "" {
+			effectiveWT = strings.TrimSpace(qJob.Repo)
+		}
+		if h.engine != nil {
+			hostID := qJob.ClaimedHost
+			if hostID == "" {
+				hostID = qJob.HostID
+			}
+			boundWT := h.engine.BindDispatchJobRepo(hostID, effectiveWT, jobID)
+			if boundWT != "" {
+				effectiveWT = boundWT
+			}
+		}
+		if updater, ok := h.queue.(interface {
+			UpdateRuntimeMetadata(jobID, worktreePath, activeConvID string, harnessPID, toolPID int, elapsedSec int64) (*dispatch.Job, bool)
+		}); ok {
+			updater.UpdateRuntimeMetadata(jobID, effectiveWT, req.ActiveConversationID, req.AgentPID, req.ToolPID, 0)
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status":  "acknowledged",
-		"job_id":  jobID,
-		"message": "Phase 2 lease handshake completed; job transitioned to running",
+		"status":        "acknowledged",
+		"job_id":        jobID,
+		"worktree_path": effectiveWT,
+		"message":       "Phase 2 lease handshake completed; job transitioned to running",
 	})
 }
 
@@ -934,8 +1045,14 @@ func (h *JobLifecycleHandler) Heartbeat(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var req struct {
-		LeaseToken   string `json:"lease_token"`
-		FencingToken int64  `json:"fencing_token"`
+		LeaseToken           string `json:"lease_token"`
+		FencingToken         int64  `json:"fencing_token"`
+		WorktreePath         string `json:"worktree_path,omitempty"`
+		Repo                 string `json:"repo,omitempty"`
+		AgentPID             int    `json:"agent_pid,omitempty"`
+		ToolPID              int    `json:"tool_pid,omitempty"`
+		ActiveConversationID string `json:"active_conversation_id,omitempty"`
+		ElapsedSeconds       int64  `json:"elapsed_seconds,omitempty"`
 	}
 	if r.Body != nil {
 		bodyBytes, _ := io.ReadAll(io.LimitReader(r.Body, 1<<18))
@@ -944,9 +1061,10 @@ func (h *JobLifecycleHandler) Heartbeat(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
+	var qJob *dispatch.Job
 	var errQueue error
 	if h.queue != nil {
-		_, errQueue = h.queue.Heartbeat(r.Context(), jobID, req.FencingToken)
+		qJob, errQueue = h.queue.Heartbeat(r.Context(), jobID, req.FencingToken)
 	}
 
 	var errEngine error
@@ -957,6 +1075,31 @@ func (h *JobLifecycleHandler) Heartbeat(w http.ResponseWriter, r *http.Request) 
 	if errQueue != nil && errEngine != nil {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("failed to heartbeat job: %v", errQueue))
 		return
+	}
+
+	if qJob != nil {
+		effectiveWT := strings.TrimSpace(req.WorktreePath)
+		if effectiveWT == "" {
+			effectiveWT = strings.TrimSpace(req.Repo)
+		}
+		if effectiveWT == "" {
+			effectiveWT = strings.TrimSpace(qJob.Repo)
+		}
+		if h.engine != nil {
+			hostID := qJob.ClaimedHost
+			if hostID == "" {
+				hostID = qJob.HostID
+			}
+			boundWT := h.engine.BindDispatchJobRepo(hostID, effectiveWT, jobID)
+			if boundWT != "" {
+				effectiveWT = boundWT
+			}
+		}
+		if updater, ok := h.queue.(interface {
+			UpdateRuntimeMetadata(jobID, worktreePath, activeConvID string, harnessPID, toolPID int, elapsedSec int64) (*dispatch.Job, bool)
+		}); ok {
+			updater.UpdateRuntimeMetadata(jobID, effectiveWT, req.ActiveConversationID, req.AgentPID, req.ToolPID, req.ElapsedSeconds)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -1020,6 +1163,7 @@ func (h *JobLifecycleHandler) Failover(w http.ResponseWriter, r *http.Request) {
 
 	var errEngine error
 	if h.engine != nil {
+		h.engine.ReleaseDispatchJobRepo(jobID)
 		_, errEngine = h.engine.FailoverJob(jobID, attempt)
 	}
 

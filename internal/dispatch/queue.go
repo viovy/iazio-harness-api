@@ -187,7 +187,11 @@ type Job struct {
 	Traceparent             string               `json:"traceparent,omitempty"`
 	InfraRequeueCount       int                  `json:"infra_requeue_count,omitempty"`
 	AgentPID                int                  `json:"agent_pid,omitempty"`
+	HarnessPID              int                  `json:"harness_pid,omitempty"`
+	ToolPID                 int                  `json:"tool_pid,omitempty"`
+	ElapsedSeconds          int64                `json:"elapsed_seconds,omitempty"`
 	ActiveConversationID    string               `json:"active_conversation_id,omitempty"`
+	ConversationIDs         []string             `json:"conversation_ids,omitempty"`
 
 	// doneCh signals when the job has been completed or failed.
 	doneCh chan struct{}
@@ -1269,9 +1273,13 @@ func (q *InMemoryQueue) AckLease(ctx context.Context, jobID, leaseToken string, 
 	}
 	if agentPID > 0 {
 		job.AgentPID = agentPID
+		if job.HarnessPID == 0 {
+			job.HarnessPID = agentPID
+		}
 	}
 	if activeConvID != "" {
 		job.ActiveConversationID = activeConvID
+		addConversationIDLocked(job, activeConvID)
 	}
 	job.HeartbeatAt = &now
 	expires := now.Add(DefaultHeartbeatTimeout)
@@ -1284,6 +1292,86 @@ func (q *InMemoryQueue) AckLease(ctx context.Context, jobID, leaseToken string, 
 		_ = q.store.SaveQueueJob(ctx, job)
 	}
 	return job, nil
+}
+
+func addConversationIDLocked(job *Job, convID string) {
+	cid := strings.TrimSpace(convID)
+	if cid == "" || job == nil {
+		return
+	}
+	for _, existing := range job.ConversationIDs {
+		if existing == cid {
+			return
+		}
+	}
+	job.ConversationIDs = append(job.ConversationIDs, cid)
+}
+
+// UpdateRuntimeMetadata updates the delegated worktree path, active conversation, PIDs, and elapsed time on a job.
+func (q *InMemoryQueue) UpdateRuntimeMetadata(jobID, worktreePath, activeConvID string, harnessPID, toolPID int, elapsedSec int64) (*Job, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	job, exists := q.jobs[jobID]
+	if !exists || job == nil {
+		return nil, false
+	}
+	changed := false
+	wt := strings.TrimSpace(worktreePath)
+	if wt != "" && wt != "." && wt != "root" && job.Repo != wt {
+		origSubmodule := job.Repo
+		job.Repo = wt
+		changed = true
+		if len(job.Payload) > 0 {
+			var payloadMap map[string]any
+			if err := json.Unmarshal(job.Payload, &payloadMap); err == nil && payloadMap != nil {
+				if _, hasSub := payloadMap["submodule"]; !hasSub && origSubmodule != "" {
+					payloadMap["submodule"] = origSubmodule
+				}
+				payloadMap["worktree_path"] = wt
+				payloadMap["repo"] = wt
+				if updated, err := json.Marshal(payloadMap); err == nil {
+					job.Payload = updated
+				}
+			}
+		}
+	}
+	if cid := strings.TrimSpace(activeConvID); cid != "" {
+		if job.ActiveConversationID != cid {
+			job.ActiveConversationID = cid
+			changed = true
+		}
+		prevLen := len(job.ConversationIDs)
+		addConversationIDLocked(job, cid)
+		if len(job.ConversationIDs) != prevLen {
+			changed = true
+		}
+	}
+	if harnessPID > 0 && job.HarnessPID != harnessPID {
+		job.HarnessPID = harnessPID
+		if job.AgentPID == 0 {
+			job.AgentPID = harnessPID
+		}
+		changed = true
+	}
+	if toolPID > 0 && job.ToolPID != toolPID {
+		job.ToolPID = toolPID
+		changed = true
+	}
+	if elapsedSec > 0 && job.ElapsedSeconds != elapsedSec {
+		job.ElapsedSeconds = elapsedSec
+		changed = true
+	}
+	if job.Status == JobStatusRunning || job.Status == JobStatusClaimed || job.Status == JobStatusLeased {
+		now := q.now()
+		job.HeartbeatAt = &now
+		expires := now.Add(DefaultHeartbeatTimeout)
+		job.LeaseExpiresAt = &expires
+	}
+	if changed && q.store != nil {
+		_ = q.store.SaveQueueJob(context.Background(), job)
+	}
+	return job, true
 }
 
 // Failover records an attempt failure and resets the job to pending for re-dispatch.

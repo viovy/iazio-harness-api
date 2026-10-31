@@ -19,13 +19,18 @@ import (
 	"github.com/viovy/iazio-harness-api/internal/telemetry"
 )
 
-const defaultStoryDispatchTimeout = 10 * time.Second
+const (
+	defaultStoryDispatchTimeout = 10 * time.Second
+	indexYMLFileName            = "index.yml"
+)
 
 // CreateStoryRequest defines the semantic parameters for scaffolding an autopilot-governed story.
 type CreateStoryRequest struct {
 	ID                   string   `json:"id,omitempty"`
 	Repo                 string   `json:"repo,omitempty"`
 	Submodule            string   `json:"submodule"`
+	Backlog              string   `json:"backlog,omitempty"`
+	Command              string   `json:"command,omitempty"`
 	Title                string   `json:"title"`
 	Priority             string   `json:"priority,omitempty"`
 	Problem              string   `json:"problem"`
@@ -357,14 +362,21 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if storyID != "" {
 			title = fmt.Sprintf("Execute story %s: %s", storyID, req.Title)
 		}
+		targetRepo := req.Submodule
+		if alloc.TargetRepo != "" && alloc.TargetRepo != "root" && (req.Submodule == "" || req.Submodule == "." || req.Submodule == "root") {
+			targetRepo = alloc.TargetRepo
+		}
 		execPayload, _ := json.Marshal(map[string]any{
 			"prompt_id":             promptID,
-			"repo":                  req.Submodule,
+			"repo":                  targetRepo,
+			"submodule":             req.Submodule,
+			"worktree_path":         targetRepo,
 			"story_id":              storyID,
 			"title":                 title,
-			"prompt":                promptText,
+			"prompt":                normalizedPrompt,
 			"normalized_prompt":     normalizedPrompt,
 			"target_agent":          targetAgent,
+			"target_host":           alloc.TargetHost,
 			"priority":              req.Priority,
 			"problem":               req.Problem,
 			"acceptance_criteria":   req.AcceptanceCriteria,
@@ -381,7 +393,7 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			ej, _ := h.queue.Enqueue(r.Context(), &dispatch.Job{
 				Type:                  dispatch.JobTypePromptExecute,
-				Repo:                  req.Submodule,
+				Repo:                  targetRepo,
 				TargetHost:            alloc.TargetHost,
 				TargetAgent:           targetAgent,
 				StoryID:               storyID,
@@ -474,6 +486,40 @@ func resolveStoriesRoot(repoRoot string) string {
 		return envRoot
 	}
 	return findStoriesRoot()
+}
+
+func resolveBacklogStoriesRoot(repoRoot, backlog, submodule string) string {
+	base := resolveStoriesRoot(repoRoot)
+	key := strings.ToLower(strings.TrimSpace(backlog))
+	if key == "" {
+		key = strings.ToLower(strings.TrimSpace(submodule))
+	}
+	metaKey := "meta" + "-repo"
+	iazioHub := "iazio" + "-infra"
+	var hubRel string
+	switch {
+	case key == "" || key == "." || key == "root" || key == metaKey || key == "metarepo":
+		hubRel = "."
+	case key == "iazio" || strings.HasPrefix(key, "iazio-"):
+		hubRel = iazioHub
+	case key == "autopilot" || strings.HasPrefix(key, "autopilot-"):
+		hubRel = "autopilot-umbrella"
+	case key == "vigo" || strings.HasPrefix(key, "vigo-"):
+		hubRel = "vigo"
+	case key == "eye-habit" || key == "eyehabit" || strings.HasPrefix(key, "eye-habit-"):
+		hubRel = "eye-habit"
+	case key == "fin-hub" || key == "finhub" || strings.HasPrefix(key, "fin-hub-"):
+		hubRel = "fin-hub"
+	default:
+		hubRel = key
+	}
+	if hubRel != "." {
+		cand := filepath.Join(base, filepath.FromSlash(hubRel))
+		if _, err := os.Stat(filepath.Join(cand, "docs", "stories", indexYMLFileName)); err == nil {
+			return cand
+		}
+	}
+	return base
 }
 
 func resolveStoriesRootForWrite(repoRoot string) string {
@@ -578,7 +624,7 @@ func synthesizeCanonicalStoryMarkdown(s control.Story, status string) string {
 func findStoriesRoot() string {
 	for _, env := range []string{"STORIES_ROOT", "WORKSPACE_ROOT", "META_REPO_ROOT"} {
 		if val := strings.TrimSpace(os.Getenv(env)); val != "" {
-			if _, err := os.Stat(filepath.Join(val, "docs", "stories", "index.yml")); err == nil {
+			if _, err := os.Stat(filepath.Join(val, "docs", "stories", indexYMLFileName)); err == nil {
 				return val
 			}
 		}
@@ -588,7 +634,7 @@ func findStoriesRoot() string {
 		return "."
 	}
 	for i := 0; i < 6; i++ {
-		if _, err := os.Stat(filepath.Join(dir, "docs", "stories", "index.yml")); err == nil {
+		if _, err := os.Stat(filepath.Join(dir, "docs", "stories", indexYMLFileName)); err == nil {
 			return dir
 		}
 		parent := filepath.Dir(dir)
@@ -601,7 +647,7 @@ func findStoriesRoot() string {
 }
 
 func loadIndexStories(root string) []StoryDetail {
-	indexPath := filepath.Join(root, "docs", "stories", "index.yml")
+	indexPath := filepath.Join(root, "docs", "stories", indexYMLFileName)
 	f, err := os.Open(indexPath)
 	if err != nil {
 		return nil
@@ -687,7 +733,8 @@ func (h *StoriesHandler) ListStories(w http.ResponseWriter, r *http.Request) {
 		limit = 100
 	}
 
-	root := resolveStoriesRoot(h.repoRoot)
+	backlogFilter := strings.TrimSpace(r.URL.Query().Get("backlog"))
+	root := resolveBacklogStoriesRoot(h.repoRoot, backlogFilter, submoduleFilter)
 	indexStories := loadIndexStories(root)
 	indexByID := make(map[string]StoryDetail, len(indexStories))
 	for _, idxS := range indexStories {
@@ -808,7 +855,8 @@ func (h *StoriesHandler) GetStory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var found *StoryDetail
-	root := resolveStoriesRoot(h.repoRoot)
+	backlogFilter := strings.TrimSpace(r.URL.Query().Get("backlog"))
+	root := resolveBacklogStoriesRoot(h.repoRoot, backlogFilter, "")
 	indexStories := loadIndexStories(root)
 
 	// 1. Database engine is authoritative:

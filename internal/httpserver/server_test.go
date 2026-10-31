@@ -3009,3 +3009,122 @@ func TestV4_UpdateAllRoutesAndSingleToolTargetVersionGuard(t *testing.T) {
 		}
 	}
 }
+
+func TestGov3839_DispatchJobRepoBindingAndLiveTelemetry(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	eng := control.NewEngine(nil)
+	s := &Server{
+		Engine: eng,
+		Queue:  q,
+	}
+	eng.RegisterHost("debian", "permanent")
+	_ = eng.UpsertRepo(control.Repo{
+		HostID:                       "debian",
+		WorktreePath:                 "/home/romeo/work/meta-repo",
+		CloneURL:                     "https://example.test/meta-repo.git",
+		Lock:                         "DIRTY",
+		GlobalQueueAllocationEnabled: true,
+	})
+	_ = eng.UpsertRepo(control.Repo{
+		HostID:                       "debian",
+		WorktreePath:                 "/home/romeo/work/meta-repo-02",
+		CloneURL:                     "https://example.test/meta-repo-02.git",
+		Lock:                         control.LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+	_ = eng.Heartbeat("debian", []control.Tool{
+		{Name: "agy", Installed: true, Path: "/usr/local/bin/agy", Status: "ok"},
+	}, false)
+
+	alloc := eng.ResolveToolPriorityAllocation("agy", "debian", ".")
+	if alloc.TargetRepo != "/home/romeo/work/meta-repo-02" {
+		t.Fatalf("expected ResolveToolPriorityAllocation to select IDLE worktree /home/romeo/work/meta-repo-02 when /home/romeo/work/meta-repo is DIRTY, got %q", alloc.TargetRepo)
+	}
+
+	rawPayload, _ := json.Marshal(map[string]any{
+		"prompt":            "Execute story on idle worktree",
+		"normalized_prompt": "Execute story on idle worktree",
+		"submodule":         ".",
+	})
+	job, err := q.Enqueue(context.Background(), &dispatch.Job{
+		ID:          "job_697e5159287042b2",
+		Type:        "prompt.execute",
+		Repo:        alloc.TargetRepo,
+		TargetAgent: "agy",
+		TargetHost:  "debian",
+		Payload:     rawPayload,
+		TraceID:     "trace-gov-3839",
+	})
+	if err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
+
+	claimed, err := q.Claim(context.Background(), "debian", []string{"prompt.execute"})
+	if err != nil || claimed == nil || claimed.ID != job.ID {
+		t.Fatalf("expected job %s to be claimed by debian, err=%v", job.ID, err)
+	}
+	boundWT := eng.BindDispatchJobRepo("debian", claimed.Repo, claimed.ID)
+	if boundWT != "/home/romeo/work/meta-repo-02" {
+		t.Fatalf("expected boundWT /home/romeo/work/meta-repo-02, got %q", boundWT)
+	}
+
+	handler := s.Handler()
+
+	// Post tick + chunk + conversation for dispatch job
+	tickReq := httptest.NewRequest(http.MethodPost, "/v1/jobs/job_697e5159287042b2/chunks", bytes.NewBufferString(`{"type":"OUTPUT_TICK","silent_for_ms":2000,"harness_pid":4200,"tool_pid":4300,"elapsed_seconds":14}`))
+	tickRR := httptest.NewRecorder()
+	handler.ServeHTTP(tickRR, tickReq)
+	if tickRR.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted for tick, got %d: %s", tickRR.Code, tickRR.Body.String())
+	}
+
+	chunkReq := httptest.NewRequest(http.MethodPost, "/v1/jobs/job_697e5159287042b2/chunks", bytes.NewBufferString(`{"type":"OUTPUT_CHUNK","stream":"stdout","text":"[agy] Running story...\n"}`))
+	chunkRR := httptest.NewRecorder()
+	handler.ServeHTTP(chunkRR, chunkReq)
+	if chunkRR.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted for chunk, got %d: %s", chunkRR.Code, chunkRR.Body.String())
+	}
+
+	convReq := httptest.NewRequest(http.MethodPost, "/v1/jobs/job_697e5159287042b2/conversations", bytes.NewBufferString(`{"conversation_id":"c0ffee00-697e-5159-2870-42b200003839"}`))
+	convRR := httptest.NewRecorder()
+	handler.ServeHTTP(convRR, convReq)
+	if convRR.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for conversation, got %d: %s", convRR.Code, convRR.Body.String())
+	}
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/v1/jobs/job_697e5159287042b2", nil)
+	detailRR := httptest.NewRecorder()
+	handler.ServeHTTP(detailRR, detailReq)
+	if detailRR.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for job detail, got %d: %s", detailRR.Code, detailRR.Body.String())
+	}
+	var detail map[string]any
+	if err := json.Unmarshal(detailRR.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("decode job detail: %v", err)
+	}
+	if detail["worktree_path"] != "/home/romeo/work/meta-repo-02" {
+		t.Fatalf("expected worktree_path=/home/romeo/work/meta-repo-02, got %v", detail["worktree_path"])
+	}
+	if detail["active_conversation_id"] != "c0ffee00-697e-5159-2870-42b200003839" {
+		t.Fatalf("expected active_conversation_id to be updated, got %v", detail["active_conversation_id"])
+	}
+	if detail["heartbeat_at"] == nil || detail["heartbeat_at"] == "" {
+		t.Fatalf("expected non-empty heartbeat_at on active dispatch job, got %v", detail["heartbeat_at"])
+	}
+	if int(detail["harness_pid"].(float64)) != 4200 || int(detail["tool_pid"].(float64)) != 4300 {
+		t.Fatalf("expected harness_pid=4200 and tool_pid=4300, got %v / %v", detail["harness_pid"], detail["tool_pid"])
+	}
+
+	hostsReq := httptest.NewRequest(http.MethodGet, "/v1/hosts/debian", nil)
+	hostsRR := httptest.NewRecorder()
+	handler.ServeHTTP(hostsRR, hostsReq)
+	if hostsRR.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for host detail, got %d", hostsRR.Code)
+	}
+	var hostData map[string]any
+	_ = json.Unmarshal(hostsRR.Body.Bytes(), &hostData)
+	hostObj, _ := hostData["host"].(map[string]any)
+	if int(hostObj["harness_executions"].(float64)) < 1 || hostObj["harness_active"] != true {
+		t.Fatalf("expected debian host to report harness_executions>=1 and harness_active=true, got %v / %v", hostObj["harness_executions"], hostObj["harness_active"])
+	}
+}

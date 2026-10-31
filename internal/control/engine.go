@@ -1270,6 +1270,22 @@ func isToolUsableForDispatch(t Tool) bool {
 	return st == "HEALTHY" || st == "OK" || st == "INSTALLED" || st == "UP_TO_DATE" || st == "BEHIND" || st == "ACTIVE" || st == "READY"
 }
 
+func isRepoSlotIdleForDispatch(r *Repo) bool {
+	if r == nil {
+		return false
+	}
+	if r.RunningJobID != "" || r.LockHolder != "" {
+		return false
+	}
+	if r.Lock != "" && r.Lock != LockIdle {
+		return false
+	}
+	if r.DirtyStoryID != "" || strings.TrimSpace(r.Porcelain) != "" || len(r.DirtySubmodules) > 0 {
+		return false
+	}
+	return true
+}
+
 // ResolveToolPriorityAllocation resolves the target agent, host, and workspace repo according to Global Queue Tool Priority.
 func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, requestedRepo string) ToolPriorityAllocation {
 	e.mu.Lock()
@@ -1282,10 +1298,67 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 		reqRepo = "root"
 	}
 
+	hostIDs := make([]string, 0, len(e.hosts))
+	for id := range e.hosts {
+		hostIDs = append(hostIDs, id)
+	}
+	sort.Strings(hostIDs)
+
 	if reqAgent != "" && reqAgent != "auto" {
+		firstEligibleHost := reqHost
+		for _, hostID := range hostIDs {
+			h := e.hosts[hostID]
+			if h == nil {
+				continue
+			}
+			if (!strings.EqualFold(h.Presence, "online") && !strings.EqualFold(h.Presence, "idle")) || (!h.LastSeen.IsZero() && e.now().Sub(h.LastSeen) > 5*time.Minute) {
+				continue
+			}
+			if reqHost != "" && h.ID != reqHost {
+				continue
+			}
+			if e.isToolOnCooldownLocked(h.ID, reqAgent) {
+				continue
+			}
+			hasTool := false
+			for _, t := range h.Tools {
+				if toolNamesMatch(t.Name, reqAgent) && isToolUsableForDispatch(t) {
+					hasTool = true
+					break
+				}
+			}
+			if !hasTool && len(h.Tools) > 0 {
+				continue
+			}
+			if firstEligibleHost == "" {
+				firstEligibleHost = h.ID
+			}
+			var hostRepos []*Repo
+			for _, r := range e.repos {
+				if r != nil && r.HostID == h.ID {
+					hostRepos = append(hostRepos, r)
+				}
+			}
+			sort.Slice(hostRepos, func(a, b int) bool {
+				return hostRepos[a].WorktreePath < hostRepos[b].WorktreePath
+			})
+			for _, r := range hostRepos {
+				repoMatches := r.GlobalQueueAllocationEnabled && (reqRepo == "" || reqRepo == "root" || r.WorktreePath == reqRepo || r.EffectiveAlias() == reqRepo || strings.Contains(r.WorktreePath, reqRepo))
+				if repoMatches && isRepoSlotIdleForDispatch(r) {
+					return ToolPriorityAllocation{
+						TargetAgent:          reqAgent,
+						TargetHost:           h.ID,
+						TargetRepo:           r.WorktreePath,
+						PriorityRankSelected: 0,
+						AllocationSource:     "explicit_override",
+						ImmediateClaimable:   true,
+					}
+				}
+			}
+		}
 		return ToolPriorityAllocation{
 			TargetAgent:          reqAgent,
-			TargetHost:           reqHost,
+			TargetHost:           firstEligibleHost,
 			TargetRepo:           reqRepo,
 			PriorityRankSelected: 0,
 			AllocationSource:     "explicit_override",
@@ -1297,12 +1370,6 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 	if len(toolPriority) == 0 {
 		toolPriority = []string{"agy", "opencode", "claude", "cursor"}
 	}
-
-	hostIDs := make([]string, 0, len(e.hosts))
-	for id := range e.hosts {
-		hostIDs = append(hostIDs, id)
-	}
-	sort.Strings(hostIDs)
 
 	for i, candidateTool := range toolPriority {
 		candidateToolLower := strings.ToLower(candidateTool)
@@ -1348,7 +1415,7 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 			for _, r := range hostRepos {
 				repoMatches := r.GlobalQueueAllocationEnabled && (reqRepo == "" || reqRepo == "root" || r.WorktreePath == reqRepo || r.EffectiveAlias() == reqRepo || strings.Contains(r.WorktreePath, reqRepo))
 				if repoMatches {
-					if r.RunningJobID == "" && r.LockHolder == "" && r.Lock != LockRunning {
+					if isRepoSlotIdleForDispatch(r) {
 						return ToolPriorityAllocation{
 							TargetAgent:          candidateToolLower,
 							TargetHost:           h.ID,
@@ -1386,6 +1453,186 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 		AllocationSource:     "global_queue_tool_priority",
 		ImmediateClaimable:   false,
 	}
+}
+
+// BindDispatchJobRepo locks an eligible repo worktree on hostID for a dispatch.Queue job and returns its canonical WorktreePath.
+func (e *Engine) BindDispatchJobRepo(hostID, worktreePath, jobID string) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	cleanJobID := strings.TrimSpace(jobID)
+	cleanHostID := strings.TrimSpace(hostID)
+	cleanWT := strings.TrimSpace(worktreePath)
+	if cleanJobID == "" {
+		return cleanWT
+	}
+
+	var hostRepos []*Repo
+	for _, r := range e.repos {
+		if r == nil {
+			continue
+		}
+		if cleanHostID == "" || r.HostID == cleanHostID {
+			hostRepos = append(hostRepos, r)
+		}
+	}
+	sort.Slice(hostRepos, func(a, b int) bool {
+		return hostRepos[a].WorktreePath < hostRepos[b].WorktreePath
+	})
+
+	// 1. If already bound to this jobID on a specific repo and cleanWT is empty/generic or matches, return it.
+	for _, r := range hostRepos {
+		if r.RunningJobID == cleanJobID {
+			if cleanWT == "" || cleanWT == "." || cleanWT == "root" || r.WorktreePath == cleanWT || r.EffectiveAlias() == cleanWT {
+				r.Lock = LockRunning
+				r.LockHolder = cleanJobID
+				if h, ok := e.hosts[r.HostID]; ok && h != nil {
+					h.HarnessActive = true
+				}
+				return r.WorktreePath
+			}
+		}
+	}
+
+	var matched *Repo
+	// 2. Exact worktree path or alias match
+	if cleanWT != "" && cleanWT != "." && cleanWT != "root" {
+		for _, r := range hostRepos {
+			if r.WorktreePath == cleanWT || r.EffectiveAlias() == cleanWT {
+				if r.RunningJobID == "" || r.RunningJobID == cleanJobID {
+					matched = r
+					break
+				}
+			}
+		}
+		if matched == nil {
+			for _, r := range hostRepos {
+				if strings.HasSuffix(r.WorktreePath, "/"+cleanWT) && (r.RunningJobID == "" || r.RunningJobID == cleanJobID) {
+					matched = r
+					break
+				}
+			}
+		}
+	}
+
+	// 3. Fallback to first IDLE repo on hostID when worktreePath is "." / "root" / submodule name
+	if matched == nil {
+		for _, r := range hostRepos {
+			if r.GlobalQueueAllocationEnabled && isRepoSlotIdleForDispatch(r) {
+				matched = r
+				break
+			}
+		}
+	}
+
+	if matched == nil {
+		return cleanWT
+	}
+
+	// Release any previous repo held by this jobID if it moved
+	for _, r := range e.repos {
+		if r != nil && r != matched && (r.RunningJobID == cleanJobID || r.LockHolder == cleanJobID) {
+			r.Lock = LockIdle
+			r.RunningJobID = ""
+			r.LockHolder = ""
+		}
+	}
+
+	matched.Lock = LockRunning
+	matched.RunningJobID = cleanJobID
+	matched.LockHolder = cleanJobID
+	if h, ok := e.hosts[matched.HostID]; ok && h != nil {
+		h.HarnessActive = true
+	}
+	return matched.WorktreePath
+}
+
+// ReleaseDispatchJobRepo unlocks any repo worktree bound to jobID.
+func (e *Engine) ReleaseDispatchJobRepo(jobID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	cleanJobID := strings.TrimSpace(jobID)
+	if cleanJobID == "" {
+		return
+	}
+	affectedHosts := make(map[string]bool)
+	for _, r := range e.repos {
+		if r != nil && (r.RunningJobID == cleanJobID || r.LockHolder == cleanJobID) {
+			r.Lock = LockIdle
+			r.RunningJobID = ""
+			r.LockHolder = ""
+			affectedHosts[r.HostID] = true
+		}
+	}
+	for hID := range affectedHosts {
+		if h, ok := e.hosts[hID]; ok && h != nil {
+			stillActive := false
+			for _, r := range e.repos {
+				if r != nil && r.HostID == hID && r.Lock == LockRunning && r.RunningJobID != "" {
+					stillActive = true
+					break
+				}
+			}
+			var kept []ActiveJob
+			for _, aj := range h.ActiveJobs {
+				if aj.JobID != cleanJobID {
+					kept = append(kept, aj)
+				}
+			}
+			h.ActiveJobs = kept
+			h.HarnessActive = stillActive || len(h.ActiveJobs) > 0
+		}
+	}
+}
+
+// GetHostExecutionCounts returns (harnessExecutions, adhocAseExecutions, queuedExecutions) for a host from Engine state.
+func (e *Engine) GetHostExecutionCounts(hostID string) (int, int, int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	runningIDs := make(map[string]bool)
+	queuedCount := 0
+	adhocCount := 0
+
+	if h, ok := e.hosts[hostID]; ok && h != nil {
+		for _, aj := range h.ActiveJobs {
+			if id := strings.TrimSpace(aj.JobID); id != "" {
+				runningIDs[id] = true
+			}
+		}
+		for _, rs := range h.RepoStatuses {
+			prov := strings.ToUpper(strings.TrimSpace(rs.ExecutionProvenance))
+			live := strings.ToUpper(strings.TrimSpace(rs.ToolLiveness))
+			ase := strings.ToUpper(strings.TrimSpace(rs.ASEState))
+			if strings.Contains(prov, "ADHOC") && (live == "LIVE" || live == "ALIVE" || ase == "RUNNING" || ase == "IN_PROGRESS") {
+				adhocCount++
+			}
+		}
+	}
+
+	for _, r := range e.repos {
+		if r != nil && r.HostID == hostID && r.Lock == LockRunning && strings.TrimSpace(r.RunningJobID) != "" {
+			runningIDs[strings.TrimSpace(r.RunningJobID)] = true
+		}
+	}
+
+	for _, j := range e.jobs {
+		if j != nil && j.LeaseHolder == hostID && strings.EqualFold(j.Status, "RUNNING") {
+			runningIDs[j.ID] = true
+		}
+	}
+
+	for _, sch := range e.schedules {
+		if sch != nil && sch.HostID == hostID {
+			st := strings.ToUpper(strings.TrimSpace(sch.Status))
+			if st == "PENDING" || st == "QUEUED" {
+				queuedCount++
+			}
+		}
+	}
+
+	return len(runningIDs), adhocCount, queuedCount
 }
 
 // BindStoryToJob updates the story ID and metadata on an active job, schedule, and history record.

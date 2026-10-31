@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -738,3 +740,111 @@ func TestV4_StoryLifecycleTransitionsAndListQueueTotalAndFinalHarvest(t *testing
 			jobDetail.FinalTurnCount, jobDetail.FinalTranscriptSHA256)
 	}
 }
+
+func TestExecuteStory_ThreeModes_And_ResolveBacklogStoriesRoot(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	engine := control.NewEngine(nil)
+	tmpDir := t.TempDir()
+
+	_ = engine.SaveStory(control.Story{
+		ID:        "STORY-GOV-3900",
+		Title:     "Three Mode Story Dispatch",
+		Submodule: "iazio-web",
+		Priority:  "P1",
+		Status:    "READY",
+	})
+
+	jl := NewJobLifecycleHandler(q)
+	jl.SetEngine(engine)
+	jl.SetRepoRoot(tmpDir)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/stories/execute", jl.ExecuteStory)
+	mux.HandleFunc("POST /api/v1/stories/{id}/execute", jl.ExecuteStory)
+
+	// 1. Mode 1: story.create_and_execute ignores any passed story_id and concatenates /autonomous-story-execution + prompt
+	req1 := httptest.NewRequest(http.MethodPost, "/api/v1/stories/execute", bytes.NewBufferString(`{
+		"mode": "story.create_and_execute",
+		"story_id": "STORY-FAKE-999",
+		"backlog": "iazio",
+		"submodule": "iazio-web",
+		"prompt": "Sort prompts alphabetically"
+	}`))
+	rr1 := httptest.NewRecorder()
+	mux.ServeHTTP(rr1, req1)
+	if rr1.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for story.create_and_execute, got %d: %s", rr1.Code, rr1.Body.String())
+	}
+	var resp1 ExecuteStoryResponse
+	_ = json.Unmarshal(rr1.Body.Bytes(), &resp1)
+	if resp1.StoryID != "" {
+		t.Fatalf("expected empty StoryID for story.create_and_execute, got %q", resp1.StoryID)
+	}
+	if resp1.Mode != "story.create_and_execute" || resp1.EffectiveAction != "/autonomous-story-execution" {
+		t.Fatalf("unexpected mode/action: mode=%q action=%q", resp1.Mode, resp1.EffectiveAction)
+	}
+	if !strings.HasPrefix(resp1.NormalizedPrompt, "/autonomous-story-execution") || !strings.Contains(resp1.NormalizedPrompt, "Sort prompts alphabetically") {
+		t.Fatalf("unexpected NormalizedPrompt: %q", resp1.NormalizedPrompt)
+	}
+
+	// 2. Mode 2: story.execute without story_id returns 422
+	req2Err := httptest.NewRequest(http.MethodPost, "/api/v1/stories/execute", bytes.NewBufferString(`{
+		"mode": "story.execute",
+		"prompt": "Missing story id"
+	}`))
+	rr2Err := httptest.NewRecorder()
+	mux.ServeHTTP(rr2Err, req2Err)
+	if rr2Err.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for story.execute without story_id, got %d", rr2Err.Code)
+	}
+
+	// Mode 2 with story_id concatenates /autonomous-story-execution + story_id + extra prompt
+	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/stories/STORY-GOV-3900/execute", bytes.NewBufferString(`{
+		"mode": "story.execute",
+		"prompt": "run TDD"
+	}`))
+	rr2 := httptest.NewRecorder()
+	mux.ServeHTTP(rr2, req2)
+	if rr2.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for story.execute, got %d: %s", rr2.Code, rr2.Body.String())
+	}
+	var resp2 ExecuteStoryResponse
+	_ = json.Unmarshal(rr2.Body.Bytes(), &resp2)
+	if resp2.NormalizedPrompt != "/autonomous-story-execution STORY-GOV-3900 run TDD" {
+		t.Fatalf("expected '/autonomous-story-execution STORY-GOV-3900 run TDD', got %q", resp2.NormalizedPrompt)
+	}
+
+	// 3. Mode 3: story.create uses /story-create and clears story_id
+	req3 := httptest.NewRequest(http.MethodPost, "/api/v1/stories/execute", bytes.NewBufferString(`{
+		"mode": "story.create",
+		"backlog": "autopilot",
+		"submodule": "autopilot-plugins",
+		"prompt": "Create story for backlog family hub"
+	}`))
+	rr3 := httptest.NewRecorder()
+	mux.ServeHTTP(rr3, req3)
+	if rr3.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for story.create, got %d: %s", rr3.Code, rr3.Body.String())
+	}
+	var resp3 ExecuteStoryResponse
+	_ = json.Unmarshal(rr3.Body.Bytes(), &resp3)
+	if resp3.StoryID != "" || resp3.EffectiveAction != "/story-create" {
+		t.Fatalf("expected empty StoryID and /story-create for story.create, got id=%q action=%q", resp3.StoryID, resp3.EffectiveAction)
+	}
+
+	// 4. Verify resolveBacklogStoriesRoot across family hubs
+	autopilotHub := filepath.Join(tmpDir, "autopilot-umbrella", "docs", "stories")
+	if err := os.MkdirAll(autopilotHub, 0o755); err != nil {
+		t.Fatalf("mkdir autopilotHub: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(autopilotHub, "index.yml"), []byte("stories: []\n"), 0o600); err != nil {
+		t.Fatalf("write index.yml: %v", err)
+	}
+	if got := resolveBacklogStoriesRoot(tmpDir, "autopilot", ""); got != filepath.Join(tmpDir, "autopilot-umbrella") {
+		t.Fatalf("expected autopilot-umbrella root, got %q", got)
+	}
+	for _, b := range []string{"", "root", "iazio", "vigo", "eye-habit", "fin-hub", "custom-sub"} {
+		_ = resolveBacklogStoriesRoot(tmpDir, b, "")
+	}
+}
+
