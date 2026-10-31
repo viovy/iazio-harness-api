@@ -94,3 +94,37 @@ func TestListHistory_ChronologicalSorting(t *testing.T) {
 		t.Errorf("expected newest item in limited result, got %v", respLimit.History[0]["job_id"])
 	}
 }
+
+func TestListPrompts_AlphabeticalSortingHTTP(t *testing.T) {
+	s := &Server{
+		Engine: control.NewEngine(nil),
+		Queue:  dispatch.NewInMemoryQueue(),
+	}
+	s.Engine.PutPrompt(control.Prompt{ID: "p-zeta", Title: "zeta prompt", Body: "run", Engine: "agy", Status: "READY"})
+	s.Engine.PutPrompt(control.Prompt{ID: "p-empty", Title: "   ", Body: "run", Engine: "agy", Status: "READY"})
+	s.Engine.PutPrompt(control.Prompt{ID: "p-alpha", Title: "Alpha Prompt", Body: "run", Engine: "agy", Status: "READY"})
+	s.Engine.PutPrompt(control.Prompt{ID: "p-beta", Title: "beta prompt", Body: "run", Engine: "agy", Status: "READY"})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/prompts", nil)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rr.Code)
+	}
+	var resp struct {
+		Prompts []map[string]any `json:"prompts"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode /v1/prompts: %v", err)
+	}
+	wantIDs := []string{"p-alpha", "p-beta", "p-zeta", "p-empty"}
+	if len(resp.Prompts) != len(wantIDs) {
+		t.Fatalf("expected %d prompts, got %d", len(wantIDs), len(resp.Prompts))
+	}
+	for i, want := range wantIDs {
+		if got := resp.Prompts[i]["id"]; got != want {
+			t.Errorf("position %d: expected id %q, got %v", i, want, got)
+		}
+	}
+}

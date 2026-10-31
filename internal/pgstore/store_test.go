@@ -35,6 +35,23 @@ func TestNilStore(t *testing.T) {
 	if prompts, err := s.LoadPrompts(ctx); err != nil || prompts != nil {
 		t.Fatalf("expected nil prompts, got %v, %v", prompts, err)
 	}
+}
+
+func TestSortLoadedPromptsHelper(t *testing.T) {
+	items := []control.Prompt{
+		{ID: "p-zeta", Title: "zeta"},
+		{ID: "p-empty", Title: " \t "},
+		{ID: "p-alpha", Title: "Alpha"},
+	}
+	sortLoadedPrompts(items)
+	if items[0].ID != "p-alpha" || items[1].ID != "p-zeta" || items[2].ID != "p-empty" {
+		t.Fatalf("unexpected sorted order: %+v", items)
+	}
+}
+
+func TestNilStoreRemaining(t *testing.T) {
+	var s *Store
+	ctx := context.Background()
 
 	if err := s.SaveRepo(ctx, control.Repo{}); err != nil {
 		t.Fatal(err)
@@ -142,34 +159,63 @@ func TestLiveStoreIfConfigured(t *testing.T) {
 	}
 	defer store.Close()
 
-	// 1. Prompt round-trip
-	testPrompt := control.Prompt{
-		ID:       "test-p1",
-		Title:    "Test Title",
+	// 1. Prompt round-trip & alphabetical ordering
+	testPromptZeta := control.Prompt{
+		ID:       "test-p-zeta",
+		Title:    "zeta prompt",
 		Body:     "Test Body",
 		Engine:   "agent",
 		Status:   "READY",
 		Revision: 1,
 	}
-	if err := store.SavePrompt(ctx, testPrompt); err != nil {
-		t.Fatalf("SavePrompt: %v", err)
+	testPrompt := control.Prompt{
+		ID:       "test-p1",
+		Title:    "Alpha Title",
+		Body:     "Test Body",
+		Engine:   "agent",
+		Status:   "READY",
+		Revision: 1,
+	}
+	testPromptEmpty := control.Prompt{
+		ID:       "test-p-empty",
+		Title:    "   ",
+		Body:     "Test Body",
+		Engine:   "agent",
+		Status:   "READY",
+		Revision: 1,
+	}
+	for _, tp := range []control.Prompt{testPromptZeta, testPrompt, testPromptEmpty} {
+		if err := store.SavePrompt(ctx, tp); err != nil {
+			t.Fatalf("SavePrompt(%s): %v", tp.ID, err)
+		}
 	}
 	prompts, err := store.LoadPrompts(ctx)
 	if err != nil {
 		t.Fatalf("LoadPrompts: %v", err)
 	}
-	var found bool
-	for _, p := range prompts {
-		if p.ID == "test-p1" && p.Title == "Test Title" {
-			found = true
-			break
+	idxAlpha, idxZeta, idxEmpty := -1, -1, -1
+	for i, p := range prompts {
+		switch p.ID {
+		case "test-p1":
+			if p.Title == "Alpha Title" {
+				idxAlpha = i
+			}
+		case "test-p-zeta":
+			idxZeta = i
+		case "test-p-empty":
+			idxEmpty = i
 		}
 	}
-	if !found {
-		t.Fatalf("saved prompt test-p1 not found in loaded prompts")
+	if idxAlpha < 0 || idxZeta < 0 || idxEmpty < 0 {
+		t.Fatalf("saved prompts not all found in loaded prompts: alpha=%d zeta=%d empty=%d", idxAlpha, idxZeta, idxEmpty)
 	}
-	if err := store.DeletePrompt(ctx, "test-p1"); err != nil {
-		t.Fatalf("DeletePrompt: %v", err)
+	if !(idxAlpha < idxZeta && idxZeta < idxEmpty) {
+		t.Errorf("expected alphabetical LoadPrompts order alpha(%d) < zeta(%d) < empty(%d)", idxAlpha, idxZeta, idxEmpty)
+	}
+	for _, id := range []string{"test-p1", "test-p-zeta", "test-p-empty"} {
+		if err := store.DeletePrompt(ctx, id); err != nil {
+			t.Fatalf("DeletePrompt(%s): %v", id, err)
+		}
 	}
 
 	// 2. Repo round-trip
@@ -188,7 +234,7 @@ func TestLiveStoreIfConfigured(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadRepos: %v", err)
 	}
-	found = false
+	var found bool
 	for _, r := range repos {
 		if r.HostID == "test-host-1" && r.WorktreePath == "/test/repo/path" {
 			found = true

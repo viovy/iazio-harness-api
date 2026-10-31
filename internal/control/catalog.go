@@ -110,7 +110,44 @@ func (e *Engine) ListIdeas() []Idea {
 	return out
 }
 
-// ListPrompts returns every prompt record.
+// ComparePromptsAlphabetically compares two prompts case-insensitively by
+// trimmed title (code-point/ASCII A-Z, not locale collation), placing missing
+// or whitespace-only titles after non-empty titles and breaking ties
+// deterministically by raw trimmed title, lowercase ID, and raw ID.
+func ComparePromptsAlphabetically(a, b Prompt) int {
+	ta := strings.TrimSpace(a.Title)
+	tb := strings.TrimSpace(b.Title)
+	aEmpty := ta == ""
+	bEmpty := tb == ""
+	if aEmpty != bEmpty {
+		if aEmpty {
+			return 1
+		}
+		return -1
+	}
+	if !aEmpty {
+		if cmp := strings.Compare(strings.ToLower(ta), strings.ToLower(tb)); cmp != 0 {
+			return cmp
+		}
+		if cmp := strings.Compare(ta, tb); cmp != 0 {
+			return cmp
+		}
+	}
+	if cmp := strings.Compare(strings.ToLower(a.ID), strings.ToLower(b.ID)); cmp != 0 {
+		return cmp
+	}
+	return strings.Compare(a.ID, b.ID)
+}
+
+// SortPromptsAlphabetically sorts prompts in place using ComparePromptsAlphabetically.
+func SortPromptsAlphabetically(prompts []Prompt) {
+	sort.Slice(prompts, func(i, j int) bool {
+		return ComparePromptsAlphabetically(prompts[i], prompts[j]) < 0
+	})
+}
+
+// ListPrompts returns every prompt record sorted alphabetically (case-insensitive A-Z)
+// by title with deterministic tie-breaking.
 func (e *Engine) ListPrompts() []Prompt {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -118,6 +155,7 @@ func (e *Engine) ListPrompts() []Prompt {
 	for _, p := range e.prompts {
 		out = append(out, *p)
 	}
+	SortPromptsAlphabetically(out)
 	return out
 }
 
