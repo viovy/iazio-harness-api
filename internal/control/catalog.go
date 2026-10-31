@@ -297,6 +297,23 @@ func (e *Engine) HeartbeatWithCapabilities(id, presence string, tools []Tool, fe
 	for _, aj := range activeJobs {
 		if aj.JobID != "" {
 			activeMap[aj.JobID] = true
+			wt := strings.TrimSpace(aj.WorktreePath)
+			if wt != "" && wt != "." && wt != "root" {
+				for _, r := range e.repos {
+					if r != nil && r.HostID == id && (r.WorktreePath == wt || r.EffectiveAlias() == wt) {
+						if r.RunningJobID == "" || r.RunningJobID == aj.JobID {
+							r.Lock = LockRunning
+							r.RunningJobID = aj.JobID
+							r.LockHolder = aj.JobID
+						}
+					}
+				}
+			}
+		}
+	}
+	for _, r := range e.repos {
+		if r != nil && r.HostID == id && r.Lock == LockRunning && r.RunningJobID != "" {
+			h.HarnessActive = true
 		}
 	}
 

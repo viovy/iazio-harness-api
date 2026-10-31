@@ -1632,11 +1632,56 @@ func (s *Server) declineJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+func (s *Server) enrichHostView(hv map[string]any, host control.Host) map[string]any {
+	if hv == nil {
+		return hv
+	}
+	harnessExecs, adhocExecs, queuedExecs := 0, 0, 0
+	if s.Engine != nil {
+		harnessExecs, adhocExecs, queuedExecs = s.Engine.GetHostExecutionCounts(host.ID)
+	}
+	if s.Queue != nil {
+		runningSet := make(map[string]bool)
+		for _, aj := range host.ActiveJobs {
+			if id := strings.TrimSpace(aj.JobID); id != "" {
+				runningSet[id] = true
+			}
+		}
+		if qJobs, err := s.Queue.List(context.Background(), dispatch.JobFilter{Limit: 100}); err == nil {
+			for _, j := range qJobs {
+				if j == nil {
+					continue
+				}
+				switch j.Status {
+				case dispatch.JobStatusRunning, dispatch.JobStatusClaimed, dispatch.JobStatusLeased:
+					if j.ClaimedHost == host.ID || j.HostID == host.ID {
+						if !runningSet[j.ID] {
+							runningSet[j.ID] = true
+							harnessExecs++
+						}
+					}
+				case dispatch.JobStatusPending:
+					if j.TargetHost == host.ID || j.HostID == host.ID {
+						queuedExecs++
+					}
+				}
+			}
+		}
+	}
+	hv["harness_executions"] = harnessExecs
+	hv["adhoc_ase_executions"] = adhocExecs
+	hv["queued_executions"] = queuedExecs
+	if harnessExecs > 0 {
+		hv["harness_active"] = true
+	}
+	return hv
+}
+
 func (s *Server) listHosts(w http.ResponseWriter, _ *http.Request) {
 	hosts := s.Engine.ListHosts()
 	rows := make([]map[string]any, 0, len(hosts))
 	for _, h := range hosts {
-		rows = append(rows, hostView(h.Host, h.ReposPaused))
+		rows = append(rows, s.enrichHostView(hostView(h.Host, h.ReposPaused), h.Host))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"hosts": rows})
 }
@@ -1660,7 +1705,7 @@ func (s *Server) hostDetail(w http.ResponseWriter, r *http.Request) {
 		tools = append(tools, toolView(tool))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"host":  hostView(detail.Host, paused),
+		"host":  s.enrichHostView(hostView(detail.Host, paused), detail.Host),
 		"repos": repos,
 		"tools": tools,
 	})
@@ -1842,9 +1887,15 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.Queue != nil {
 		activeJobIDs := make([]string, 0, len(activeJobs))
+		updater, hasUpdater := s.Queue.(interface {
+			UpdateRuntimeMetadata(jobID, worktreePath, activeConvID string, harnessPID, toolPID int, elapsedSec int64) (*dispatch.Job, bool)
+		})
 		for _, aj := range activeJobs {
 			if aj.JobID != "" {
 				activeJobIDs = append(activeJobIDs, aj.JobID)
+				if hasUpdater && aj.WorktreePath != "" && aj.WorktreePath != "." {
+					updater.UpdateRuntimeMetadata(aj.JobID, aj.WorktreePath, "", aj.PID, 0, 0)
+				}
 			}
 		}
 		_, _ = s.Queue.ExtendLeasesForHost(r.Context(), hostID, activeJobIDs)
@@ -3326,7 +3377,8 @@ func (s *Server) appendChunk(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": "filtered"})
 		return
 	}
-	s.Engine.AppendLog(r.PathValue("id"), control.LogChunk{
+	jobID := r.PathValue("id")
+	s.Engine.AppendLog(jobID, control.LogChunk{
 		Type:             raw.Type,
 		Stream:           raw.Stream,
 		Text:             raw.Text,
@@ -3339,6 +3391,13 @@ func (s *Server) appendChunk(w http.ResponseWriter, r *http.Request) {
 		UnmetGates:       raw.UnmetGates,
 		ActiveChildTasks: raw.ActiveChildTasks,
 	})
+	if s.Queue != nil && (raw.HarnessPID > 0 || raw.ToolPID > 0 || raw.ElapsedSeconds > 0 || raw.ConversationID != "") {
+		if updater, ok := s.Queue.(interface {
+			UpdateRuntimeMetadata(jobID, worktreePath, activeConvID string, harnessPID, toolPID int, elapsedSec int64) (*dispatch.Job, bool)
+		}); ok {
+			updater.UpdateRuntimeMetadata(jobID, "", raw.ConversationID, raw.HarnessPID, raw.ToolPID, raw.ElapsedSeconds)
+		}
+	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "stored"})
 }
 
@@ -3365,6 +3424,7 @@ func (s *Server) addJobConversation(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errors.New("invalid conversation_id: contains illegal characters or path traversal"))
 		return
 	}
+	jobID := r.PathValue("id")
 	opt := control.ConversationAttachOptions{
 		Fallback:          raw.Fallback,
 		FallbackReason:    raw.FallbackReason,
@@ -3373,8 +3433,19 @@ func (s *Server) addJobConversation(w http.ResponseWriter, r *http.Request) {
 		ASEPhase:          raw.ASEPhase,
 		RehydrationStatus: raw.RehydrationStatus,
 	}
-	if err := s.Engine.AddJobConversationWithOptions(r.PathValue("id"), cid, opt); err != nil {
-		writeErr(w, http.StatusNotFound, err)
+	engineErr := s.Engine.AddJobConversationWithOptions(jobID, cid, opt)
+	queueFound := false
+	if s.Queue != nil {
+		if updater, ok := s.Queue.(interface {
+			UpdateRuntimeMetadata(jobID, worktreePath, activeConvID string, harnessPID, toolPID int, elapsedSec int64) (*dispatch.Job, bool)
+		}); ok {
+			_, queueFound = updater.UpdateRuntimeMetadata(jobID, "", cid, 0, 0, 0)
+		} else if _, ok := s.Queue.Get(jobID); ok {
+			queueFound = true
+		}
+	}
+	if engineErr != nil && !queueFound {
+		writeErr(w, http.StatusNotFound, engineErr)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "recorded", "conversation_id": cid})
@@ -3392,6 +3463,12 @@ func (s *Server) postJobReadiness(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	if err := s.Engine.SetJobReadiness(id, raw.ReapResult, raw.WorkspaceStateManifest, raw.RehydrationStatus); err != nil {
+		if s.Queue != nil {
+			if _, ok := s.Queue.Get(id); ok {
+				writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+				return
+			}
+		}
 		writeErr(w, http.StatusNotFound, err)
 		return
 	}

@@ -29,9 +29,15 @@ type CompleteJobRequest struct {
 
 // HeartbeatJobRequest is sent by an iazio-agent daemon to extend its execution lease.
 type HeartbeatJobRequest struct {
-	FencingToken int64  `json:"fencing_token"`
-	LeaseToken   string `json:"lease_token,omitempty"`
-	StoryID      string `json:"story_id,omitempty"`
+	FencingToken         int64  `json:"fencing_token"`
+	LeaseToken           string `json:"lease_token,omitempty"`
+	StoryID              string `json:"story_id,omitempty"`
+	WorktreePath         string `json:"worktree_path,omitempty"`
+	Repo                 string `json:"repo,omitempty"`
+	AgentPID             int    `json:"agent_pid,omitempty"`
+	ToolPID              int    `json:"tool_pid,omitempty"`
+	ActiveConversationID string `json:"active_conversation_id,omitempty"`
+	ElapsedSeconds       int64  `json:"elapsed_seconds,omitempty"`
 }
 
 // AgentJobsHandler manages agent job claims and completion reports.
@@ -82,6 +88,19 @@ func (h *AgentJobsHandler) ClaimHandler(w http.ResponseWriter, r *http.Request) 
 	if job == nil {
 		w.WriteHeader(http.StatusNoContent)
 		return
+	}
+
+	if h.engine != nil {
+		boundWT := h.engine.BindDispatchJobRepo(req.HostID, job.Repo, job.ID)
+		if boundWT != "" && boundWT != "." && boundWT != "root" && (job.Repo == "" || job.Repo == "." || job.Repo == "root") {
+			if updater, ok := h.queue.(interface {
+				UpdateRuntimeMetadata(jobID, worktreePath, activeConvID string, harnessPID, toolPID int, elapsedSec int64) (*dispatch.Job, bool)
+			}); ok {
+				if updated, ok := updater.UpdateRuntimeMetadata(job.ID, boundWT, "", 0, 0, 0); ok && updated != nil {
+					job = updated
+				}
+			}
+		}
 	}
 
 	if sID := strings.TrimSpace(job.StoryID); sID != "" && sID != "pending-allocation" && sID != "pending" {
@@ -156,6 +175,10 @@ func (h *AgentJobsHandler) CompleteHandler(w http.ResponseWriter, r *http.Reques
 		h.queue.SetFinalHarvest(jobID, req.FinalTurnCount, req.FinalTranscriptSHA256)
 	}
 
+	if h.engine != nil {
+		h.engine.ReleaseDispatchJobRepo(jobID)
+	}
+
 	job, _ := h.queue.Get(jobID)
 	storyID := ""
 	storyTitle := ""
@@ -165,11 +188,22 @@ func (h *AgentJobsHandler) CompleteHandler(w http.ResponseWriter, r *http.Reques
 		storyTitle = job.StoryTitle
 		storySubmodule = job.Repo
 	}
-	if storyID == "" && len(req.Result) > 0 {
+	if len(req.Result) > 0 {
 		var resMap map[string]any
 		if json.Unmarshal(req.Result, &resMap) == nil {
-			if rawID, ok := resMap["story_id"].(string); ok {
-				storyID = strings.TrimSpace(rawID)
+			if storyID == "" {
+				if rawID, ok := resMap["story_id"].(string); ok {
+					storyID = strings.TrimSpace(rawID)
+				}
+			}
+			resWT, _ := resMap["worktree_path"].(string)
+			resConv, _ := resMap["conversation_id"].(string)
+			if (resWT != "" || resConv != "") && h.queue != nil {
+				if updater, ok := h.queue.(interface {
+					UpdateRuntimeMetadata(jobID, worktreePath, activeConvID string, harnessPID, toolPID int, elapsedSec int64) (*dispatch.Job, bool)
+				}); ok {
+					updater.UpdateRuntimeMetadata(jobID, resWT, resConv, 0, 0, 0)
+				}
 			}
 		}
 	}
@@ -260,6 +294,31 @@ func (h *AgentJobsHandler) HeartbeatHandler(w http.ResponseWriter, r *http.Reque
 		}
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+
+	if job != nil {
+		effectiveWT := strings.TrimSpace(req.WorktreePath)
+		if effectiveWT == "" {
+			effectiveWT = strings.TrimSpace(req.Repo)
+		}
+		if effectiveWT == "" {
+			effectiveWT = strings.TrimSpace(job.Repo)
+		}
+		if h.engine != nil {
+			hostID := job.ClaimedHost
+			if hostID == "" {
+				hostID = job.HostID
+			}
+			boundWT := h.engine.BindDispatchJobRepo(hostID, effectiveWT, job.ID)
+			if boundWT != "" {
+				effectiveWT = boundWT
+			}
+		}
+		if updater, ok := h.queue.(interface {
+			UpdateRuntimeMetadata(jobID, worktreePath, activeConvID string, harnessPID, toolPID int, elapsedSec int64) (*dispatch.Job, bool)
+		}); ok {
+			updater.UpdateRuntimeMetadata(job.ID, effectiveWT, req.ActiveConversationID, req.AgentPID, req.ToolPID, req.ElapsedSeconds)
+		}
 	}
 
 	boundStoryID := strings.TrimSpace(req.StoryID)

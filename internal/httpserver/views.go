@@ -109,6 +109,17 @@ func hostView(h control.Host, paused int) map[string]any {
 	if h.EagerReadiness != nil {
 		eagerReadiness = h.EagerReadiness
 	}
+	adhocExecs := 0
+	for _, rs := range h.RepoStatuses {
+		prov := strings.ToUpper(strings.TrimSpace(rs.ExecutionProvenance))
+		live := strings.ToUpper(strings.TrimSpace(rs.ToolLiveness))
+		ase := strings.ToUpper(strings.TrimSpace(rs.ASEState))
+		if strings.Contains(prov, "ADHOC") && (live == "LIVE" || live == "ALIVE" || ase == "RUNNING" || ase == "IN_PROGRESS") {
+			adhocExecs++
+		}
+	}
+	harnessExecs := len(h.ActiveJobs)
+	harnessActive := h.HarnessActive || harnessExecs > 0
 	res := map[string]any{
 		"id":                   h.ID,
 		"name":                 name,
@@ -120,7 +131,10 @@ func hostView(h control.Host, paused int) map[string]any {
 		"repos_paused":         paused,
 		"fetch_failed":         h.FetchFailed,
 		"fleet_git_clean":      fleetGitClean,
-		"harness_active":       h.HarnessActive,
+		"harness_active":       harnessActive,
+		"harness_executions":   harnessExecs,
+		"adhoc_ase_executions": adhocExecs,
+		"queued_executions":    0,
 		"fleet_checked_at":     fleetChecked,
 		"tools":                tools,
 		"eager_readiness":      eagerReadiness,
@@ -722,6 +736,12 @@ func dispatchHistoryView(j *dispatch.Job) map[string]any {
 		return map[string]any{}
 	}
 	title, _, storyID := parseDispatchPayload(j.Payload)
+	if j.StoryID != "" {
+		storyID = j.StoryID
+	}
+	if title == "" && j.StoryTitle != "" {
+		title = j.StoryTitle
+	}
 	if title == "" {
 		title = fmt.Sprintf("Dispatch Job %s (%s)", j.ID, j.Type)
 	}
@@ -750,6 +770,13 @@ func dispatchHistoryView(j *dispatch.Job) map[string]any {
 	if !j.CreatedAt.IsZero() {
 		createdAtStr = j.CreatedAt.UTC().Format(time.RFC3339)
 	}
+	convIDs := j.ConversationIDs
+	if len(convIDs) == 0 && j.ActiveConversationID != "" {
+		convIDs = []string{j.ActiveConversationID}
+	}
+	if convIDs == nil {
+		convIDs = []string{}
+	}
 
 	return map[string]any{
 		"host_id":                hostID,
@@ -762,7 +789,8 @@ func dispatchHistoryView(j *dispatch.Job) map[string]any {
 		"status":                 status,
 		"clean":                  clean,
 		"ase_complete":           clean,
-		"conversation_ids":       []string{},
+		"conversation_ids":       convIDs,
+		"active_conversation_id": j.ActiveConversationID,
 		"reason":                 j.Error,
 		"error_message":          j.Error,
 		"diagnostic_code":        "",
@@ -791,8 +819,17 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 		return map[string]any{}
 	}
 	title, promptText, storyID := parseDispatchPayload(j.Payload)
+	if j.StoryID != "" {
+		storyID = j.StoryID
+	}
+	if title == "" && j.StoryTitle != "" {
+		title = j.StoryTitle
+	}
 	if title == "" {
 		title = fmt.Sprintf("Dispatch Job %s (%s)", j.ID, j.Type)
+	}
+	if promptText == "" && j.NormalizedPrompt != "" {
+		promptText = j.NormalizedPrompt
 	}
 	engine := j.TargetAgent
 	if engine == "" {
@@ -809,6 +846,28 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 	if targetHost == "" || targetHost == "auto" {
 		targetHost = hostID
 	}
+	convIDs := j.ConversationIDs
+	if len(convIDs) == 0 && j.ActiveConversationID != "" {
+		convIDs = []string{j.ActiveConversationID}
+	}
+	if convIDs == nil {
+		convIDs = []string{}
+	}
+	harnessPID := j.HarnessPID
+	if harnessPID == 0 {
+		harnessPID = j.AgentPID
+	}
+	elapsedSec := j.ElapsedSeconds
+	if elapsedSec <= 0 && j.ClaimedAt != nil {
+		if j.CompletedAt != nil {
+			elapsedSec = int64(j.CompletedAt.Sub(*j.ClaimedAt).Seconds())
+		} else {
+			elapsedSec = int64(time.Since(*j.ClaimedAt).Seconds())
+		}
+		if elapsedSec < 0 {
+			elapsedSec = 0
+		}
+	}
 	res := map[string]any{
 		"id":                             j.ID,
 		"schedule_id":                    "",
@@ -817,16 +876,32 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 		"engine":                         engine,
 		"target_agent":                   j.TargetAgent,
 		"target_host":                    targetHost,
+		"claimed_host":                   j.ClaimedHost,
 		"host_id":                        hostID,
+		"repo":                           j.Repo,
 		"prompt":                         promptText,
+		"normalized_prompt":              j.NormalizedPrompt,
+		"effective_action":               j.EffectiveAction,
 		"prompt_title":                   title,
 		"story_id":                       storyID,
+		"story_title":                    j.StoryTitle,
+		"story_path":                     j.StoryPath,
+		"story_allocation_status":        j.StoryAllocationStatus,
+		"allocation_source":              j.AllocationSource,
+		"priority_rank_selected":         j.PriorityRankSelected,
 		"worktree_path":                  j.Repo,
 		"docs_hub_path":                  "",
 		"env_vars":                       map[string]string{},
 		"max_execution_duration_seconds": 0,
 		"resume_conversation_id":         "",
-		"conversation_ids":               []string{},
+		"active_conversation_id":         j.ActiveConversationID,
+		"conversation_ids":               convIDs,
+		"harness_pid":                    harnessPID,
+		"tool_pid":                       j.ToolPID,
+		"agent_pid":                      j.AgentPID,
+		"elapsed_seconds":                elapsedSec,
+		"fencing_token":                  j.FencingToken,
+		"attempts":                       j.Attempts,
 		"silent_for_seconds":             0,
 		"is_stalled":                     false,
 		"reason":                         j.Error,
@@ -840,6 +915,7 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 		"failure_reason_summary":         j.FailureReasonSummary,
 		"retriable":                      j.Retriable,
 		"attempt_history":                j.AttemptHistory,
+		"dispatch_diagnostics":           j.DispatchDiagnostics,
 		"zipkin_trace_id":                j.ZipkinTraceID,
 		"zipkin_trace_url":               j.ZipkinTraceURL,
 		"traceparent":                    j.Traceparent,
@@ -851,6 +927,15 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 	}
 	if j.ClaimedAt != nil {
 		res["claimed_at"] = j.ClaimedAt.UTC().Format(time.RFC3339)
+	}
+	if j.AckedAt != nil {
+		res["acked_at"] = j.AckedAt.UTC().Format(time.RFC3339)
+	}
+	if j.HeartbeatAt != nil {
+		res["heartbeat_at"] = j.HeartbeatAt.UTC().Format(time.RFC3339)
+	}
+	if j.LeaseExpiresAt != nil {
+		res["lease_expires_at"] = j.LeaseExpiresAt.UTC().Format(time.RFC3339)
 	}
 	if j.CompletedAt != nil {
 		res["completed_at"] = j.CompletedAt.UTC().Format(time.RFC3339)
