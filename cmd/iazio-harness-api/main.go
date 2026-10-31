@@ -92,7 +92,9 @@ func run(ctx context.Context, args []string) error {
 			}
 			log.Printf("loaded %d ideas from database", len(ideas))
 		}
-		if prompts, err := store.LoadPrompts(ctx); err == nil {
+		if prompts, err := store.LoadPrompts(ctx); err != nil {
+			log.Printf("warn: load prompts: %v", err)
+		} else {
 			for _, p := range prompts {
 				srv.Engine.PutPrompt(p)
 			}

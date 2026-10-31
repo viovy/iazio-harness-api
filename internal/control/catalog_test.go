@@ -52,6 +52,102 @@ func TestCatalogIdeasAndPrompts(t *testing.T) {
 	}
 }
 
+func TestListPromptsAlphabeticalSortingAndTieBreaking(t *testing.T) {
+	e := NewEngine(nil)
+
+	e.PutPrompt(Prompt{ID: "p-zeta", Title: "zeta prompt", Body: "run"})
+	e.PutPrompt(Prompt{ID: "p-empty-b", Title: "   ", Body: "run"})
+	e.PutPrompt(Prompt{ID: "p-alpha-2", Title: "alpha prompt", Body: "run"})
+	e.PutPrompt(Prompt{ID: "p-alpha-1", Title: "Alpha Prompt", Body: "run"})
+	e.PutPrompt(Prompt{ID: "p-alpha-0", Title: "alpha prompt", Body: "run"})
+	e.PutPrompt(Prompt{ID: "p-empty-a", Title: "", Body: "run"})
+	e.PutPrompt(Prompt{ID: "p-beta", Title: "  Beta Prompt  ", Body: "run"})
+
+	got := e.ListPrompts()
+	wantIDs := []string{
+		"p-alpha-1", // "Alpha Prompt" < "alpha prompt" raw tie-breaker when lower is equal
+		"p-alpha-0", // "alpha prompt" id tie-breaker
+		"p-alpha-2", // "alpha prompt" id tie-breaker
+		"p-beta",    // "Beta Prompt"
+		"p-zeta",    // "zeta prompt"
+		"p-empty-a", // empty title sorted after non-empty, id tie-breaker
+		"p-empty-b", // whitespace title sorted after non-empty, id tie-breaker
+	}
+	if len(got) != len(wantIDs) {
+		t.Fatalf("expected %d prompts, got %d", len(wantIDs), len(got))
+	}
+	for i, want := range wantIDs {
+		if got[i].ID != want {
+			t.Errorf("position %d: expected prompt ID %q, got %q (title=%q)", i, want, got[i].ID, got[i].Title)
+		}
+	}
+}
+
+func TestComparePromptsAlphabeticallyProperties(t *testing.T) {
+	cases := []struct {
+		name string
+		a    Prompt
+		b    Prompt
+		want int
+	}{
+		{
+			name: "reflexive non-empty",
+			a:    Prompt{ID: "p-1", Title: "Alpha"},
+			b:    Prompt{ID: "p-1", Title: "Alpha"},
+			want: 0,
+		},
+		{
+			name: "reflexive empty",
+			a:    Prompt{ID: "p-1", Title: "\t\n "},
+			b:    Prompt{ID: "p-1", Title: ""},
+			want: 0,
+		},
+		{
+			name: "case-insensitive primary order",
+			a:    Prompt{ID: "p-2", Title: "alpha"},
+			b:    Prompt{ID: "p-1", Title: "Beta"},
+			want: -1,
+		},
+		{
+			name: "raw title tie-breaker",
+			a:    Prompt{ID: "p-2", Title: "Alpha Prompt"},
+			b:    Prompt{ID: "p-1", Title: "alpha prompt"},
+			want: -1,
+		},
+		{
+			name: "case-insensitive ID tie-breaker",
+			a:    Prompt{ID: "p-a", Title: "Same"},
+			b:    Prompt{ID: "p-B", Title: "Same"},
+			want: -1,
+		},
+		{
+			name: "raw ID tie-breaker",
+			a:    Prompt{ID: "p-A", Title: "Same"},
+			b:    Prompt{ID: "p-a", Title: "Same"},
+			want: -1,
+		},
+		{
+			name: "tab/newline title placed after non-empty",
+			a:    Prompt{ID: "p-1", Title: "\t\n"},
+			b:    Prompt{ID: "p-2", Title: "Zeta"},
+			want: 1,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ComparePromptsAlphabetically(tc.a, tc.b)
+			if (tc.want < 0 && got >= 0) || (tc.want > 0 && got <= 0) || (tc.want == 0 && got != 0) {
+				t.Errorf("ComparePromptsAlphabetically(%+v, %+v) = %d, want sign %d", tc.a, tc.b, got, tc.want)
+			}
+			rev := ComparePromptsAlphabetically(tc.b, tc.a)
+			if (got < 0 && rev <= 0) || (got > 0 && rev >= 0) || (got == 0 && rev != 0) {
+				t.Errorf("antisymmetry failed: forward=%d reverse=%d", got, rev)
+			}
+		})
+	}
+}
+
 func TestCatalogToolUpdatesAndHosts(t *testing.T) {
 	e := NewEngine(nil)
 

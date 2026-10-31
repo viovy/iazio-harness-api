@@ -497,14 +497,15 @@ func (s *Store) DeletePrompt(ctx context.Context, id string) error {
 	return nil
 }
 
-// LoadPrompts loads all prompts from the database.
+// LoadPrompts loads all prompts from the database and sorts them via
+// control.SortPromptsAlphabetically (defense-in-depth alongside Engine.ListPrompts).
 func (s *Store) LoadPrompts(ctx context.Context) ([]control.Prompt, error) {
 	if s == nil || s.db == nil {
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, title, body, engine, story_id, source_idea_id, status, revision
-FROM harness_prompts ORDER BY id
+FROM harness_prompts
 `)
 	if err != nil {
 		return nil, fmt.Errorf("load prompts: %w", err)
@@ -519,7 +520,15 @@ FROM harness_prompts ORDER BY id
 		}
 		out = append(out, p)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sortLoadedPrompts(out)
+	return out, nil
+}
+
+func sortLoadedPrompts(out []control.Prompt) {
+	control.SortPromptsAlphabetically(out)
 }
 
 // SaveRepo inserts or updates a repository row.
