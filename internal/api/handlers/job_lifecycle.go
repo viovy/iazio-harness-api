@@ -29,6 +29,13 @@ type StoryValidator interface {
 	StoryExists(storyID, submodule string) bool
 }
 
+const (
+	modeStoryCreate           = "story.create"
+	modeStoryExecute          = "story.execute"
+	modeStoryCreateAndExecute = "story.create_and_execute"
+	defaultASECommand         = "/autonomous-story-execution"
+)
+
 // JobLifecycleHandler manages querying, listing, canceling, and retrying agent jobs.
 type JobLifecycleHandler struct {
 	queue          dispatch.Queue
@@ -494,19 +501,19 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 
 	mode := strings.TrimSpace(req.Mode)
 	switch mode {
-	case "story.create_and_execute", "story.create":
+	case modeStoryCreateAndExecute, modeStoryCreate:
 		// Modes 1 and 3 never mock or accept a pre-assigned story ID.
 		storyID = ""
-	case "story.execute":
+	case modeStoryExecute:
 		if storyID == "" {
 			writeJSONError(w, http.StatusUnprocessableEntity, "story_id is mandatory for story.execute")
 			return
 		}
 	default:
 		if storyID != "" {
-			mode = "story.execute"
+			mode = modeStoryExecute
 		} else {
-			mode = "story.create_and_execute"
+			mode = modeStoryCreateAndExecute
 		}
 	}
 
@@ -577,10 +584,10 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		action = strings.TrimSpace(req.Action)
 	}
 	if action == "" {
-		if mode == "story.create" {
+		if mode == modeStoryCreate {
 			action = "/story-create"
 		} else {
-			action = "/autonomous-story-execution"
+			action = defaultASECommand
 		}
 	}
 	if !strings.HasPrefix(action, "/") {
@@ -588,7 +595,7 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 	}
 
 	var normalizedPrompt string
-	if mode == "story.execute" && storyID != "" {
+	if mode == modeStoryExecute && storyID != "" {
 		// Mode 2: concatenation of command ("/autonomous-story-execution") followed by story_id (and optional prompt)
 		if strings.HasPrefix(promptText, action+" "+storyID) || strings.HasPrefix(promptText, action+"\n"+storyID) {
 			normalizedPrompt = promptText
@@ -603,7 +610,7 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		}
 	} else {
 		if promptText == "" {
-			if mode == "story.create" {
+			if mode == modeStoryCreate {
 				promptText = fmt.Sprintf("Create story in backlog for %s.", submodule)
 			} else {
 				promptText = fmt.Sprintf("Execute autonomous story flow in %s.", submodule)

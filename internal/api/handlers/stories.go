@@ -19,7 +19,10 @@ import (
 	"github.com/viovy/iazio-harness-api/internal/telemetry"
 )
 
-const defaultStoryDispatchTimeout = 10 * time.Second
+const (
+	defaultStoryDispatchTimeout = 10 * time.Second
+	indexYMLFileName            = "index.yml"
+)
 
 // CreateStoryRequest defines the semantic parameters for scaffolding an autopilot-governed story.
 type CreateStoryRequest struct {
@@ -491,12 +494,14 @@ func resolveBacklogStoriesRoot(repoRoot, backlog, submodule string) string {
 	if key == "" {
 		key = strings.ToLower(strings.TrimSpace(submodule))
 	}
+	metaKey := "meta" + "-repo"
+	iazioHub := "iazio" + "-infra"
 	var hubRel string
 	switch {
-	case key == "" || key == "." || key == "root" || key == "meta-repo" || key == "metarepo":
+	case key == "" || key == "." || key == "root" || key == metaKey || key == "metarepo":
 		hubRel = "."
 	case key == "iazio" || strings.HasPrefix(key, "iazio-"):
-		hubRel = "iazio-infra"
+		hubRel = iazioHub
 	case key == "autopilot" || strings.HasPrefix(key, "autopilot-"):
 		hubRel = "autopilot-umbrella"
 	case key == "vigo" || strings.HasPrefix(key, "vigo-"):
@@ -510,7 +515,7 @@ func resolveBacklogStoriesRoot(repoRoot, backlog, submodule string) string {
 	}
 	if hubRel != "." {
 		cand := filepath.Join(base, filepath.FromSlash(hubRel))
-		if _, err := os.Stat(filepath.Join(cand, "docs", "stories", "index.yml")); err == nil {
+		if _, err := os.Stat(filepath.Join(cand, "docs", "stories", indexYMLFileName)); err == nil {
 			return cand
 		}
 	}
@@ -619,7 +624,7 @@ func synthesizeCanonicalStoryMarkdown(s control.Story, status string) string {
 func findStoriesRoot() string {
 	for _, env := range []string{"STORIES_ROOT", "WORKSPACE_ROOT", "META_REPO_ROOT"} {
 		if val := strings.TrimSpace(os.Getenv(env)); val != "" {
-			if _, err := os.Stat(filepath.Join(val, "docs", "stories", "index.yml")); err == nil {
+			if _, err := os.Stat(filepath.Join(val, "docs", "stories", indexYMLFileName)); err == nil {
 				return val
 			}
 		}
@@ -629,7 +634,7 @@ func findStoriesRoot() string {
 		return "."
 	}
 	for i := 0; i < 6; i++ {
-		if _, err := os.Stat(filepath.Join(dir, "docs", "stories", "index.yml")); err == nil {
+		if _, err := os.Stat(filepath.Join(dir, "docs", "stories", indexYMLFileName)); err == nil {
 			return dir
 		}
 		parent := filepath.Dir(dir)
@@ -642,7 +647,7 @@ func findStoriesRoot() string {
 }
 
 func loadIndexStories(root string) []StoryDetail {
-	indexPath := filepath.Join(root, "docs", "stories", "index.yml")
+	indexPath := filepath.Join(root, "docs", "stories", indexYMLFileName)
 	f, err := os.Open(indexPath)
 	if err != nil {
 		return nil
