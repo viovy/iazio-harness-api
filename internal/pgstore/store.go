@@ -342,6 +342,9 @@ ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS agent_affinity text N
 ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS agent_pid integer NOT NULL DEFAULT 0;
 ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS active_conversation_id text NOT NULL DEFAULT '';
 ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS lease_ack_deadline_at timestamp with time zone;
+UPDATE harness_dispatch_jobs
+   SET failure_category = '', failure_stage = '', failure_reason_summary = ''
+ WHERE status = 'completed' AND error = '' AND failure_category <> '';
 
 CREATE INDEX IF NOT EXISTS harness_dispatch_jobs_status_idx ON harness_dispatch_jobs (status);
 CREATE INDEX IF NOT EXISTS harness_dispatch_jobs_host_idx ON harness_dispatch_jobs (claimed_host, status);
@@ -1469,6 +1472,50 @@ ORDER BY created_at ASC;
 		}
 		if len(attemptHistBytes) > 0 {
 			_ = json.Unmarshal(attemptHistBytes, &j.AttemptHistory)
+		}
+		if j.HarnessPID == 0 && j.AgentPID > 0 {
+			j.HarnessPID = j.AgentPID
+		}
+		if len(resultBytes) > 0 {
+			var resMap map[string]any
+			if json.Unmarshal(resultBytes, &resMap) == nil {
+				if cid, _ := resMap["active_conversation_id"].(string); strings.TrimSpace(cid) != "" && j.ActiveConversationID == "" {
+					j.ActiveConversationID = strings.TrimSpace(cid)
+				}
+				if cids, ok := resMap["conversation_ids"].([]any); ok {
+					for _, raw := range cids {
+						if s, ok := raw.(string); ok && strings.TrimSpace(s) != "" {
+							j.ConversationIDs = append(j.ConversationIDs, strings.TrimSpace(s))
+						}
+					}
+				}
+				if hpid, ok := resMap["harness_pid"].(float64); ok && int(hpid) > 0 {
+					j.HarnessPID = int(hpid)
+				}
+				if tpid, ok := resMap["tool_pid"].(float64); ok && int(tpid) > 0 {
+					j.ToolPID = int(tpid)
+				}
+				if elapsed, ok := resMap["elapsed_seconds"].(float64); ok && int64(elapsed) > 0 {
+					j.ElapsedSeconds = int64(elapsed)
+				}
+			}
+		}
+		if j.ActiveConversationID != "" && len(j.ConversationIDs) == 0 {
+			j.ConversationIDs = []string{j.ActiveConversationID}
+		}
+		if j.ElapsedSeconds <= 0 && j.CompletedAt != nil {
+			start := j.CreatedAt
+			if j.ClaimedAt != nil && !j.ClaimedAt.IsZero() {
+				start = *j.ClaimedAt
+			}
+			if !start.IsZero() && j.CompletedAt.After(start) {
+				j.ElapsedSeconds = int64(j.CompletedAt.Sub(start).Seconds())
+			}
+		}
+		if j.Status == dispatch.JobStatusCompleted && strings.TrimSpace(j.Error) == "" {
+			j.FailureCategory = ""
+			j.FailureStage = ""
+			j.FailureReasonSummary = ""
 		}
 		jobs = append(jobs, &j)
 	}

@@ -161,6 +161,12 @@ type JobDetailResponse struct {
 	NormalizedPrompt        string                        `json:"normalized_prompt,omitempty"`
 	EffectiveAction         string                        `json:"effective_action,omitempty"`
 	SourceConversationTitle string                        `json:"source_conversation_title,omitempty"`
+	ActiveConversationID    string                        `json:"active_conversation_id,omitempty"`
+	ConversationIDs         []string                      `json:"conversation_ids,omitempty"`
+	AgentPID                int                           `json:"agent_pid,omitempty"`
+	HarnessPID              int                           `json:"harness_pid,omitempty"`
+	ToolPID                 int                           `json:"tool_pid,omitempty"`
+	ElapsedSeconds          int64                         `json:"elapsed_seconds,omitempty"`
 	LiveURL                 string                        `json:"live_url,omitempty"`
 	Status                  string                        `json:"status"`
 	Result                  json.RawMessage               `json:"result,omitempty"`
@@ -850,6 +856,22 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		}
 	}
 
+	convIDs := j.ConversationIDs
+	if len(convIDs) == 0 && j.ActiveConversationID != "" {
+		convIDs = []string{j.ActiveConversationID}
+	}
+	harnessPID := j.HarnessPID
+	if harnessPID == 0 {
+		harnessPID = j.AgentPID
+	}
+	elapsedSec := j.ElapsedSeconds
+	if elapsedSec <= 0 && j.CompletedAt != nil && !j.CreatedAt.IsZero() {
+		elapsedSec = int64(j.CompletedAt.Sub(j.CreatedAt).Seconds())
+		if elapsedSec < 0 {
+			elapsedSec = 0
+		}
+	}
+
 	resp := JobDetailResponse{
 		ID:                      j.ID,
 		Type:                    j.Type,
@@ -867,6 +889,12 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		NormalizedPrompt:        j.NormalizedPrompt,
 		EffectiveAction:         j.EffectiveAction,
 		SourceConversationTitle: j.SourceConversationTitle,
+		ActiveConversationID:    j.ActiveConversationID,
+		ConversationIDs:         convIDs,
+		AgentPID:                j.AgentPID,
+		HarnessPID:              harnessPID,
+		ToolPID:                 j.ToolPID,
+		ElapsedSeconds:          elapsedSec,
 		Status:                  j.Status,
 		Result:                  j.Result,
 		Error:                   j.Error,

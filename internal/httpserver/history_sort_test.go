@@ -128,3 +128,90 @@ func TestListPrompts_AlphabeticalSortingHTTP(t *testing.T) {
 		}
 	}
 }
+
+func TestRepoDetailAndHistory_IncludesDispatchJob3ffa5d0be1649f0e(t *testing.T) {
+	s := &Server{
+		Engine: control.NewEngine(nil),
+		Queue:  dispatch.NewInMemoryQueue(),
+	}
+
+	_ = s.Engine.UpsertRepo(control.Repo{HostID: "debian", WorktreePath: "/home/romeo/work/meta-repo-02"})
+
+	now := time.Date(2026, 10, 31, 17, 49, 15, 0, time.UTC)
+	claimedAt := now.Add(-6434 * time.Second)
+	qJob := &dispatch.Job{
+		ID:                   "job_3ffa5d0be1649f0e",
+		Type:                 dispatch.JobTypePromptExecute,
+		Status:               dispatch.JobStatusCompleted,
+		Repo:                 "/home/romeo/work/meta-repo-02",
+		TargetHost:           "debian",
+		ClaimedHost:          "debian",
+		HostID:               "debian",
+		TargetAgent:          "agy",
+		StoryID:              "STORY-GOV-3850",
+		ActiveConversationID: "ba042127-c63f-4b1e-a42e-95b307e61bbc",
+		ConversationIDs:      []string{"ba042127-c63f-4b1e-a42e-95b307e61bbc"},
+		AgentPID:             2779723,
+		HarnessPID:           2779723,
+		ToolPID:              2781140,
+		ElapsedSeconds:       6434,
+		TraceID:              "7e97788c6f8c8bcea43de8bd9cc29e0b",
+		Payload:              json.RawMessage(`{"prompt":"/autonomous-story-execution","target_agent":"agy"}`),
+		CreatedAt:            claimedAt,
+		ClaimedAt:            &claimedAt,
+		CompletedAt:          &now,
+	}
+	_, _ = s.Queue.Enqueue(context.Background(), qJob)
+
+	// 1. Check /v1/history?host=debian&path=/home/romeo/work/meta-repo-02
+	reqHist := httptest.NewRequest(http.MethodGet, "/v1/history?host=debian&path=/home/romeo/work/meta-repo-02", nil)
+	rrHist := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rrHist, reqHist)
+	if rrHist.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /v1/history, got %d", rrHist.Code)
+	}
+	var histResp struct {
+		History []map[string]any `json:"history"`
+	}
+	if err := json.NewDecoder(rrHist.Body).Decode(&histResp); err != nil {
+		t.Fatalf("decode /v1/history: %v", err)
+	}
+	if len(histResp.History) != 1 || histResp.History[0]["job_id"] != "job_3ffa5d0be1649f0e" {
+		t.Fatalf("expected job_3ffa5d0be1649f0e in /v1/history for debian/meta-repo-02, got %+v", histResp.History)
+	}
+	if histResp.History[0]["story_id"] != "STORY-GOV-3850" {
+		t.Errorf("expected story_id=STORY-GOV-3850, got %v", histResp.History[0]["story_id"])
+	}
+
+	// 2. Check /v1/hosts/debian/repos?path=/home/romeo/work/meta-repo-02 (used by /agents/debian/meta-repo-02/history)
+	reqRepo := httptest.NewRequest(http.MethodGet, "/v1/hosts/debian/repos?path=/home/romeo/work/meta-repo-02", nil)
+	rrRepo := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rrRepo, reqRepo)
+	if rrRepo.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /v1/hosts/debian/repos, got %d", rrRepo.Code)
+	}
+	var repoResp struct {
+		History []map[string]any `json:"history"`
+	}
+	if err := json.NewDecoder(rrRepo.Body).Decode(&repoResp); err != nil {
+		t.Fatalf("decode /v1/hosts/debian/repos: %v", err)
+	}
+	if len(repoResp.History) != 1 || repoResp.History[0]["job_id"] != "job_3ffa5d0be1649f0e" {
+		t.Fatalf("expected job_3ffa5d0be1649f0e in repo detail history, got %+v", repoResp.History)
+	}
+
+	// 3. Check /v1/jobs/job_3ffa5d0be1649f0e detail and fallback chunk telemetry
+	reqJob := httptest.NewRequest(http.MethodGet, "/v1/jobs/job_3ffa5d0be1649f0e", nil)
+	rrJob := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rrJob, reqJob)
+	if rrJob.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /v1/jobs/job_3ffa5d0be1649f0e, got %d", rrJob.Code)
+	}
+	var jobResp map[string]any
+	if err := json.NewDecoder(rrJob.Body).Decode(&jobResp); err != nil {
+		t.Fatalf("decode /v1/jobs/job_3ffa5d0be1649f0e: %v", err)
+	}
+	if jobResp["active_conversation_id"] != "ba042127-c63f-4b1e-a42e-95b307e61bbc" {
+		t.Errorf("expected active_conversation_id=ba042127-c63f-4b1e-a42e-95b307e61bbc, got %v", jobResp["active_conversation_id"])
+	}
+}

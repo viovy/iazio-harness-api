@@ -1833,3 +1833,121 @@ func TestV4_ListCaseInsensitiveAliasesAndCountAndFailoverClearsHost(t *testing.T
 		t.Fatalf("expected Failover to clear payload target_host, got %q", th)
 	}
 }
+
+func TestJob3ffa5d0be1649f0e_LiveToolPIDNotExpiredAndReconcilesFailureCategory(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 31, 16, 0, 0, 0, time.UTC)
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+
+	job, err := q.Enqueue(ctx, &Job{
+		ID:          "job_3ffa5d0be1649f0e",
+		Type:        JobTypePromptExecute,
+		Repo:        "/home/romeo/work/meta-repo-02",
+		TargetHost:  "debian",
+		TargetAgent: "agy",
+		StoryID:     "STORY-GOV-3850",
+		Payload:     json.RawMessage(`{"prompt":"/autonomous-story-execution","target_agent":"agy"}`),
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	claimed, err := q.Claim(ctx, "debian", []string{JobTypePromptExecute})
+	if err != nil || claimed == nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+	q.mu.Lock()
+	q.jobs[job.ID].HarnessPID = 2779723
+	q.jobs[job.ID].ToolPID = 2781140
+	q.jobs[job.ID].ElapsedSeconds = 1800
+	q.jobs[job.ID].ActiveConversationID = "ba042127-c63f-4b1e-a42e-95b307e61bbc"
+	q.mu.Unlock()
+
+	// Advance past DefaultClaimTimeout (30m) while heartbeat & ToolPID are active (e.g. 1h 47m elapsed)
+	now = now.Add(107 * time.Minute)
+	if _, err := q.Heartbeat(ctx, job.ID, claimed.FencingToken); err != nil {
+		t.Fatalf("heartbeat at 107m should succeed while lease/ToolPID active, got: %v", err)
+	}
+	// Trigger reapExpiredLocked via List while lease is still valid
+	_, _ = q.List(ctx, JobFilter{})
+
+	fetched, ok := q.Get(job.ID)
+	if !ok {
+		t.Fatalf("expected job to exist")
+	}
+	if fetched.Status == JobStatusFailed || fetched.FailureCategory == FailureCategoryBackgroundDrainTimeout {
+		t.Fatalf("active job with live ToolPID & heartbeat should not be expired or tagged BACKGROUND_DRAIN_TIMEOUT: status=%s cat=%s",
+			fetched.Status, fetched.FailureCategory)
+	}
+
+	// Simulate transient BACKGROUND_DRAIN_TIMEOUT set before lease recovery + clean completion
+	q.mu.Lock()
+	q.jobs[job.ID].FailureCategory = FailureCategoryBackgroundDrainTimeout
+	q.jobs[job.ID].FailureStage = "BACKGROUND_DRAIN"
+	q.mu.Unlock()
+
+	resultJSON := json.RawMessage(`{
+		"status": "completed",
+		"story_id": "STORY-GOV-3850",
+		"active_conversation_id": "ba042127-c63f-4b1e-a42e-95b307e61bbc",
+		"conversation_ids": ["ba042127-c63f-4b1e-a42e-95b307e61bbc"],
+		"harness_pid": 2779723,
+		"tool_pid": 2781140,
+		"elapsed_seconds": 6434.4
+	}`)
+	// Reset ElapsedSeconds to 0 so CompleteWithFencing extracts elapsed_seconds from resultJSON
+	q.mu.Lock()
+	q.jobs[job.ID].ElapsedSeconds = 0
+	q.mu.Unlock()
+
+	if err := q.CompleteWithFencing(ctx, job.ID, claimed.FencingToken, resultJSON, ""); err != nil {
+		t.Fatalf("CompleteWithFencing: %v", err)
+	}
+
+	done, _ := q.Get(job.ID)
+	if done.Status != JobStatusCompleted {
+		t.Fatalf("expected completed status, got %s", done.Status)
+	}
+	if done.FailureCategory != "" || done.FailureStage != "" {
+		t.Fatalf("expected completed job to clear stale failure_category/stage, got cat=%q stage=%q",
+			done.FailureCategory, done.FailureStage)
+	}
+	if done.ActiveConversationID != "ba042127-c63f-4b1e-a42e-95b307e61bbc" {
+		t.Fatalf("expected ActiveConversationID preserved, got %q", done.ActiveConversationID)
+	}
+	if done.HarnessPID != 2779723 || done.ToolPID != 2781140 || done.ElapsedSeconds != 6434 {
+		t.Fatalf("expected runtime telemetry preserved (harness=%d tool=%d elapsed=%v)",
+			done.HarnessPID, done.ToolPID, done.ElapsedSeconds)
+	}
+
+	// Conversely, if CompleteWithFencing receives a result reporting timed_out / BACKGROUND_DRAIN_TIMEOUT,
+	// it must record Status = failed (never contradictory COMPLETED + BACKGROUND_DRAIN_TIMEOUT).
+	job2, _ := q.Enqueue(ctx, &Job{
+		ID:          "job_bg_drain_unrecovered",
+		Type:        JobTypePromptExecute,
+		Repo:        "/home/romeo/work/meta-repo-02",
+		TargetHost:  "debian",
+		TargetAgent: "agy",
+		StoryID:     "STORY-GOV-3850",
+	})
+	claimed2, _ := q.Claim(ctx, "debian", []string{JobTypePromptExecute})
+	timedOutResult := json.RawMessage(`{
+		"status": "timed_out",
+		"failure_category": "BACKGROUND_DRAIN_TIMEOUT",
+		"failure_stage": "BACKGROUND_DRAIN",
+		"active_conversation_id": "ba042127-c63f-4b1e-a42e-95b307e61bbc",
+		"summary": "background task drain exceeded grace period"
+	}`)
+	if err := q.CompleteWithFencing(ctx, job2.ID, claimed2.FencingToken, timedOutResult, ""); err != nil {
+		t.Fatalf("CompleteWithFencing timedOutResult: %v", err)
+	}
+	failedJob, _ := q.Get(job2.ID)
+	if failedJob.Status != JobStatusFailed {
+		t.Fatalf("expected timed_out result to mark job failed, got %s", failedJob.Status)
+	}
+	if failedJob.FailureCategory != FailureCategoryBackgroundDrainTimeout || failedJob.FailureStage != "BACKGROUND_DRAIN" {
+		t.Fatalf("expected FailureCategory=BACKGROUND_DRAIN_TIMEOUT and FailureStage=BACKGROUND_DRAIN, got %q / %q",
+			failedJob.FailureCategory, failedJob.FailureStage)
+	}
+}
