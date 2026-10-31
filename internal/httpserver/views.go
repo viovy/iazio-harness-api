@@ -356,6 +356,7 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 		"max_healing_attempts":            d.Repo.MaxHealingAttempts,
 		"last_healing_error":              d.Repo.LastHealingError,
 		"active_healer_run_id":            d.Repo.ActiveHealerRunID,
+		"running_job_id":                  d.Repo.RunningJobID,
 		"running_job":                     running,
 		"schedules":                       schedules,
 		"global_schedules":                globalSchedules,
@@ -868,6 +869,15 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 			elapsedSec = 0
 		}
 	}
+	diag := j.DispatchDiagnostics
+	if diag != nil {
+		stLower := strings.ToLower(strings.TrimSpace(j.Status))
+		if stLower == dispatch.JobStatusRunning || stLower == dispatch.JobStatusCompleted || stLower == dispatch.JobStatusFailed || stLower == dispatch.JobStatusCanceled || stLower == "cancelled" {
+			diagCopy := *diag
+			diagCopy.QueueState = stLower
+			diag = &diagCopy
+		}
+	}
 	res := map[string]any{
 		"id":                             j.ID,
 		"schedule_id":                    "",
@@ -915,7 +925,7 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 		"failure_reason_summary":         j.FailureReasonSummary,
 		"retriable":                      j.Retriable,
 		"attempt_history":                j.AttemptHistory,
-		"dispatch_diagnostics":           j.DispatchDiagnostics,
+		"dispatch_diagnostics":           diag,
 		"zipkin_trace_id":                j.ZipkinTraceID,
 		"zipkin_trace_url":               j.ZipkinTraceURL,
 		"traceparent":                    j.Traceparent,

@@ -3128,3 +3128,112 @@ func TestGov3839_DispatchJobRepoBindingAndLiveTelemetry(t *testing.T) {
 		t.Fatalf("expected debian host to report harness_executions>=1 and harness_active=true, got %v / %v", hostObj["harness_executions"], hostObj["harness_active"])
 	}
 }
+
+func TestGov3851_DispatchJobRepoDetailLockPreservationAndFallbackLogs(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	eng := control.NewEngine(nil)
+	s := &Server{
+		Engine: eng,
+		Queue:  q,
+	}
+	handler := s.Handler()
+	eng.RegisterHost("debian", "permanent")
+	_ = eng.UpsertRepo(control.Repo{
+		HostID:                       "debian",
+		WorktreePath:                 "/home/romeo/work/meta-repo-02",
+		CloneURL:                     "https://example.test/meta-repo-02.git",
+		Lock:                         control.LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	rawPayload, _ := json.Marshal(map[string]any{
+		"prompt":            "Deep review and fix live output",
+		"normalized_prompt": "Deep review and fix live output",
+	})
+	job, err := q.Enqueue(context.Background(), &dispatch.Job{
+		ID:          "job_3ffa5d0be1649f0e",
+		Type:        "prompt.execute",
+		Repo:        "/home/romeo/work/meta-repo-02",
+		StoryID:     "STORY-GOV-3850",
+		TargetAgent: "agy",
+		TargetHost:  "debian",
+		Payload:     rawPayload,
+	})
+	if err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
+	_ = q.SetDispatchDiagnostics(job.ID, &dispatch.DispatchDiagnostics{
+		QueueState: "dispatching",
+	})
+	if _, err := q.Claim(context.Background(), "debian", []string{"prompt.execute"}); err != nil {
+		t.Fatalf("Claim failed: %v", err)
+	}
+	eng.BindDispatchJobRepo("debian", "/home/romeo/work/meta-repo-02", job.ID)
+
+	// 1. Report harness_pid=3169210 and tool_pid=3169307 via OUTPUT_TICK
+	tickReq := httptest.NewRequest(http.MethodPost, "/v1/jobs/job_3ffa5d0be1649f0e/chunks", bytes.NewBufferString(`{"type":"OUTPUT_TICK","silent_for_ms":4000,"harness_pid":3169210,"tool_pid":3169307,"elapsed_seconds":266}`))
+	tickRR := httptest.NewRecorder()
+	handler.ServeHTTP(tickRR, tickReq)
+	if tickRR.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted for tick, got %d", tickRR.Code)
+	}
+
+	// 2. Host heartbeat with AgentPID=2779723 (toolPID=0) must NOT overwrite HarnessPID=3169210
+	hbBody := `{"tools":[{"name":"agy","installed":true,"status":"ok"}],"active_jobs":[{"job_id":"job_3ffa5d0be1649f0e","worktree_path":"/home/romeo/work/meta-repo-02","pid":2779723,"engine":"agy","active_conversation_id":"ba042127-79e5-4cb2-b35c-5d47145ef4fa"}]}`
+	hbReq := httptest.NewRequest(http.MethodPost, "/v1/hosts/debian/heartbeat", bytes.NewBufferString(hbBody))
+	hbRR := httptest.NewRecorder()
+	handler.ServeHTTP(hbRR, hbReq)
+	if hbRR.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for heartbeat, got %d: %s", hbRR.Code, hbRR.Body.String())
+	}
+
+	// 3. GET /v1/jobs/job_3ffa5d0be1649f0e preserves harness_pid=3169210, agent_pid=2779723, tool_pid=3169307, and updates dispatch_diagnostics.queue_state="running"
+	jobReq := httptest.NewRequest(http.MethodGet, "/v1/jobs/job_3ffa5d0be1649f0e", nil)
+	jobRR := httptest.NewRecorder()
+	handler.ServeHTTP(jobRR, jobReq)
+	if jobRR.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for job detail, got %d", jobRR.Code)
+	}
+	var jobView map[string]any
+	_ = json.Unmarshal(jobRR.Body.Bytes(), &jobView)
+	if int(jobView["harness_pid"].(float64)) != 3169210 {
+		t.Fatalf("expected harness_pid=3169210 (not overwritten by agent_pid=2779723), got %v", jobView["harness_pid"])
+	}
+	if int(jobView["agent_pid"].(float64)) != 2779723 {
+		t.Fatalf("expected agent_pid=2779723, got %v", jobView["agent_pid"])
+	}
+	if diag, ok := jobView["dispatch_diagnostics"].(map[string]any); !ok || diag["queue_state"] != "running" {
+		t.Fatalf("expected dispatch_diagnostics.queue_state='running', got %v", jobView["dispatch_diagnostics"])
+	}
+
+	// 4. GET /v1/jobs/job_3ffa5d0be1649f0e/logs synthesizes a fallback chunk when no stdout chunks have arrived yet
+	logsReq := httptest.NewRequest(http.MethodGet, "/v1/jobs/job_3ffa5d0be1649f0e/logs", nil)
+	logsRR := httptest.NewRecorder()
+	handler.ServeHTTP(logsRR, logsReq)
+	if logsRR.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for job logs, got %d", logsRR.Code)
+	}
+	var logsView map[string]any
+	_ = json.Unmarshal(logsRR.Body.Bytes(), &logsView)
+	rawChunks, _ := logsView["chunks"].([]any)
+	if len(rawChunks) == 0 {
+		t.Fatalf("expected non-empty fallback chunks for active dispatch job")
+	}
+
+	// 5. GET /v1/hosts/debian/repos?path=/home/romeo/work/meta-repo-02 preserves lock=RUNNING_HARNESS and populates running_job
+	repoReq := httptest.NewRequest(http.MethodGet, "/v1/hosts/debian/repos?path=/home/romeo/work/meta-repo-02", nil)
+	repoRR := httptest.NewRecorder()
+	handler.ServeHTTP(repoRR, repoReq)
+	if repoRR.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for repo detail, got %d: %s", repoRR.Code, repoRR.Body.String())
+	}
+	var repoView map[string]any
+	_ = json.Unmarshal(repoRR.Body.Bytes(), &repoView)
+	if repoView["lock"] != control.LockRunning {
+		t.Fatalf("expected repo lock=%s, got %v", control.LockRunning, repoView["lock"])
+	}
+	runningJob, ok := repoView["running_job"].(map[string]any)
+	if !ok || runningJob == nil || runningJob["id"] != "job_3ffa5d0be1649f0e" {
+		t.Fatalf("expected running_job.id='job_3ffa5d0be1649f0e' on repo detail, got %v", repoView["running_job"])
+	}
+}

@@ -873,6 +873,27 @@ type Engine struct {
 	OnHistoryChange      func(host, path string, row HistoryRow)
 	OnHistoryDelete      func(host, path string, jobID string)
 	OnToolPriorityChange func(tools []string)
+	IsDispatchJobActive  func(jobID string) bool
+}
+
+func (e *Engine) isExternalDispatchJobActiveLocked(repo *Repo, jobID string) bool {
+	cleanID := strings.TrimSpace(jobID)
+	if cleanID == "" {
+		return false
+	}
+	if e.IsDispatchJobActive != nil && e.IsDispatchJobActive(cleanID) {
+		return true
+	}
+	if repo != nil {
+		if h, ok := e.hosts[repo.HostID]; ok && h != nil {
+			for _, aj := range h.ActiveJobs {
+				if strings.TrimSpace(aj.JobID) == cleanID {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (e *Engine) notifyRepoLocked(r *Repo) {
@@ -1541,9 +1562,11 @@ func (e *Engine) BindDispatchJobRepo(hostID, worktreePath, jobID string) string 
 	matched.Lock = LockRunning
 	matched.RunningJobID = cleanJobID
 	matched.LockHolder = cleanJobID
+	matched.LastRuntimeCheck = e.now()
 	if h, ok := e.hosts[matched.HostID]; ok && h != nil {
 		h.HarnessActive = true
 	}
+	e.notifyRepoLocked(matched)
 	return matched.WorktreePath
 }
 
@@ -2035,6 +2058,12 @@ func (e *Engine) ApplyPreflight(host, path string, p Preflight) Halt {
 						break
 					}
 				}
+			}
+		}
+		if !hasActive && (e.isExternalDispatchJobActiveLocked(repo, repo.RunningJobID) || e.isExternalDispatchJobActiveLocked(repo, repo.LockHolder)) {
+			hasActive = true
+			if repo.RunningJobID == "" {
+				repo.RunningJobID = repo.LockHolder
 			}
 		}
 		if hasActive {
@@ -3678,9 +3707,18 @@ func (e *Engine) reapExpiredLocked() {
 					}
 				}
 			}
+			if !hasActive && (e.isExternalDispatchJobActiveLocked(repo, repo.RunningJobID) || e.isExternalDispatchJobActiveLocked(repo, repo.LockHolder)) {
+				hasActive = true
+				if repo.RunningJobID == "" {
+					repo.RunningJobID = repo.LockHolder
+				}
+			}
 			if !hasActive {
 				repo.Lock = LockIdle
 				repo.RunningJobID = ""
+				if strings.HasPrefix(repo.LockHolder, "job_") || strings.HasPrefix(repo.LockHolder, "job-") {
+					repo.LockHolder = ""
+				}
 				e.notifyRepoLocked(repo)
 			}
 		} else if repo.Lock == LockAutopilot && !repo.LockExpiresAt.IsZero() && now.After(repo.LockExpiresAt) {
@@ -3691,7 +3729,7 @@ func (e *Engine) reapExpiredLocked() {
 				repo.RunningJobID = ""
 			}
 			e.notifyRepoLocked(repo)
-		} else if repo.Lock == LockIdle && repo.RunningJobID != "" {
+		} else if repo.Lock == LockIdle && (repo.RunningJobID != "" || strings.HasPrefix(repo.LockHolder, "job_")) {
 			hasActive := false
 			for _, job := range e.jobs {
 				if !job.ExitPosted && (job.Status == "RUNNING" || job.Status == "LEASED" || job.Status == "CANCEL_REQUESTED") && job.ID == repo.RunningJobID {
@@ -3699,8 +3737,19 @@ func (e *Engine) reapExpiredLocked() {
 					break
 				}
 			}
+			if !hasActive && (e.isExternalDispatchJobActiveLocked(repo, repo.RunningJobID) || e.isExternalDispatchJobActiveLocked(repo, repo.LockHolder)) {
+				hasActive = true
+				repo.Lock = LockRunning
+				if repo.RunningJobID == "" {
+					repo.RunningJobID = repo.LockHolder
+				}
+				e.notifyRepoLocked(repo)
+			}
 			if !hasActive {
 				repo.RunningJobID = ""
+				if strings.HasPrefix(repo.LockHolder, "job_") || strings.HasPrefix(repo.LockHolder, "job-") {
+					repo.LockHolder = ""
+				}
 				e.notifyRepoLocked(repo)
 			}
 		}
@@ -6945,6 +6994,8 @@ func (e *Engine) reconcileStaleWorkspaceSlotsLocked(now time.Time, staleGrace ti
 					shouldReclaim = true
 					reclaimReason = fmt.Sprintf("active job %s lease expired at %s", repo.RunningJobID, job.LeaseExpiry.Format(time.RFC3339))
 				}
+			} else if e.isExternalDispatchJobActiveLocked(repo, repo.RunningJobID) || e.isExternalDispatchJobActiveLocked(repo, repo.LockHolder) {
+				// Active dispatch.Queue job — keep slot locked
 			} else {
 				// No known job in memory matches RunningJobID: only reclaim if slot has been unchanged longer than staleGrace
 				if !repo.LastRuntimeCheck.IsZero() && now.Sub(repo.LastRuntimeCheck) > staleGrace {
