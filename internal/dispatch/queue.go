@@ -1347,12 +1347,17 @@ func (q *InMemoryQueue) UpdateRuntimeMetadata(jobID, worktreePath, activeConvID 
 			changed = true
 		}
 	}
-	if harnessPID > 0 && job.HarnessPID != harnessPID {
-		job.HarnessPID = harnessPID
-		if job.AgentPID == 0 {
+	if harnessPID > 0 {
+		if job.AgentPID == 0 && toolPID == 0 {
 			job.AgentPID = harnessPID
+			changed = true
 		}
-		changed = true
+		if job.HarnessPID == 0 || toolPID > 0 || (harnessPID != job.AgentPID && job.HarnessPID != harnessPID) {
+			if job.HarnessPID != harnessPID {
+				job.HarnessPID = harnessPID
+				changed = true
+			}
+		}
 	}
 	if toolPID > 0 && job.ToolPID != toolPID {
 		job.ToolPID = toolPID

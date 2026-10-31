@@ -479,3 +479,95 @@ func TestE2E_GlobalQueue_OrphanedRunStartupGraceWindow(t *testing.T) {
 			detail.History[0].Status, detail.History[0].Reason)
 	}
 }
+
+func TestE2E_GlobalQueue_MockAgyBufferedStdoutLiveStreamingAndRepoLiveView(t *testing.T) {
+	eng := control.NewEngine(nil)
+	queue := dispatch.NewInMemoryQueue()
+	srv := &httpserver.Server{Engine: eng, Queue: queue}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. Register host debian and idle repo /home/romeo/work/meta-repo-02
+	eng.RegisterHost("debian", "permanent")
+	_ = eng.UpsertRepo(control.Repo{
+		HostID:                       "debian",
+		WorktreePath:                 "/home/romeo/work/meta-repo-02",
+		CloneURL:                     "https://example.test/meta-repo-02.git",
+		Lock:                         control.LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	// 2. Enqueue and claim job_3ffa5d0be1649f0e with initial DispatchDiagnostics queue_state="dispatching"
+	job, err := queue.Enqueue(context.Background(), &dispatch.Job{
+		ID:          "job_3ffa5d0be1649f0e",
+		Repo:        "/home/romeo/work/meta-repo-02",
+		StoryID:     "STORY-GOV-3850",
+		Type:        "prompt.execute",
+		Payload:     []byte(`{"prompt":"/autonomous-story-execution STORY-GOV-3850"}`),
+		TargetAgent: "agy",
+		TargetHost:  "debian",
+	})
+	if err != nil {
+		t.Fatalf("failed to enqueue job: %v", err)
+	}
+	_ = queue.SetDispatchDiagnostics(job.ID, &dispatch.DispatchDiagnostics{
+		QueueState: "dispatching",
+	})
+	if _, err := queue.Claim(context.Background(), "debian", []string{"prompt.execute"}); err != nil {
+		t.Fatalf("failed to claim job: %v", err)
+	}
+	eng.BindDispatchJobRepo("debian", "/home/romeo/work/meta-repo-02", job.ID)
+
+	// 3. Before any stdout chunk arrives, GET /v1/jobs/{id}/logs returns a synthesized [ASE-SUPERVISOR] fallback chunk
+	logsResp1, err := http.Get(ts.URL + "/v1/jobs/" + job.ID + "/logs")
+	if err != nil || logsResp1.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/jobs/%s/logs failed: %v", job.ID, err)
+	}
+	var logsPayload1 map[string]any
+	_ = json.NewDecoder(logsResp1.Body).Decode(&logsPayload1)
+	_ = logsResp1.Body.Close()
+	chunks1, _ := logsPayload1["chunks"].([]any)
+	if len(chunks1) == 0 {
+		t.Fatalf("expected fallback telemetry chunk before stdout arrives, got 0 chunks")
+	}
+
+	// 4. Simulate iazio-harness reporting harness_pid=3169210, tool_pid=3169307 and streaming transcript chunks,
+	// followed by iazio-agent heartbeat reporting agent_pid=2779723 (tool_pid=0).
+	_, _ = http.Post(ts.URL+"/v1/jobs/"+job.ID+"/chunks", "application/json",
+		bytes.NewBufferString(`{"type":"OUTPUT_TICK","silent_for_ms":2000,"harness_pid":3169210,"tool_pid":3169307,"elapsed_seconds":266}`))
+	_, _ = http.Post(ts.URL+"/v1/jobs/"+job.ID+"/chunks", "application/json",
+		bytes.NewBufferString(`{"type":"OUTPUT_CHUNK","stream":"stdout","text":"[ASE-SUPERVISOR] Starting CLI invocation (engine=agy)\n[agy] Thinking: Inspecting repository live output pipeline\n"}`))
+	_, _ = http.Post(ts.URL+"/v1/hosts/debian/heartbeat", "application/json",
+		bytes.NewBufferString(`{"tools":[{"name":"agy","installed":true,"status":"ok"}],"active_jobs":[{"job_id":"job_3ffa5d0be1649f0e","worktree_path":"/home/romeo/work/meta-repo-02","pid":2779723,"engine":"agy","active_conversation_id":"ba042127-79e5-4cb2-b35c-5d47145ef4fa"}]}`))
+
+	// 5. Verify GET /v1/jobs/{id} preserves harness_pid=3169210, agent_pid=2779723, tool_pid=3169307, and queue_state="running"
+	jobResp, err := http.Get(ts.URL + "/v1/jobs/" + job.ID)
+	if err != nil || jobResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/jobs/%s failed: %v", job.ID, err)
+	}
+	var jobData map[string]any
+	_ = json.NewDecoder(jobResp.Body).Decode(&jobData)
+	_ = jobResp.Body.Close()
+	if int(jobData["harness_pid"].(float64)) != 3169210 || int(jobData["tool_pid"].(float64)) != 3169307 {
+		t.Fatalf("expected harness_pid=3169210 and tool_pid=3169307, got %v / %v", jobData["harness_pid"], jobData["tool_pid"])
+	}
+	if diag, ok := jobData["dispatch_diagnostics"].(map[string]any); !ok || diag["queue_state"] != "running" {
+		t.Fatalf("expected dispatch_diagnostics.queue_state='running', got %v", jobData["dispatch_diagnostics"])
+	}
+
+	// 6. Verify GET /v1/hosts/debian/repos?path=/home/romeo/work/meta-repo-02 returns lock="RUNNING_HARNESS" and running_job
+	repoResp, err := http.Get(ts.URL + "/v1/hosts/debian/repos?path=/home/romeo/work/meta-repo-02")
+	if err != nil || repoResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/hosts/debian/repos failed: %v", err)
+	}
+	var repoData map[string]any
+	_ = json.NewDecoder(repoResp.Body).Decode(&repoData)
+	_ = repoResp.Body.Close()
+	if repoData["lock"] != control.LockRunning {
+		t.Fatalf("expected repo lock=%s, got %v", control.LockRunning, repoData["lock"])
+	}
+	runningJob, ok := repoData["running_job"].(map[string]any)
+	if !ok || runningJob == nil || runningJob["id"] != job.ID {
+		t.Fatalf("expected non-null running_job with id=%s on repo detail, got %v", job.ID, repoData["running_job"])
+	}
+}
