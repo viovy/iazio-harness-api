@@ -848,3 +848,57 @@ func TestExecuteStory_ThreeModes_And_ResolveBacklogStoriesRoot(t *testing.T) {
 	}
 }
 
+func TestFormatJobDetail_Job110f47f09551baba_SanitizesStaleFailureFieldsOnCompletedJob(t *testing.T) {
+	completedAt := time.Date(2026, 11, 1, 5, 42, 41, 0, time.UTC)
+	createdAt := time.Date(2026, 11, 1, 4, 29, 32, 0, time.UTC)
+	job := &dispatch.Job{
+		ID:                   "job_110f47f09551baba",
+		Type:                 dispatch.JobTypeStoryExecute,
+		Repo:                 ".",
+		ClaimedHost:          "debian",
+		HostID:               "debian",
+		TargetAgent:          "agy",
+		StoryID:              "STORY-GOV-3873",
+		Status:               dispatch.JobStatusCompleted,
+		Error:                "",
+		FailureCategory:      dispatch.FailureCategoryBackgroundDrainTimeout,
+		FailureStage:         "BACKGROUND_DRAIN",
+		FailureReasonSummary: "stale background drain timeout",
+		Retriable:            true,
+		CreatedAt:            createdAt,
+		CompletedAt:          &completedAt,
+		DispatchDiagnostics: &dispatch.DispatchDiagnostics{
+			QueueState: "dispatching",
+		},
+	}
+
+	detail := formatJobDetail(job)
+	if detail.Status != dispatch.JobStatusCompleted {
+		t.Fatalf("expected status=completed, got %q", detail.Status)
+	}
+	if detail.FailureCategory != "" || detail.FailureStage != "" || detail.FailureDirection != "" || detail.FailureService != "" || detail.FailureReasonSummary != "" || detail.Retriable {
+		t.Fatalf("expected formatJobDetail to sanitize stale failure fields on completed job, got %+v", detail)
+	}
+	if detail.DispatchDiagnostics == nil || detail.DispatchDiagnostics.QueueState != dispatch.JobStatusCompleted {
+		t.Fatalf("expected DispatchDiagnostics.QueueState='completed', got %+v", detail.DispatchDiagnostics)
+	}
+
+	// Verify failed job populates FailureDirection and FailureService
+	failedJob := &dispatch.Job{
+		ID:                   "job_failed_downstream",
+		Type:                 dispatch.JobTypeStoryExecute,
+		Status:               dispatch.JobStatusFailed,
+		Error:                "background drain timed out",
+		FailureCategory:      dispatch.FailureCategoryBackgroundDrainTimeout,
+		FailureStage:         "BACKGROUND_DRAIN",
+		FailureReasonSummary: "background drain timed out",
+		Retriable:            true,
+		CreatedAt:            createdAt,
+	}
+	failedDetail := formatJobDetail(failedJob)
+	if failedDetail.FailureDirection != dispatch.FailureDirectionLocalExecution || failedDetail.FailureService != "agy-cli" {
+		t.Fatalf("expected FailureDirection=LOCAL_EXECUTION and FailureService=agy-cli on failed job, got dir=%q svc=%q",
+			failedDetail.FailureDirection, failedDetail.FailureService)
+	}
+}
+

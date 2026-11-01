@@ -62,6 +62,11 @@ const (
 	FailureStageBackgroundDrain = "BACKGROUND_DRAIN"
 	FailureStageCompletionGate  = "COMPLETION_GATE"
 	FailureStageStoryValidation = "STORY_VALIDATION"
+
+	FailureDirectionNone           = "NONE"
+	FailureDirectionUpstream       = "UPSTREAM"
+	FailureDirectionDownstream     = "DOWNSTREAM"
+	FailureDirectionLocalExecution = "LOCAL_EXECUTION"
 )
 
 const (
@@ -70,23 +75,25 @@ const (
 
 // AttemptFailure models one failed dispatch or execution attempt.
 type AttemptFailure struct {
-	AttemptNumber   int    `json:"attempt_number"`
-	Host            string `json:"host"`
-	Workspace       string `json:"workspace"`
-	Tool            string `json:"tool"`
-	FailureCategory string `json:"failure_category"`
-	FailureStage    string `json:"failure_stage,omitempty"`
-	Reason          string `json:"reason,omitempty"`
-	ExitCode        int    `json:"exit_code,omitempty"`
-	StderrTail      string `json:"stderr_tail,omitempty"`
-	ZipkinSpanID    string `json:"zipkin_span_id,omitempty"`
-	Timestamp       string `json:"timestamp,omitempty"`
-	StartedAt       string `json:"started_at,omitempty"`
-	EndedAt         string `json:"ended_at,omitempty"`
-	TriggerReason   string `json:"trigger_reason,omitempty"`
-	OutcomeSummary  string `json:"outcome_summary,omitempty"`
-	LogSeqOffset    int    `json:"log_seq_offset,omitempty"`
-	LogByteOffset   int64  `json:"log_byte_offset,omitempty"`
+	AttemptNumber    int    `json:"attempt_number"`
+	Host             string `json:"host"`
+	Workspace        string `json:"workspace"`
+	Tool             string `json:"tool"`
+	FailureCategory  string `json:"failure_category"`
+	FailureStage     string `json:"failure_stage,omitempty"`
+	FailureDirection string `json:"failure_direction,omitempty"`
+	FailureService   string `json:"failure_service,omitempty"`
+	Reason           string `json:"reason,omitempty"`
+	ExitCode         int    `json:"exit_code,omitempty"`
+	StderrTail       string `json:"stderr_tail,omitempty"`
+	ZipkinSpanID     string `json:"zipkin_span_id,omitempty"`
+	Timestamp        string `json:"timestamp,omitempty"`
+	StartedAt        string `json:"started_at,omitempty"`
+	EndedAt          string `json:"ended_at,omitempty"`
+	TriggerReason    string `json:"trigger_reason,omitempty"`
+	OutcomeSummary   string `json:"outcome_summary,omitempty"`
+	LogSeqOffset     int    `json:"log_seq_offset,omitempty"`
+	LogByteOffset    int64  `json:"log_byte_offset,omitempty"`
 }
 
 const (
@@ -177,6 +184,8 @@ type Job struct {
 	LeaseVersion            int64                `json:"lease_version,omitempty"`
 	FailureCategory         string               `json:"failure_category,omitempty"`
 	FailureStage            string               `json:"failure_stage,omitempty"`
+	FailureDirection        string               `json:"failure_direction,omitempty"`
+	FailureService          string               `json:"failure_service,omitempty"`
 	FailureReasonSummary    string               `json:"failure_reason_summary,omitempty"`
 	Retriable               bool                 `json:"retriable"`
 	FinalTurnCount          int                  `json:"final_turn_count,omitempty"`
@@ -280,12 +289,30 @@ func (q *InMemoryQueue) SetStore(s QueueStore) error {
 		}
 		q.mu.Lock()
 		defer q.mu.Unlock()
+		now := q.now()
 		for _, j := range persisted {
 			if j.FencingToken > q.fencingSeq {
 				q.fencingSeq = j.FencingToken
 			}
 			if j.LeaseVersion > q.fencingSeq {
 				q.fencingSeq = j.LeaseVersion
+			}
+			if j.Status == JobStatusCompleted && strings.TrimSpace(j.Error) == "" {
+				j.FailureCategory = ""
+				j.FailureStage = ""
+				j.FailureDirection = ""
+				j.FailureService = ""
+				j.FailureReasonSummary = ""
+				j.Retriable = false
+				if j.DispatchDiagnostics != nil {
+					j.DispatchDiagnostics.QueueState = "completed"
+				}
+			}
+			if q.startupGrace > 0 && (j.Status == JobStatusRunning || j.Status == JobStatusClaimed || j.Status == JobStatusLeased) {
+				minExpiry := now.Add(q.startupGrace)
+				if j.LeaseExpiresAt == nil || j.LeaseExpiresAt.Before(minExpiry) {
+					j.LeaseExpiresAt = &minExpiry
+				}
 			}
 			if existing, ok := q.jobs[j.ID]; !ok || existing.CreatedAt.Before(j.CreatedAt) {
 				if j.doneCh == nil {
@@ -314,14 +341,28 @@ func (q *InMemoryQueue) SetStartupGrace(d time.Duration) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.startupGrace = d
+	q.startupTime = q.now()
+	if d > 0 {
+		minExpiry := q.startupTime.Add(d)
+		for _, j := range q.jobs {
+			if j != nil && (j.Status == JobStatusRunning || j.Status == JobStatusClaimed || j.Status == JobStatusLeased) {
+				if j.LeaseExpiresAt == nil || j.LeaseExpiresAt.Before(minExpiry) {
+					exp := minExpiry
+					j.LeaseExpiresAt = &exp
+				}
+			}
+		}
+	}
 }
 
 // NewInMemoryQueue constructs a new thread-safe InMemoryQueue.
 func NewInMemoryQueue() *InMemoryQueue {
+	now := time.Now().UTC()
 	return &InMemoryQueue{
 		jobs:         make(map[string]*Job),
 		claimTimeout: DefaultClaimTimeout,
 		jobTimeout:   DefaultJobTimeout,
+		startupTime:  now,
 		nowFunc:      func() time.Time { return time.Now().UTC() },
 	}
 }
@@ -357,6 +398,9 @@ func (q *InMemoryQueue) now() time.Time {
 func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 	if now.IsZero() {
 		now = q.now()
+	}
+	if q.startupGrace > 0 && !q.startupTime.IsZero() && now.Sub(q.startupTime) < q.startupGrace {
+		return nil
 	}
 	var expiredIDs []string
 	var doneChannels []chan struct{}
@@ -674,15 +718,37 @@ func (q *InMemoryQueue) HeartbeatWithStory(ctx context.Context, jobID string, fe
 	if !exists {
 		return nil, ErrJobNotFound
 	}
-	if job.Status != JobStatusClaimed && job.Status != JobStatusLeased && job.Status != JobStatusRunning {
-		return nil, fmt.Errorf("job %s is not currently claimed (status: %s)", jobID, job.Status)
-	}
 	if job.FencingToken > 0 && fencingToken != job.FencingToken {
 		return nil, ErrLeaseFenced
 	}
+	reconciledFromOutage := false
+	if (job.Status == JobStatusFailed && isReconcilableFailure(job.Error+" "+job.FailureCategory+" "+job.FailureReasonSummary)) ||
+		(job.Status == JobStatusPending && fencingToken > 0 && (job.FencingToken == 0 || fencingToken == job.FencingToken)) {
+		job.Status = JobStatusRunning
+		if job.FencingToken == 0 && fencingToken > 0 {
+			job.FencingToken = fencingToken
+			job.LeaseVersion = fencingToken
+		}
+		job.Error = ""
+		job.FailureCategory = ""
+		job.FailureStage = ""
+		job.FailureDirection = ""
+		job.FailureService = ""
+		job.FailureReasonSummary = ""
+		job.Retriable = false
+		job.CompletedAt = nil
+		if job.DispatchDiagnostics != nil {
+			job.DispatchDiagnostics.QueueState = "running"
+		}
+		job.doneCh = make(chan struct{})
+		reconciledFromOutage = true
+	}
+	if job.Status != JobStatusClaimed && job.Status != JobStatusLeased && job.Status != JobStatusRunning {
+		return nil, fmt.Errorf("job %s is not currently claimed (status: %s)", jobID, job.Status)
+	}
 
 	now := q.now()
-	statusTransitioned := false
+	statusTransitioned := reconciledFromOutage
 	if job.Status == JobStatusLeased || job.Status == JobStatusClaimed {
 		job.Status = JobStatusRunning
 		job.LeaseAckDeadlineAt = nil
@@ -751,21 +817,31 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 		if j == nil {
 			continue
 		}
-		// Match jobs allocated to this host
-		hostMatch := (j.ClaimedHost == hostID || j.HostID == hostID || (j.AgentAffinity != nil && j.AgentAffinity.HostID == hostID))
+		// Match jobs allocated to this host (or explicitly reported active by this host after transient reclaim)
+		hostMatch := (j.ClaimedHost == hostID || j.HostID == hostID || (j.AgentAffinity != nil && j.AgentAffinity.HostID == hostID) || (activeSet[j.ID] && (j.ClaimedHost == "" || j.ClaimedHost == hostID)))
 		if !hostMatch {
 			continue
 		}
 
-		// Auto-reconcile jobs marked failed due to lease expiration or timeout if reported active by agent
-		if j.Status == JobStatusFailed && activeSet[j.ID] && isReconcilableFailure(j.Error) {
+		reconciled := false
+		// Auto-reconcile jobs marked failed or reverted to pending due to lease expiration/timeout if reported active by agent
+		if activeSet[j.ID] && ((j.Status == JobStatusFailed && isReconcilableFailure(j.Error+" "+j.FailureCategory+" "+j.FailureReasonSummary)) || (j.Status == JobStatusPending && (len(j.AttemptHistory) > 0 || j.InfraRequeueCount > 0 || j.FencingToken > 0))) {
 			j.Status = JobStatusRunning
+			j.ClaimedHost = hostID
+			j.HostID = hostID
 			j.Error = ""
 			j.FailureCategory = ""
 			j.FailureStage = ""
+			j.FailureDirection = ""
+			j.FailureService = ""
 			j.FailureReasonSummary = ""
 			j.Retriable = false
 			j.CompletedAt = nil
+			if j.DispatchDiagnostics != nil {
+				j.DispatchDiagnostics.QueueState = "running"
+			}
+			j.doneCh = make(chan struct{})
+			reconciled = true
 		}
 
 		// Only extend active jobs (leased, claimed, running)
@@ -793,6 +869,10 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 		j.LeaseVersion = j.FencingToken
 		if j.Status == JobStatusLeased || j.Status == JobStatusClaimed {
 			j.Status = JobStatusRunning
+			reconciled = true
+		}
+		if reconciled && q.store != nil {
+			_ = q.store.SaveQueueJob(ctx, j)
 		}
 		extended = append(extended, j.ID)
 	}
@@ -819,6 +899,14 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 				rehydrated.LeaseExpiresAt = &expires
 				rehydrated.LeaseOwner = hostID
 				rehydrated.LeaseVersion = rehydrated.FencingToken
+				rehydrated.Error = ""
+				rehydrated.FailureCategory = ""
+				rehydrated.FailureStage = ""
+				rehydrated.FailureDirection = ""
+				rehydrated.FailureService = ""
+				rehydrated.FailureReasonSummary = ""
+				rehydrated.Retriable = false
+				rehydrated.CompletedAt = nil
 				if rehydrated.doneCh == nil {
 					rehydrated.doneCh = make(chan struct{})
 				}
@@ -842,6 +930,7 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 					delete(q.jobs, jobID)
 					continue
 				}
+				_ = q.store.SaveQueueJob(ctx, q.jobs[jobID])
 			}
 			extended = append(extended, jobID)
 		}
@@ -862,31 +951,45 @@ func (q *InMemoryQueue) Complete(ctx context.Context, jobID string, result json.
 	return q.CompleteWithFencing(ctx, jobID, fencingToken, result, errStr)
 }
 
-// ClassifyDispatchFailure maps an error string to canonical failure taxonomy.
-func ClassifyDispatchFailure(errStr string) (category, stage, summary string, retriable bool) {
+// ClassifyDispatchFailureWithDirection maps an error string to canonical failure taxonomy including upstream/downstream service direction.
+func ClassifyDispatchFailureWithDirection(errStr string) (category, stage, direction, service, summary string, retriable bool) {
 	lower := strings.ToLower(strings.TrimSpace(errStr))
 	switch {
 	case strings.Contains(lower, "claim") || strings.Contains(lower, "startup_heartbeat") || strings.Contains(lower, "unacknowledged lease"):
-		return FailureCategoryDispatchClaimTimeout, FailureStageQueueDispatch, "Agent lease claim timed out or lost before initial acknowledgement", true
-	case strings.Contains(lower, "429") || strings.Contains(lower, "resource_exhausted") || strings.Contains(lower, "quota") || strings.Contains(lower, "auth") || strings.Contains(lower, "token limit") || strings.Contains(lower, "unauthorized") || strings.Contains(lower, "preflight_or_early_tool_exit"):
-		return FailureCategoryToolQuotaOrAuth, FailureStageToolExecution, "Tool startup failed due to quota exhaustion, rate limit, or auth expiration", true
+		return FailureCategoryDispatchClaimTimeout, FailureStageQueueDispatch, FailureDirectionDownstream, "iazio-agent", "Agent lease claim timed out or lost before initial acknowledgement", true
+	case strings.Contains(lower, "429") || strings.Contains(lower, "resource_exhausted") || strings.Contains(lower, "resourceexhausted") || strings.Contains(lower, "quota") || strings.Contains(lower, "auth") || strings.Contains(lower, "token limit") || strings.Contains(lower, "unauthorized") || strings.Contains(lower, "preflight_or_early_tool_exit"):
+		return FailureCategoryToolQuotaOrAuth, FailureStageToolExecution, FailureDirectionUpstream, "antigravity-llm-provider", "Tool startup failed due to quota exhaustion, rate limit, or auth expiration", true
+	case strings.Contains(lower, "api.github.com") || (strings.Contains(lower, "github.com") && (strings.Contains(lower, "502") || strings.Contains(lower, "503") || strings.Contains(lower, "504") || strings.Contains(lower, "connection refused"))):
+		return "UPSTREAM_SCM_UNAVAILABLE", FailureStageCompletionGate, FailureDirectionUpstream, "github-api", "Upstream GitHub SCM API unavailable during delivery", true
+	case strings.Contains(lower, "jenkins") || strings.Contains(lower, "sonarqube"):
+		return "UPSTREAM_CI_UNAVAILABLE", FailureStageCompletionGate, FailureDirectionUpstream, "jenkins-ci", "Upstream CI/SonarQube pipeline unavailable during verification", true
+	case strings.Contains(lower, "postgres") || strings.Contains(lower, "pgvector") || strings.Contains(lower, "sqlstate"):
+		return "DOWNSTREAM_DATABASE_UNAVAILABLE", FailureStageQueueDispatch, FailureDirectionDownstream, "postgresql", "Downstream PostgreSQL database unavailable", true
+	case strings.Contains(lower, "iazio-api") || strings.Contains(lower, "iazio-harvester") || strings.Contains(lower, "/v1/ingest"):
+		return "DOWNSTREAM_INGEST_UNAVAILABLE", FailureStageCompletionGate, FailureDirectionDownstream, "iazio-api", "Downstream ingestion API or harvester unavailable", true
 	case strings.Contains(lower, "crash") || strings.Contains(lower, "exit status") || strings.Contains(lower, "sigsegv") || strings.Contains(lower, "binary"):
-		return FailureCategoryToolCrash, FailureStageToolExecution, "AI agent tool process crashed or exited non-zero during early execution", true
+		return FailureCategoryToolCrash, FailureStageToolExecution, FailureDirectionLocalExecution, "iazio-harness", "AI agent tool process crashed or exited non-zero during early execution", true
 	case strings.Contains(lower, "dirty_worktree_post_exit") || strings.Contains(lower, "post_exit"):
-		return FailureCategoryASEGateIncomplete, FailureStageCompletionGate, "Post-execution gate: child engine exited but left uncommitted worktree changes", true
+		return FailureCategoryASEGateIncomplete, FailureStageCompletionGate, FailureDirectionLocalExecution, "autopilot", "Post-execution gate: child engine exited but left uncommitted worktree changes", true
 	case strings.Contains(lower, "worktree") || strings.Contains(lower, "workspace_prep") || strings.Contains(lower, "lock") || strings.Contains(lower, "porcelain") || strings.Contains(lower, "submodule") || strings.Contains(lower, "dirty"):
-		return FailureCategoryWorkspacePrepError, FailureStageWorkspacePrep, "Workspace preparation conflict: dirty worktree or stale git locks", true
+		return FailureCategoryWorkspacePrepError, FailureStageWorkspacePrep, FailureDirectionLocalExecution, "iazio-agent", "Workspace preparation conflict: dirty worktree or stale git locks", true
 	case strings.Contains(lower, "1h0m0s") || strings.Contains(lower, "background task") || strings.Contains(lower, "drain") || strings.Contains(lower, "lease_expired") || strings.Contains(lower, "heartbeat_timeout") || strings.Contains(lower, "execution_timeout") || strings.Contains(lower, "lease expired"):
-		return FailureCategoryBackgroundDrainTimeout, FailureStageBackgroundDrain, errStr, true
+		return FailureCategoryBackgroundDrainTimeout, FailureStageBackgroundDrain, FailureDirectionLocalExecution, "agy-cli", errStr, true
 	case strings.Contains(lower, "circuit") || strings.Contains(lower, "breaker") || strings.Contains(lower, "retry_capped"):
-		return FailureCategoryCircuitBreakerTripped, FailureStageQueueDispatch, errStr, false
+		return FailureCategoryCircuitBreakerTripped, FailureStageQueueDispatch, FailureDirectionDownstream, "iazio-harness-api", errStr, false
 	case strings.Contains(lower, "story_not_found") || strings.Contains(lower, "not found in backlog") || strings.Contains(lower, "cannot execute nonexistent story"):
-		return FailureCategoryStoryNotFound, FailureStageStoryValidation, "Story not found in backlog or control plane: cannot execute nonexistent story", false
+		return FailureCategoryStoryNotFound, FailureStageStoryValidation, FailureDirectionLocalExecution, "backlog", "Story not found in backlog or control plane: cannot execute nonexistent story", false
 	case strings.Contains(lower, "gate") || strings.Contains(lower, "dod") || strings.Contains(lower, "incomplete") || strings.Contains(lower, "ase_gate"):
-		return FailureCategoryASEGateIncomplete, FailureStageCompletionGate, "Autonomous Story Execution DoD or review scheme validation incomplete", false
+		return FailureCategoryASEGateIncomplete, FailureStageCompletionGate, FailureDirectionLocalExecution, "autopilot", "Autonomous Story Execution DoD or review scheme validation incomplete", false
 	default:
-		return FailureCategoryToolCrash, FailureStageToolExecution, "Execution error: " + errStr, true
+		return FailureCategoryToolCrash, FailureStageToolExecution, FailureDirectionLocalExecution, "iazio-harness", "Execution error: " + errStr, true
 	}
+}
+
+// ClassifyDispatchFailure maps an error string to canonical failure taxonomy.
+func ClassifyDispatchFailure(errStr string) (category, stage, summary string, retriable bool) {
+	cat, stg, _, _, sum, ret := ClassifyDispatchFailureWithDirection(errStr)
+	return cat, stg, sum, ret
 }
 
 // isReconcilableFailure checks whether a failure reason was caused by lease/heartbeat/reaper timeout.
@@ -895,6 +998,7 @@ func isReconcilableFailure(errStr string) bool {
 	return strings.Contains(lower, "lease_expired") ||
 		strings.Contains(lower, "heartbeat_timeout") ||
 		strings.Contains(lower, "execution_timeout") ||
+		strings.Contains(lower, "background_drain_timeout") ||
 		strings.Contains(lower, "stalled") ||
 		strings.Contains(lower, "process_died") ||
 		strings.Contains(lower, "lease expired")
@@ -912,15 +1016,15 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 		q.mu.Unlock()
 		return ErrJobAlreadyCompleted
 	}
-	if job.Status == JobStatusFailed {
-		if !isReconcilableFailure(job.Error) {
-			q.mu.Unlock()
-			return ErrJobAlreadyCompleted
-		}
-	}
 	if job.FencingToken > 0 && fencingToken != job.FencingToken {
 		q.mu.Unlock()
 		return ErrLeaseFenced
+	}
+	if job.Status == JobStatusFailed {
+		if !isReconcilableFailure(job.Error) && !(errStr == "" && fencingToken > 0 && fencingToken == job.FencingToken) {
+			q.mu.Unlock()
+			return ErrJobAlreadyCompleted
+		}
 	}
 
 	now := q.now()
@@ -991,25 +1095,39 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 		job.Status = JobStatusFailed
 		job.Result = result
 		job.Error = errStr
-		cat, stage, summary, retriable := ClassifyDispatchFailure(errStr)
+		cat, stage, dir, svc, summary, retriable := ClassifyDispatchFailureWithDirection(errStr)
 		if job.FailureCategory == "" || job.FailureCategory == FailureCategoryNone {
 			job.FailureCategory = cat
 		}
 		if job.FailureStage == "" {
 			job.FailureStage = stage
 		}
+		if job.FailureDirection == "" {
+			job.FailureDirection = dir
+		}
+		if job.FailureService == "" {
+			job.FailureService = svc
+		}
 		if job.FailureReasonSummary == "" {
 			job.FailureReasonSummary = summary
 		}
 		job.Retriable = retriable
+		if job.DispatchDiagnostics != nil {
+			job.DispatchDiagnostics.QueueState = "failed"
+		}
 	} else {
 		job.Status = JobStatusCompleted
 		job.Result = result
 		job.Error = ""
 		job.FailureCategory = ""
 		job.FailureStage = ""
+		job.FailureDirection = ""
+		job.FailureService = ""
 		job.FailureReasonSummary = ""
 		job.Retriable = false
+		if job.DispatchDiagnostics != nil {
+			job.DispatchDiagnostics.QueueState = "completed"
+		}
 	}
 
 	if q.store != nil && job.CompletedAt != nil {
@@ -1440,6 +1558,24 @@ func (q *InMemoryQueue) UpdateRuntimeMetadata(jobID, worktreePath, activeConvID 
 	}
 	if elapsedSec > 0 && job.ElapsedSeconds != elapsedSec {
 		job.ElapsedSeconds = elapsedSec
+		changed = true
+	}
+	if (harnessPID > 0 || toolPID > 0 || activeConvID != "") &&
+		((job.Status == JobStatusFailed && isReconcilableFailure(job.Error)) ||
+			(job.Status == JobStatusPending && (len(job.AttemptHistory) > 0 || job.InfraRequeueCount > 0 || job.FencingToken > 0))) {
+		job.Status = JobStatusRunning
+		job.Error = ""
+		job.FailureCategory = ""
+		job.FailureStage = ""
+		job.FailureDirection = ""
+		job.FailureService = ""
+		job.FailureReasonSummary = ""
+		job.Retriable = false
+		job.CompletedAt = nil
+		if job.DispatchDiagnostics != nil {
+			job.DispatchDiagnostics.QueueState = "running"
+		}
+		job.doneCh = make(chan struct{})
 		changed = true
 	}
 	if job.Status == JobStatusRunning || job.Status == JobStatusClaimed || job.Status == JobStatusLeased {
