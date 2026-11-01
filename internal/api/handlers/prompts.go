@@ -75,6 +75,17 @@ func (h *PromptsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer span.End()
 	r = r.WithContext(ctx)
 
+	if r.Method == http.MethodGet {
+		prompts := []control.Prompt{}
+		if h.engine != nil {
+			prompts = h.engine.ListPrompts()
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"prompts": prompts})
+		return
+	}
+
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return

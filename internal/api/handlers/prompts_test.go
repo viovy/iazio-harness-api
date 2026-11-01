@@ -217,4 +217,26 @@ func TestPromptsHandlerPreservesBranchAndAllocatesTool(t *testing.T) {
 	if savedPayload.Branch != "feat/custom-branch" {
 		t.Fatalf("expected Branch feat/custom-branch in job payload, got %q", savedPayload.Branch)
 	}
+
+	engine.PutPrompt(control.Prompt{ID: "p-zeta", Title: "zeta", Body: "z", Status: "READY"})
+	engine.PutPrompt(control.Prompt{ID: "p-alpha", Title: "Alpha", Body: "a", Status: "READY"})
+
+	getReq := httptest.NewRequest(http.MethodGet, "/api/v1/prompts", nil)
+	getW := httptest.NewRecorder()
+	handler.ServeHTTP(getW, getReq)
+	if getW.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for GET /api/v1/prompts, got %d", getW.Code)
+	}
+	var listResp struct {
+		Prompts []control.Prompt `json:"prompts"`
+	}
+	if err := json.NewDecoder(getW.Body).Decode(&listResp); err != nil {
+		t.Fatalf("decode GET /api/v1/prompts: %v", err)
+	}
+	if len(listResp.Prompts) != 3 {
+		t.Fatalf("expected 3 prompts, got %d", len(listResp.Prompts))
+	}
+	if listResp.Prompts[0].Title != "Alpha" || listResp.Prompts[1].Title != "Branch-aware prompt" || listResp.Prompts[2].Title != "zeta" {
+		t.Fatalf("expected alphabetical prompt order, got %+v", listResp.Prompts)
+	}
 }

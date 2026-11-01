@@ -295,6 +295,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/ideas/{id}/triage", s.triage)
 	mux.HandleFunc("POST /v1/ideas/{id}/refine", s.refine)
 	mux.HandleFunc("GET /v1/prompts", s.listPrompts)
+	mux.HandleFunc("GET /api/v1/prompts", s.listPrompts)
 	mux.HandleFunc("POST /v1/prompts", s.createPrompt)
 	mux.HandleFunc("PUT /v1/prompts/{id}", s.updatePrompt)
 	mux.HandleFunc("DELETE /v1/prompts/{id}", s.deletePrompt)

@@ -105,26 +105,28 @@ func TestListPrompts_AlphabeticalSortingHTTP(t *testing.T) {
 	s.Engine.PutPrompt(control.Prompt{ID: "p-alpha", Title: "Alpha Prompt", Body: "run", Engine: "agy", Status: "READY"})
 	s.Engine.PutPrompt(control.Prompt{ID: "p-beta", Title: "beta prompt", Body: "run", Engine: "agy", Status: "READY"})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/prompts", nil)
-	rr := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rr, req)
+	for _, path := range []string{"/v1/prompts", "/api/v1/prompts"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d", rr.Code)
-	}
-	var resp struct {
-		Prompts []map[string]any `json:"prompts"`
-	}
-	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode /v1/prompts: %v", err)
-	}
-	wantIDs := []string{"p-alpha", "p-beta", "p-zeta", "p-empty"}
-	if len(resp.Prompts) != len(wantIDs) {
-		t.Fatalf("expected %d prompts, got %d", len(wantIDs), len(resp.Prompts))
-	}
-	for i, want := range wantIDs {
-		if got := resp.Prompts[i]["id"]; got != want {
-			t.Errorf("position %d: expected id %q, got %v", i, want, got)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%s: expected 200 OK, got %d", path, rr.Code)
+		}
+		var resp struct {
+			Prompts []map[string]any `json:"prompts"`
+		}
+		if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode %s: %v", path, err)
+		}
+		wantIDs := []string{"p-alpha", "p-beta", "p-zeta", "p-empty"}
+		if len(resp.Prompts) != len(wantIDs) {
+			t.Fatalf("%s: expected %d prompts, got %d", path, len(wantIDs), len(resp.Prompts))
+		}
+		for i, want := range wantIDs {
+			if got := resp.Prompts[i]["id"]; got != want {
+				t.Errorf("%s position %d: expected id %q, got %v", path, i, want, got)
+			}
 		}
 	}
 }
