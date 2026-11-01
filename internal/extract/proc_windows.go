@@ -4,10 +4,12 @@ package extract
 
 import (
 	"os/exec"
+
+	"github.com/viovy/iazio-harness-api/internal/procutil"
 )
 
 func setSysProcAttr(cmd *exec.Cmd) {
-	// Windows does not require specific process-group attributes for extract workers.
+	procutil.HideWindow(cmd)
 }
 
 func killProcessGroup(cmd *exec.Cmd) {

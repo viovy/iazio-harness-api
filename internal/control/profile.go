@@ -8,12 +8,12 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/viovy/iazio-harness-api/internal/procutil"
 	"gopkg.in/yaml.v3"
 )
 
@@ -498,7 +498,7 @@ func (e *Engine) ScanRepoProfile(hostID, repoPath, profileName string) (*Distrib
 	if b, err := os.ReadFile(metaFile); err == nil && len(b) > 0 {
 		raw = b
 		scanSource = fmt.Sprintf("local:%s", repoPath)
-		cmd := exec.Command("git", "describe", "--tags", "--always")
+		cmd := procutil.Command("git", "describe", "--tags", "--always")
 		cmd.Dir = repoPath
 		if out, err := cmd.Output(); err == nil && len(out) > 0 {
 			version = strings.TrimSpace(string(out))

@@ -7,12 +7,13 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/viovy/iazio-harness-api/internal/procutil"
 )
 
 // ToolRelease represents the latest release information for a tool.
@@ -153,7 +154,7 @@ func NewReleaseService() *ReleaseService {
 		token = os.Getenv("GH_TOKEN")
 	}
 	if token == "" {
-		if out, err := exec.Command("gh", "auth", "token").Output(); err == nil {
+		if out, err := procutil.Command("gh", "auth", "token").Output(); err == nil {
 			token = strings.TrimSpace(string(out))
 		}
 	}
