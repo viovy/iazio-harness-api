@@ -6,9 +6,10 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/viovy/iazio-harness-api/internal/procutil"
 )
 
 // Deadline is the worker's overall limit. The process group is killed when it elapses.
@@ -22,7 +23,7 @@ func Run(ctx context.Context, script, shareURL string) (title, transcript string
 	}
 	ctx, cancel := context.WithTimeout(ctx, Deadline)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "python3", script)
+	cmd := procutil.CommandContext(ctx, "python3", script)
 	cmd.Env = append(os.Environ(), "SHARE_URL="+shareURL)
 	setSysProcAttr(cmd)
 	var stdout, stderr bytes.Buffer
