@@ -2057,3 +2057,127 @@ func TestJob110f47f09551baba_RestartGraceAndCompletionReconciliation(t *testing.
 		t.Fatalf("expected LOCAL_EXECUTION / agy-cli, got %s / %s", dir3, svc3)
 	}
 }
+
+type fakePersistenceStore struct {
+	loadedJobs []*Job
+	savedJobs  []*Job
+}
+
+func (f *fakePersistenceStore) SaveQueueJob(_ context.Context, j *Job) error {
+	f.savedJobs = append(f.savedJobs, j)
+	return nil
+}
+
+func (f *fakePersistenceStore) UpdateQueueJobLease(_ context.Context, _ string, _ string, _ int64, _, _ time.Time) error {
+	return nil
+}
+
+func (f *fakePersistenceStore) CompleteQueueJob(_ context.Context, _ string, _ string, _ json.RawMessage, _ string, _ time.Time) error {
+	return nil
+}
+
+func (f *fakePersistenceStore) LoadQueueJobs(_ context.Context) ([]*Job, error) {
+	return f.loadedJobs, nil
+}
+
+func TestClassifyDispatchFailureWithDirection_AllBranchesAndUpdateRuntimeMetadata(t *testing.T) {
+	cases := []struct {
+		errStr    string
+		wantCat   string
+		wantDir   string
+		wantSvc   string
+		retriable bool
+	}{
+		{"unacknowledged lease claim", FailureCategoryDispatchClaimTimeout, FailureDirectionDownstream, "iazio-agent", true},
+		{"429 quota exceeded", FailureCategoryToolQuotaOrAuth, FailureDirectionUpstream, "antigravity-llm-provider", true},
+		{"https://api.github.com 503", "UPSTREAM_SCM_UNAVAILABLE", FailureDirectionUpstream, "github-api", true},
+		{"jenkins pipeline failed", "UPSTREAM_CI_UNAVAILABLE", FailureDirectionUpstream, "jenkins-ci", true},
+		{"postgres connection sqlstate", "DOWNSTREAM_DATABASE_UNAVAILABLE", FailureDirectionDownstream, "postgresql", true},
+		{"iazio-harvester /v1/ingest failed", "DOWNSTREAM_INGEST_UNAVAILABLE", FailureDirectionDownstream, "iazio-api", true},
+		{"exit status 139 sigsegv", FailureCategoryToolCrash, FailureDirectionLocalExecution, "iazio-harness", true},
+		{"dirty_worktree_post_exit", FailureCategoryASEGateIncomplete, FailureDirectionLocalExecution, "autopilot", true},
+		{"dirty worktree lock", FailureCategoryWorkspacePrepError, FailureDirectionLocalExecution, "iazio-agent", true},
+		{"lease_expired after 1h0m0s", FailureCategoryBackgroundDrainTimeout, FailureDirectionLocalExecution, "agy-cli", true},
+		{"circuit breaker retry_capped", FailureCategoryCircuitBreakerTripped, FailureDirectionDownstream, "iazio-harness-api", false},
+		{"story_not_found in backlog", FailureCategoryStoryNotFound, FailureDirectionLocalExecution, "backlog", false},
+		{"dod gate incomplete", FailureCategoryASEGateIncomplete, FailureDirectionLocalExecution, "autopilot", false},
+		{"unrecognized random error", FailureCategoryToolCrash, FailureDirectionLocalExecution, "iazio-harness", true},
+	}
+
+	for _, tc := range cases {
+		cat, _, dir, svc, _, ret := ClassifyDispatchFailureWithDirection(tc.errStr)
+		if cat != tc.wantCat || dir != tc.wantDir || svc != tc.wantSvc || ret != tc.retriable {
+			t.Fatalf("ClassifyDispatchFailureWithDirection(%q) = (%s, %s, %s, %v), want (%s, %s, %s, %v)",
+				tc.errStr, cat, dir, svc, ret, tc.wantCat, tc.wantDir, tc.wantSvc, tc.retriable)
+		}
+		cat2, _, _, ret2 := ClassifyDispatchFailure(tc.errStr)
+		if cat2 != tc.wantCat || ret2 != tc.retriable {
+			t.Fatalf("ClassifyDispatchFailure(%q) mismatch: got (%s, %v)", tc.errStr, cat2, ret2)
+		}
+	}
+
+	// Test SetStore rehydration & sanitization + UpdateRuntimeMetadata + ExtendLeasesForHost
+	now := time.Date(2026, 11, 1, 6, 0, 0, 0, time.UTC)
+	store := &fakePersistenceStore{
+		loadedJobs: []*Job{
+			{
+				ID:                   "job_completed_stale",
+				Status:               JobStatusCompleted,
+				FailureCategory:      FailureCategoryBackgroundDrainTimeout,
+				FailureStage:         "BACKGROUND_DRAIN",
+				FailureReasonSummary: "stale",
+				Retriable:            true,
+				DispatchDiagnostics:  &DispatchDiagnostics{QueueState: "dispatching"},
+			},
+			{
+				ID:          "job_active_restart",
+				Status:      JobStatusRunning,
+				Repo:        "meta-repo",
+				ClaimedHost: "mac1",
+				Payload:     json.RawMessage(`{"prompt":"test"}`),
+			},
+		},
+	}
+
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+	if err := q.SetStore(store); err != nil {
+		t.Fatalf("SetStore failed: %v", err)
+	}
+
+	compJob, ok := q.Get("job_completed_stale")
+	if !ok || compJob.FailureCategory != "" || compJob.Retriable || compJob.DispatchDiagnostics.QueueState != JobStatusCompleted {
+		t.Fatalf("expected SetStore to sanitize completed job, got %+v", compJob)
+	}
+
+	// UpdateRuntimeMetadata when job is failed with reconcilable error
+	q.mu.Lock()
+	q.jobs["job_active_restart"].Status = JobStatusFailed
+	q.jobs["job_active_restart"].Error = "LEASE_EXPIRED: execution lease expired"
+	q.jobs["job_active_restart"].FailureCategory = FailureCategoryBackgroundDrainTimeout
+	q.jobs["job_active_restart"].Retriable = true
+	q.jobs["job_active_restart"].DispatchDiagnostics = &DispatchDiagnostics{QueueState: "failed"}
+	q.mu.Unlock()
+
+	updated, ok := q.UpdateRuntimeMetadata("job_active_restart", "/tmp/worktrees/job_active_restart", "conv-123", 4100, 4200, 125)
+	if !ok || updated == nil {
+		t.Fatalf("expected UpdateRuntimeMetadata to succeed")
+	}
+	if updated.Status != JobStatusRunning || updated.FailureCategory != "" || updated.Repo != "/tmp/worktrees/job_active_restart" || updated.ActiveConversationID != "conv-123" || updated.HarnessPID != 4100 || updated.ToolPID != 4200 || updated.ElapsedSeconds != 125 {
+		t.Fatalf("unexpected UpdateRuntimeMetadata result: %+v", updated)
+	}
+
+	// ExtendLeasesForHost when job is failed with reconcilable failure category
+	q.mu.Lock()
+	q.jobs["job_active_restart"].Status = JobStatusFailed
+	q.jobs["job_active_restart"].Error = ""
+	q.jobs["job_active_restart"].FailureCategory = FailureCategoryBackgroundDrainTimeout
+	q.jobs["job_active_restart"].Retriable = true
+	q.mu.Unlock()
+
+	_, _ = q.ExtendLeasesForHost(context.Background(), "mac1", []string{"job_active_restart"})
+	extJob, _ := q.Get("job_active_restart")
+	if extJob.Status != JobStatusRunning || extJob.FailureCategory != "" {
+		t.Fatalf("expected ExtendLeasesForHost to reconcile status=running, got %+v", extJob)
+	}
+}
