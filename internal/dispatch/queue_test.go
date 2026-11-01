@@ -1951,3 +1951,109 @@ func TestJob3ffa5d0be1649f0e_LiveToolPIDNotExpiredAndReconcilesFailureCategory(t
 			failedJob.FailureCategory, failedJob.FailureStage)
 	}
 }
+
+func TestJob110f47f09551baba_RestartGraceAndCompletionReconciliation(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 1, 5, 39, 45, 0, time.UTC)
+	store := &fakeQueueStore{}
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+	_ = q.SetStore(store)
+
+	// 1. Verify startupGrace protects active running jobs across API restart
+	q.SetStartupGrace(60 * time.Second)
+	expiredLease := now.Add(-2 * time.Minute)
+	job, err := q.Enqueue(ctx, &Job{
+		ID:          "job_110f47f09551baba",
+		Type:        JobTypeStoryExecute,
+		Repo:        "/home/romeo/work/meta-repo",
+		TargetHost:  "debian",
+		TargetAgent: "agy",
+		StoryID:     "STORY-GOV-3873",
+		Payload:     json.RawMessage(`{"prompt":"/autonomous-story-execution","target_agent":"agy"}`),
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	claimed, err := q.Claim(ctx, "debian", []string{JobTypeStoryExecute})
+	if err != nil || claimed == nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+	_, _ = q.AckLease(ctx, job.ID, claimed.LeaseToken, 88210, "bd2df24c-71a0-4ab0-ac30-1fb8df05279d")
+	q.mu.Lock()
+	q.jobs[job.ID].LeaseExpiresAt = &expiredLease
+	q.jobs[job.ID].HeartbeatAt = &expiredLease
+	q.mu.Unlock()
+
+	// Within startupGrace, List (which triggers reapExpiredLocked) must NOT mark the job failed
+	_, _ = q.List(ctx, JobFilter{})
+	duringGrace, _ := q.Get(job.ID)
+	if duringGrace.Status != JobStatusRunning {
+		t.Fatalf("expected job to remain running during startupGrace, got %s", duringGrace.Status)
+	}
+
+	// 2. Simulate transient BACKGROUND_DRAIN_TIMEOUT state on job_110f47f09551baba followed by HeartbeatWithStory and CompleteWithFencing
+	q.mu.Lock()
+	q.jobs[job.ID].Status = JobStatusFailed
+	q.jobs[job.ID].FailureCategory = FailureCategoryBackgroundDrainTimeout
+	q.jobs[job.ID].FailureStage = "BACKGROUND_DRAIN"
+	q.jobs[job.ID].FailureDirection = FailureDirectionDownstream
+	q.jobs[job.ID].FailureService = "agy"
+	q.jobs[job.ID].FailureReasonSummary = "background drain timed out"
+	q.jobs[job.ID].Retriable = true
+	q.jobs[job.ID].DispatchDiagnostics = &DispatchDiagnostics{QueueState: "dispatching"}
+	q.mu.Unlock()
+
+	// HeartbeatWithStory auto-reconciles transiently failed job back to running and clears stale failure fields
+	reconciled, err := q.HeartbeatWithStory(ctx, job.ID, claimed.FencingToken, "STORY-GOV-3873")
+	if err != nil {
+		t.Fatalf("HeartbeatWithStory auto-reconcile failed: %v", err)
+	}
+	if reconciled.Status != JobStatusRunning || reconciled.FailureCategory != "" || reconciled.Retriable {
+		t.Fatalf("expected HeartbeatWithStory to reconcile status=running and clear failure metadata, got status=%s cat=%q retriable=%v",
+			reconciled.Status, reconciled.FailureCategory, reconciled.Retriable)
+	}
+
+	// CompleteWithFencing with completed ASE result clears any remaining failure fields and sets QueueState="completed"
+	q.mu.Lock()
+	q.jobs[job.ID].FailureCategory = FailureCategoryBackgroundDrainTimeout
+	q.jobs[job.ID].FailureStage = "BACKGROUND_DRAIN"
+	q.jobs[job.ID].Retriable = true
+	q.jobs[job.ID].DispatchDiagnostics = &DispatchDiagnostics{QueueState: "dispatching"}
+	q.mu.Unlock()
+
+	resultJSON := json.RawMessage(`{
+		"status": "completed",
+		"story_id": "STORY-GOV-3873",
+		"active_conversation_id": "bd2df24c-71a0-4ab0-ac30-1fb8df05279d",
+		"summary": "[2026-11-01T05:39:45Z] [agy step #321] output: Autonomous story execution is complete for both STORY-GOV-3873 and STORY-GOV-POINTERS-20261101-044815"
+	}`)
+	if err := q.CompleteWithFencing(ctx, job.ID, claimed.FencingToken, resultJSON, ""); err != nil {
+		t.Fatalf("CompleteWithFencing failed: %v", err)
+	}
+	done, _ := q.Get(job.ID)
+	if done.Status != JobStatusCompleted {
+		t.Fatalf("expected completed status, got %s", done.Status)
+	}
+	if done.FailureCategory != "" || done.FailureStage != "" || done.FailureDirection != "" || done.FailureService != "" || done.Retriable {
+		t.Fatalf("expected all failure metadata cleared on completed job, got cat=%q stage=%q dir=%q svc=%q retriable=%v",
+			done.FailureCategory, done.FailureStage, done.FailureDirection, done.FailureService, done.Retriable)
+	}
+	if done.DispatchDiagnostics == nil || done.DispatchDiagnostics.QueueState != JobStatusCompleted {
+		t.Fatalf("expected DispatchDiagnostics.QueueState='completed', got %+v", done.DispatchDiagnostics)
+	}
+
+	// 3. Verify ClassifyDispatchFailureWithDirection classifies upstream vs downstream vs local faults
+	_, _, dir1, svc1, _, _ := ClassifyDispatchFailureWithDirection("HTTP 429 resource_exhausted quota limit")
+	if dir1 != FailureDirectionUpstream || svc1 != "antigravity-llm-provider" {
+		t.Fatalf("expected UPSTREAM / antigravity-llm-provider, got %s / %s", dir1, svc1)
+	}
+	_, _, dir2, svc2, _, _ := ClassifyDispatchFailureWithDirection("DISPATCH_CLAIM_TIMEOUT: lease ack timeout")
+	if dir2 != FailureDirectionDownstream || svc2 != "iazio-agent" {
+		t.Fatalf("expected DOWNSTREAM / iazio-agent, got %s / %s", dir2, svc2)
+	}
+	_, _, dir3, svc3, _, _ := ClassifyDispatchFailureWithDirection("BACKGROUND_DRAIN_TIMEOUT: drain timeout")
+	if dir3 != FailureDirectionLocalExecution || svc3 != "agy-cli" {
+		t.Fatalf("expected LOCAL_EXECUTION / agy-cli, got %s / %s", dir3, svc3)
+	}
+}

@@ -343,8 +343,8 @@ ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS agent_pid integer NOT
 ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS active_conversation_id text NOT NULL DEFAULT '';
 ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS lease_ack_deadline_at timestamp with time zone;
 UPDATE harness_dispatch_jobs
-   SET failure_category = '', failure_stage = '', failure_reason_summary = ''
- WHERE status = 'completed' AND error = '' AND failure_category <> '';
+   SET failure_category = '', failure_stage = '', failure_reason_summary = '', retriable = false
+ WHERE status = 'completed' AND COALESCE(error, '') = '' AND (failure_category <> '' OR failure_stage <> '' OR retriable = true);
 
 CREATE INDEX IF NOT EXISTS harness_dispatch_jobs_status_idx ON harness_dispatch_jobs (status);
 CREATE INDEX IF NOT EXISTS harness_dispatch_jobs_host_idx ON harness_dispatch_jobs (claimed_host, status);
@@ -1405,6 +1405,10 @@ SET status = $2,
     result = $3,
     error = $4,
     completed_at = $5,
+    failure_category = CASE WHEN $2 = 'completed' AND COALESCE($4, '') = '' THEN '' ELSE failure_category END,
+    failure_stage = CASE WHEN $2 = 'completed' AND COALESCE($4, '') = '' THEN '' ELSE failure_stage END,
+    failure_reason_summary = CASE WHEN $2 = 'completed' AND COALESCE($4, '') = '' THEN '' ELSE failure_reason_summary END,
+    retriable = CASE WHEN $2 = 'completed' AND COALESCE($4, '') = '' THEN false ELSE retriable END,
     updated_at = now()
 WHERE id = $1 AND status != 'completed';
 `, jobID, status, resBytes, errStr, completedAt)
@@ -1515,7 +1519,12 @@ ORDER BY created_at ASC;
 		if j.Status == dispatch.JobStatusCompleted && strings.TrimSpace(j.Error) == "" {
 			j.FailureCategory = ""
 			j.FailureStage = ""
+			j.FailureDirection = ""
+			j.FailureService = ""
 			j.FailureReasonSummary = ""
+			j.Retriable = false
+		} else if j.FailureCategory != "" && j.FailureDirection == "" {
+			_, _, j.FailureDirection, j.FailureService, _, _ = dispatch.ClassifyDispatchFailureWithDirection(j.FailureCategory + " " + j.FailureStage + " " + j.FailureReasonSummary)
 		}
 		jobs = append(jobs, &j)
 	}

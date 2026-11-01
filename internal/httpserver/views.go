@@ -963,6 +963,22 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 			diag = &diagCopy
 		}
 	}
+	failureCat := j.FailureCategory
+	failureStage := j.FailureStage
+	failureDir := j.FailureDirection
+	failureSvc := j.FailureService
+	failureReason := j.FailureReasonSummary
+	retriable := j.Retriable
+	if strings.EqualFold(j.Status, dispatch.JobStatusCompleted) && strings.TrimSpace(j.Error) == "" {
+		failureCat = ""
+		failureStage = ""
+		failureDir = ""
+		failureSvc = ""
+		failureReason = ""
+		retriable = false
+	} else if failureCat != "" && failureDir == "" {
+		_, _, failureDir, failureSvc, _, _ = dispatch.ClassifyDispatchFailureWithDirection(failureCat + " " + failureStage + " " + failureReason)
+	}
 	res := map[string]any{
 		"id":                             j.ID,
 		"schedule_id":                    "",
@@ -1005,10 +1021,12 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 		"parent_id":                      j.ParentID,
 		"lease_token":                    j.LeaseToken,
 		"lease_ack_deadline_at":          j.LeaseAckDeadlineAt,
-		"failure_category":               j.FailureCategory,
-		"failure_stage":                  j.FailureStage,
-		"failure_reason_summary":         j.FailureReasonSummary,
-		"retriable":                      j.Retriable,
+		"failure_category":               failureCat,
+		"failure_stage":                  failureStage,
+		"failure_direction":              failureDir,
+		"failure_service":                failureSvc,
+		"failure_reason_summary":         failureReason,
+		"retriable":                      retriable,
 		"attempt_history":                j.AttemptHistory,
 		"dispatch_diagnostics":           diag,
 		"zipkin_trace_id":                j.ZipkinTraceID,

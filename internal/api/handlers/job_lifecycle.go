@@ -173,6 +173,8 @@ type JobDetailResponse struct {
 	Error                   string                        `json:"error,omitempty"`
 	FailureCategory         string                        `json:"failure_category,omitempty"`
 	FailureStage            string                        `json:"failure_stage,omitempty"`
+	FailureDirection        string                        `json:"failure_direction,omitempty"`
+	FailureService          string                        `json:"failure_service,omitempty"`
 	FailureReasonSummary    string                        `json:"failure_reason_summary,omitempty"`
 	Retriable               bool                          `json:"retriable,omitempty"`
 	ParentID                string                        `json:"parent_id,omitempty"`
@@ -872,6 +874,33 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		}
 	}
 
+	failureCat := j.FailureCategory
+	failureStage := j.FailureStage
+	failureDir := j.FailureDirection
+	failureSvc := j.FailureService
+	failureReason := j.FailureReasonSummary
+	retriable := j.Retriable
+	if strings.EqualFold(j.Status, dispatch.JobStatusCompleted) && strings.TrimSpace(j.Error) == "" {
+		failureCat = ""
+		failureStage = ""
+		failureDir = ""
+		failureSvc = ""
+		failureReason = ""
+		retriable = false
+	} else if failureCat != "" && failureDir == "" {
+		_, _, failureDir, failureSvc, _, _ = dispatch.ClassifyDispatchFailureWithDirection(failureCat + " " + failureStage + " " + failureReason)
+	}
+
+	diag := j.DispatchDiagnostics
+	if diag != nil {
+		stLower := strings.ToLower(strings.TrimSpace(j.Status))
+		if stLower == dispatch.JobStatusRunning || stLower == dispatch.JobStatusCompleted || stLower == dispatch.JobStatusFailed || stLower == dispatch.JobStatusCanceled || stLower == "cancelled" {
+			diagCopy := *diag
+			diagCopy.QueueState = stLower
+			diag = &diagCopy
+		}
+	}
+
 	resp := JobDetailResponse{
 		ID:                      j.ID,
 		Type:                    j.Type,
@@ -898,10 +927,12 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		Status:                  j.Status,
 		Result:                  j.Result,
 		Error:                   j.Error,
-		FailureCategory:         j.FailureCategory,
-		FailureStage:            j.FailureStage,
-		FailureReasonSummary:    j.FailureReasonSummary,
-		Retriable:               j.Retriable,
+		FailureCategory:         failureCat,
+		FailureStage:            failureStage,
+		FailureDirection:        failureDir,
+		FailureService:          failureSvc,
+		FailureReasonSummary:    failureReason,
+		Retriable:               retriable,
 		ParentID:                j.ParentID,
 		InfraRequeueCount:       j.InfraRequeueCount,
 		AttemptHistory:          j.AttemptHistory,
@@ -914,7 +945,7 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		FinalTurnCount:          j.FinalTurnCount,
 		FinalTranscriptSHA256:   j.FinalTranscriptSHA256,
 		AgentAffinity:           j.AgentAffinity,
-		DispatchDiagnostics:     j.DispatchDiagnostics,
+		DispatchDiagnostics:     diag,
 		CreatedAt:               j.CreatedAt.Format(time.RFC3339),
 	}
 
@@ -1140,15 +1171,17 @@ func (h *JobLifecycleHandler) Heartbeat(w http.ResponseWriter, r *http.Request) 
 
 // FailoverRequest carries details when a tool startup or pre-progress check fails.
 type FailoverRequest struct {
-	Host            string `json:"host"`
-	Tool            string `json:"tool"`
-	Workspace       string `json:"workspace"`
-	ExitCode        int    `json:"exit_code"`
-	StderrTail      string `json:"stderr_tail"`
-	FailureCategory string `json:"failure_category"`
-	FailureStage    string `json:"failure_stage"`
-	Reason          string `json:"reason"`
-	Timestamp       string `json:"timestamp"`
+	Host             string `json:"host"`
+	Tool             string `json:"tool"`
+	Workspace        string `json:"workspace"`
+	ExitCode         int    `json:"exit_code"`
+	StderrTail       string `json:"stderr_tail"`
+	FailureCategory  string `json:"failure_category"`
+	FailureStage     string `json:"failure_stage"`
+	FailureDirection string `json:"failure_direction,omitempty"`
+	FailureService   string `json:"failure_service,omitempty"`
+	Reason           string `json:"reason"`
+	Timestamp        string `json:"timestamp"`
 }
 
 // Failover serves POST /api/v1/global-queue/jobs/{id}/failover and POST /api/v1/jobs/{id}/failover.
@@ -1173,15 +1206,17 @@ func (h *JobLifecycleHandler) Failover(w http.ResponseWriter, r *http.Request) {
 	}
 
 	attempt := dispatch.AttemptFailure{
-		Host:            req.Host,
-		Tool:            req.Tool,
-		Workspace:       req.Workspace,
-		ExitCode:        req.ExitCode,
-		StderrTail:      req.StderrTail,
-		FailureCategory: req.FailureCategory,
-		FailureStage:    req.FailureStage,
-		Reason:          req.Reason,
-		Timestamp:       req.Timestamp,
+		Host:             req.Host,
+		Tool:             req.Tool,
+		Workspace:        req.Workspace,
+		ExitCode:         req.ExitCode,
+		StderrTail:       req.StderrTail,
+		FailureCategory:  req.FailureCategory,
+		FailureStage:     req.FailureStage,
+		FailureDirection: req.FailureDirection,
+		FailureService:   req.FailureService,
+		Reason:           req.Reason,
+		Timestamp:        req.Timestamp,
 	}
 
 	var errQueue error
