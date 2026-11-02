@@ -3237,3 +3237,28 @@ func TestGov3851_DispatchJobRepoDetailLockPreservationAndFallbackLogs(t *testing
 		t.Fatalf("expected running_job.id='job_3ffa5d0be1649f0e' on repo detail, got %v", repoView["running_job"])
 	}
 }
+
+func TestTelemetryConfigEndpoint(t *testing.T) {
+	t.Setenv("CENTRAL_TELEMETRY_GATEWAY_URL", "https://telemetry.custom.local")
+	s := &Server{Engine: control.NewEngine(nil)}
+	for _, path := range []string{"/v1/telemetry/config", "/api/v1/telemetry/config"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK for %s, got %d", path, rr.Code)
+		}
+
+		var res map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &res); err != nil {
+			t.Fatalf("failed to decode json: %v", err)
+		}
+		if res["central_telemetry_gateway_url"] != "https://telemetry.custom.local" {
+			t.Errorf("expected gateway url https://telemetry.custom.local, got %v", res["central_telemetry_gateway_url"])
+		}
+		if res["status"] != "healthy" {
+			t.Errorf("expected status healthy, got %v", res["status"])
+		}
+	}
+}
