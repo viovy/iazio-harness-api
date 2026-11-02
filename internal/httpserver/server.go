@@ -285,6 +285,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/observability/metrics", s.observabilityMetrics)
 	mux.HandleFunc("GET /v1/observability/stats", s.observabilityMetrics)
 	mux.HandleFunc("GET /api/v1/observability/metrics", s.observabilityMetrics)
+	mux.HandleFunc("GET /v1/telemetry/config", s.telemetryConfig)
+	mux.HandleFunc("GET /api/v1/telemetry/config", s.telemetryConfig)
+
 	mux.HandleFunc("GET /swagger", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/swagger/", http.StatusMovedPermanently)
 	})
@@ -4541,6 +4544,7 @@ func (s *Server) observabilityMetrics(w http.ResponseWriter, r *http.Request) {
 		"telemetry": map[string]any{
 			"zipkin_endpoint":        zipkinEndpoint,
 			"elasticsearch_endpoint": esEndpoint,
+			"central_telemetry_gateway_url": resolveCentralTelemetryGatewayURL(),
 			"service_name":           "iazio-harness-api",
 			"tracing_enabled":        true,
 		},
@@ -4556,3 +4560,20 @@ func DecodeLimit(r io.Reader, v any) error {
 
 // NowUnix is a test helper clock.
 func NowUnix() time.Time { return time.Unix(0, 0) }
+
+
+func resolveCentralTelemetryGatewayURL() string {
+	u := strings.TrimSpace(os.Getenv("CENTRAL_TELEMETRY_GATEWAY_URL"))
+	if u == "" {
+		u = strings.TrimSpace(os.Getenv("IAZIO_CENTRAL_TELEMETRY_GATEWAY_URL"))
+	}
+	return u
+}
+
+func (s *Server) telemetryConfig(w http.ResponseWriter, _ *http.Request) {
+	gatewayURL := resolveCentralTelemetryGatewayURL()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"central_telemetry_gateway_url": gatewayURL,
+		"status":                        "healthy",
+	})
+}
