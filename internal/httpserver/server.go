@@ -279,6 +279,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -515,7 +518,8 @@ func withAuth(next http.Handler, token string) http.Handler {
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
-		if path == "/" || path == "/healthz" || path == "/readyz" || path == "/version" ||
+		if path == "/" || path == "/healthz" || path == "/health" || path == "/readyz" || path == "/version" ||
+			path == "/v1/telemetry/config" || path == "/api/v1/telemetry/config" ||
 			strings.HasPrefix(path, "/swagger") || r.Method == http.MethodOptions {
 			next.ServeHTTP(w, r)
 			return

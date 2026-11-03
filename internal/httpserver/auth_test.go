@@ -39,6 +39,9 @@ func TestAuthMiddleware(t *testing.T) {
 	if rrPrompt.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for unauthenticated request, got %d", rrPrompt.Code)
 	}
+	if h := rrPrompt.Header().Get("WWW-Authenticate"); h != `Bearer error="invalid_token"` {
+		t.Fatalf("expected WWW-Authenticate header with Bearer error=\"invalid_token\", got %q", h)
+	}
 
 	// 4. Protected route with invalid token must be rejected with 401
 	reqInvalid := httptest.NewRequest(http.MethodGet, "/v1/prompts", nil)
@@ -47,6 +50,24 @@ func TestAuthMiddleware(t *testing.T) {
 	handler.ServeHTTP(rrInvalid, reqInvalid)
 	if rrInvalid.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for invalid token, got %d", rrInvalid.Code)
+	}
+	if h := rrInvalid.Header().Get("WWW-Authenticate"); h != `Bearer error="invalid_token"` {
+		t.Fatalf("expected WWW-Authenticate header with Bearer error=\"invalid_token\", got %q", h)
+	}
+
+	// 4b. Telemetry config and /health public routes must succeed without auth
+	reqHealth2 := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rrHealth2 := httptest.NewRecorder()
+	handler.ServeHTTP(rrHealth2, reqHealth2)
+	if rrHealth2.Code != http.StatusOK {
+		t.Fatalf("expected 200 for public /health, got %d", rrHealth2.Code)
+	}
+
+	reqTelem := httptest.NewRequest(http.MethodGet, "/v1/telemetry/config", nil)
+	rrTelem := httptest.NewRecorder()
+	handler.ServeHTTP(rrTelem, reqTelem)
+	if rrTelem.Code != http.StatusOK {
+		t.Fatalf("expected 200 for public /v1/telemetry/config, got %d", rrTelem.Code)
 	}
 
 	// 5. Protected route with valid token must succeed
