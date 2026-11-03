@@ -274,6 +274,11 @@ func TestProfileTool_AuthStatusEnabled_ManifestAndHeartbeatEnrichment(t *testing
       repository: viovy/iazio-agent
       binary_name: iazio-agent
       tier: baseline
+      service:
+        enabled: true
+        autostart: true
+        label: io.iazio.iazio-agent
+        run_args: ["run"]
 `
 	prof, err := e.SyncGenericProfile([]byte(rawYAML))
 	if err != nil {
@@ -284,13 +289,18 @@ func TestProfileTool_AuthStatusEnabled_ManifestAndHeartbeatEnrichment(t *testing
 	}
 
 	// Enable AuthStatusEnabled on iazio-harvester via UpsertProfile (simulating UI checkbox tick)
+	// Also clear Service on iazio-agent incoming payload to verify UpsertProfile preserves existing Service.
 	prof.Tools[0].AuthStatusEnabled = true
+	prof.Tools[1].Service = nil
 	updated, err := e.UpsertProfile(*prof)
 	if err != nil {
 		t.Fatalf("UpsertProfile failed: %v", err)
 	}
 	if !updated.Tools[0].AuthStatusEnabled {
 		t.Fatalf("expected AuthStatusEnabled=true on iazio-harvester")
+	}
+	if updated.Tools[1].Service == nil || updated.Tools[1].Service.Label != "io.iazio.iazio-agent" {
+		t.Fatalf("expected UpsertProfile to preserve existing tool Service definition, got %+v", updated.Tools[1].Service)
 	}
 
 	// Verify GetManifest includes AuthStatusEnabled

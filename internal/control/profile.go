@@ -303,6 +303,9 @@ func (e *Engine) UpsertProfile(p DistributionProfile) (*DistributionProfile, err
 				if p.Tools[i].LastSyncError == "" {
 					p.Tools[i].LastSyncError = exTool.LastSyncError
 				}
+				if p.Tools[i].Service == nil && exTool.Service != nil {
+					p.Tools[i].Service = exTool.Service
+				}
 			}
 		}
 	} else {
@@ -323,8 +326,17 @@ func (e *Engine) UpsertProfile(p DistributionProfile) (*DistributionProfile, err
 	}
 
 	e.mu.Lock()
-	e.profiles[name] = &candidate
+	stored := candidate
+	if len(candidate.Tools) > 0 {
+		stored.Tools = make([]ProfileTool, len(candidate.Tools))
+		copy(stored.Tools, candidate.Tools)
+	}
+	e.profiles[name] = &stored
 	cp := candidate
+	if len(candidate.Tools) > 0 {
+		cp.Tools = make([]ProfileTool, len(candidate.Tools))
+		copy(cp.Tools, candidate.Tools)
+	}
 	e.mu.Unlock()
 	return &cp, nil
 }
