@@ -310,7 +310,26 @@ func (e *Engine) HeartbeatWithCapabilities(id, presence string, tools []Tool, fe
 	}
 	h.LastSeen = e.now()
 	h.FetchFailed = fetchFailed
-	h.Tools = append([]Tool(nil), tools...)
+	mergedTools := append([]Tool(nil), tools...)
+	if len(h.Tools) > 0 && len(mergedTools) > 0 {
+		prevByName := make(map[string]Tool, len(h.Tools))
+		for _, pt := range h.Tools {
+			prevByName[strings.ToLower(strings.TrimSpace(pt.Name))] = pt
+		}
+		for i := range mergedTools {
+			if prev, hasPrev := prevByName[strings.ToLower(strings.TrimSpace(mergedTools[i].Name))]; hasPrev {
+				if len(mergedTools[i].AuthStatus) == 0 && mergedTools[i].AuthStatusError == "" && mergedTools[i].AuthCheckedAt == "" {
+					if mergedTools[i].AuthStatusEnabled || prev.AuthStatusEnabled {
+						mergedTools[i].AuthStatus = prev.AuthStatus
+						mergedTools[i].AuthStatusError = prev.AuthStatusError
+						mergedTools[i].AuthCheckedAt = prev.AuthCheckedAt
+					}
+				}
+			}
+		}
+	}
+	e.enrichToolsWithProfileLocked(h.DistributionProfile, mergedTools)
+	h.Tools = mergedTools
 	h.ActiveJobs = append([]ActiveJob(nil), activeJobs...)
 	h.HarnessActive = len(activeJobs) > 0
 	if len(supportedCaps) > 0 {
@@ -404,6 +423,10 @@ func (e *Engine) ListHosts() []HostSummary {
 	out := make([]HostSummary, 0, len(e.hosts))
 	for _, h := range e.hosts {
 		hostCopy := *h
+		if len(h.Tools) > 0 {
+			hostCopy.Tools = append([]Tool(nil), h.Tools...)
+			e.enrichToolsWithProfileLocked(hostCopy.DistributionProfile, hostCopy.Tools)
+		}
 		if !hostCopy.LastSeen.IsZero() && now.Sub(hostCopy.LastSeen) > LeaseInterval*2 {
 			hostCopy.Presence = "OFFLINE"
 		}
@@ -434,6 +457,10 @@ func (e *Engine) GetHostDetail(id string) (HostDetail, bool) {
 		return HostDetail{}, false
 	}
 	hostCopy := *h
+	if len(h.Tools) > 0 {
+		hostCopy.Tools = append([]Tool(nil), h.Tools...)
+		e.enrichToolsWithProfileLocked(hostCopy.DistributionProfile, hostCopy.Tools)
+	}
 	if !hostCopy.LastSeen.IsZero() && e.now().Sub(hostCopy.LastSeen) > LeaseInterval*2 {
 		hostCopy.Presence = "OFFLINE"
 	}
@@ -444,6 +471,47 @@ func (e *Engine) GetHostDetail(id string) (HostDetail, bool) {
 		}
 	}
 	return detail, true
+}
+
+func (e *Engine) enrichToolsWithProfileLocked(profileName string, tools []Tool) {
+	if len(tools) == 0 {
+		return
+	}
+	pName := strings.TrimSpace(profileName)
+	if pName == "" {
+		pName = "generic"
+	}
+	p, ok := e.profiles[pName]
+	if !ok || p == nil {
+		p = e.profiles["generic"]
+	}
+	if p == nil || len(p.Tools) == 0 {
+		return
+	}
+	enabledByName := make(map[string]bool, len(p.Tools)*2)
+	definedByName := make(map[string]bool, len(p.Tools)*2)
+	for _, pt := range p.Tools {
+		n := strings.ToLower(strings.TrimSpace(pt.Name))
+		if n != "" {
+			definedByName[n] = true
+			enabledByName[n] = pt.AuthStatusEnabled
+		}
+		b := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(pt.BinaryName)), ".exe")
+		if b != "" {
+			definedByName[b] = true
+			enabledByName[b] = pt.AuthStatusEnabled
+		}
+	}
+	for i := range tools {
+		tn := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(tools[i].Name)), ".exe")
+		if definedByName[tn] {
+			if enabledByName[tn] {
+				tools[i].AuthStatusEnabled = true
+			} else if !tools[i].AuthStatusEnabled {
+				tools[i].AuthStatusEnabled = false
+			}
+		}
+	}
 }
 
 // UpdateEagerReadiness updates or stores the eager update readiness report for a host.
