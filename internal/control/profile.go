@@ -57,6 +57,7 @@ type ProfileTool struct {
 	Tier                   string       `json:"tier" yaml:"tier"` // baseline | optional
 	TargetVersion          string       `json:"target_version,omitempty" yaml:"target_version,omitempty"`
 	TrackLatest            *bool        `json:"track_latest,omitempty" yaml:"track_latest,omitempty"`
+	AuthStatusEnabled      bool         `json:"auth_status_enabled,omitempty" yaml:"auth_status_enabled,omitempty"`
 	LatestAvailableVersion string       `json:"latest_available_version,omitempty" yaml:"latest_available_version,omitempty"`
 	LatestReleaseURL       string       `json:"latest_release_url,omitempty" yaml:"latest_release_url,omitempty"`
 	LatestPublishedAt      *time.Time   `json:"latest_published_at,omitempty" yaml:"latest_published_at,omitempty"`
@@ -112,6 +113,7 @@ type ManifestToolItem struct {
 	Tier                   string       `json:"tier"`
 	TargetVersion          string       `json:"target_version,omitempty"`
 	LatestAvailableVersion string       `json:"latest_available_version,omitempty"`
+	AuthStatusEnabled      bool         `json:"auth_status_enabled,omitempty"`
 	Service                *ToolService `json:"service,omitempty"`
 }
 
@@ -382,13 +384,14 @@ func parseFleetDistribution(raw []byte) (*DistributionProfile, error) {
 				IsPrivate bool   `yaml:"is_private" json:"is_private"`
 			} `yaml:"repositories" json:"repositories"`
 			Tools []struct {
-				Name          string       `yaml:"name" json:"name"`
-				Repository    string       `yaml:"repository" json:"repository"`
-				BinaryName    string       `yaml:"binary_name" json:"binary_name"`
-				Description   string       `yaml:"description" json:"description"`
-				Tier          string       `yaml:"tier" json:"tier"`
-				TargetVersion string       `yaml:"target_version" json:"target_version"`
-				Service       *ToolService `yaml:"service" json:"service"`
+				Name              string       `yaml:"name" json:"name"`
+				Repository        string       `yaml:"repository" json:"repository"`
+				BinaryName        string       `yaml:"binary_name" json:"binary_name"`
+				Description       string       `yaml:"description" json:"description"`
+				Tier              string       `yaml:"tier" json:"tier"`
+				TargetVersion     string       `yaml:"target_version" json:"target_version"`
+				AuthStatusEnabled *bool        `yaml:"auth_status_enabled" json:"auth_status_enabled"`
+				Service           *ToolService `yaml:"service" json:"service"`
 			} `yaml:"tools" json:"tools"`
 		} `yaml:"fleet_distribution" json:"fleet_distribution"`
 	}
@@ -424,15 +427,20 @@ func parseFleetDistribution(raw []byte) (*DistributionProfile, error) {
 			repo = repoDef.Repo
 		}
 		trackLatest := t.TargetVersion == "" || t.TargetVersion == "latest"
+		authStatusEnabled := false
+		if t.AuthStatusEnabled != nil {
+			authStatusEnabled = *t.AuthStatusEnabled
+		}
 		profile.Tools = append(profile.Tools, ProfileTool{
-			Name:          t.Name,
-			Repository:    repo,
-			BinaryName:    t.BinaryName,
-			Description:   t.Description,
-			Tier:          t.Tier,
-			TargetVersion: t.TargetVersion,
-			TrackLatest:   BoolPtr(trackLatest),
-			Service:       t.Service,
+			Name:              t.Name,
+			Repository:        repo,
+			BinaryName:        t.BinaryName,
+			Description:       t.Description,
+			Tier:              t.Tier,
+			TargetVersion:     t.TargetVersion,
+			TrackLatest:       BoolPtr(trackLatest),
+			AuthStatusEnabled: authStatusEnabled,
+			Service:           t.Service,
 		})
 	}
 	return &profile, nil
@@ -444,6 +452,7 @@ func (e *Engine) SyncGenericProfile(raw []byte) (*DistributionProfile, error) {
 	if err != nil {
 		return nil, err
 	}
+	e.preserveExistingAuthStatusFlags(p)
 	upserted, err := e.UpsertProfile(*p)
 	if err != nil {
 		return nil, err
@@ -580,6 +589,7 @@ func (e *Engine) ScanRepoProfile(hostID, repoPath, profileName string) (*Distrib
 	profile.Description = fmt.Sprintf("Scanned from %s on host %s (%s, git flow: %s)", filepath.Base(repoPath), hostID, scanSource, version)
 	profile.IsDefault = (pName == "generic")
 
+	e.preserveExistingAuthStatusFlags(profile)
 	upserted, err := e.UpsertProfile(*profile)
 	if err != nil {
 		return nil, err
@@ -721,6 +731,7 @@ func (e *Engine) GetManifest(profileName, targetOS, targetArch string) (*Manifes
 			Tier:                   t.Tier,
 			TargetVersion:          t.TargetVersion,
 			LatestAvailableVersion: t.LatestAvailableVersion,
+			AuthStatusEnabled:      t.AuthStatusEnabled,
 			Service:                t.Service,
 		})
 	}
@@ -732,4 +743,25 @@ func (e *Engine) GetManifest(profileName, targetOS, targetArch string) (*Manifes
 		Tools:        tools,
 		GeneratedAt:  e.now(),
 	}, nil
+}
+
+func (e *Engine) preserveExistingAuthStatusFlags(p *DistributionProfile) {
+	if p == nil {
+		return
+	}
+	existing, err := e.GetProfile(p.Name)
+	if err != nil || existing == nil {
+		return
+	}
+	exByName := make(map[string]bool, len(existing.Tools))
+	for _, t := range existing.Tools {
+		if t.AuthStatusEnabled {
+			exByName[strings.ToLower(t.Name)] = true
+		}
+	}
+	for i := range p.Tools {
+		if !p.Tools[i].AuthStatusEnabled && exByName[strings.ToLower(p.Tools[i].Name)] {
+			p.Tools[i].AuthStatusEnabled = true
+		}
+	}
 }

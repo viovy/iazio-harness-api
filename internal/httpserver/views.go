@@ -236,6 +236,18 @@ func toolView(t control.Tool) map[string]any {
 	if t.TargetCommitSHA != "" {
 		res["target_commit_sha"] = t.TargetCommitSHA
 	}
+	if t.AuthStatusEnabled {
+		res["auth_status_enabled"] = true
+	}
+	if len(t.AuthStatus) > 0 {
+		res["auth_status"] = t.AuthStatus
+	}
+	if t.AuthStatusError != "" {
+		res["auth_status_error"] = t.AuthStatusError
+	}
+	if t.AuthCheckedAt != "" {
+		res["auth_checked_at"] = t.AuthCheckedAt
+	}
 	return res
 }
 

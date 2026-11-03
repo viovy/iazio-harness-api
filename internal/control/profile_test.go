@@ -257,3 +257,105 @@ func TestProfileTool_IsTrackingLatest_OptionalTier(t *testing.T) {
 		t.Errorf("expected explicit TrackLatest=true to be honored in non-default profile, got false")
 	}
 }
+
+func TestProfileTool_AuthStatusEnabled_ManifestAndHeartbeatEnrichment(t *testing.T) {
+	e := NewEngine(time.Now)
+	rawYAML := `fleet_distribution:
+  schema_version: 1
+  install_root:
+    unix:
+      primary: ~/.local/bin
+  tools:
+    - name: iazio-harvester
+      repository: viovy/iazio-harvester
+      binary_name: iazio-harvester
+      tier: baseline
+    - name: iazio-agent
+      repository: viovy/iazio-agent
+      binary_name: iazio-agent
+      tier: baseline
+`
+	prof, err := e.SyncGenericProfile([]byte(rawYAML))
+	if err != nil {
+		t.Fatalf("SyncGenericProfile failed: %v", err)
+	}
+	if len(prof.Tools) != 2 {
+		t.Fatalf("expected 2 tools, got %d", len(prof.Tools))
+	}
+
+	// Enable AuthStatusEnabled on iazio-harvester via UpsertProfile (simulating UI checkbox tick)
+	prof.Tools[0].AuthStatusEnabled = true
+	updated, err := e.UpsertProfile(*prof)
+	if err != nil {
+		t.Fatalf("UpsertProfile failed: %v", err)
+	}
+	if !updated.Tools[0].AuthStatusEnabled {
+		t.Fatalf("expected AuthStatusEnabled=true on iazio-harvester")
+	}
+
+	// Verify GetManifest includes AuthStatusEnabled
+	manifest, err := e.GetManifest("generic", "linux", "amd64")
+	if err != nil {
+		t.Fatalf("GetManifest failed: %v", err)
+	}
+	if !manifest.Tools[0].AuthStatusEnabled {
+		t.Errorf("expected manifest tool iazio-harvester AuthStatusEnabled=true")
+	}
+	if manifest.Tools[1].AuthStatusEnabled {
+		t.Errorf("expected manifest tool iazio-agent AuthStatusEnabled=false")
+	}
+
+	// Verify SyncGenericProfile preserves AuthStatusEnabled when re-synced from YAML
+	resynced, err := e.SyncGenericProfile([]byte(rawYAML))
+	if err != nil {
+		t.Fatalf("re-SyncGenericProfile failed: %v", err)
+	}
+	if !resynced.Tools[0].AuthStatusEnabled {
+		t.Errorf("expected SyncGenericProfile to preserve AuthStatusEnabled=true on iazio-harvester")
+	}
+
+	// Verify Host Heartbeat enriches AuthStatusEnabled from profile and preserves AuthStatus across intermediate heartbeats
+	e.RegisterHost("debian", "debian", "permanent")
+	hbErr := e.HeartbeatWithCapabilities("debian", "ONLINE", []Tool{
+		{
+			Name:    "iazio-harvester",
+			Path:    "/usr/local/bin/iazio-harvester",
+			Version: "0.2.0",
+			Status:  "OK",
+			AuthStatus: map[string]any{
+				"token_status":          "available",
+				"refresh_token_present": true,
+				"api_base_url":          "https://tian.go.ro/iazio-harvester-api",
+			},
+			AuthCheckedAt: "2026-11-03T15:00:00Z",
+		},
+	}, false, nil, "1.0.0", "abc")
+	if hbErr != nil {
+		t.Fatalf("HeartbeatWithCapabilities failed: %v", hbErr)
+	}
+
+	detail, ok := e.GetHostDetail("debian")
+	if !ok || len(detail.Host.Tools) != 1 {
+		t.Fatalf("expected debian host detail with 1 tool")
+	}
+	if !detail.Host.Tools[0].AuthStatusEnabled {
+		t.Errorf("expected debian tool iazio-harvester to have AuthStatusEnabled=true from generic profile")
+	}
+	if detail.Host.Tools[0].AuthStatus["token_status"] != "available" {
+		t.Errorf("unexpected AuthStatus: %+v", detail.Host.Tools[0].AuthStatus)
+	}
+
+	// Intermediate heartbeat without AuthStatus should preserve cached AuthStatus while AuthStatusEnabled is true
+	_ = e.HeartbeatWithCapabilities("debian", "ONLINE", []Tool{
+		{
+			Name:    "iazio-harvester",
+			Path:    "/usr/local/bin/iazio-harvester",
+			Version: "0.2.0",
+			Status:  "OK",
+		},
+	}, false, nil, "1.0.0", "abc")
+	detailAfter, _ := e.GetHostDetail("debian")
+	if detailAfter.Host.Tools[0].AuthStatus["token_status"] != "available" {
+		t.Errorf("expected intermediate heartbeat to preserve AuthStatus, got: %+v", detailAfter.Host.Tools[0].AuthStatus)
+	}
+}

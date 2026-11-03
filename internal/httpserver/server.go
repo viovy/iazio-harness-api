@@ -1862,22 +1862,26 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		EagerUpdateEnabled    bool       `json:"eager_update_enabled"`
 		LastEagerUpdateAt     *time.Time `json:"last_eager_update_at"`
 		Tools                 []struct {
-			Name             string   `json:"name"`
-			Path             string   `json:"path"`
-			Version          string   `json:"version"`
-			CommitSHA        string   `json:"commit_sha"`
-			TargetVersion    string   `json:"target_version"`
-			TargetCommitSHA  string   `json:"target_commit_sha"`
-			Status           string   `json:"status"`
-			ServiceInstalled bool     `json:"service_installed"`
-			ServiceType      string   `json:"service_type"`
-			ServiceStatus    string   `json:"service_status"`
-			Capabilities     []string `json:"capabilities"`
-			Installed        bool     `json:"installed"`
-			InstallationType string   `json:"installation_type"`
-			ActiveState      string   `json:"active_state"`
-			WatchdogEnabled  bool     `json:"watchdog_enabled"`
-			ConfigStatus     string   `json:"config_status"`
+			Name              string         `json:"name"`
+			Path              string         `json:"path"`
+			Version           string         `json:"version"`
+			CommitSHA         string         `json:"commit_sha"`
+			TargetVersion     string         `json:"target_version"`
+			TargetCommitSHA   string         `json:"target_commit_sha"`
+			Status            string         `json:"status"`
+			ServiceInstalled  bool           `json:"service_installed"`
+			ServiceType       string         `json:"service_type"`
+			ServiceStatus     string         `json:"service_status"`
+			Capabilities      []string       `json:"capabilities"`
+			Installed         bool           `json:"installed"`
+			InstallationType  string         `json:"installation_type"`
+			ActiveState       string         `json:"active_state"`
+			WatchdogEnabled   bool           `json:"watchdog_enabled"`
+			ConfigStatus      string         `json:"config_status"`
+			AuthStatusEnabled bool           `json:"auth_status_enabled"`
+			AuthStatus        map[string]any `json:"auth_status"`
+			AuthStatusError   string         `json:"auth_status_error"`
+			AuthCheckedAt     string         `json:"auth_checked_at"`
 		} `json:"tools"`
 		ActiveJobs []struct {
 			JobID        string `json:"job_id"`
@@ -1892,22 +1896,26 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	tools := make([]control.Tool, 0, len(raw.Tools))
 	for _, t := range raw.Tools {
 		tools = append(tools, control.Tool{
-			Name:             t.Name,
-			Path:             t.Path,
-			Version:          t.Version,
-			CommitSHA:        t.CommitSHA,
-			TargetVersion:    t.TargetVersion,
-			TargetCommitSHA:  t.TargetCommitSHA,
-			Status:           t.Status,
-			ServiceInstalled: t.ServiceInstalled,
-			ServiceType:      t.ServiceType,
-			ServiceStatus:    t.ServiceStatus,
-			Capabilities:     t.Capabilities,
-			Installed:        t.Installed,
-			InstallationType: t.InstallationType,
-			ActiveState:      t.ActiveState,
-			WatchdogEnabled:  t.WatchdogEnabled,
-			ConfigStatus:     t.ConfigStatus,
+			Name:              t.Name,
+			Path:              t.Path,
+			Version:           t.Version,
+			CommitSHA:         t.CommitSHA,
+			TargetVersion:     t.TargetVersion,
+			TargetCommitSHA:   t.TargetCommitSHA,
+			Status:            t.Status,
+			ServiceInstalled:  t.ServiceInstalled,
+			ServiceType:       t.ServiceType,
+			ServiceStatus:     t.ServiceStatus,
+			Capabilities:      t.Capabilities,
+			Installed:         t.Installed,
+			InstallationType:  t.InstallationType,
+			ActiveState:       t.ActiveState,
+			WatchdogEnabled:   t.WatchdogEnabled,
+			ConfigStatus:      t.ConfigStatus,
+			AuthStatusEnabled: t.AuthStatusEnabled,
+			AuthStatus:        t.AuthStatus,
+			AuthStatusError:   t.AuthStatusError,
+			AuthCheckedAt:     t.AuthCheckedAt,
 		})
 	}
 	var activeJobs []control.ActiveJob

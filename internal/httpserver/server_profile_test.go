@@ -224,3 +224,91 @@ fleet_distribution:
 		t.Errorf("expected repo distribution profile mac-profile, got %s", detail.DistributionProfile)
 	}
 }
+
+func TestProfileAuthStatusAndHeartbeatToolViewAPI(t *testing.T) {
+	e := control.NewEngine(time.Now)
+	e.RegisterHost("debian", "debian", "generic")
+	srv := &Server{Engine: e}
+	handler := srv.Handler()
+
+	// Create generic profile with AuthStatusEnabled on iazio-harvester
+	_, err := e.UpsertProfile(control.DistributionProfile{
+		Name:      "generic",
+		IsDefault: true,
+		Tools: []control.ProfileTool{
+			{
+				Name:              "iazio-harvester",
+				Repository:        "viovy/iazio-harvester",
+				BinaryName:        "iazio-harvester",
+				Tier:              "baseline",
+				AuthStatusEnabled: true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("UpsertProfile: %v", err)
+	}
+
+	// Send heartbeat with auth_status payload
+	hbPayload := map[string]any{
+		"presence": "ONLINE",
+		"version":  "0.5.0",
+		"tools": []map[string]any{
+			{
+				"name":                "iazio-harvester",
+				"path":                "/usr/local/bin/iazio-harvester",
+				"version":             "0.2.1",
+				"status":              "OK",
+				"auth_status_enabled": true,
+				"auth_checked_at":     "2026-11-03T15:10:00Z",
+				"auth_status": map[string]any{
+					"config_path":           "/home/debian/.iazio/harvester.json",
+					"api_base_url":          "https://tian.go.ro/iazio-harvester-api",
+					"client_id":             "iazio-harvester-cli",
+					"refresh_token_present": true,
+					"access_token_present":  true,
+					"token_status":          "available",
+				},
+			},
+		},
+	}
+	hbBytes, _ := json.Marshal(hbPayload)
+	recHB := httptest.NewRecorder()
+	handler.ServeHTTP(recHB, httptest.NewRequest("POST", "/v1/hosts/debian/heartbeat", bytes.NewReader(hbBytes)))
+	if recHB.Code != http.StatusOK {
+		t.Fatalf("expected 200 on heartbeat, got %d: %s", recHB.Code, recHB.Body.String())
+	}
+
+	// Query GET /v1/hosts/debian/tools
+	recTools := httptest.NewRecorder()
+	handler.ServeHTTP(recTools, httptest.NewRequest("GET", "/v1/hosts/debian/tools", nil))
+	if recTools.Code != http.StatusOK {
+		t.Fatalf("expected 200 on getAgentTools, got %d: %s", recTools.Code, recTools.Body.String())
+	}
+
+	var toolsResp struct {
+		Host  string `json:"host"`
+		Tools []struct {
+			Name              string         `json:"name"`
+			AuthStatusEnabled bool           `json:"auth_status_enabled"`
+			AuthCheckedAt     string         `json:"auth_checked_at"`
+			AuthStatus        map[string]any `json:"auth_status"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(recTools.Body.Bytes(), &toolsResp); err != nil {
+		t.Fatalf("unmarshal tools response: %v", err)
+	}
+	if len(toolsResp.Tools) != 1 {
+		t.Fatalf("expected 1 tool in response, got %d", len(toolsResp.Tools))
+	}
+	gotTool := toolsResp.Tools[0]
+	if !gotTool.AuthStatusEnabled {
+		t.Errorf("expected auth_status_enabled=true")
+	}
+	if gotTool.AuthCheckedAt != "2026-11-03T15:10:00Z" {
+		t.Errorf("unexpected auth_checked_at: %s", gotTool.AuthCheckedAt)
+	}
+	if gotTool.AuthStatus["token_status"] != "available" {
+		t.Errorf("unexpected auth_status: %+v", gotTool.AuthStatus)
+	}
+}
