@@ -59,6 +59,12 @@ func run(ctx context.Context, args []string) error {
 	} else if tok := strings.TrimSpace(os.Getenv("IAZIO_HARNESS_API_TOKEN")); tok != "" {
 		srv.AuthToken = tok
 	}
+	if hydraAdmin := strings.TrimSpace(os.Getenv("HYDRA_ADMIN_URL")); hydraAdmin != "" {
+		srv.HydraAdminURL = hydraAdmin
+	}
+	if reqOAuth := strings.TrimSpace(strings.ToLower(os.Getenv("IAZIO_REQUIRE_OAUTH"))); reqOAuth == "1" || reqOAuth == "true" || reqOAuth == "yes" {
+		srv.RequireOAuth = true
+	}
 	srv.Engine.StartReaper(ctx, 10*time.Second)
 	if srv.Queue != nil {
 		if inMem, ok := srv.Queue.(*dispatch.InMemoryQueue); ok {

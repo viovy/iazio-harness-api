@@ -23,6 +23,7 @@ import (
 	"github.com/viovy/iazio-harness-api/internal/control"
 	"github.com/viovy/iazio-harness-api/internal/dispatch"
 	"github.com/viovy/iazio-harness-api/internal/gitlease"
+	"github.com/viovy/iazio-harness-api/internal/oauth"
 	"github.com/viovy/iazio-harness-api/internal/sse"
 	"github.com/viovy/iazio-harness-api/internal/telemetry"
 	"github.com/viovy/iazio-harness-api/internal/version"
@@ -57,6 +58,12 @@ type Server struct {
 	ReconcileLineage func(ctx context.Context) error
 	// AuthToken, when non-empty, requires Bearer token authentication on control-plane endpoints.
 	AuthToken string
+	// HydraAdminURL, when non-empty, enables Ory Hydra OAuth2 RFC 7662 token introspection and scope authorization.
+	HydraAdminURL string
+	// OAuthIntrospector, when non-nil, introspects OAuth2 Bearer tokens (auto-initialized from HydraAdminURL if nil).
+	OAuthIntrospector *oauth.Introspector
+	// RequireOAuth, when true, rejects requests without a valid static AuthToken or OAuth2 Bearer token even when AuthToken is empty.
+	RequireOAuth bool
 	// CodebaseStore manages fleet repository discovery and codebase RAG search chunks.
 	CodebaseStore codebase.Store
 	// EventHub manages cursor-resumable SSE streaming and heartbeat telemetry.
@@ -485,7 +492,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /v1/global-queue/tool-priority", s.setToolPriority)
 	mux.HandleFunc("GET /api/v1/global-queue/tool-priority", s.getToolPriority)
 	mux.HandleFunc("PUT /api/v1/global-queue/tool-priority", s.setToolPriority)
-	return withTracing(withCORS(withAuth(mux, s.AuthToken)))
+	mux.HandleFunc("GET /v1/auth/whoami", s.authWhoami)
+	mux.HandleFunc("GET /api/v1/auth/whoami", s.authWhoami)
+	introspector := s.OAuthIntrospector
+	if introspector == nil && strings.TrimSpace(s.HydraAdminURL) != "" {
+		introspector = oauth.NewIntrospector(s.HydraAdminURL)
+		s.OAuthIntrospector = introspector
+	}
+	return withTracing(withCORS(withAuthWithOAuth(mux, s.AuthToken, introspector, s.RequireOAuth)))
 }
 
 func withTracing(next http.Handler) http.Handler {
@@ -512,10 +526,13 @@ func withTracing(next http.Handler) http.Handler {
 }
 
 func withAuth(next http.Handler, token string) http.Handler {
+	return withAuthWithOAuth(next, token, nil, false)
+}
+
+func withAuthWithOAuth(next http.Handler, token string, introspector *oauth.Introspector, requireOAuth bool) http.Handler {
 	token = strings.TrimSpace(token)
-	if token == "" {
-		return next
-	}
+	hasStatic := token != ""
+	hasOAuth := introspector != nil && introspector.Enabled()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		if path == "/" || path == "/healthz" || path == "/health" || path == "/readyz" || path == "/version" ||
@@ -525,21 +542,74 @@ func withAuth(next http.Handler, token string) http.Handler {
 			return
 		}
 
+		isWhoami := path == "/v1/auth/whoami" || path == "/api/v1/auth/whoami"
 		authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
 		const prefix = "Bearer "
 		if !strings.HasPrefix(authHeader, prefix) {
+			if hasStatic || requireOAuth || isWhoami {
+				w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		got := strings.TrimSpace(strings.TrimPrefix(authHeader, prefix))
+		if got == "" {
 			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
-		got := strings.TrimSpace(strings.TrimPrefix(authHeader, prefix))
-		if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+
+		if hasStatic && subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1 {
+			ctx := oauth.WithPrincipal(r.Context(), oauth.IntrospectionResult{
+				Active:     true,
+				AuthMethod: "static_token",
+				Scope:      "harness:read harness:write credentials:manage",
+			})
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+
+		if hasOAuth {
+			res, err := introspector.Introspect(r.Context(), got)
+			if err != nil || !res.Active {
+				w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+				return
+			}
+			reqScope := oauth.RequiredScopeForRequest(r.Method, path)
+			if reqScope != "" && !res.HasScope(reqScope) {
+				w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer error="insufficient_scope", scope="%s"`, reqScope))
+				writeJSON(w, http.StatusForbidden, map[string]string{
+					"error":          "insufficient_scope",
+					"required_scope": reqScope,
+				})
+				return
+			}
+			ctx := oauth.WithPrincipal(r.Context(), res)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+
+		if hasStatic || requireOAuth || isWhoami {
 			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) authWhoami(w http.ResponseWriter, r *http.Request) {
+	p, ok := oauth.PrincipalFromContext(r.Context())
+	if !ok || !p.Active {
+		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
 }
 
 func withCORS(next http.Handler) http.Handler {
