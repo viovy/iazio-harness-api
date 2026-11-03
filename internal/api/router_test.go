@@ -94,6 +94,60 @@ func TestRouter_AuthMiddleware(t *testing.T) {
 	if recClaim.Code != http.StatusOK {
 		t.Fatalf("expected 200 OK claiming queued prompt job, got %d: %s", recClaim.Code, recClaim.Body.String())
 	}
+
+	// 7. OAuth2 Hydra token introspection + scope enforcement
+	hydraSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		tok := r.FormValue("token")
+		w.Header().Set("Content-Type", "application/json")
+		switch tok {
+		case "oauth-read-only":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"active":    true,
+				"client_id": "iazio-agent-cli",
+				"scope":     "openid harness:read",
+			})
+		case "oauth-read-write":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"active":    true,
+				"client_id": "iazio-agent-cli",
+				"scope":     "openid harness:read harness:write",
+			})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{"active": false})
+		}
+	}))
+	defer hydraSrv.Close()
+
+	oauthRouter := NewRouter(RouterConfig{
+		Store:         store,
+		AuthToken:     validToken,
+		HydraAdminURL: hydraSrv.URL,
+	})
+
+	reqOAuthGet := httptest.NewRequest(http.MethodGet, "/api/v1/repos", nil)
+	reqOAuthGet.Header.Set("Authorization", "Bearer oauth-read-only")
+	recOAuthGet := httptest.NewRecorder()
+	oauthRouter.ServeHTTP(recOAuthGet, reqOAuthGet)
+	if recOAuthGet.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for oauth-read-only GET, got %d", recOAuthGet.Code)
+	}
+
+	reqOAuthPostForbidden := httptest.NewRequest(http.MethodPost, "/api/v1/prompts", bytes.NewReader(promptBody))
+	reqOAuthPostForbidden.Header.Set("Authorization", "Bearer oauth-read-only")
+	recOAuthPostForbidden := httptest.NewRecorder()
+	oauthRouter.ServeHTTP(recOAuthPostForbidden, reqOAuthPostForbidden)
+	if recOAuthPostForbidden.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for oauth-read-only POST, got %d", recOAuthPostForbidden.Code)
+	}
+
+	reqOAuthPostOK := httptest.NewRequest(http.MethodPost, "/api/v1/prompts", bytes.NewReader(promptBody))
+	reqOAuthPostOK.Header.Set("Authorization", "Bearer oauth-read-write")
+	recOAuthPostOK := httptest.NewRecorder()
+	oauthRouter.ServeHTTP(recOAuthPostOK, reqOAuthPostOK)
+	if recOAuthPostOK.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for oauth-read-write POST, got %d", recOAuthPostOK.Code)
+	}
 }
 
 func TestRouter_StoriesRoute(t *testing.T) {

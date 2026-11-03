@@ -52,6 +52,79 @@ func TestVersion(t *testing.T) {
 	}
 }
 
+func TestOAuthIntrospectionAndScopeAuth(t *testing.T) {
+	hydra := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		tok := r.FormValue("token")
+		w.Header().Set("Content-Type", "application/json")
+		switch tok {
+		case "agent-at":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"active":    true,
+				"client_id": "iazio-agent-cli",
+				"sub":       "romeo",
+				"scope":     "openid offline_access harness:read harness:write credentials:manage",
+			})
+		case "readonly-at":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"active":    true,
+				"client_id": "iazio-agent-cli",
+				"sub":       "romeo",
+				"scope":     "openid harness:read",
+			})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{"active": false})
+		}
+	}))
+	defer hydra.Close()
+
+	s := &Server{
+		Engine:        control.NewEngine(nil),
+		AuthToken:     "static-tok",
+		HydraAdminURL: hydra.URL,
+	}
+	s.Engine.RegisterHost("debian", "permanent")
+	h := s.Handler()
+
+	// 1. Whoami without token -> 401
+	req := httptest.NewRequest(http.MethodGet, "/v1/auth/whoami", nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on unauthenticated whoami, got %d", rr.Code)
+	}
+
+	// 2. Whoami with OAuth token -> 200 OK with client_id
+	req = httptest.NewRequest(http.MethodGet, "/v1/auth/whoami", nil)
+	req.Header.Set("Authorization", "Bearer agent-at")
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 on oauth whoami, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"client_id":"iazio-agent-cli"`) {
+		t.Fatalf("expected client_id in whoami response, got %s", rr.Body.String())
+	}
+
+	// 3. POST /v1/hosts/debian/heartbeat with readonly-at -> 403 insufficient_scope
+	req = httptest.NewRequest(http.MethodPost, "/v1/hosts/debian/heartbeat", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer readonly-at")
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 on write endpoint with readonly token, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// 4. POST /v1/hosts/debian/heartbeat with agent-at -> 200 OK
+	req = httptest.NewRequest(http.MethodPost, "/v1/hosts/debian/heartbeat", strings.NewReader(`{"agent_version":"0.0.134"}`))
+	req.Header.Set("Authorization", "Bearer agent-at")
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 on write endpoint with agent-at, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestRoot(t *testing.T) {
 	s := &Server{Engine: control.NewEngine(nil)}
 	req := httptest.NewRequest(http.MethodGet, "/", nil)

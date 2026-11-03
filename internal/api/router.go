@@ -11,15 +11,19 @@ import (
 	"github.com/viovy/iazio-harness-api/internal/api/handlers"
 	"github.com/viovy/iazio-harness-api/internal/codebase"
 	"github.com/viovy/iazio-harness-api/internal/dispatch"
+	"github.com/viovy/iazio-harness-api/internal/oauth"
 )
 
 // RouterConfig contains dependencies and settings for the API router.
 type RouterConfig struct {
-	Store       codebase.Store
-	Ingestor    codebase.Ingestor
-	Queue       dispatch.Queue
-	Idempotency *handlers.IdempotencyStore
-	AuthToken   string
+	Store             codebase.Store
+	Ingestor          codebase.Ingestor
+	Queue             dispatch.Queue
+	Idempotency       *handlers.IdempotencyStore
+	AuthToken         string
+	HydraAdminURL     string
+	OAuthIntrospector *oauth.Introspector
+	RequireOAuth      bool
 }
 
 // NewRouter constructs an http.Handler with all /api/v1 routes and auth middleware.
@@ -62,12 +66,22 @@ func NewRouter(cfg RouterConfig) http.Handler {
 		http.NotFound(w, r)
 	})
 
-	return withAuthMiddleware(mux, cfg.AuthToken)
+	introspector := cfg.OAuthIntrospector
+	if introspector == nil && strings.TrimSpace(cfg.HydraAdminURL) != "" {
+		introspector = oauth.NewIntrospector(cfg.HydraAdminURL)
+	}
+	return withAuthMiddlewareWithOAuth(mux, cfg.AuthToken, introspector, cfg.RequireOAuth)
 }
 
 func withAuthMiddleware(next http.Handler, token string) http.Handler {
+	return withAuthMiddlewareWithOAuth(next, token, nil, false)
+}
+
+func withAuthMiddlewareWithOAuth(next http.Handler, token string, introspector *oauth.Introspector, requireOAuth bool) http.Handler {
 	token = strings.TrimSpace(token)
-	if token == "" {
+	hasStatic := token != ""
+	hasOAuth := introspector != nil && introspector.Enabled()
+	if !hasStatic && !hasOAuth && !requireOAuth {
 		return next
 	}
 
@@ -80,17 +94,53 @@ func withAuthMiddleware(next http.Handler, token string) http.Handler {
 		authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
 		const prefix = "Bearer "
 		if !strings.HasPrefix(authHeader, prefix) {
-			writeAuthError(w)
+			if hasStatic || requireOAuth {
+				writeAuthError(w)
+				return
+			}
+			next.ServeHTTP(w, r)
 			return
 		}
 
 		got := strings.TrimSpace(strings.TrimPrefix(authHeader, prefix))
-		if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+		if got == "" {
 			writeAuthError(w)
 			return
 		}
 
-		next.ServeHTTP(w, r)
+		if hasStatic && subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1 {
+			ctx := oauth.WithPrincipal(r.Context(), oauth.IntrospectionResult{
+				Active:     true,
+				AuthMethod: "static_token",
+				Scope:      "harness:read harness:write credentials:manage",
+			})
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+
+		if hasOAuth {
+			res, err := introspector.Introspect(r.Context(), got)
+			if err != nil || !res.Active {
+				writeAuthError(w)
+				return
+			}
+			reqScope := oauth.RequiredScopeForRequest(r.Method, r.URL.Path)
+			if reqScope != "" && !res.HasScope(reqScope) {
+				w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_scope", scope="`+reqScope+`"`)
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(http.StatusForbidden)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"error":          "insufficient_scope",
+					"required_scope": reqScope,
+				})
+				return
+			}
+			ctx := oauth.WithPrincipal(r.Context(), res)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+
+		writeAuthError(w)
 	})
 }
 
