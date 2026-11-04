@@ -284,6 +284,51 @@ func (h *AgentJobsHandler) HeartbeatHandler(w http.ResponseWriter, r *http.Reque
 		job, err = h.queue.Heartbeat(r.Context(), jobID, req.FencingToken)
 	}
 	if err != nil {
+		if err == dispatch.ErrLeaseFenced && req.FencingToken == 0 && (req.ToolPID > 0 || strings.TrimSpace(req.ActiveConversationID) != "") {
+			if updater, ok := h.queue.(interface {
+				UpdateRuntimeMetadata(jobID, worktreePath, activeConvID string, harnessPID, toolPID int, elapsedSec int64) (*dispatch.Job, bool)
+			}); ok {
+				if updatedJob, okU := updater.UpdateRuntimeMetadata(jobID, strings.TrimSpace(req.WorktreePath), req.ActiveConversationID, req.AgentPID, req.ToolPID, req.ElapsedSeconds); okU && updatedJob != nil {
+					job = updatedJob
+					err = nil
+				}
+			}
+		} else if err == dispatch.ErrJobNotFound && (req.AgentPID > 0 || req.ToolPID > 0 || strings.TrimSpace(req.ActiveConversationID) != "") {
+			effectiveWT := strings.TrimSpace(req.WorktreePath)
+			if effectiveWT == "" {
+				effectiveWT = strings.TrimSpace(req.Repo)
+			}
+			cleanConv := strings.TrimSpace(req.ActiveConversationID)
+			ft := req.FencingToken
+			if ft <= 0 {
+				ft = 1
+			}
+			rehydrated, enqErr := h.queue.Enqueue(r.Context(), &dispatch.Job{
+				ID:                    jobID,
+				Type:                  dispatch.JobTypePromptExecute,
+				Repo:                  effectiveWT,
+				StoryID:               strings.TrimSpace(req.StoryID),
+				FencingToken:          ft,
+				LeaseToken:            strings.TrimSpace(req.LeaseToken),
+				ActiveConversationID:  cleanConv,
+				InitialConversationID: cleanConv,
+				ResumeConversationID:  cleanConv,
+				HarnessPID:            req.AgentPID,
+				ToolPID:               req.ToolPID,
+				ElapsedSeconds:        req.ElapsedSeconds,
+			})
+			if enqErr == nil && rehydrated != nil {
+				if hbWithStory, ok := h.queue.(interface {
+					HeartbeatWithStory(ctx context.Context, jobID string, fencingToken int64, storyID string) (*dispatch.Job, error)
+				}); ok {
+					job, err = hbWithStory.HeartbeatWithStory(r.Context(), jobID, ft, strings.TrimSpace(req.StoryID))
+				} else {
+					job, err = h.queue.Heartbeat(r.Context(), jobID, ft)
+				}
+			}
+		}
+	}
+	if err != nil {
 		if err == dispatch.ErrJobNotFound {
 			writeJSONError(w, http.StatusNotFound, "job not found")
 			return

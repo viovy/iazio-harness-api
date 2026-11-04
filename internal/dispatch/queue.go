@@ -197,6 +197,8 @@ type Job struct {
 	HarnessPID              int                  `json:"harness_pid,omitempty"`
 	ToolPID                 int                  `json:"tool_pid,omitempty"`
 	ElapsedSeconds          int64                `json:"elapsed_seconds,omitempty"`
+	ResumeConversationID    string               `json:"resume_conversation_id,omitempty"`
+	InitialConversationID   string               `json:"initial_conversation_id,omitempty"`
 	ActiveConversationID    string               `json:"active_conversation_id,omitempty"`
 	ConversationIDs         []string             `json:"conversation_ids,omitempty"`
 
@@ -669,6 +671,25 @@ func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []str
 	oldest.LeaseToken = fmt.Sprintf("lt-%s-%d", oldest.ID, now.UnixNano())
 	ackDeadline := now.Add(DefaultLeaseAckDeadline)
 	oldest.LeaseAckDeadlineAt = &ackDeadline
+	if oldest.ResumeConversationID == "" {
+		if oldest.InitialConversationID != "" {
+			oldest.ResumeConversationID = oldest.InitialConversationID
+		} else if oldest.ActiveConversationID != "" {
+			oldest.ResumeConversationID = oldest.ActiveConversationID
+		} else if len(oldest.ConversationIDs) > 0 {
+			oldest.ResumeConversationID = oldest.ConversationIDs[0]
+		}
+	}
+	if oldest.ResumeConversationID != "" && len(oldest.Payload) > 0 {
+		var payloadMap map[string]any
+		if err := json.Unmarshal(oldest.Payload, &payloadMap); err == nil && payloadMap != nil {
+			payloadMap["resume_conversation_id"] = oldest.ResumeConversationID
+			payloadMap["conversation_id"] = oldest.ResumeConversationID
+			if updated, err := json.Marshal(payloadMap); err == nil {
+				oldest.Payload = updated
+			}
+		}
+	}
 	if oldest.TraceID != "" && oldest.Traceparent == "" {
 		oldest.Traceparent = fmt.Sprintf("00-%s-%016x-01", oldest.TraceID, now.UnixNano())
 	}
@@ -716,14 +737,11 @@ func (q *InMemoryQueue) HeartbeatWithStory(ctx context.Context, jobID string, fe
 	if !exists {
 		return nil, ErrJobNotFound
 	}
-	if job.FencingToken > 0 && fencingToken != job.FencingToken {
-		return nil, ErrLeaseFenced
-	}
 	reconciledFromOutage := false
 	if (job.Status == JobStatusFailed && isReconcilableFailure(job.Error+" "+job.FailureCategory+" "+job.FailureReasonSummary)) ||
-		(job.Status == JobStatusPending && fencingToken > 0 && (job.FencingToken == 0 || fencingToken == job.FencingToken)) {
+		(job.Status == JobStatusPending && fencingToken > 0) {
 		job.Status = JobStatusRunning
-		if job.FencingToken == 0 && fencingToken > 0 {
+		if fencingToken > 0 {
 			job.FencingToken = fencingToken
 			job.LeaseVersion = fencingToken
 		}
@@ -740,6 +758,9 @@ func (q *InMemoryQueue) HeartbeatWithStory(ctx context.Context, jobID string, fe
 		}
 		job.doneCh = make(chan struct{})
 		reconciledFromOutage = true
+	}
+	if job.FencingToken > 0 && fencingToken != job.FencingToken {
+		return nil, ErrLeaseFenced
 	}
 	if job.Status != JobStatusClaimed && job.Status != JobStatusLeased && job.Status != JobStatusRunning {
 		return nil, fmt.Errorf("job %s is not currently claimed (status: %s)", jobID, job.Status)
@@ -1490,6 +1511,22 @@ func addConversationIDLocked(job *Job, convID string) {
 	if cid == "" || job == nil {
 		return
 	}
+	if job.InitialConversationID == "" {
+		job.InitialConversationID = cid
+	}
+	if job.ResumeConversationID == "" {
+		job.ResumeConversationID = cid
+	}
+	if len(job.Payload) > 0 {
+		var payloadMap map[string]any
+		if err := json.Unmarshal(job.Payload, &payloadMap); err == nil && payloadMap != nil {
+			payloadMap["resume_conversation_id"] = job.ResumeConversationID
+			payloadMap["conversation_id"] = cid
+			if updated, err := json.Marshal(payloadMap); err == nil {
+				job.Payload = updated
+			}
+		}
+	}
 	for _, existing := range job.ConversationIDs {
 		if existing == cid {
 			return
@@ -1530,6 +1567,9 @@ func (q *InMemoryQueue) UpdateRuntimeMetadata(jobID, worktreePath, activeConvID 
 	if cid := strings.TrimSpace(activeConvID); cid != "" {
 		if job.ActiveConversationID != cid {
 			job.ActiveConversationID = cid
+			changed = true
+		}
+		if job.InitialConversationID == "" || job.ResumeConversationID == "" {
 			changed = true
 		}
 		prevLen := len(job.ConversationIDs)
@@ -1581,6 +1621,7 @@ func (q *InMemoryQueue) UpdateRuntimeMetadata(jobID, worktreePath, activeConvID 
 		job.HeartbeatAt = &now
 		expires := now.Add(DefaultHeartbeatTimeout)
 		job.LeaseExpiresAt = &expires
+		changed = true
 	}
 	if changed && q.store != nil {
 		_ = q.store.SaveQueueJob(context.Background(), job)
