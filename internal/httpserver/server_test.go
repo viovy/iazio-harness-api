@@ -13,6 +13,7 @@ import (
 
 	"github.com/viovy/iazio-harness-api/internal/control"
 	"github.com/viovy/iazio-harness-api/internal/dispatch"
+	"github.com/viovy/iazio-harness-api/internal/oauth"
 )
 
 func TestImportRejectsAppURLAndBusy(t *testing.T) {
@@ -3333,5 +3334,67 @@ func TestTelemetryConfigEndpoint(t *testing.T) {
 		if res["status"] != "healthy" {
 			t.Errorf("expected status healthy, got %v", res["status"])
 		}
+	}
+}
+
+func TestOAuthIntrospection_GeminiMCPScopeAndReadOnlyPostSearch(t *testing.T) {
+	hydra := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		tok := r.FormValue("token")
+		w.Header().Set("Content-Type", "application/json")
+		switch tok {
+		case "gemini-mcp-token":
+			_ = json.NewEncoder(w).Encode(oauth.IntrospectionResult{
+				Active:   true,
+				ClientID: "iazio-mcp-gemini-romeo",
+				Sub:      "romeo",
+				Scope:    "openid offline_access profile email conversation_read conversation_push iazio:mcp autopilot:write workspace:read",
+				Exp:      time.Now().Add(10 * time.Minute).Unix(),
+			})
+		case "workspace-read-only-token":
+			_ = json.NewEncoder(w).Encode(oauth.IntrospectionResult{
+				Active:   true,
+				ClientID: "iazio-mcp-readonly",
+				Sub:      "viewer",
+				Scope:    "openid workspace:read",
+				Exp:      time.Now().Add(10 * time.Minute).Unix(),
+			})
+		default:
+			_ = json.NewEncoder(w).Encode(oauth.IntrospectionResult{Active: false})
+		}
+	}))
+	defer hydra.Close()
+
+	s := &Server{
+		Engine:            control.NewEngine(nil),
+		OAuthIntrospector: oauth.NewIntrospector(hydra.URL),
+	}
+	handler := s.Handler()
+
+	// 1. Gemini MCP token succeeds on POST mutation (satisfied via autopilot:write / iazio:mcp -> harness:write)
+	regReq := httptest.NewRequest(http.MethodPost, "/v1/hosts/register", bytes.NewBufferString(`{"host_id":"debian","mode":"permanent"}`))
+	regReq.Header.Set("Authorization", "Bearer gemini-mcp-token")
+	regRR := httptest.NewRecorder()
+	handler.ServeHTTP(regRR, regReq)
+	if regRR.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for Gemini MCP token on POST /v1/hosts/register, got %d: %s", regRR.Code, regRR.Body.String())
+	}
+
+	// 2. Read-only workspace:read token is rejected with 403 insufficient_scope on POST /v1/hosts/register
+	roMutReq := httptest.NewRequest(http.MethodPost, "/v1/hosts/register", bytes.NewBufferString(`{"host_id":"debian","mode":"permanent"}`))
+	roMutReq.Header.Set("Authorization", "Bearer workspace-read-only-token")
+	roMutRR := httptest.NewRecorder()
+	handler.ServeHTTP(roMutRR, roMutReq)
+	if roMutRR.Code != http.StatusForbidden || !strings.Contains(roMutRR.Body.String(), "harness:write") {
+		t.Fatalf("expected 403 Forbidden (required_scope=harness:write) for read-only token on POST mutation, got %d: %s", roMutRR.Code, roMutRR.Body.String())
+	}
+
+	// 3. Read-only workspace:read token passes OAuth scope check on POST /api/v1/codebase/search (requires harness:read, not harness:write)
+	searchReq := httptest.NewRequest(http.MethodPost, "/api/v1/codebase/search", bytes.NewBufferString(`{"query":"OfflineReportSpooler"}`))
+	searchReq.Header.Set("Authorization", "Bearer workspace-read-only-token")
+	searchRR := httptest.NewRecorder()
+	handler.ServeHTTP(searchRR, searchReq)
+	if searchRR.Code == http.StatusForbidden || searchRR.Code == http.StatusUnauthorized {
+		t.Fatalf("expected POST /api/v1/codebase/search to pass OAuth read scope check, got %d: %s", searchRR.Code, searchRR.Body.String())
 	}
 }
