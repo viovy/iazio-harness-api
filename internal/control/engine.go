@@ -1613,34 +1613,83 @@ func (e *Engine) ReleaseDispatchJobRepo(jobID string) {
 	}
 }
 
+// ReasonAdhocASE indicates a repository's queue is paused because an ad-hoc ASE flow
+// (not executed by iazio-harness) is currently active on the repository.
+const ReasonAdhocASE = "adhoc_ase_active"
+
+// IsAdhocASEActive returns true when a repository has an active ASE or agent execution
+// that is NOT coordinated by iazio-harness.
+func IsAdhocASEActive(prov, live, ase string, isCoordinatedHarness bool) bool {
+	if isCoordinatedHarness {
+		return false
+	}
+	p := strings.ToUpper(strings.TrimSpace(prov))
+	l := strings.ToUpper(strings.TrimSpace(live))
+	a := strings.ToUpper(strings.TrimSpace(ase))
+	if p == "COORDINATED_HARNESS" || p == "COORDINATED_HARNESS_FAILED" || p == "HARNESS" {
+		return false
+	}
+	isAdhocProv := strings.Contains(p, "ADHOC") || p == "INDEPENDENT_USER_SESSION" || p == "INDEPENDENT"
+	isRunningASE := a == "RUNNING" || a == "IN_PROGRESS"
+	isLiveTool := l == "LIVE" || l == "ALIVE"
+	if isAdhocProv && (isLiveTool || isRunningASE) {
+		return true
+	}
+	if isRunningASE && (p == "" || p == "NONE" || isAdhocProv) {
+		return true
+	}
+	return false
+}
+
 // GetHostExecutionCounts returns (harnessExecutions, adhocAseExecutions, queuedExecutions) for a host from Engine state.
 func (e *Engine) GetHostExecutionCounts(hostID string) (int, int, int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	runningIDs := make(map[string]bool)
+	coordinatedRepoPaths := make(map[string]bool)
+	adhocRepoPaths := make(map[string]bool)
 	queuedCount := 0
-	adhocCount := 0
 
 	if h, ok := e.hosts[hostID]; ok && h != nil {
 		for _, aj := range h.ActiveJobs {
 			if id := strings.TrimSpace(aj.JobID); id != "" {
 				runningIDs[id] = true
 			}
-		}
-		for _, rs := range h.RepoStatuses {
-			prov := strings.ToUpper(strings.TrimSpace(rs.ExecutionProvenance))
-			live := strings.ToUpper(strings.TrimSpace(rs.ToolLiveness))
-			ase := strings.ToUpper(strings.TrimSpace(rs.ASEState))
-			if strings.Contains(prov, "ADHOC") && (live == "LIVE" || live == "ALIVE" || ase == "RUNNING" || ase == "IN_PROGRESS") {
-				adhocCount++
+			if wp := strings.TrimSpace(aj.WorktreePath); wp != "" {
+				coordinatedRepoPaths[filepath.Clean(wp)] = true
 			}
 		}
 	}
 
 	for _, r := range e.repos {
-		if r != nil && r.HostID == hostID && r.Lock == LockRunning && strings.TrimSpace(r.RunningJobID) != "" {
-			runningIDs[strings.TrimSpace(r.RunningJobID)] = true
+		if r != nil && r.HostID == hostID {
+			cleanPath := filepath.Clean(r.WorktreePath)
+			if r.Lock == LockRunning && strings.TrimSpace(r.RunningJobID) != "" {
+				runningIDs[strings.TrimSpace(r.RunningJobID)] = true
+				coordinatedRepoPaths[cleanPath] = true
+			}
+		}
+	}
+
+	if h, ok := e.hosts[hostID]; ok && h != nil {
+		for path, rs := range h.RepoStatuses {
+			cleanPath := filepath.Clean(path)
+			if rs.RepoPath != "" {
+				cleanPath = filepath.Clean(rs.RepoPath)
+			}
+			if IsAdhocASEActive(rs.ExecutionProvenance, rs.ToolLiveness, rs.ASEState, coordinatedRepoPaths[cleanPath]) {
+				adhocRepoPaths[cleanPath] = true
+			}
+		}
+	}
+
+	for _, r := range e.repos {
+		if r != nil && r.HostID == hostID {
+			cleanPath := filepath.Clean(r.WorktreePath)
+			if IsAdhocASEActive(r.ExecutionProvenance, r.ToolLiveness, r.ASEState, coordinatedRepoPaths[cleanPath]) {
+				adhocRepoPaths[cleanPath] = true
+			}
 		}
 	}
 
@@ -1659,7 +1708,7 @@ func (e *Engine) GetHostExecutionCounts(hostID string) (int, int, int) {
 		}
 	}
 
-	return len(runningIDs), adhocCount, queuedCount
+	return len(runningIDs), len(adhocRepoPaths), queuedCount
 }
 
 // BindStoryToJob updates the story ID and metadata on an active job, schedule, and history record.
@@ -3294,6 +3343,14 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 		for _, st := range statuses {
 			cleanPath := filepath.Clean(st.RepoPath)
 			st.LastCheckedAt = now // Always stamp server receive time to prevent client clock skew issues (G1)
+			if prev, exists := h.RepoStatuses[cleanPath]; exists && st.ASEState == "" && st.ExecutionProvenance == "" && st.ToolLiveness == "" && !st.IsClean {
+				st.ASEState = prev.ASEState
+				st.ActiveStoryID = prev.ActiveStoryID
+				st.ActiveTool = prev.ActiveTool
+				st.ToolLiveness = prev.ToolLiveness
+				st.ExecutionProvenance = prev.ExecutionProvenance
+				st.ActiveConversationID = prev.ActiveConversationID
+			}
 			h.RepoStatuses[cleanPath] = st
 		}
 
@@ -3347,10 +3404,12 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 				r.SubmodulesClean = st.SubmodulesClean
 				r.DirtySubmodules = st.DirtySubmodules
 				r.NonMainSubmodules = st.NonMainSubmodules
-				r.ASEState = st.ASEState
-				r.ActiveTool = st.ActiveTool
-				r.ToolLiveness = st.ToolLiveness
-				r.ExecutionProvenance = st.ExecutionProvenance
+				if st.ASEState != "" || st.ExecutionProvenance != "" || st.ToolLiveness != "" || st.IsClean {
+					r.ASEState = st.ASEState
+					r.ActiveTool = st.ActiveTool
+					r.ToolLiveness = st.ToolLiveness
+					r.ExecutionProvenance = st.ExecutionProvenance
+				}
 				r.LastRuntimeCheck = st.LastCheckedAt
 
 				if st.MetadataYmlRaw != "" {
@@ -3362,10 +3421,19 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 					r.GitVersion = st.GitVersion
 				}
 
-				// Auto-recovery: if repo was HEALING or PAUSED(ReasonDirty/ReasonHealFailed),
-				// and git status is now verified clean with no active running harness job:
-				if st.IsClean && r.Lock == LockIdle {
-					if r.Queue == QueueHealing || (r.Queue == QueuePaused && (r.Reason == ReasonDirty || r.Reason == ReasonHealFailed)) {
+				isCoordinated := r.Lock == LockRunning || strings.TrimSpace(r.RunningJobID) != ""
+				adhocActive := IsAdhocASEActive(r.ExecutionProvenance, r.ToolLiveness, r.ASEState, isCoordinated)
+
+				if adhocActive && r.Lock == LockIdle {
+					if r.Queue != QueuePaused || r.Reason != ReasonAdhocASE {
+						r.Queue = QueuePaused
+						r.Reason = ReasonAdhocASE
+						e.notifyRepoLocked(r)
+					}
+				} else if st.IsClean && r.Lock == LockIdle {
+					// Auto-recovery: if repo was HEALING or PAUSED(ReasonDirty/ReasonHealFailed/ReasonAdhocASE),
+					// and git status is now verified clean with no active running harness or ad-hoc ASE job:
+					if r.Queue == QueueHealing || (r.Queue == QueuePaused && (r.Reason == ReasonDirty || r.Reason == ReasonHealFailed || r.Reason == ReasonAdhocASE)) {
 						r.Queue = QueueOpen
 						r.Reason = ""
 						r.Porcelain = ""

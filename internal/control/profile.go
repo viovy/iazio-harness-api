@@ -72,6 +72,48 @@ func BoolPtr(b bool) *bool {
 	return &b
 }
 
+// sanitizeProfileTools deduplicates profile tools by name and drops deprecated unprefixed
+// "git-flow" when canonical "autopilot-git-flow" is present (CONF-PLUGIN-001).
+func sanitizeProfileTools(tools []ProfileTool) []ProfileTool {
+	if len(tools) == 0 {
+		return tools
+	}
+	hasCanonicalGitFlow := false
+	for _, t := range tools {
+		if strings.EqualFold(strings.TrimSpace(t.Name), "autopilot-git-flow") ||
+			strings.EqualFold(strings.TrimSpace(t.BinaryName), "autopilot-git-flow") {
+			hasCanonicalGitFlow = true
+			break
+		}
+	}
+	seen := make(map[string]int, len(tools))
+	out := make([]ProfileTool, 0, len(tools))
+	for _, t := range tools {
+		key := strings.ToLower(strings.TrimSpace(t.Name))
+		if key == "" {
+			key = strings.ToLower(strings.TrimSpace(t.BinaryName))
+		}
+		if key == "" {
+			continue
+		}
+		if key == "git-flow" && hasCanonicalGitFlow {
+			continue
+		}
+		if idx, exists := seen[key]; exists {
+			if out[idx].LatestAvailableVersion == "" && t.LatestAvailableVersion != "" {
+				out[idx].LatestAvailableVersion = t.LatestAvailableVersion
+			}
+			if out[idx].Service == nil && t.Service != nil {
+				out[idx].Service = t.Service
+			}
+			continue
+		}
+		seen[key] = len(out)
+		out = append(out, t)
+	}
+	return out
+}
+
 // IsTrackingLatest determines if the tool should auto-advance to latest upstream releases.
 // If track_latest was omitted in storage (nil, legacy rows), it defaults to tracking latest for
 // all tools in default/generic profiles or unpinned targets regardless of tool tier. Explicit false is strictly preserved.
@@ -195,6 +237,7 @@ func (e *Engine) UpdateProfileTools(name string, updater func(tools []ProfileToo
 	copy(clonedTools, p.Tools)
 
 	newTools, configChanged := updater(clonedTools)
+	newTools = sanitizeProfileTools(newTools)
 	if !configChanged {
 		p.Tools = newTools
 		cp := *p
@@ -314,6 +357,7 @@ func (e *Engine) UpsertProfile(p DistributionProfile) (*DistributionProfile, err
 		p.VersionSeq = 1
 	}
 
+	p.Tools = sanitizeProfileTools(p.Tools)
 	candidate := p
 	saveFn := e.OnSaveProfile
 	e.mu.Unlock()
@@ -354,6 +398,7 @@ func (e *Engine) LoadProfile(p DistributionProfile) {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	p.Tools = sanitizeProfileTools(p.Tools)
 	cp := p
 	if len(p.Tools) > 0 {
 		cp.Tools = make([]ProfileTool, len(p.Tools))
@@ -455,6 +500,7 @@ func parseFleetDistribution(raw []byte) (*DistributionProfile, error) {
 			Service:           t.Service,
 		})
 	}
+	profile.Tools = sanitizeProfileTools(profile.Tools)
 	return &profile, nil
 }
 
@@ -729,8 +775,9 @@ func (e *Engine) GetManifest(profileName, targetOS, targetArch string) (*Manifes
 	}
 
 	isWindows := strings.EqualFold(targetOS, "windows")
-	tools := make([]ManifestToolItem, 0, len(p.Tools))
-	for _, t := range p.Tools {
+	sanitized := sanitizeProfileTools(p.Tools)
+	tools := make([]ManifestToolItem, 0, len(sanitized))
+	for _, t := range sanitized {
 		bin := t.BinaryName
 		if isWindows && !strings.HasSuffix(strings.ToLower(bin), ".exe") {
 			bin += ".exe"
