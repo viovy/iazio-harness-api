@@ -111,10 +111,7 @@ func hostView(h control.Host, paused int) map[string]any {
 	}
 	adhocExecs := 0
 	for _, rs := range h.RepoStatuses {
-		prov := strings.ToUpper(strings.TrimSpace(rs.ExecutionProvenance))
-		live := strings.ToUpper(strings.TrimSpace(rs.ToolLiveness))
-		ase := strings.ToUpper(strings.TrimSpace(rs.ASEState))
-		if strings.Contains(prov, "ADHOC") && (live == "LIVE" || live == "ALIVE" || ase == "RUNNING" || ase == "IN_PROGRESS") {
+		if control.IsAdhocASEActive(rs.ExecutionProvenance, rs.ToolLiveness, rs.ASEState, false) {
 			adhocExecs++
 		}
 	}
@@ -174,6 +171,10 @@ func repoSummary(r control.Repo) map[string]any {
 		"running_job_id":                  runningID,
 		"dirty_story_id":                  r.DirtyStoryID,
 		"current_branch":                  r.CurrentBranch,
+		"ase_state":                       r.ASEState,
+		"active_tool":                     r.ActiveTool,
+		"tool_liveness":                   r.ToolLiveness,
+		"execution_provenance":            r.ExecutionProvenance,
 		"global_queue_allocation_enabled": r.GlobalQueueAllocationEnabled,
 	}
 }

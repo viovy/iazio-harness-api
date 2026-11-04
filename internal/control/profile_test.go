@@ -369,3 +369,91 @@ func TestProfileTool_AuthStatusEnabled_ManifestAndHeartbeatEnrichment(t *testing
 		t.Errorf("expected intermediate heartbeat to preserve AuthStatus, got: %+v", detailAfter.Host.Tools[0].AuthStatus)
 	}
 }
+
+func TestSanitizeProfileTools_AndAdhocASEQueuePause(t *testing.T) {
+	e := NewEngine(time.Now)
+	e.LoadProfile(DistributionProfile{
+		Name: "generic",
+		Tools: []ProfileTool{
+			{Name: "autopilot-git-flow", BinaryName: "autopilot-git-flow", TargetVersion: "0.0.579"},
+			{Name: "autopilot-git-flow", BinaryName: "autopilot-git-flow", TargetVersion: "0.0.579"},
+			{Name: "git-flow", BinaryName: "git-flow", TargetVersion: "0.0.579"},
+		},
+	})
+	manifest, err := e.GetManifest("generic", "darwin", "arm64")
+	if err != nil {
+		t.Fatalf("GetManifest failed: %v", err)
+	}
+	if len(manifest.Tools) != 1 || manifest.Tools[0].Name != "autopilot-git-flow" {
+		t.Fatalf("expected sanitized manifest with 1 autopilot-git-flow entry, got %+v", manifest.Tools)
+	}
+
+	e.RegisterHost("mac-mini", "mac-mini", "permanent")
+	if err := e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: "/Users/romeo/work/meta-repo",
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	}); err != nil {
+		t.Fatalf("UpsertRepo failed: %v", err)
+	}
+
+	// 1. Report active ad-hoc ASE flow (INDEPENDENT_USER_SESSION)
+	e.UpdateRepoRuntimeStatus("mac-mini", []RepoRuntimeStatus{
+		{
+			RepoPath:            "/Users/romeo/work/meta-repo",
+			IsClean:             false,
+			Branch:              "fix/vigo-0235-bws",
+			ASEState:            "RUNNING",
+			ActiveStoryID:       "STORY-VIGO-0235",
+			ActiveTool:          "autopilot-ase",
+			ToolLiveness:        "LIVE",
+			ExecutionProvenance: "INDEPENDENT_USER_SESSION",
+		},
+	})
+
+	harnessExecs, adhocExecs, _ := e.GetHostExecutionCounts("mac-mini")
+	if harnessExecs != 0 || adhocExecs != 1 {
+		t.Fatalf("expected harnessExecs=0 adhocExecs=1, got harness=%d adhoc=%d", harnessExecs, adhocExecs)
+	}
+	repo, ok := e.GetRepo("mac-mini", "/Users/romeo/work/meta-repo")
+	if !ok {
+		t.Fatalf("expected repo to exist")
+	}
+	if repo.Queue != QueuePaused || repo.Reason != ReasonAdhocASE {
+		t.Fatalf("expected repo queue PAUSED with reason %q, got queue=%q reason=%q", ReasonAdhocASE, repo.Queue, repo.Reason)
+	}
+
+	// 2. Partial status report (empty ASEState while still dirty) must preserve adhoc ASE state and queue pause
+	e.UpdateRepoRuntimeStatus("mac-mini", []RepoRuntimeStatus{
+		{
+			RepoPath: "/Users/romeo/work/meta-repo",
+			IsClean:  false,
+			Branch:   "fix/vigo-0235-bws",
+		},
+	})
+	_, adhocExecs2, _ := e.GetHostExecutionCounts("mac-mini")
+	if adhocExecs2 != 1 {
+		t.Fatalf("expected adhocExecs=1 preserved across partial dirty report, got %d", adhocExecs2)
+	}
+
+	// 3. Ad-hoc ASE completes and lands back on clean main -> queue auto-reopens
+	e.UpdateRepoRuntimeStatus("mac-mini", []RepoRuntimeStatus{
+		{
+			RepoPath:            "/Users/romeo/work/meta-repo",
+			IsClean:             true,
+			Branch:              "main",
+			ASEState:            "IDLE",
+			ToolLiveness:        "NONE",
+			ExecutionProvenance: "NONE",
+		},
+	})
+	_, adhocExecs3, _ := e.GetHostExecutionCounts("mac-mini")
+	if adhocExecs3 != 0 {
+		t.Fatalf("expected adhocExecs=0 after completion, got %d", adhocExecs3)
+	}
+	repoAfter, _ := e.GetRepo("mac-mini", "/Users/romeo/work/meta-repo")
+	if repoAfter.Queue != QueueOpen || repoAfter.Reason != "" {
+		t.Fatalf("expected repo queue to auto-reopen to OPEN after ad-hoc ASE finishes, got queue=%q reason=%q", repoAfter.Queue, repoAfter.Reason)
+	}
+}
