@@ -30,7 +30,8 @@ type IntrospectionResult struct {
 	AuthMethod string `json:"auth_method,omitempty"`
 }
 
-// HasScope reports whether the space-delimited Scope string contains required.
+// HasScope reports whether the space-delimited Scope string contains required
+// (or an equivalent Gemini/MCP scope grant for harness:read / harness:write).
 func (r IntrospectionResult) HasScope(required string) bool {
 	required = strings.TrimSpace(required)
 	if required == "" {
@@ -39,6 +40,16 @@ func (r IntrospectionResult) HasScope(required string) bool {
 	for _, s := range strings.Fields(r.Scope) {
 		if s == required {
 			return true
+		}
+		switch required {
+		case "harness:write":
+			if s == "autopilot:write" || s == "iazio:mcp" {
+				return true
+			}
+		case "harness:read":
+			if s == "harness:write" || s == "workspace:read" || s == "autopilot:write" || s == "iazio:mcp" {
+				return true
+			}
 		}
 	}
 	return false
@@ -162,12 +173,23 @@ func RequiredScopeForRequest(method, path string) string {
 	if strings.HasPrefix(path, "/v1/credentials") || strings.HasPrefix(path, "/api/v1/credentials") {
 		return "credentials:manage"
 	}
+	if isReadOnlyPostPath(path) {
+		return "harness:read"
+	}
 	switch method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:
 		return "harness:read"
 	default:
 		return "harness:write"
 	}
+}
+
+func isReadOnlyPostPath(path string) bool {
+	switch path {
+	case "/v1/codebase/search", "/api/v1/codebase/search", "/v1/rag/search", "/api/v1/rag/search":
+		return true
+	}
+	return strings.HasPrefix(path, "/v1/search/") || strings.HasPrefix(path, "/api/v1/search/")
 }
 
 type principalContextKey struct{}

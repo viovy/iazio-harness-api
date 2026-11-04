@@ -83,6 +83,28 @@ func TestIntrospectorAndScopes(t *testing.T) {
 	if got := RequiredScopeForRequest(http.MethodGet, "/v1/auth/whoami"); got != "" {
 		t.Errorf("expected empty scope for whoami, got %q", got)
 	}
+	if got := RequiredScopeForRequest(http.MethodPost, "/api/v1/codebase/search"); got != "harness:read" {
+		t.Errorf("expected harness:read for read-only POST search, got %q", got)
+	}
+	if got := RequiredScopeForRequest(http.MethodPost, "/v1/codebase/search"); got != "harness:read" {
+		t.Errorf("expected harness:read for /v1/codebase/search, got %q", got)
+	}
+
+	geminiToken := IntrospectionResult{
+		Active:   true,
+		ClientID: "iazio-mcp-gemini-romeo",
+		Scope:    "openid offline_access profile email conversation_read conversation_push iazio:mcp autopilot:write workspace:read",
+	}
+	if !geminiToken.HasScope("harness:write") || !geminiToken.HasScope("harness:read") {
+		t.Errorf("expected Gemini MCP token with autopilot:write / iazio:mcp to satisfy harness:write and harness:read")
+	}
+	readOnlyToken := IntrospectionResult{
+		Active: true,
+		Scope:  "openid workspace:read",
+	}
+	if !readOnlyToken.HasScope("harness:read") || readOnlyToken.HasScope("harness:write") {
+		t.Errorf("expected workspace:read token to satisfy harness:read only")
+	}
 
 	// Principal context round-trip
 	pCtx := WithPrincipal(ctx, res)
