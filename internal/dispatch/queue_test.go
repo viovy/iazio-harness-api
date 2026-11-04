@@ -2163,8 +2163,11 @@ func TestClassifyDispatchFailureWithDirection_AllBranchesAndUpdateRuntimeMetadat
 	if !ok || updated == nil {
 		t.Fatalf("expected UpdateRuntimeMetadata to succeed")
 	}
-	if updated.Status != JobStatusRunning || updated.FailureCategory != "" || updated.Repo != "/tmp/worktrees/job_active_restart" || updated.ActiveConversationID != "conv-123" || updated.HarnessPID != 4100 || updated.ToolPID != 4200 || updated.ElapsedSeconds != 125 {
+	if updated.Status != JobStatusRunning || updated.FailureCategory != "" || updated.Repo != "/tmp/worktrees/job_active_restart" || updated.ActiveConversationID != "conv-123" || updated.InitialConversationID != "conv-123" || updated.ResumeConversationID != "conv-123" || updated.HarnessPID != 4100 || updated.ToolPID != 4200 || updated.ElapsedSeconds != 125 {
 		t.Fatalf("unexpected UpdateRuntimeMetadata result: %+v", updated)
+	}
+	if !strings.Contains(string(updated.Payload), `"resume_conversation_id":"conv-123"`) {
+		t.Fatalf("expected UpdateRuntimeMetadata to inject resume_conversation_id into Payload, got %s", string(updated.Payload))
 	}
 
 	// ExtendLeasesForHost when job is failed with reconcilable failure category

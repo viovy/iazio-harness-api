@@ -223,3 +223,34 @@ func TestAgentJobsHandler_HeartbeatAndFencing(t *testing.T) {
 		t.Fatalf("expected 200 OK for valid complete, got %d: %s", wValidComp.Code, wValidComp.Body.String())
 	}
 }
+
+func TestAgentJobsHandler_HeartbeatRehydratesInFlightJobOnAPIRestart(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	handler := NewAgentJobsHandler(q)
+
+	hbBody, _ := json.Marshal(HeartbeatJobRequest{
+		FencingToken:         7,
+		StoryID:              "STORY-GOV-5145",
+		WorktreePath:         "/home/romeo/work/meta-repo",
+		AgentPID:             4242,
+		ToolPID:              4243,
+		ActiveConversationID: "29c18bab-aa8a-4d78-8426-4808d832582a",
+		ElapsedSeconds:       36000,
+	})
+	reqHb := httptest.NewRequest(http.MethodPost, "/api/v1/agent/jobs/job_multiday_in_flight/heartbeat", bytes.NewReader(hbBody))
+	wHb := httptest.NewRecorder()
+	handler.HeartbeatHandler(wHb, reqHb)
+	if wHb.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK rehydrating in-flight job on heartbeat, got %d: %s", wHb.Code, wHb.Body.String())
+	}
+	rehydrated, ok := q.Get("job_multiday_in_flight")
+	if !ok || rehydrated == nil {
+		t.Fatalf("expected job_multiday_in_flight to be rehydrated in queue")
+	}
+	if rehydrated.Status != dispatch.JobStatusRunning {
+		t.Fatalf("expected rehydrated job status=running, got %s", rehydrated.Status)
+	}
+	if rehydrated.InitialConversationID != "29c18bab-aa8a-4d78-8426-4808d832582a" || rehydrated.ResumeConversationID != "29c18bab-aa8a-4d78-8426-4808d832582a" {
+		t.Fatalf("expected pinned conversation ID on rehydrated job, got initial=%q resume=%q", rehydrated.InitialConversationID, rehydrated.ResumeConversationID)
+	}
+}
