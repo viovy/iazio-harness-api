@@ -5,11 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/smtp"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -899,6 +903,189 @@ func TestFormatJobDetail_Job110f47f09551baba_SanitizesStaleFailureFieldsOnComple
 	if failedDetail.FailureDirection != dispatch.FailureDirectionLocalExecution || failedDetail.FailureService != "agy-cli" {
 		t.Fatalf("expected FailureDirection=LOCAL_EXECUTION and FailureService=agy-cli on failed job, got dir=%q svc=%q",
 			failedDetail.FailureDirection, failedDetail.FailureService)
+	}
+}
+
+func TestJobLifecycleHandler_JobChaining_Webhook_Email_And_Notifications(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	h := NewJobLifecycleHandler(q)
+	v := &mockStoryValidator{
+		availableStories: map[string]bool{
+			"STORY-ASE-001": true,
+			"STORY-ASE-002": true,
+		},
+	}
+	h.SetStoryValidator(v)
+
+	// Configure test webhook server that fails once with 503 then succeeds with 200 OK to verify retry resilience
+	var webhookAttempts int32
+	var webhookMu sync.Mutex
+	var receivedWebhooks []TerminalJobCallbackPayload
+	var receivedSignatures []string
+	var receivedEvents []string
+
+	webhookSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := atomic.AddInt32(&webhookAttempts, 1)
+		if attempt == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		bodyBytes, _ := io.ReadAll(r.Body)
+		var payload TerminalJobCallbackPayload
+		_ = json.Unmarshal(bodyBytes, &payload)
+
+		webhookMu.Lock()
+		receivedWebhooks = append(receivedWebhooks, payload)
+		receivedSignatures = append(receivedSignatures, r.Header.Get("X-Iazio-Signature-256"))
+		receivedEvents = append(receivedEvents, r.Header.Get("X-Iazio-Event"))
+		webhookMu.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhookSrv.Close()
+
+	// Configure SMTP env vars and test SMTP capture hook
+	t.Setenv("IAZIO_CALLBACK_SMTP_HOST", "smtp.example.com")
+	t.Setenv("IAZIO_CALLBACK_SMTP_PORT", "587")
+	t.Setenv("IAZIO_CALLBACK_SMTP_USER", "bot@example.com")
+	t.Setenv("IAZIO_CALLBACK_SMTP_PASS", "secret-pass")
+	t.Setenv("IAZIO_CALLBACK_EMAIL_FROM", "ase@example.com")
+	t.Setenv("IAZIO_CALLBACK_EMAIL_TO", "romeo@example.com")
+	t.Setenv("IAZIO_CALLBACK_WEBHOOK_SECRET", "test-hmac-secret")
+
+	var smtpMu sync.Mutex
+	var capturedSMTPMsgs []string
+	var capturedSMTPAddr string
+	var capturedSMTPFrom string
+	var capturedSMTPTo []string
+	h.SetSMTPSendFunc(func(addr string, a smtp.Auth, from string, to []string, msg []byte) error {
+		smtpMu.Lock()
+		defer smtpMu.Unlock()
+		capturedSMTPAddr = addr
+		capturedSMTPFrom = from
+		capturedSMTPTo = append([]string(nil), to...)
+		capturedSMTPMsgs = append(capturedSMTPMsgs, string(msg))
+		return nil
+	})
+
+	var recordedNotifs []NotificationRecord
+	h.SetNotificationRecorder(func(n NotificationRecord) {
+		smtpMu.Lock()
+		defer smtpMu.Unlock()
+		recordedNotifs = append(recordedNotifs, n)
+	})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/stories/{id}/execute", h.ExecuteStory)
+	mux.HandleFunc("GET /api/v1/jobs/{id}", h.GetJob)
+	mux.HandleFunc("GET /v1/notifications", h.ServeNotifications)
+
+	// 1. Enqueue Wave 1 story execution with callback_url
+	req1Body := fmt.Sprintf(`{"submodule":"iazio-harness-api","target_agent":"agy","callback_url":%q}`, webhookSrv.URL)
+	req1 := httptest.NewRequest(http.MethodPost, "/api/v1/stories/STORY-ASE-001/execute", strings.NewReader(req1Body))
+	rr1 := httptest.NewRecorder()
+	mux.ServeHTTP(rr1, req1)
+	if rr1.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for wave 1, got %d: %s", rr1.Code, rr1.Body.String())
+	}
+	var exec1 ExecuteStoryResponse
+	_ = json.Unmarshal(rr1.Body.Bytes(), &exec1)
+	if exec1.Status != dispatch.JobStatusPending || exec1.CallbackURL != webhookSrv.URL {
+		t.Fatalf("unexpected wave 1 response: %+v", exec1)
+	}
+
+	// 2. Enqueue Wave 2 story execution chained via depends_on_job_id
+	req2Body := fmt.Sprintf(`{"submodule":"iazio-mcp","target_agent":"agy","depends_on_job_id":%q,"callback_url":%q}`, exec1.JobID, webhookSrv.URL)
+	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/stories/STORY-ASE-002/execute", strings.NewReader(req2Body))
+	rr2 := httptest.NewRecorder()
+	mux.ServeHTTP(rr2, req2)
+	if rr2.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for wave 2, got %d: %s", rr2.Code, rr2.Body.String())
+	}
+	var exec2 ExecuteStoryResponse
+	_ = json.Unmarshal(rr2.Body.Bytes(), &exec2)
+	if exec2.Status != dispatch.JobStatusBlockedByDependency || exec2.DependsOnJobID != exec1.JobID {
+		t.Fatalf("expected wave 2 status=%s and depends_on_job_id=%s, got %+v", dispatch.JobStatusBlockedByDependency, exec1.JobID, exec2)
+	}
+
+	// 3. Complete Wave 1 job -> should promote Wave 2 to pending, send [IAZIO-ASE-CALLBACK] email, POST webhook, and emit NotificationRecord
+	resJSON := json.RawMessage(`{"status":"completed","git_head_sha":"a1b2c3d4e5f6","summary":"Implemented server-side job chaining and callbacks"}`)
+	if err := q.Complete(context.Background(), exec1.JobID, resJSON, ""); err != nil {
+		t.Fatalf("Complete wave 1 failed: %v", err)
+	}
+	if !h.WaitForCallbacks(3 * time.Second) {
+		t.Fatalf("timed out waiting for async webhook callbacks")
+	}
+
+	// Verify Wave 2 promoted to pending
+	job2, ok := q.Get(exec2.JobID)
+	if !ok || job2.Status != dispatch.JobStatusPending {
+		t.Fatalf("expected wave 2 job to be promoted to pending, got %+v", job2)
+	}
+
+	// Verify SMTP email formatting
+	smtpMu.Lock()
+	if len(capturedSMTPMsgs) != 1 {
+		t.Fatalf("expected 1 SMTP email, got %d", len(capturedSMTPMsgs))
+	}
+	emailMsg := capturedSMTPMsgs[0]
+	smtpAddr := capturedSMTPAddr
+	smtpFrom := capturedSMTPFrom
+	smtpTo := capturedSMTPTo
+	notifs := append([]NotificationRecord(nil), recordedNotifs...)
+	smtpMu.Unlock()
+
+	if smtpAddr != "smtp.example.com:587" || smtpFrom != "ase@example.com" || len(smtpTo) != 1 || smtpTo[0] != "romeo@example.com" {
+		t.Fatalf("unexpected SMTP envelope: addr=%q from=%q to=%v", smtpAddr, smtpFrom, smtpTo)
+	}
+	expectedSubject := fmt.Sprintf("Subject: [IAZIO-ASE-CALLBACK] job=%s story=STORY-ASE-001 status=completed", exec1.JobID)
+	if !strings.Contains(emailMsg, expectedSubject) {
+		t.Fatalf("expected email to contain exact subject %q, got:\n%s", expectedSubject, emailMsg)
+	}
+	for _, requiredField := range []string{
+		"job_id: " + exec1.JobID,
+		"story_id: STORY-ASE-001",
+		"repo: iazio-harness-api",
+		"status: completed",
+		"duration_ms:",
+		"git_head_sha: a1b2c3d4e5f6",
+		"error:",
+		"summary: Implemented server-side job chaining and callbacks",
+	} {
+		if !strings.Contains(emailMsg, requiredField) {
+			t.Errorf("expected email body to contain %q, got:\n%s", requiredField, emailMsg)
+		}
+	}
+
+	// Verify Webhook delivery and retry resilience
+	webhookMu.Lock()
+	if len(receivedWebhooks) != 1 {
+		t.Fatalf("expected 1 delivered webhook after retry, got %d (attempts=%d)", len(receivedWebhooks), atomic.LoadInt32(&webhookAttempts))
+	}
+	wh := receivedWebhooks[0]
+	sig := receivedSignatures[0]
+	ev := receivedEvents[0]
+	webhookMu.Unlock()
+
+	if wh.JobID != exec1.JobID || wh.StoryID != "STORY-ASE-001" || wh.Status != "completed" || wh.GitHeadSHA != "a1b2c3d4e5f6" {
+		t.Fatalf("unexpected webhook payload: %+v", wh)
+	}
+	if len(wh.PromotedJobIDs) != 1 || wh.PromotedJobIDs[0] != exec2.JobID {
+		t.Fatalf("expected webhook payload PromotedJobIDs=[%s], got %+v", exec2.JobID, wh.PromotedJobIDs)
+	}
+	if !strings.HasPrefix(sig, "sha256=") || ev != "job.completed" {
+		t.Fatalf("expected valid HMAC signature header and event=job.completed, got sig=%q event=%q", sig, ev)
+	}
+
+	// Verify NotificationRecord emitted and served by GET /v1/notifications
+	if len(notifs) != 1 || notifs[0].JobID != exec1.JobID || notifs[0].Status != "completed" {
+		t.Fatalf("expected 1 recorded NotificationRecord for %s, got %+v", exec1.JobID, notifs)
+	}
+	reqNotif := httptest.NewRequest(http.MethodGet, "/v1/notifications", nil)
+	rrNotif := httptest.NewRecorder()
+	mux.ServeHTTP(rrNotif, reqNotif)
+	if rrNotif.Code != http.StatusOK || !strings.Contains(rrNotif.Body.String(), exec1.JobID) {
+		t.Fatalf("expected GET /v1/notifications to return notification for %s, got %d: %s", exec1.JobID, rrNotif.Code, rrNotif.Body.String())
 	}
 }
 
