@@ -599,6 +599,7 @@ func (h *JobLifecycleHandler) isStoryAvailable(storyID, submodule string) bool {
 // JobDetailResponse is the detailed JSON representation of a dispatch job.
 type JobDetailResponse struct {
 	ID                      string                        `json:"id"`
+	ScheduleID              string                        `json:"schedule_id,omitempty"`
 	Type                    string                        `json:"type"`
 	Repo                    string                        `json:"repo"`
 	TargetHost              string                        `json:"target_host,omitempty"`
@@ -634,6 +635,8 @@ type JobDetailResponse struct {
 	InfraRequeueCount       int                           `json:"infra_requeue_count,omitempty"`
 	AttemptHistory          []dispatch.AttemptFailure     `json:"attempt_history,omitempty"`
 	TraceID                 string                        `json:"trace_id,omitempty"`
+	ZipkinTraceID           string                        `json:"zipkin_trace_id,omitempty"`
+	ZipkinTraceURL          string                        `json:"zipkin_trace_url,omitempty"`
 	SearchID                string                        `json:"search_id,omitempty"`
 	RelevanceEmitted        bool                          `json:"relevance_emitted"`
 	PromotedMemories        []string                      `json:"promoted_memories,omitempty"`
@@ -734,6 +737,14 @@ func (h *JobLifecycleHandler) GetJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	job, found := h.queue.Get(jobID)
+	if (!found || job == nil) && strings.HasPrefix(jobID, "sch-") {
+		altID := "job_" + strings.TrimPrefix(jobID, "sch-")
+		if altJob, altFound := h.queue.Get(altID); altFound && altJob != nil {
+			job = altJob
+			found = true
+			jobID = altID
+		}
+	}
 	if !found || job == nil {
 		if h.historyFinder != nil {
 			if row, host, path, hFound := h.historyFinder.FindHistoryRow(jobID); hFound {
@@ -1293,8 +1304,13 @@ func (h *JobLifecycleHandler) BindStory(w http.ResponseWriter, r *http.Request) 
 }
 
 func formatHistoryRowToJobDetail(row control.HistoryRow, host, path string) JobDetailResponse {
+	schedID := strings.TrimSpace(row.ScheduleID)
+	if schedID == "" && strings.HasPrefix(row.JobID, "job_") {
+		schedID = "sch-" + strings.TrimPrefix(row.JobID, "job_")
+	}
 	return JobDetailResponse{
 		ID:                    row.JobID,
+		ScheduleID:            schedID,
 		Type:                  "story_execution",
 		Repo:                  path,
 		TargetHost:            host,
@@ -1305,6 +1321,9 @@ func formatHistoryRowToJobDetail(row control.HistoryRow, host, path string) JobD
 		PriorityRankSelected:  row.PriorityRankSelected,
 		Status:                row.Status,
 		Error:                 row.ErrorMessage,
+		TraceID:               row.TraceID,
+		ZipkinTraceID:         row.ZipkinTraceID,
+		ZipkinTraceURL:        row.ZipkinTraceURL,
 		CreatedAt:             row.CreatedAt.Format(time.RFC3339),
 		PromotedMemories:      []string{},
 	}
@@ -1372,8 +1391,32 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		}
 	}
 
+	schedID := ""
+	if strings.HasPrefix(j.ID, "job_") {
+		schedID = "sch-" + strings.TrimPrefix(j.ID, "job_")
+	} else if strings.HasPrefix(j.ID, "job-") {
+		schedID = "sch-" + strings.TrimPrefix(j.ID, "job-")
+	}
+	zID := strings.TrimSpace(j.ZipkinTraceID)
+	if zID == "" {
+		zID = strings.TrimSpace(j.TraceID)
+	}
+	zURL := strings.TrimSpace(j.ZipkinTraceURL)
+	if zURL == "" && zID != "" {
+		base := strings.TrimRight(strings.TrimSpace(os.Getenv("IAZIO_ZIPKIN_UI_URL")), "/")
+		if base == "" {
+			base = "https://tian.go.ro/zipkin"
+		}
+		zURL = fmt.Sprintf("%s/traces/%s", base, zID)
+	}
+	cleanStoryTitle := j.StoryTitle
+	if j.StoryID != "" && cleanStoryTitle != "" {
+		cleanStoryTitle, _ = dispatch.NormalizeStoryTitle(j.StoryID, cleanStoryTitle)
+	}
+
 	resp := JobDetailResponse{
 		ID:                      j.ID,
+		ScheduleID:              schedID,
 		Type:                    j.Type,
 		Repo:                    j.Repo,
 		TargetHost:              effectiveHost,
@@ -1381,7 +1424,7 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		HostID:                  j.HostID,
 		TargetAgent:             j.TargetAgent,
 		StoryID:                 j.StoryID,
-		StoryTitle:              j.StoryTitle,
+		StoryTitle:              cleanStoryTitle,
 		StoryPath:               j.StoryPath,
 		StoryAllocationStatus:   j.StoryAllocationStatus,
 		AllocationSource:        j.AllocationSource,
@@ -1408,6 +1451,8 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		InfraRequeueCount:       j.InfraRequeueCount,
 		AttemptHistory:          j.AttemptHistory,
 		TraceID:                 j.TraceID,
+		ZipkinTraceID:           zID,
+		ZipkinTraceURL:          zURL,
 		SearchID:                j.SearchID,
 		RelevanceEmitted:        j.RelevanceEmitted,
 		PromotedMemories:        promoted,
