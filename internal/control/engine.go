@@ -1624,18 +1624,13 @@ func IsAdhocASEActive(prov, live, ase string, isCoordinatedHarness bool) bool {
 		return false
 	}
 	p := strings.ToUpper(strings.TrimSpace(prov))
-	l := strings.ToUpper(strings.TrimSpace(live))
 	a := strings.ToUpper(strings.TrimSpace(ase))
 	if p == "COORDINATED_HARNESS" || p == "COORDINATED_HARNESS_FAILED" || p == "HARNESS" {
 		return false
 	}
 	isAdhocProv := strings.Contains(p, "ADHOC") || p == "INDEPENDENT_USER_SESSION" || p == "INDEPENDENT"
 	isRunningASE := a == "RUNNING" || a == "IN_PROGRESS"
-	isLiveTool := l == "LIVE" || l == "ALIVE"
-	if isAdhocProv && (isLiveTool || isRunningASE) {
-		return true
-	}
-	if isRunningASE && (p == "" || p == "NONE" || isAdhocProv) {
+	if isRunningASE && (p == "" || p == "NONE" || p == "IDLE" || isAdhocProv) {
 		return true
 	}
 	return false
@@ -3397,6 +3392,8 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 				r.Porcelain = st.Porcelain
 				if isStoryID(st.ActiveStoryID) {
 					r.DirtyStoryID = st.ActiveStoryID
+				} else if st.ASEState != "" && !strings.EqualFold(strings.TrimSpace(st.ASEState), "RUNNING") && !strings.EqualFold(strings.TrimSpace(st.ASEState), "IN_PROGRESS") {
+					r.DirtyStoryID = ""
 				}
 				if st.ActiveConversationID != "" {
 					r.DetectedConversationID = st.ActiveConversationID
@@ -3437,6 +3434,7 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 						r.Queue = QueueOpen
 						r.Reason = ""
 						r.Porcelain = ""
+						r.DirtyStoryID = ""
 						r.HealingAttempts = 0
 						r.HealingAttemptCount = 0
 						r.HealingReasonCode = ""
@@ -3445,6 +3443,11 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 						r.ActiveHealerRunID = ""
 						e.notifyRepoLocked(r)
 					}
+				} else if !adhocActive && r.Lock == LockIdle && r.Queue == QueuePaused && r.Reason == ReasonAdhocASE && !st.IsClean {
+					// Ad-hoc ASE finished (ASEState == IDLE) while worktree still has uncommitted changes:
+					// transition pause reason from ReasonAdhocASE to ReasonDirty so UI never remains stuck on "Adhoc ASE Active".
+					r.Reason = ReasonDirty
+					e.notifyRepoLocked(r)
 				} else if r.Queue == QueueHealing && !st.IsClean {
 					if st.HasActiveGitLock {
 						r.HealingReasonCode = HealingReasonGitLock

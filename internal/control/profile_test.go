@@ -456,4 +456,12 @@ func TestSanitizeProfileTools_AndAdhocASEQueuePause(t *testing.T) {
 	if repoAfter.Queue != QueueOpen || repoAfter.Reason != "" {
 		t.Fatalf("expected repo queue to auto-reopen to OPEN after ad-hoc ASE finishes, got queue=%q reason=%q", repoAfter.Queue, repoAfter.Reason)
 	}
+	if repoAfter.DirtyStoryID != "" {
+		t.Fatalf("expected DirtyStoryID to be cleared after ad-hoc ASE finishes, got %q", repoAfter.DirtyStoryID)
+	}
+
+	// 4. Idle interactive shell (ToolLiveness=LIVE, ASEState=IDLE) on clean main must NOT trigger Adhoc ASE Active
+	if IsAdhocASEActive("INDEPENDENT_USER_SESSION", "LIVE", "IDLE", false) {
+		t.Fatalf("expected IsAdhocASEActive=false when ASEState=IDLE even if ToolLiveness=LIVE")
+	}
 }
