@@ -3,6 +3,7 @@ package httpserver
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -672,7 +673,43 @@ func parseDispatchPayload(payload []byte) (title, prompt, storyID string) {
 	if s, ok := m["story_id"].(string); ok {
 		storyID = s
 	}
+	if storyID != "" && title != "" {
+		_, title = dispatch.NormalizeStoryTitle(storyID, title)
+	}
 	return title, prompt, storyID
+}
+
+func dispatchJobScheduleID(jobID string) string {
+	id := strings.TrimSpace(jobID)
+	switch {
+	case strings.HasPrefix(id, "sch-"):
+		return id
+	case strings.HasPrefix(id, "job_"):
+		return "sch-" + strings.TrimPrefix(id, "job_")
+	case strings.HasPrefix(id, "job-"):
+		return "sch-" + strings.TrimPrefix(id, "job-")
+	default:
+		return ""
+	}
+}
+
+func resolveDispatchZipkinTrace(j *dispatch.Job) (string, string) {
+	if j == nil {
+		return "", ""
+	}
+	zID := strings.TrimSpace(j.ZipkinTraceID)
+	if zID == "" {
+		zID = strings.TrimSpace(j.TraceID)
+	}
+	zURL := strings.TrimSpace(j.ZipkinTraceURL)
+	if zURL == "" && zID != "" {
+		base := strings.TrimRight(strings.TrimSpace(os.Getenv("IAZIO_ZIPKIN_UI_URL")), "/")
+		if base == "" {
+			base = "https://tian.go.ro/zipkin"
+		}
+		zURL = fmt.Sprintf("%s/traces/%s", base, zID)
+	}
+	return zID, zURL
 }
 
 func dispatchScheduleView(j *dispatch.Job) map[string]any {
@@ -680,6 +717,15 @@ func dispatchScheduleView(j *dispatch.Job) map[string]any {
 		return map[string]any{}
 	}
 	title, _, storyID := parseDispatchPayload(j.Payload)
+	if j.StoryID != "" {
+		storyID = j.StoryID
+	}
+	if storyID != "" && title != "" {
+		_, title = dispatch.NormalizeStoryTitle(storyID, title)
+	}
+	if title == "" && j.StoryTitle != "" {
+		_, title = dispatch.NormalizeStoryTitle(storyID, j.StoryTitle)
+	}
 	if title == "" {
 		title = fmt.Sprintf("Dispatch Job %s (%s)", j.ID, j.Type)
 	}
@@ -713,9 +759,24 @@ func dispatchScheduleView(j *dispatch.Job) map[string]any {
 	case "REQUEUED", "RETRY_WAIT":
 		status = "REQUEUED"
 	}
+	iterRem := 1
+	iterComp := 0
+	if status == "COMPLETED" {
+		iterRem = 0
+		iterComp = 1
+	}
+	schedID := dispatchJobScheduleID(j.ID)
+	zID, zURL := resolveDispatchZipkinTrace(j)
+	assocJobs := []string{}
+	if j.ID != "" {
+		assocJobs = []string{j.ID}
+	}
 
 	return map[string]any{
 		"id":                     j.ID,
+		"schedule_id":            schedID,
+		"job_id":                 j.ID,
+		"associated_jobs":        assocJobs,
 		"prompt_id":              "",
 		"prompt_title":           title,
 		"host_id":                hostID,
@@ -723,14 +784,14 @@ func dispatchScheduleView(j *dispatch.Job) map[string]any {
 		"repo_path":              j.Repo,
 		"iterations":             1,
 		"iterations_total":       1,
-		"iterations_remaining":   1,
-		"iterations_completed":   0,
+		"iterations_remaining":   iterRem,
+		"iterations_completed":   iterComp,
 		"env_keys":               []string{},
 		"kind":                   j.Type,
 		"priority":               5,
 		"status":                 status,
 		"engine":                 engine,
-		"resume_conversation_id": "",
+		"resume_conversation_id": j.ResumeConversationID,
 		"story_id":               storyID,
 		"is_global":              true,
 		"trace_id":               j.TraceID,
@@ -742,8 +803,8 @@ func dispatchScheduleView(j *dispatch.Job) map[string]any {
 		"failure_reason_summary": j.FailureReasonSummary,
 		"retriable":              j.Retriable,
 		"attempt_history":        j.AttemptHistory,
-		"zipkin_trace_id":        j.ZipkinTraceID,
-		"zipkin_trace_url":       j.ZipkinTraceURL,
+		"zipkin_trace_id":        zID,
+		"zipkin_trace_url":       zURL,
 		"traceparent":            j.Traceparent,
 		"infra_requeue_count":    j.InfraRequeueCount,
 	}
@@ -757,8 +818,11 @@ func dispatchJobToHistoryRow(j *dispatch.Job) control.HistoryRow {
 	if j.StoryID != "" {
 		storyID = j.StoryID
 	}
+	if storyID != "" && title != "" {
+		_, title = dispatch.NormalizeStoryTitle(storyID, title)
+	}
 	if title == "" && j.StoryTitle != "" {
-		title = j.StoryTitle
+		_, title = dispatch.NormalizeStoryTitle(storyID, j.StoryTitle)
 	}
 	if title == "" && storyID != "" {
 		title = storyID
@@ -787,8 +851,10 @@ func dispatchJobToHistoryRow(j *dispatch.Job) control.HistoryRow {
 	if attempts < 1 {
 		attempts = 1
 	}
+	zID, zURL := resolveDispatchZipkinTrace(j)
 	return control.HistoryRow{
 		JobID:                 j.ID,
+		ScheduleID:            dispatchJobScheduleID(j.ID),
 		StoryID:               storyID,
 		StoryAllocationStatus: j.StoryAllocationStatus,
 		AllocationSource:      j.AllocationSource,
@@ -817,8 +883,8 @@ func dispatchJobToHistoryRow(j *dispatch.Job) control.HistoryRow {
 		FailureReasonSummary:  j.FailureReasonSummary,
 		Retriable:             j.Retriable,
 		AttemptHistory:        j.AttemptHistory,
-		ZipkinTraceID:         j.ZipkinTraceID,
-		ZipkinTraceURL:        j.ZipkinTraceURL,
+		ZipkinTraceID:         zID,
+		ZipkinTraceURL:        zURL,
 		Traceparent:           j.Traceparent,
 		InfraRequeueCount:     j.InfraRequeueCount,
 	}
@@ -832,8 +898,11 @@ func dispatchHistoryView(j *dispatch.Job) map[string]any {
 	if j.StoryID != "" {
 		storyID = j.StoryID
 	}
+	if storyID != "" && title != "" {
+		_, title = dispatch.NormalizeStoryTitle(storyID, title)
+	}
 	if title == "" && j.StoryTitle != "" {
-		title = j.StoryTitle
+		_, title = dispatch.NormalizeStoryTitle(storyID, j.StoryTitle)
 	}
 	if title == "" {
 		title = fmt.Sprintf("Dispatch Job %s (%s)", j.ID, j.Type)
@@ -870,13 +939,14 @@ func dispatchHistoryView(j *dispatch.Job) map[string]any {
 	if convIDs == nil {
 		convIDs = []string{}
 	}
+	zID, zURL := resolveDispatchZipkinTrace(j)
 
 	return map[string]any{
 		"host_id":                hostID,
 		"target_host":            targetHost,
 		"repo_path":              j.Repo,
 		"job_id":                 j.ID,
-		"schedule_id":            "",
+		"schedule_id":            dispatchJobScheduleID(j.ID),
 		"prompt_title":           title,
 		"engine":                 engine,
 		"status":                 status,
@@ -900,8 +970,8 @@ func dispatchHistoryView(j *dispatch.Job) map[string]any {
 		"failure_reason_summary": j.FailureReasonSummary,
 		"retriable":              j.Retriable,
 		"attempt_history":        j.AttemptHistory,
-		"zipkin_trace_id":        j.ZipkinTraceID,
-		"zipkin_trace_url":       j.ZipkinTraceURL,
+		"zipkin_trace_id":        zID,
+		"zipkin_trace_url":       zURL,
 		"traceparent":            j.Traceparent,
 		"infra_requeue_count":    j.InfraRequeueCount,
 	}
@@ -915,8 +985,15 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 	if j.StoryID != "" {
 		storyID = j.StoryID
 	}
-	if title == "" && j.StoryTitle != "" {
-		title = j.StoryTitle
+	if storyID != "" && title != "" {
+		_, title = dispatch.NormalizeStoryTitle(storyID, title)
+	}
+	cleanStoryTitle := j.StoryTitle
+	if storyID != "" && cleanStoryTitle != "" {
+		cleanStoryTitle, _ = dispatch.NormalizeStoryTitle(storyID, cleanStoryTitle)
+	}
+	if title == "" && cleanStoryTitle != "" {
+		_, title = dispatch.NormalizeStoryTitle(storyID, cleanStoryTitle)
 	}
 	if title == "" {
 		title = fmt.Sprintf("Dispatch Job %s (%s)", j.ID, j.Type)
@@ -992,9 +1069,10 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 	} else if failureCat != "" && failureDir == "" {
 		_, _, failureDir, failureSvc, _, _ = dispatch.ClassifyDispatchFailureWithDirection(failureCat + " " + failureStage + " " + failureReason)
 	}
+	zID, zURL := resolveDispatchZipkinTrace(j)
 	res := map[string]any{
 		"id":                             j.ID,
-		"schedule_id":                    "",
+		"schedule_id":                    dispatchJobScheduleID(j.ID),
 		"kind":                           j.Type,
 		"status":                         strings.ToUpper(j.Status),
 		"engine":                         engine,
@@ -1008,7 +1086,7 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 		"effective_action":               j.EffectiveAction,
 		"prompt_title":                   title,
 		"story_id":                       storyID,
-		"story_title":                    j.StoryTitle,
+		"story_title":                    cleanStoryTitle,
 		"story_path":                     j.StoryPath,
 		"story_allocation_status":        j.StoryAllocationStatus,
 		"allocation_source":              j.AllocationSource,
@@ -1017,7 +1095,7 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 		"docs_hub_path":                  "",
 		"env_vars":                       map[string]string{},
 		"max_execution_duration_seconds": 0,
-		"resume_conversation_id":         "",
+		"resume_conversation_id":         j.ResumeConversationID,
 		"active_conversation_id":         j.ActiveConversationID,
 		"conversation_ids":               convIDs,
 		"harness_pid":                    harnessPID,
@@ -1042,8 +1120,8 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 		"retriable":                      retriable,
 		"attempt_history":                j.AttemptHistory,
 		"dispatch_diagnostics":           diag,
-		"zipkin_trace_id":                j.ZipkinTraceID,
-		"zipkin_trace_url":               j.ZipkinTraceURL,
+		"zipkin_trace_id":                zID,
+		"zipkin_trace_url":               zURL,
 		"traceparent":                    j.Traceparent,
 		"infra_requeue_count":            j.InfraRequeueCount,
 	}

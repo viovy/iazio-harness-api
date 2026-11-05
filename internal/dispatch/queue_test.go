@@ -2280,3 +2280,189 @@ func TestQueue_DependsOnJobID_ChainingPromotionAndFailureCascade(t *testing.T) {
 		t.Fatalf("expected DEPENDENCY_FAILED category/error on wave3, got category=%q error=%q", w3Failed.FailureCategory, w3Failed.Error)
 	}
 }
+
+type contextCheckingQueueStore struct {
+	mu               sync.Mutex
+	savedOrder       []string
+	leaseUpdatedIDs  []string
+	failLeaseUpdates bool
+	seenCanceledCtx  bool
+}
+
+func (s *contextCheckingQueueStore) SaveQueueJob(ctx context.Context, j *Job) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ctx.Err() != nil {
+		s.seenCanceledCtx = true
+		return ctx.Err()
+	}
+	s.savedOrder = append(s.savedOrder, "save:"+j.ID)
+	return nil
+}
+
+func (s *contextCheckingQueueStore) UpdateQueueJobLease(ctx context.Context, jobID string, _ string, _ int64, _, _ time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ctx.Err() != nil {
+		s.seenCanceledCtx = true
+		return ctx.Err()
+	}
+	s.savedOrder = append(s.savedOrder, "lease:"+jobID)
+	s.leaseUpdatedIDs = append(s.leaseUpdatedIDs, jobID)
+	if s.failLeaseUpdates {
+		return errors.New("transient db timeout")
+	}
+	return nil
+}
+
+func (s *contextCheckingQueueStore) CompleteQueueJob(ctx context.Context, _ string, _ string, _ json.RawMessage, _ string, _ time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ctx.Err() != nil {
+		s.seenCanceledCtx = true
+		return ctx.Err()
+	}
+	return nil
+}
+
+func (s *contextCheckingQueueStore) LoadQueueJobs(_ context.Context) ([]*Job, error) {
+	return nil, nil
+}
+
+func TestForensicWaveJobs_ExtendLeasesResilienceAndIdempotentStoryTitle(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 5, 20, 38, 0, 0, time.UTC)
+	store := &contextCheckingQueueStore{}
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+	_ = q.SetStore(store)
+
+	// 1. Enqueue and claim job_38eeeb536a5a7130
+	job, err := q.Enqueue(ctx, &Job{
+		ID:          "job_38eeeb536a5a7130",
+		Type:        JobTypeStoryExecute,
+		Repo:        "iazio-harness-api",
+		TargetHost:  "debian",
+		TargetAgent: "agy",
+		Payload:     json.RawMessage(`{"prompt":"/autonomous-story-execution","title":"Autonomous Story Execution"}`),
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+	claimed, err := q.Claim(ctx, "debian", []string{JobTypeStoryExecute})
+	if err != nil || claimed == nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+	_, _ = q.AckLease(ctx, job.ID, claimed.LeaseToken, 1001, "conv-0185")
+
+	// 2. Advance 50s and call ExtendLeasesForHost with an ALREADY CANCELED HTTP request context + rehydrated job-1424 in active_jobs
+	now = now.Add(50 * time.Second)
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	// Because storeContext detaches via context.WithoutCancel, persistence succeeds even when HTTP request ctx was canceled!
+	extended, err := q.ExtendLeasesForHost(canceledCtx, "debian", []string{job.ID, "job-1424", "job_rehydrated_hex"})
+	if err != nil {
+		t.Fatalf("ExtendLeasesForHost failed: %v", err)
+	}
+	if store.seenCanceledCtx {
+		t.Fatalf("expected storeContext to detach from canceled HTTP request context via context.WithoutCancel")
+	}
+	afterExtend, _ := q.Get(job.ID)
+	if afterExtend.HeartbeatAt == nil || !afterExtend.HeartbeatAt.Equal(now) {
+		t.Fatalf("expected in-memory HeartbeatAt to be updated to %v when HTTP ctx was canceled, got %v", now, afterExtend.HeartbeatAt)
+	}
+	if len(extended) != 3 {
+		t.Fatalf("expected 3 extended jobs (including rehydrated jobs), got %v", extended)
+	}
+
+	// Verify 90s ReconcileGlobalQueueSlots does NOT reclaim the job 8s later
+	now = now.Add(8 * time.Second)
+	reclaimed := q.ReconcileGlobalQueueSlots(now, DefaultHeartbeatTimeout)
+	if len(reclaimed) != 0 {
+		t.Fatalf("expected 0 reclaimed jobs after fresh host heartbeat, got %v", reclaimed)
+	}
+
+	// Verify rehydration of job_rehydrated_hex and job-1424 called SaveQueueJob BEFORE UpdateQueueJobLease
+	store.mu.Lock()
+	order := append([]string(nil), store.savedOrder...)
+	store.mu.Unlock()
+	for _, target := range []string{"job_rehydrated_hex", "job-1424"} {
+		saveIdx, leaseIdx := -1, -1
+		for idx, entry := range order {
+			if entry == "save:"+target && saveIdx == -1 {
+				saveIdx = idx
+			}
+			if entry == "lease:"+target && leaseIdx == -1 {
+				leaseIdx = idx
+			}
+		}
+		if saveIdx == -1 || leaseIdx == -1 || saveIdx > leaseIdx {
+			t.Fatalf("expected SaveQueueJob before UpdateQueueJobLease for rehydrated %s, got order=%v", target, order)
+		}
+	}
+
+	// 3. Verify BindStoryWithFencing is idempotent across repeated bindings (no duplicate "Execute story STORY-IAZIO-0185: Execute story STORY-IAZIO-0185:")
+	_, err = q.BindStoryWithFencing(ctx, job.ID, "STORY-IAZIO-0185", "Autonomous Story Execution", "docs/stories/0185.story.md", claimed.FencingToken)
+	if err != nil {
+		t.Fatalf("first BindStoryWithFencing failed: %v", err)
+	}
+	// Simulate second attempt passing payload["title"] ("Execute story STORY-IAZIO-0185: Autonomous Story Execution") back into BindStoryWithFencing
+	bound2, err := q.BindStoryWithFencing(ctx, job.ID, "STORY-IAZIO-0185", "Execute story STORY-IAZIO-0185: Execute story STORY-IAZIO-0185: Autonomous Story Execution", "docs/stories/0185.story.md", claimed.FencingToken)
+	if err != nil {
+		t.Fatalf("second BindStoryWithFencing failed: %v", err)
+	}
+	if bound2.StoryTitle != "Autonomous Story Execution" {
+		t.Fatalf("expected normalized StoryTitle='Autonomous Story Execution', got %q", bound2.StoryTitle)
+	}
+	var payloadMap map[string]any
+	_ = json.Unmarshal(bound2.Payload, &payloadMap)
+	if payloadMap["title"] != "Execute story STORY-IAZIO-0185: Autonomous Story Execution" {
+		t.Fatalf("expected idempotent payload title 'Execute story STORY-IAZIO-0185: Autonomous Story Execution', got %q", payloadMap["title"])
+	}
+
+	// 4. Verify job_38eeeb536a5a7130 scenario: control-plane restart / lease expiry while Attempt 1 is still active on debian.
+	// When the job reverts to pending (and/or has a mismatched fencing token prior to any second worker claiming it),
+	// AckLease, BindStoryWithFencing, and CompleteWithFencing from Attempt 1 re-adopt the lease and complete in Attempt 1 without requiring Attempt 2!
+	job0185, err := q.Enqueue(ctx, &Job{
+		ID:      "job_38eeeb536a5a7130",
+		Type:    JobTypePromptExecute,
+		Repo:    ".",
+		StoryID: "STORY-IAZIO-0185",
+		Payload: json.RawMessage(`{"prompt":"/autonomous-story-execution STORY-IAZIO-0185"}`),
+	})
+	if err != nil {
+		t.Fatalf("enqueue job_38eeeb536a5a7130: %v", err)
+	}
+	claimed0185, err := q.Claim(ctx, "debian", []string{JobTypePromptExecute})
+	if err != nil || claimed0185 == nil || claimed0185.ID != job0185.ID {
+		t.Fatalf("claim job_38eeeb536a5a7130: %v", err)
+	}
+	tokenAttempt1 := claimed0185.FencingToken
+
+	// Simulate lease expiration during control-plane restart (reverts to pending)
+	now = now.Add(3 * time.Minute)
+	_ = q.ReapExpired(now)
+	reapedCheck, okReaped := q.Get(job0185.ID)
+	if !okReaped || reapedCheck.Status != JobStatusPending {
+		t.Fatalf("expected job_38eeeb536a5a7130 to be reaped to pending, got %+v", reapedCheck)
+	}
+	// AckLease from active Attempt 1 re-adopts the job back into running
+	acked0185, err := q.AckLease(ctx, job0185.ID, claimed0185.LeaseToken, 4321, "1aee4b3a-fedd-4c71-a7b5-4b816e7664a5")
+	if err != nil || acked0185.Status != JobStatusRunning {
+		t.Fatalf("expected AckLease to re-adopt pending job into running, got job=%+v err=%v", acked0185, err)
+	}
+
+	// Simulate another transient reap to pending right before CompleteWithFencing arrives from Attempt 1
+	now = now.Add(3 * time.Minute)
+	_ = q.ReapExpired(now)
+	if err := q.CompleteWithFencing(ctx, job0185.ID, tokenAttempt1, json.RawMessage(`{"status":"completed","story_id":"STORY-IAZIO-0185","active_conversation_id":"1aee4b3a-fedd-4c71-a7b5-4b816e7664a5"}`), ""); err != nil {
+		t.Fatalf("expected CompleteWithFencing from Attempt 1 to re-adopt and complete job_38eeeb536a5a7130 in 1st attempt, got %v", err)
+	}
+	done0185, ok := q.Get(job0185.ID)
+	if !ok || done0185.Status != JobStatusCompleted || done0185.Attempts != 1 {
+		t.Fatalf("expected job_38eeeb536a5a7130 completed in Attempt 1, got status=%s attempts=%d", done0185.Status, done0185.Attempts)
+	}
+}
+
+

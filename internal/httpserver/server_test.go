@@ -3398,3 +3398,99 @@ func TestOAuthIntrospection_GeminiMCPScopeAndReadOnlyPostSearch(t *testing.T) {
 		t.Fatalf("expected POST /api/v1/codebase/search to pass OAuth read scope check, got %d: %s", searchRR.Code, searchRR.Body.String())
 	}
 }
+
+func TestForensicWaveJobs_ScheduleAndJobBidirectionalResolutionAndZipkinTrace(t *testing.T) {
+	ctx := context.Background()
+	q := dispatch.NewInMemoryQueue()
+	s := &Server{
+		Engine: control.NewEngine(nil),
+		Queue:  q,
+	}
+	handler := s.Handler()
+
+	// Enqueue Wave 2 job_22d4d50920421e3c with TraceID and complete it
+	job, err := q.Enqueue(ctx, &dispatch.Job{
+		ID:          "job_22d4d50920421e3c",
+		Type:        dispatch.JobTypeStoryExecute,
+		Repo:        "iazio-agent",
+		TargetHost:  "pc1",
+		TargetAgent: "agy",
+		StoryID:     "STORY-IAZIO-0184",
+		StoryTitle:  "Execute story STORY-IAZIO-0184: Execute story STORY-IAZIO-0184: Wave 2 Supervisor Worktree Resolution",
+		TraceID:     "9fb82c1044a75e129fb82c1044a75e12",
+		Payload:     json.RawMessage(`{"prompt":"/autonomous-story-execution","story_id":"STORY-IAZIO-0184","title":"Execute story STORY-IAZIO-0184: Execute story STORY-IAZIO-0184: Wave 2 Supervisor Worktree Resolution"}`),
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+	claimed, err := q.Claim(ctx, "pc1", []string{dispatch.JobTypeStoryExecute})
+	if err != nil || claimed == nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+	if err := q.CompleteWithFencing(ctx, job.ID, claimed.FencingToken, json.RawMessage(`{"status":"completed","story_id":"STORY-IAZIO-0184","active_conversation_id":"e184356a-4cd1-42c3-ac87-e7cc3874b410"}`), ""); err != nil {
+		t.Fatalf("complete failed: %v", err)
+	}
+
+	// 1. GET /v1/schedules/sch-22d4d50920421e3c resolves completed global queue job
+	reqSch := httptest.NewRequest(http.MethodGet, "/v1/schedules/sch-22d4d50920421e3c", nil)
+	rrSch := httptest.NewRecorder()
+	handler.ServeHTTP(rrSch, reqSch)
+	if rrSch.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for GET /v1/schedules/sch-22d4d50920421e3c, got %d: %s", rrSch.Code, rrSch.Body.String())
+	}
+	var schView map[string]any
+	_ = json.Unmarshal(rrSch.Body.Bytes(), &schView)
+	if schView["id"] != "sch-22d4d50920421e3c" || schView["schedule_id"] != "sch-22d4d50920421e3c" || schView["job_id"] != "job_22d4d50920421e3c" {
+		t.Fatalf("unexpected schedule view IDs: %+v", schView)
+	}
+	zURL, _ := schView["zipkin_trace_url"].(string)
+	if schView["zipkin_trace_id"] != "9fb82c1044a75e129fb82c1044a75e12" || !strings.Contains(zURL, "9fb82c1044a75e129fb82c1044a75e12") {
+		t.Fatalf("expected zipkin_trace_id and zipkin_trace_url populated on schedule view, got %+v", schView)
+	}
+
+	// 2. GET /v1/jobs/job_22d4d50920421e3c and GET /v1/jobs/sch-22d4d50920421e3c both return schedule_id, normalized title, and zipkin_trace_url
+	for _, path := range []string{"/v1/jobs/job_22d4d50920421e3c", "/v1/jobs/sch-22d4d50920421e3c"} {
+		reqJob := httptest.NewRequest(http.MethodGet, path, nil)
+		rrJob := httptest.NewRecorder()
+		handler.ServeHTTP(rrJob, reqJob)
+		if rrJob.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK for %s, got %d: %s", path, rrJob.Code, rrJob.Body.String())
+		}
+		var jobView map[string]any
+		_ = json.Unmarshal(rrJob.Body.Bytes(), &jobView)
+		if jobView["id"] != "job_22d4d50920421e3c" || jobView["schedule_id"] != "sch-22d4d50920421e3c" {
+			t.Fatalf("expected id=job_22d4d50920421e3c and schedule_id=sch-22d4d50920421e3c on %s, got %+v", path, jobView)
+		}
+		pTitle, _ := jobView["prompt_title"].(string)
+		if strings.Contains(pTitle, "Execute story STORY-IAZIO-0184: Execute story STORY-IAZIO-0184:") {
+			t.Fatalf("expected deduplicated prompt_title on %s, got %q", path, pTitle)
+		}
+		if jobView["zipkin_trace_id"] != "9fb82c1044a75e129fb82c1044a75e12" {
+			t.Fatalf("expected zipkin_trace_id on %s, got %+v", path, jobView)
+		}
+	}
+
+	// 3. GET /v1/jobs/sch-22d4d50920421e3c/logs synthesizes fallback log chunk via sch-* ID
+	reqLogs := httptest.NewRequest(http.MethodGet, "/v1/jobs/sch-22d4d50920421e3c/logs", nil)
+	rrLogs := httptest.NewRecorder()
+	handler.ServeHTTP(rrLogs, reqLogs)
+	if rrLogs.Code != http.StatusOK || !strings.Contains(rrLogs.Body.String(), "job_22d4d50920421e3c") {
+		t.Fatalf("expected 200 OK with synthesized log chunk for sch-22d4d50920421e3c, got %d: %s", rrLogs.Code, rrLogs.Body.String())
+	}
+
+	// 4. GET /v1/history includes schedule_id="sch-22d4d50920421e3c" and zipkin_trace_url
+	reqHist := httptest.NewRequest(http.MethodGet, "/v1/history", nil)
+	rrHist := httptest.NewRecorder()
+	handler.ServeHTTP(rrHist, reqHist)
+	if rrHist.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /v1/history, got %d", rrHist.Code)
+	}
+	var histResp struct {
+		History []map[string]any `json:"history"`
+	}
+	_ = json.Unmarshal(rrHist.Body.Bytes(), &histResp)
+	if len(histResp.History) != 1 || histResp.History[0]["schedule_id"] != "sch-22d4d50920421e3c" {
+		t.Fatalf("expected /v1/history item to carry schedule_id=sch-22d4d50920421e3c, got %+v", histResp.History)
+	}
+}
+

@@ -1081,15 +1081,54 @@ func (q *InMemoryQueue) HeartbeatWithStory(ctx context.Context, jobID string, fe
 	expires := now.Add(DefaultHeartbeatTimeout)
 	job.LeaseExpiresAt = &expires
 	if q.store != nil {
-		if err := q.store.UpdateQueueJobLease(ctx, job.ID, job.LeaseOwner, job.FencingToken, now, expires); err != nil {
+		sctx, cancel := storeContext(ctx)
+		defer cancel()
+		if err := q.store.UpdateQueueJobLease(sctx, job.ID, job.LeaseOwner, job.FencingToken, now, expires); err != nil {
 			log.Printf("[dispatch-queue] ERROR: failed to persist heartbeat lease for %s: %v", jobID, err)
 			return nil, fmt.Errorf("persist heartbeat lease: %w", err)
 		}
 		if statusTransitioned || storyUpdated {
-			_ = q.store.SaveQueueJob(ctx, job)
+			_ = q.store.SaveQueueJob(sctx, job)
 		}
 	}
 	return job, nil
+}
+
+func storeContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+}
+
+// NormalizeStoryTitle strips any duplicate "Execute story <ID>:" prefix from title
+// so repeated story bindings across retries remain idempotent.
+func NormalizeStoryTitle(storyID, title string) (string, string) {
+	cleanID := strings.TrimSpace(storyID)
+	cleanTitle := strings.TrimSpace(title)
+	if cleanID == "" {
+		return cleanTitle, cleanTitle
+	}
+	prefixColon := "execute story " + strings.ToLower(cleanID) + ":"
+	prefixBare := "execute story " + strings.ToLower(cleanID)
+	for {
+		lower := strings.ToLower(cleanTitle)
+		if strings.HasPrefix(lower, prefixColon) {
+			cleanTitle = strings.TrimSpace(cleanTitle[len(prefixColon):])
+			continue
+		}
+		if strings.HasPrefix(lower, prefixBare) {
+			rest := strings.TrimSpace(cleanTitle[len(prefixBare):])
+			rest = strings.TrimLeft(rest, ":- ")
+			cleanTitle = strings.TrimSpace(rest)
+			continue
+		}
+		break
+	}
+	if cleanTitle == "" {
+		return "", "Execute story " + cleanID
+	}
+	return cleanTitle, fmt.Sprintf("Execute story %s: %s", cleanID, cleanTitle)
 }
 
 // ExtendLeasesForHost refreshes heartbeat timestamps and lease deadlines for all active jobs
@@ -1156,10 +1195,13 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 
 		expires := now.Add(DefaultHeartbeatTimeout)
 		if q.store != nil {
-			if err := q.store.UpdateQueueJobLease(ctx, j.ID, hostID, j.FencingToken, now, expires); err != nil {
+			sctx, cancel := storeContext(ctx)
+			if err := q.store.UpdateQueueJobLease(sctx, j.ID, hostID, j.FencingToken, now, expires); err != nil {
+				cancel()
 				log.Printf("[dispatch-queue] ERROR: failed to persist lease update for %s: %v", j.ID, err)
 				continue
 			}
+			cancel()
 		}
 
 		j.HeartbeatAt = &now
@@ -1171,7 +1213,9 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 			reconciled = true
 		}
 		if reconciled && q.store != nil {
-			_ = q.store.SaveQueueJob(ctx, j)
+			sctx, cancel := storeContext(ctx)
+			_ = q.store.SaveQueueJob(sctx, j)
+			cancel()
 		}
 		extended = append(extended, j.ID)
 	}
@@ -1180,7 +1224,8 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 		if _, exists := q.jobs[jobID]; !exists {
 			var rehydrated *Job
 			if q.store != nil {
-				if loaded, err := q.store.LoadQueueJobs(ctx); err == nil {
+				sctx, cancel := storeContext(ctx)
+				if loaded, err := q.store.LoadQueueJobs(sctx); err == nil {
 					for _, lj := range loaded {
 						if lj.ID == jobID {
 							rehydrated = lj
@@ -1188,6 +1233,7 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 						}
 					}
 				}
+				cancel()
 			}
 			expires := now.Add(DefaultHeartbeatTimeout)
 			if rehydrated != nil {
@@ -1224,12 +1270,15 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 				}
 			}
 			if q.store != nil {
-				if err := q.store.UpdateQueueJobLease(ctx, jobID, hostID, q.jobs[jobID].FencingToken, now, expires); err != nil {
+				sctx, cancel := storeContext(ctx)
+				_ = q.store.SaveQueueJob(sctx, q.jobs[jobID])
+				if err := q.store.UpdateQueueJobLease(sctx, jobID, hostID, q.jobs[jobID].FencingToken, now, expires); err != nil {
 					log.Printf("[dispatch-queue] ERROR: failed to persist rehydrated lease for %s: %v", jobID, err)
+					cancel()
 					delete(q.jobs, jobID)
 					continue
 				}
-				_ = q.store.SaveQueueJob(ctx, q.jobs[jobID])
+				cancel()
 			}
 			extended = append(extended, jobID)
 		}
@@ -1315,12 +1364,19 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 		q.mu.Unlock()
 		return ErrJobAlreadyCompleted
 	}
+	reconcilableFailed := job.Status == JobStatusFailed && isReconcilableFailure(job.Error+" "+job.FailureCategory+" "+job.FailureReasonSummary)
+	if (job.Status == JobStatusPending || reconcilableFailed) && fencingToken > 0 {
+		// Active worker finished while job was requeued to pending or reconcilable failed (before any other worker claimed it).
+		// Re-adopt fencingToken so Attempt 1 completes cleanly without requiring a redundant Attempt 2 retrigger.
+		job.FencingToken = fencingToken
+		job.LeaseVersion = fencingToken
+	}
 	if job.FencingToken > 0 && fencingToken != job.FencingToken {
 		q.mu.Unlock()
 		return ErrLeaseFenced
 	}
 	if job.Status == JobStatusFailed {
-		if !isReconcilableFailure(job.Error) && !(errStr == "" && fencingToken > 0 && fencingToken == job.FencingToken) {
+		if !reconcilableFailed && !(errStr == "" && fencingToken > 0 && fencingToken == job.FencingToken) {
 			q.mu.Unlock()
 			return ErrJobAlreadyCompleted
 		}
@@ -1360,13 +1416,20 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 		if el, ok := resMap["elapsed_seconds"].(float64); ok && int64(el) > 0 && job.ElapsedSeconds == 0 {
 			job.ElapsedSeconds = int64(el)
 		}
-		if sid, ok := resMap["story_id"].(string); ok && strings.TrimSpace(sid) != "" && job.StoryID == "" {
-			job.StoryID = strings.TrimSpace(sid)
+		if sid, ok := resMap["story_id"].(string); ok {
+			cleanSID := strings.TrimSpace(sid)
+			if cleanSID != "" && cleanSID != "pending-allocation" && cleanSID != "pending" {
+				job.StoryID = cleanSID
+				job.StoryAllocationStatus = "allocated"
+			}
 		}
-		if stitle, ok := resMap["story_title"].(string); ok && strings.TrimSpace(stitle) != "" && job.StoryTitle == "" {
-			job.StoryTitle = strings.TrimSpace(stitle)
+		if stitle, ok := resMap["story_title"].(string); ok && strings.TrimSpace(stitle) != "" {
+			cleanStoryTitle, _ := NormalizeStoryTitle(job.StoryID, stitle)
+			if cleanStoryTitle != "" {
+				job.StoryTitle = cleanStoryTitle
+			}
 		}
-		if spath, ok := resMap["story_path"].(string); ok && strings.TrimSpace(spath) != "" && job.StoryPath == "" {
+		if spath, ok := resMap["story_path"].(string); ok && strings.TrimSpace(spath) != "" {
 			job.StoryPath = strings.TrimSpace(spath)
 		}
 		if errStr == "" {
@@ -1430,11 +1493,14 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 	}
 
 	if q.store != nil && job.CompletedAt != nil {
-		if err := q.store.CompleteQueueJob(ctx, job.ID, job.Status, job.Result, job.Error, *job.CompletedAt); err != nil {
+		sctx, cancel := storeContext(ctx)
+		if err := q.store.CompleteQueueJob(sctx, job.ID, job.Status, job.Result, job.Error, *job.CompletedAt); err != nil {
+			cancel()
 			log.Printf("[dispatch-queue] ERROR: failed to persist job completion for %s: %v", job.ID, err)
 			q.mu.Unlock()
 			return fmt.Errorf("persist job completion: %w", err)
 		}
+		cancel()
 	}
 
 	searchID := job.SearchID
@@ -1460,7 +1526,9 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 		job.RelevanceEmitted = true
 	}
 	if q.store != nil {
-		_ = q.store.SaveQueueJob(ctx, job)
+		sctx, cancel := storeContext(ctx)
+		_ = q.store.SaveQueueJob(sctx, job)
+		cancel()
 	}
 
 	promotedJobs, cascadedFailed, depDoneChs := q.resolveDependentJobsLocked(ctx, now)
@@ -1789,10 +1857,31 @@ func (q *InMemoryQueue) AckLease(ctx context.Context, jobID, leaseToken string, 
 	if !exists {
 		return nil, ErrJobNotFound
 	}
+	if (job.Status == JobStatusPending || (job.Status == JobStatusFailed && isReconcilableFailure(job.Error+" "+job.FailureCategory+" "+job.FailureReasonSummary))) &&
+		(leaseToken != "" || agentPID > 0 || activeConvID != "") {
+		job.Status = JobStatusRunning
+		if leaseToken != "" && job.LeaseToken == "" {
+			job.LeaseToken = leaseToken
+		}
+		job.Error = ""
+		job.FailureCategory = ""
+		job.FailureStage = ""
+		job.FailureDirection = ""
+		job.FailureService = ""
+		job.FailureReasonSummary = ""
+		job.Retriable = false
+		job.CompletedAt = nil
+		if job.DispatchDiagnostics != nil {
+			job.DispatchDiagnostics.QueueState = "running"
+		}
+		job.doneCh = make(chan struct{})
+	}
 	if job.Status != JobStatusLeased && job.Status != JobStatusClaimed && job.Status != JobStatusRunning {
 		return nil, fmt.Errorf("job %s is not in leased state (status: %s)", jobID, job.Status)
 	}
-	if job.LeaseToken != "" && (leaseToken == "" || job.LeaseToken != leaseToken) {
+	if job.LeaseToken != "" && leaseToken != "" && job.LeaseToken != leaseToken {
+		return nil, errors.New("invalid or missing lease token")
+	} else if job.LeaseToken != "" && leaseToken == "" && agentPID <= 0 && activeConvID == "" {
 		return nil, errors.New("invalid or missing lease token")
 	}
 
@@ -1816,11 +1905,13 @@ func (q *InMemoryQueue) AckLease(ctx context.Context, jobID, leaseToken string, 
 	expires := now.Add(DefaultHeartbeatTimeout)
 	job.LeaseExpiresAt = &expires
 	if q.store != nil {
-		if err := q.store.UpdateQueueJobLease(ctx, job.ID, job.LeaseOwner, job.FencingToken, now, expires); err != nil {
+		sctx, cancel := storeContext(ctx)
+		defer cancel()
+		if err := q.store.UpdateQueueJobLease(sctx, job.ID, job.LeaseOwner, job.FencingToken, now, expires); err != nil {
 			log.Printf("[dispatch-queue] ERROR: failed to persist heartbeat lease for %s: %v", jobID, err)
 			return nil, fmt.Errorf("persist heartbeat lease: %w", err)
 		}
-		_ = q.store.SaveQueueJob(ctx, job)
+		_ = q.store.SaveQueueJob(sctx, job)
 	}
 	return job, nil
 }
@@ -2152,6 +2243,19 @@ func (q *InMemoryQueue) BindStoryWithFencing(ctx context.Context, jobID, storyID
 		return nil, ErrJobNotFound
 	}
 
+	if (job.Status == JobStatusPending || (job.Status == JobStatusFailed && isReconcilableFailure(job.Error+" "+job.FailureCategory+" "+job.FailureReasonSummary))) && fencingToken > 0 {
+		job.Status = JobStatusRunning
+		job.FencingToken = fencingToken
+		job.LeaseVersion = fencingToken
+		job.Error = ""
+		job.FailureCategory = ""
+		job.FailureStage = ""
+		job.FailureDirection = ""
+		job.FailureService = ""
+		job.FailureReasonSummary = ""
+		job.Retriable = false
+		job.CompletedAt = nil
+	}
 	if job.FencingToken > 0 && fencingToken != job.FencingToken {
 		return nil, ErrLeaseFenced
 	}
@@ -2161,9 +2265,11 @@ func (q *InMemoryQueue) BindStoryWithFencing(ctx context.Context, jobID, storyID
 		return nil, errors.New("story_id is required")
 	}
 
+	cleanStoryTitle, execTitle := NormalizeStoryTitle(cleanStoryID, storyTitle)
+
 	job.StoryID = cleanStoryID
-	if storyTitle != "" {
-		job.StoryTitle = storyTitle
+	if cleanStoryTitle != "" {
+		job.StoryTitle = cleanStoryTitle
 	}
 	if storyPath != "" {
 		job.StoryPath = storyPath
@@ -2175,7 +2281,10 @@ func (q *InMemoryQueue) BindStoryWithFencing(ctx context.Context, jobID, storyID
 		if err := json.Unmarshal(job.Payload, &payloadMap); err == nil {
 			payloadMap["story_id"] = cleanStoryID
 			if storyTitle != "" {
-				payloadMap["title"] = fmt.Sprintf("Execute story %s: %s", cleanStoryID, storyTitle)
+				payloadMap["title"] = execTitle
+			} else if existingTitle, ok := payloadMap["title"].(string); ok && strings.TrimSpace(existingTitle) != "" {
+				_, normExisting := NormalizeStoryTitle(cleanStoryID, existingTitle)
+				payloadMap["title"] = normExisting
 			}
 			if updated, err := json.Marshal(payloadMap); err == nil {
 				job.Payload = updated
@@ -2184,7 +2293,9 @@ func (q *InMemoryQueue) BindStoryWithFencing(ctx context.Context, jobID, storyID
 	}
 
 	if q.store != nil {
-		_ = q.store.SaveQueueJob(ctx, job)
+		sctx, cancel := storeContext(ctx)
+		_ = q.store.SaveQueueJob(sctx, job)
+		cancel()
 	}
 
 	return job, nil

@@ -253,6 +253,11 @@ func (ze *ZipkinExporter) sendSpans(ctx context.Context, spans []*Span) error {
 		for k, v := range s.Tags {
 			tags[k] = v
 		}
+		if jid, ok := tags["job.id"]; ok && jid != "" && tags["iazio.job_id"] == "" {
+			tags["iazio.job_id"] = jid
+		} else if jid, ok := tags["iazio.job_id"]; ok && jid != "" && tags["job.id"] == "" {
+			tags["job.id"] = jid
+		}
 
 		var annos []ZipkinAnnotation
 		for _, a := range s.Annotations {

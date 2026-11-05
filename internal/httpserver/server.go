@@ -284,7 +284,7 @@ func (s *Server) Handler() http.Handler {
 				_ = s.Engine.ReconcileStaleWorkspaceSlots(now, 45*time.Second)
 			}
 			if queue != nil {
-				_ = queue.ReconcileGlobalQueueSlots(now, 45*time.Second)
+				_ = queue.ReconcileGlobalQueueSlots(now, dispatch.DefaultHeartbeatTimeout)
 			}
 		}
 	}()
@@ -1481,14 +1481,40 @@ func (s *Server) decreasePriority(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, scheduleView(sch))
 }
 
+func resolveDispatchJobByScheduleOrJobID(q dispatch.Queue, id string) (*dispatch.Job, bool) {
+	if q == nil {
+		return nil, false
+	}
+	clean := strings.TrimSpace(id)
+	if clean == "" {
+		return nil, false
+	}
+	if j, ok := q.Get(clean); ok && j != nil {
+		return j, true
+	}
+	if strings.HasPrefix(clean, "sch-") {
+		suffix := strings.TrimPrefix(clean, "sch-")
+		for _, cand := range []string{"job_" + suffix, "job-" + suffix} {
+			if j, ok := q.Get(cand); ok && j != nil {
+				return j, true
+			}
+		}
+	}
+	return nil, false
+}
+
 func (s *Server) cancelSchedule(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	sch, err := s.Engine.CancelSchedule(id)
 	if err != nil {
 		if errors.Is(err, control.ErrNotFound) {
 			if s.Queue != nil {
-				if job, qErr := s.Queue.Cancel(r.Context(), id, "cancelled by operator from schedule view"); qErr == nil && job != nil {
-					writeJSON(w, http.StatusOK, map[string]string{"status": "CANCELLED", "id": id})
+				targetID := id
+				if qJob, ok := resolveDispatchJobByScheduleOrJobID(s.Queue, id); ok && qJob != nil {
+					targetID = qJob.ID
+				}
+				if job, qErr := s.Queue.Cancel(r.Context(), targetID, "cancelled by operator from schedule view"); qErr == nil && job != nil {
+					writeJSON(w, http.StatusOK, map[string]string{"status": "CANCELLED", "id": id, "job_id": job.ID})
 					return
 				}
 			}
@@ -1523,15 +1549,37 @@ func (s *Server) listSchedules(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.Queue != nil {
 		qJobs, _ := s.Queue.List(r.Context(), dispatch.JobFilter{
-			Repo: repoPath,
+			Repo:  repoPath,
+			Limit: 250,
 		})
 		for _, qj := range qJobs {
-			if qj.Status == dispatch.JobStatusPending || qj.Status == dispatch.JobStatusClaimed || qj.Status == dispatch.JobStatusLeased || qj.Status == dispatch.JobStatusRunning {
-				if status != "" && !strings.EqualFold(status, qj.Status) && !strings.EqualFold(status, "QUEUED") && !strings.EqualFold(status, "RUNNING") && !strings.EqualFold(status, "LEASED") && !strings.EqualFold(status, "PENDING_EXECUTION") {
+			if qj == nil {
+				continue
+			}
+			if hostID != "" {
+				qHost := qj.ClaimedHost
+				if qHost == "" {
+					qHost = qj.HostID
+				}
+				if qHost == "" {
+					qHost = qj.TargetHost
+				}
+				if qHost != "" && !strings.EqualFold(hostID, qHost) && !strings.EqualFold(qHost, "auto") {
 					continue
 				}
-				out = append(out, dispatchScheduleView(qj))
 			}
+			sv := dispatchScheduleView(qj)
+			svStatus, _ := sv["status"].(string)
+			if status != "" && !strings.EqualFold(status, qj.Status) && !strings.EqualFold(status, svStatus) {
+				if strings.EqualFold(status, "ACTIVE") {
+					if qj.Status != dispatch.JobStatusPending && qj.Status != dispatch.JobStatusClaimed && qj.Status != dispatch.JobStatusLeased && qj.Status != dispatch.JobStatusRunning {
+						continue
+					}
+				} else {
+					continue
+				}
+			}
+			out = append(out, sv)
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"schedules": out})
@@ -1546,8 +1594,12 @@ func (s *Server) getSchedule(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if s.Queue != nil {
-		if qJob, found := s.Queue.Get(id); found && qJob != nil {
-			writeJSON(w, http.StatusOK, dispatchScheduleView(qJob))
+		if qJob, found := resolveDispatchJobByScheduleOrJobID(s.Queue, id); found && qJob != nil {
+			view := dispatchScheduleView(qJob)
+			if strings.HasPrefix(strings.TrimSpace(id), "sch-") {
+				view["id"] = strings.TrimSpace(id)
+			}
+			writeJSON(w, http.StatusOK, view)
 			return
 		}
 	}
@@ -1672,7 +1724,7 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 	}
 	// 2. Pending jobs in dispatch queue take precedence over archived history
 	if s.Queue != nil {
-		if qJob, found := s.Queue.Get(id); found && qJob != nil {
+		if qJob, found := resolveDispatchJobByScheduleOrJobID(s.Queue, id); found && qJob != nil {
 			writeJSON(w, http.StatusOK, dispatchJobDetailView(qJob))
 			return
 		}
@@ -3908,7 +3960,7 @@ func (s *Server) jobLogs(w http.ResponseWriter, r *http.Request) {
 		chunks = append(chunks, chunkView(c))
 	}
 	if len(chunks) == 0 && page <= 1 && fromSeq == 0 && q.Get("cursor") == "" && s.Queue != nil {
-		if qJob, ok := s.Queue.Get(id); ok && qJob != nil {
+		if qJob, ok := resolveDispatchJobByScheduleOrJobID(s.Queue, id); ok && qJob != nil {
 			chunks = append(chunks, chunkView(synthesizeDispatchJobFallbackChunk(qJob)))
 		}
 	}
@@ -3924,7 +3976,7 @@ func (s *Server) jobStream(w http.ResponseWriter, r *http.Request) {
 	}
 	var dispatchJob *dispatch.Job
 	if !ok && s.Queue != nil {
-		if qJob, qOk := s.Queue.Get(id); qOk && qJob != nil {
+		if qJob, qOk := resolveDispatchJobByScheduleOrJobID(s.Queue, id); qOk && qJob != nil {
 			dispatchJob = qJob
 			st := strings.ToLower(strings.TrimSpace(qJob.Status))
 			if st == dispatch.JobStatusCompleted || st == dispatch.JobStatusFailed || st == dispatch.JobStatusCanceled || st == "cancelled" {

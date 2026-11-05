@@ -154,6 +154,16 @@ func (h *AgentJobsHandler) CompleteHandler(w http.ResponseWriter, r *http.Reques
 	}
 
 	err := h.queue.CompleteWithFencing(r.Context(), jobID, req.FencingToken, req.Result, req.Error)
+	if err == dispatch.ErrJobNotFound && req.FencingToken > 0 && len(req.Result) > 0 {
+		if rehydrated, enqErr := h.queue.Enqueue(r.Context(), &dispatch.Job{
+			ID:           jobID,
+			Type:         dispatch.JobTypePromptExecute,
+			FencingToken: req.FencingToken,
+			Status:       dispatch.JobStatusRunning,
+		}); enqErr == nil && rehydrated != nil {
+			err = h.queue.CompleteWithFencing(r.Context(), jobID, req.FencingToken, req.Result, req.Error)
+		}
+	}
 	if err != nil {
 		if err == dispatch.ErrJobNotFound {
 			writeJSONError(w, http.StatusNotFound, "job not found")
