@@ -2184,3 +2184,99 @@ func TestClassifyDispatchFailureWithDirection_AllBranchesAndUpdateRuntimeMetadat
 		t.Fatalf("expected ExtendLeasesForHost to reconcile status=running, got %+v", extJob)
 	}
 }
+
+func TestQueue_DependsOnJobID_ChainingPromotionAndFailureCascade(t *testing.T) {
+	ctx := context.Background()
+	q := NewInMemoryQueue()
+
+	// 1. Enqueue Wave 1 upstream job
+	wave1, err := q.Enqueue(ctx, &Job{
+		ID:          "job_wave1",
+		Type:        JobTypePromptExecute,
+		Repo:        "iazio-harness-api",
+		StoryID:     "STORY-WAVE-1",
+		TargetAgent: "agy",
+	})
+	if err != nil {
+		t.Fatalf("enqueue wave1 failed: %v", err)
+	}
+	if wave1.Status != JobStatusPending {
+		t.Fatalf("expected wave1 status=%s, got %s", JobStatusPending, wave1.Status)
+	}
+
+	// 2. Enqueue Wave 2 downstream job depending on wave1
+	wave2, err := q.Enqueue(ctx, &Job{
+		ID:             "job_wave2",
+		Type:           JobTypePromptExecute,
+		Repo:           "iazio-mcp",
+		StoryID:        "STORY-WAVE-2",
+		TargetAgent:    "agy",
+		DependsOnJobID: wave1.ID,
+	})
+	if err != nil {
+		t.Fatalf("enqueue wave2 failed: %v", err)
+	}
+	if wave2.Status != JobStatusBlockedByDependency {
+		t.Fatalf("expected wave2 status=%s, got %s", JobStatusBlockedByDependency, wave2.Status)
+	}
+	if len(wave2.DependsOnJobIDs) != 1 || wave2.DependsOnJobIDs[0] != wave1.ID {
+		t.Fatalf("expected DependsOnJobIDs=[%s], got %+v", wave1.ID, wave2.DependsOnJobIDs)
+	}
+
+	// 3. Enqueue Wave 3 job depending on both wave1 and wave2
+	wave3, err := q.Enqueue(ctx, &Job{
+		ID:              "job_wave3",
+		Type:            JobTypePromptExecute,
+		Repo:            "iazio-infra",
+		StoryID:         "STORY-WAVE-3",
+		TargetAgent:     "agy",
+		DependsOnJobIDs: []string{wave1.ID, wave2.ID},
+	})
+	if err != nil {
+		t.Fatalf("enqueue wave3 failed: %v", err)
+	}
+	if wave3.Status != JobStatusBlockedByDependency {
+		t.Fatalf("expected wave3 status=%s, got %s", JobStatusBlockedByDependency, wave3.Status)
+	}
+
+	// 4. Claim should lease wave1 and NOT lease wave2 or wave3
+	claimed1, err := q.Claim(ctx, "host-1", nil)
+	if err != nil || claimed1 == nil || claimed1.ID != wave1.ID {
+		t.Fatalf("expected to claim wave1, got %+v (err=%v)", claimed1, err)
+	}
+	claimedNone, err := q.Claim(ctx, "host-1", nil)
+	if err != nil || claimedNone != nil {
+		t.Fatalf("expected no claimable job while wave1 is running, got %+v (err=%v)", claimedNone, err)
+	}
+
+	// 5. Complete wave1 -> wave2 must automatically promote to pending, while wave3 stays blocked_by_dependency
+	if err := q.CompleteWithFencing(ctx, wave1.ID, claimed1.FencingToken, json.RawMessage(`{"status":"completed"}`), ""); err != nil {
+		t.Fatalf("complete wave1 failed: %v", err)
+	}
+	w2After, _ := q.Get(wave2.ID)
+	if w2After.Status != JobStatusPending {
+		t.Fatalf("expected wave2 to be promoted to %s after wave1 completed, got %s", JobStatusPending, w2After.Status)
+	}
+	w3After, _ := q.Get(wave3.ID)
+	if w3After.Status != JobStatusBlockedByDependency {
+		t.Fatalf("expected wave3 to remain %s until wave2 completes, got %s", JobStatusBlockedByDependency, w3After.Status)
+	}
+
+	// 6. Claim wave2 now succeeds
+	claimed2, err := q.Claim(ctx, "host-1", nil)
+	if err != nil || claimed2 == nil || claimed2.ID != wave2.ID {
+		t.Fatalf("expected to claim promoted wave2, got %+v (err=%v)", claimed2, err)
+	}
+
+	// 7. Fail wave2 -> wave3 must automatically cascade to failed with DEPENDENCY_FAILED
+	if err := q.CompleteWithFencing(ctx, wave2.ID, claimed2.FencingToken, nil, "unit tests failed in wave2"); err != nil {
+		t.Fatalf("fail wave2 failed: %v", err)
+	}
+	w3Failed, _ := q.Get(wave3.ID)
+	if w3Failed.Status != JobStatusFailed {
+		t.Fatalf("expected wave3 to transition to %s when wave2 failed, got %s", JobStatusFailed, w3Failed.Status)
+	}
+	if w3Failed.FailureCategory != FailureCategoryDependencyFailed || !strings.Contains(w3Failed.Error, "DEPENDENCY_FAILED") {
+		t.Fatalf("expected DEPENDENCY_FAILED category/error on wave3, got category=%q error=%q", w3Failed.FailureCategory, w3Failed.Error)
+	}
+}

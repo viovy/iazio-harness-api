@@ -1,16 +1,23 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"net/smtp"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/viovy/iazio-harness-api/internal/codebase"
@@ -29,6 +36,46 @@ type StoryValidator interface {
 	StoryExists(storyID, submodule string) bool
 }
 
+// NotificationRecord models a terminal job or system event surfaced via /v1/notifications.
+type NotificationRecord struct {
+	ID        string         `json:"id"`
+	Kind      string         `json:"kind,omitempty"`
+	Category  string         `json:"category"`
+	Severity  string         `json:"severity,omitempty"`
+	Event     string         `json:"event,omitempty"`
+	Title     string         `json:"title"`
+	Message   string         `json:"message"`
+	Source    string         `json:"source,omitempty"`
+	HostID    string         `json:"host_id,omitempty"`
+	RepoPath  string         `json:"repo_path,omitempty"`
+	JobID     string         `json:"job_id,omitempty"`
+	StoryID   string         `json:"story_id,omitempty"`
+	Status    string         `json:"status,omitempty"`
+	CreatedAt string         `json:"created_at"`
+	Timestamp time.Time      `json:"timestamp"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
+}
+
+// TerminalJobCallbackPayload is the canonical outbound payload for webhook and email completion callbacks.
+type TerminalJobCallbackPayload struct {
+	Event           string   `json:"event"`
+	JobID           string   `json:"job_id"`
+	StoryID         string   `json:"story_id"`
+	StoryTitle      string   `json:"story_title,omitempty"`
+	Repo            string   `json:"repo"`
+	Status          string   `json:"status"`
+	TargetAgent     string   `json:"target_agent,omitempty"`
+	TargetHost      string   `json:"target_host,omitempty"`
+	DurationMs      int64    `json:"duration_ms"`
+	GitHeadSHA      string   `json:"git_head_sha"`
+	Error           string   `json:"error"`
+	Summary         string   `json:"summary"`
+	DependsOnJobID  string   `json:"depends_on_job_id,omitempty"`
+	DependsOnJobIDs []string `json:"depends_on_job_ids,omitempty"`
+	PromotedJobIDs  []string `json:"promoted_job_ids,omitempty"`
+	CompletedAt     string   `json:"completed_at,omitempty"`
+}
+
 const (
 	modeStoryCreate           = "story.create"
 	modeStoryExecute          = "story.execute"
@@ -38,13 +85,19 @@ const (
 
 // JobLifecycleHandler manages querying, listing, canceling, and retrying agent jobs.
 type JobLifecycleHandler struct {
-	queue          dispatch.Queue
-	store          codebase.Store
-	scheduler      GlobalScheduler
-	historyFinder  HistoryFinder
-	storyValidator StoryValidator
-	engine         *control.Engine
-	repoRoot       string
+	queue                dispatch.Queue
+	store                codebase.Store
+	scheduler            GlobalScheduler
+	historyFinder        HistoryFinder
+	storyValidator       StoryValidator
+	engine               *control.Engine
+	repoRoot             string
+	notificationsMu      sync.Mutex
+	notifications        []NotificationRecord
+	notificationRecorder func(NotificationRecord)
+	smtpSendFunc         func(addr string, a smtp.Auth, from string, to []string, msg []byte) error
+	webhookHTTPClient    *http.Client
+	callbackWG           sync.WaitGroup
 }
 
 // NewJobLifecycleHandler constructs a new JobLifecycleHandler.
@@ -53,9 +106,409 @@ func NewJobLifecycleHandler(queue dispatch.Queue, store ...codebase.Store) *JobL
 	if len(store) > 0 {
 		s = store[0]
 	}
-	return &JobLifecycleHandler{
-		queue: queue,
-		store: s,
+	h := &JobLifecycleHandler{
+		queue:             queue,
+		store:             s,
+		webhookHTTPClient: &http.Client{Timeout: 5 * time.Second},
+	}
+	if registrar, ok := queue.(interface {
+		SetTerminalHook(fn func(job *dispatch.Job, promoted []*dispatch.Job))
+	}); ok {
+		registrar.SetTerminalHook(h.HandleTerminalJobTransition)
+	}
+	return h
+}
+
+// SetNotificationRecorder binds an external notification store callback (e.g. Server.RecordNotification).
+func (h *JobLifecycleHandler) SetNotificationRecorder(fn func(NotificationRecord)) {
+	h.notificationsMu.Lock()
+	defer h.notificationsMu.Unlock()
+	h.notificationRecorder = fn
+}
+
+// SetSMTPSendFunc overrides the SMTP transport function for testing email callback delivery.
+func (h *JobLifecycleHandler) SetSMTPSendFunc(fn func(addr string, a smtp.Auth, from string, to []string, msg []byte) error) {
+	h.notificationsMu.Lock()
+	defer h.notificationsMu.Unlock()
+	h.smtpSendFunc = fn
+}
+
+// SetWebhookHTTPClient overrides the HTTP client used for outbound webhook delivery.
+func (h *JobLifecycleHandler) SetWebhookHTTPClient(client *http.Client) {
+	h.notificationsMu.Lock()
+	defer h.notificationsMu.Unlock()
+	if client != nil {
+		h.webhookHTTPClient = client
+	}
+}
+
+// WaitForCallbacks waits until all in-flight asynchronous webhook/email callbacks complete or timeout expires.
+func (h *JobLifecycleHandler) WaitForCallbacks(timeout time.Duration) bool {
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	done := make(chan struct{})
+	go func() {
+		h.callbackWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+// ListNotifications returns recorded terminal job notifications in reverse chronological order.
+func (h *JobLifecycleHandler) ListNotifications() []NotificationRecord {
+	h.notificationsMu.Lock()
+	defer h.notificationsMu.Unlock()
+	out := make([]NotificationRecord, len(h.notifications))
+	copy(out, h.notifications)
+	return out
+}
+
+// ServeNotifications serves GET /v1/notifications and GET /api/v1/notifications.
+func (h *JobLifecycleHandler) ServeNotifications(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	items := h.ListNotifications()
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"notifications": items,
+		"total":         len(items),
+	})
+}
+
+// BuildTerminalJobCallbackPayload constructs the structured terminal callback payload from a completed/failed/canceled job.
+func BuildTerminalJobCallbackPayload(job *dispatch.Job, promoted []*dispatch.Job) TerminalJobCallbackPayload {
+	if job == nil {
+		return TerminalJobCallbackPayload{}
+	}
+	var durationMs int64
+	if job.CompletedAt != nil && !job.CreatedAt.IsZero() {
+		durationMs = job.CompletedAt.Sub(job.CreatedAt).Milliseconds()
+		if durationMs < 0 {
+			durationMs = 0
+		}
+	}
+	if durationMs == 0 && job.ElapsedSeconds > 0 {
+		durationMs = job.ElapsedSeconds * 1000
+	}
+
+	var gitHeadSHA, summary string
+	if len(job.Result) > 0 {
+		var resMap map[string]any
+		if json.Unmarshal(job.Result, &resMap) == nil && resMap != nil {
+			for _, k := range []string{"git_head_sha", "head_sha", "commit_sha", "sha"} {
+				if v, ok := resMap[k].(string); ok && strings.TrimSpace(v) != "" {
+					gitHeadSHA = strings.TrimSpace(v)
+					break
+				}
+			}
+			for _, k := range []string{"summary", "message", "output", "outcome_summary"} {
+				if v, ok := resMap[k].(string); ok && strings.TrimSpace(v) != "" {
+					summary = strings.TrimSpace(v)
+					break
+				}
+			}
+			if durationMs == 0 {
+				if d, ok := resMap["duration_ms"].(float64); ok && int64(d) > 0 {
+					durationMs = int64(d)
+				}
+			}
+		}
+	}
+	if summary == "" {
+		if job.Status == dispatch.JobStatusCompleted {
+			if job.StoryID != "" {
+				summary = fmt.Sprintf("Job %s completed story %s in %s", job.ID, job.StoryID, job.Repo)
+			} else {
+				summary = fmt.Sprintf("Job %s completed successfully in %s", job.ID, job.Repo)
+			}
+		} else {
+			summary = strings.TrimSpace(job.Error)
+			if summary == "" {
+				summary = fmt.Sprintf("Job %s terminated with status %s", job.ID, job.Status)
+			}
+		}
+	}
+
+	var promotedIDs []string
+	for _, p := range promoted {
+		if p != nil && p.ID != "" {
+			promotedIDs = append(promotedIDs, p.ID)
+		}
+	}
+
+	completedAtStr := ""
+	if job.CompletedAt != nil {
+		completedAtStr = job.CompletedAt.UTC().Format(time.RFC3339)
+	} else {
+		completedAtStr = time.Now().UTC().Format(time.RFC3339)
+	}
+
+	effectiveHost := strings.TrimSpace(job.ClaimedHost)
+	if effectiveHost == "" {
+		effectiveHost = strings.TrimSpace(job.HostID)
+	}
+	if effectiveHost == "" {
+		effectiveHost = strings.TrimSpace(job.TargetHost)
+	}
+
+	return TerminalJobCallbackPayload{
+		Event:           "job." + strings.ToLower(strings.TrimSpace(job.Status)),
+		JobID:           job.ID,
+		StoryID:         job.StoryID,
+		StoryTitle:      job.StoryTitle,
+		Repo:            job.Repo,
+		Status:          job.Status,
+		TargetAgent:     job.TargetAgent,
+		TargetHost:      effectiveHost,
+		DurationMs:      durationMs,
+		GitHeadSHA:      gitHeadSHA,
+		Error:           job.Error,
+		Summary:         summary,
+		DependsOnJobID:  job.DependsOnJobID,
+		DependsOnJobIDs: job.DependsOnJobIDs,
+		PromotedJobIDs:  promotedIDs,
+		CompletedAt:     completedAtStr,
+	}
+}
+
+// FormatASECallbackEmail formats the deterministic [IAZIO-ASE-CALLBACK] email subject, body, and RFC 822 message.
+func FormatASECallbackEmail(from string, to []string, payload TerminalJobCallbackPayload) (subject string, body string, rawMessage []byte) {
+	subject = fmt.Sprintf("[IAZIO-ASE-CALLBACK] job=%s story=%s status=%s", payload.JobID, payload.StoryID, payload.Status)
+	jsonBytes, _ := json.MarshalIndent(payload, "", "  ")
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("job_id: %s\n", payload.JobID))
+	sb.WriteString(fmt.Sprintf("story_id: %s\n", payload.StoryID))
+	sb.WriteString(fmt.Sprintf("repo: %s\n", payload.Repo))
+	sb.WriteString(fmt.Sprintf("status: %s\n", payload.Status))
+	sb.WriteString(fmt.Sprintf("duration_ms: %d\n", payload.DurationMs))
+	sb.WriteString(fmt.Sprintf("git_head_sha: %s\n", payload.GitHeadSHA))
+	sb.WriteString(fmt.Sprintf("error: %s\n", payload.Error))
+	sb.WriteString(fmt.Sprintf("summary: %s\n", payload.Summary))
+	if len(payload.PromotedJobIDs) > 0 {
+		sb.WriteString(fmt.Sprintf("promoted_job_ids: %s\n", strings.Join(payload.PromotedJobIDs, ",")))
+	}
+	sb.WriteString("\n")
+	sb.Write(jsonBytes)
+	sb.WriteString("\n")
+	body = sb.String()
+
+	var msg strings.Builder
+	if from != "" {
+		msg.WriteString(fmt.Sprintf("From: %s\r\n", from))
+	}
+	if len(to) > 0 {
+		msg.WriteString(fmt.Sprintf("To: %s\r\n", strings.Join(to, ", ")))
+	}
+	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", subject))
+	msg.WriteString("MIME-Version: 1.0\r\n")
+	msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
+	msg.WriteString("\r\n")
+	msg.WriteString(body)
+	return subject, body, []byte(msg.String())
+}
+
+// SignCallbackPayload computes the HMAC-SHA256 signature header value ("sha256=<hex>") for a webhook payload.
+func SignCallbackPayload(body []byte, secret string) string {
+	if secret == "" {
+		secret = "iazio-ase-callback-default-secret"
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write(body)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+}
+
+// HandleTerminalJobTransition executes outbound completion hooks (NotificationRecord, [IAZIO-ASE-CALLBACK] email, and webhook POST).
+func (h *JobLifecycleHandler) HandleTerminalJobTransition(job *dispatch.Job, promoted []*dispatch.Job) {
+	if h == nil || job == nil {
+		return
+	}
+	payload := BuildTerminalJobCallbackPayload(job, promoted)
+
+	// 1. Emit built-in NotificationRecord (/v1/notifications)
+	category := "success"
+	severity := "info"
+	kind := "job_completed"
+	title := fmt.Sprintf("Job %s completed", job.ID)
+	if job.StoryID != "" {
+		title = fmt.Sprintf("Story %s (%s) %s", job.StoryID, job.ID, job.Status)
+	}
+	switch job.Status {
+	case dispatch.JobStatusFailed:
+		category = "error"
+		severity = "error"
+		kind = "job_failed"
+		if job.StoryID == "" {
+			title = fmt.Sprintf("Job %s failed", job.ID)
+		}
+	case dispatch.JobStatusCanceled:
+		category = "warning"
+		severity = "warning"
+		kind = "job_canceled"
+		if job.StoryID == "" {
+			title = fmt.Sprintf("Job %s canceled", job.ID)
+		}
+	}
+
+	notif := NotificationRecord{
+		ID:        fmt.Sprintf("notif_%s_%d", job.ID, time.Now().UTC().UnixNano()),
+		Kind:      kind,
+		Category:  category,
+		Severity:  severity,
+		Event:     payload.Event,
+		Title:     title,
+		Message:   payload.Summary,
+		Source:    "iazio-harness-api",
+		HostID:    payload.TargetHost,
+		RepoPath:  job.Repo,
+		JobID:     job.ID,
+		StoryID:   job.StoryID,
+		Status:    job.Status,
+		CreatedAt: payload.CompletedAt,
+		Timestamp: time.Now().UTC(),
+		Metadata: map[string]any{
+			"story_id":     job.StoryID,
+			"repo":         job.Repo,
+			"status":       job.Status,
+			"duration_ms":  payload.DurationMs,
+			"git_head_sha": payload.GitHeadSHA,
+		},
+	}
+
+	h.notificationsMu.Lock()
+	h.notifications = append([]NotificationRecord{notif}, h.notifications...)
+	if len(h.notifications) > 200 {
+		h.notifications = h.notifications[:200]
+	}
+	recorder := h.notificationRecorder
+	smtpSender := h.smtpSendFunc
+	httpClient := h.webhookHTTPClient
+	h.notificationsMu.Unlock()
+
+	if recorder != nil {
+		recorder(notif)
+	}
+
+	// 2. Email Callback Hook ([IAZIO-ASE-CALLBACK])
+	smtpHost := strings.TrimSpace(os.Getenv("IAZIO_CALLBACK_SMTP_HOST"))
+	smtpPort := strings.TrimSpace(os.Getenv("IAZIO_CALLBACK_SMTP_PORT"))
+	if smtpPort == "" {
+		smtpPort = "587"
+	}
+	smtpUser := strings.TrimSpace(os.Getenv("IAZIO_CALLBACK_SMTP_USER"))
+	smtpPass := os.Getenv("IAZIO_CALLBACK_SMTP_PASS")
+	emailFrom := strings.TrimSpace(os.Getenv("IAZIO_CALLBACK_EMAIL_FROM"))
+	if emailFrom == "" {
+		emailFrom = smtpUser
+	}
+	if emailFrom == "" && smtpHost != "" {
+		emailFrom = "ase-callback@iazio.local"
+	}
+	var emailTo []string
+	for _, rawTo := range strings.Split(os.Getenv("IAZIO_CALLBACK_EMAIL_TO"), ",") {
+		if trimmed := strings.TrimSpace(rawTo); trimmed != "" {
+			emailTo = append(emailTo, trimmed)
+		}
+	}
+
+	if smtpHost != "" && len(emailTo) > 0 {
+		addr := smtpHost + ":" + smtpPort
+		var auth smtp.Auth
+		if smtpUser != "" && smtpPass != "" {
+			auth = smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
+		}
+		_, _, rawMsg := FormatASECallbackEmail(emailFrom, emailTo, payload)
+		if smtpSender != nil {
+			if err := smtpSender(addr, auth, emailFrom, emailTo, rawMsg); err != nil {
+				log.Printf("[ase-callback] SMTP callback failed for job %s: %v", job.ID, err)
+			}
+		} else {
+			h.callbackWG.Add(1)
+			go func() {
+				defer h.callbackWG.Done()
+				if err := smtp.SendMail(addr, auth, emailFrom, emailTo, rawMsg); err != nil {
+					log.Printf("[ase-callback] SMTP callback failed for job %s: %v", job.ID, err)
+				}
+			}()
+		}
+	}
+
+	// 3. Webhook Callback (callback_url + IAZIO_CALLBACK_WEBHOOK_URL fallback)
+	var webhookURLs []string
+	if u := strings.TrimSpace(job.CallbackURL); u != "" {
+		webhookURLs = append(webhookURLs, u)
+	}
+	if fallbackURL := strings.TrimSpace(os.Getenv("IAZIO_CALLBACK_WEBHOOK_URL")); fallbackURL != "" {
+		alreadyIncluded := false
+		for _, existing := range webhookURLs {
+			if existing == fallbackURL {
+				alreadyIncluded = true
+				break
+			}
+		}
+		if !alreadyIncluded {
+			webhookURLs = append(webhookURLs, fallbackURL)
+		}
+	}
+
+	if len(webhookURLs) > 0 {
+		if httpClient == nil {
+			httpClient = &http.Client{Timeout: 5 * time.Second}
+		}
+		secret := os.Getenv("IAZIO_CALLBACK_WEBHOOK_SECRET")
+		bodyBytes, err := json.Marshal(payload)
+		if err == nil {
+			sig := SignCallbackPayload(bodyBytes, secret)
+			for _, targetURL := range webhookURLs {
+				u := targetURL
+				h.callbackWG.Add(1)
+				go func() {
+					defer h.callbackWG.Done()
+					h.deliverWebhookWithRetry(httpClient, u, bodyBytes, sig, payload)
+				}()
+			}
+		}
+	}
+}
+
+func (h *JobLifecycleHandler) deliverWebhookWithRetry(client *http.Client, targetURL string, bodyBytes []byte, sig string, payload TerminalJobCallbackPayload) {
+	const maxAttempts = 3
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(bodyBytes))
+		if err != nil {
+			log.Printf("[ase-callback] invalid webhook URL %q for job %s: %v", targetURL, payload.JobID, err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Iazio-Event", payload.Event)
+		req.Header.Set("X-Iazio-Job-ID", payload.JobID)
+		req.Header.Set("X-Iazio-Signature-256", sig)
+
+		resp, err := client.Do(req)
+		if err == nil && resp != nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			_ = resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				return
+			}
+			if resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
+				log.Printf("[ase-callback] webhook %q returned non-retriable status %d for job %s", targetURL, resp.StatusCode, payload.JobID)
+				return
+			}
+		}
+		if attempt < maxAttempts {
+			time.Sleep(time.Duration(attempt*25) * time.Millisecond)
+		} else if err != nil {
+			log.Printf("[ase-callback] webhook delivery to %q failed after %d attempts for job %s: %v", targetURL, maxAttempts, payload.JobID, err)
+		}
 	}
 }
 
@@ -192,6 +645,9 @@ type JobDetailResponse struct {
 	LeaseExpiresAt          string                        `json:"lease_expires_at,omitempty"`
 	AgentAffinity           *dispatch.AgentAffinity       `json:"agent_affinity,omitempty"`
 	DispatchDiagnostics     *dispatch.DispatchDiagnostics `json:"dispatch_diagnostics,omitempty"`
+	DependsOnJobID          string                        `json:"depends_on_job_id,omitempty"`
+	DependsOnJobIDs         []string                      `json:"depends_on_job_ids,omitempty"`
+	CallbackURL             string                        `json:"callback_url,omitempty"`
 	CreatedAt               string                        `json:"created_at"`
 	ClaimedAt               string                        `json:"claimed_at,omitempty"`
 	CompletedAt             string                        `json:"completed_at,omitempty"`
@@ -211,43 +667,49 @@ type CancelJobRequest struct {
 
 // ExecuteStoryRequest specifies parameters for executing an existing or newly allocated story.
 type ExecuteStoryRequest struct {
-	Submodule               string `json:"submodule,omitempty"`
-	Repo                    string `json:"repo,omitempty"`
-	Backlog                 string `json:"backlog,omitempty"`
-	StoryID                 string `json:"story_id,omitempty"`
-	TargetAgent             string `json:"target_agent,omitempty"`
-	Host                    string `json:"host,omitempty"`
-	Prompt                  string `json:"prompt,omitempty"`
-	Request                 string `json:"request,omitempty"`
-	Specification           string `json:"specification,omitempty"`
-	Description             string `json:"description,omitempty"`
-	Action                  string `json:"action,omitempty"`
-	Command                 string `json:"command,omitempty"`
-	Mode                    string `json:"mode,omitempty"`
-	SourceConversationTitle string `json:"source_conversation_title,omitempty"`
-	SourceContext           string `json:"source_context,omitempty"`
-	TraceID                 string `json:"trace_id,omitempty"`
-	SearchID                string `json:"search_id,omitempty"`
+	Submodule               string   `json:"submodule,omitempty"`
+	Repo                    string   `json:"repo,omitempty"`
+	Backlog                 string   `json:"backlog,omitempty"`
+	StoryID                 string   `json:"story_id,omitempty"`
+	TargetAgent             string   `json:"target_agent,omitempty"`
+	Host                    string   `json:"host,omitempty"`
+	Prompt                  string   `json:"prompt,omitempty"`
+	Request                 string   `json:"request,omitempty"`
+	Specification           string   `json:"specification,omitempty"`
+	Description             string   `json:"description,omitempty"`
+	Action                  string   `json:"action,omitempty"`
+	Command                 string   `json:"command,omitempty"`
+	Mode                    string   `json:"mode,omitempty"`
+	SourceConversationTitle string   `json:"source_conversation_title,omitempty"`
+	SourceContext           string   `json:"source_context,omitempty"`
+	TraceID                 string   `json:"trace_id,omitempty"`
+	SearchID                string   `json:"search_id,omitempty"`
+	DependsOnJobID          string   `json:"depends_on_job_id,omitempty"`
+	DependsOnJobIDs         []string `json:"depends_on_job_ids,omitempty"`
+	CallbackURL             string   `json:"callback_url,omitempty"`
 }
 
 // ExecuteStoryResponse is returned after queuing a story for execution.
 type ExecuteStoryResponse struct {
-	JobID                 string `json:"job_id"`
-	StoryID               string `json:"story_id,omitempty"`
-	Submodule             string `json:"submodule"`
-	Backlog               string `json:"backlog,omitempty"`
-	Mode                  string `json:"mode,omitempty"`
-	TargetAgent           string `json:"target_agent"`
-	TargetHost            string `json:"target_host,omitempty"`
-	TargetRepo            string `json:"target_repo,omitempty"`
-	Status                string `json:"status"`
-	StoryAllocationStatus string `json:"story_allocation_status,omitempty"`
-	AllocationSource      string `json:"allocation_source,omitempty"`
-	PriorityRankSelected  int    `json:"priority_rank_selected,omitempty"`
-	NormalizedPrompt      string `json:"normalized_prompt,omitempty"`
-	EffectiveAction       string `json:"effective_action,omitempty"`
-	LiveURL               string `json:"live_url,omitempty"`
-	CreatedAt             string `json:"created_at"`
+	JobID                 string   `json:"job_id"`
+	StoryID               string   `json:"story_id,omitempty"`
+	Submodule             string   `json:"submodule"`
+	Backlog               string   `json:"backlog,omitempty"`
+	Mode                  string   `json:"mode,omitempty"`
+	TargetAgent           string   `json:"target_agent"`
+	TargetHost            string   `json:"target_host,omitempty"`
+	TargetRepo            string   `json:"target_repo,omitempty"`
+	Status                string   `json:"status"`
+	StoryAllocationStatus string   `json:"story_allocation_status,omitempty"`
+	AllocationSource      string   `json:"allocation_source,omitempty"`
+	PriorityRankSelected  int      `json:"priority_rank_selected,omitempty"`
+	NormalizedPrompt      string   `json:"normalized_prompt,omitempty"`
+	EffectiveAction       string   `json:"effective_action,omitempty"`
+	DependsOnJobID        string   `json:"depends_on_job_id,omitempty"`
+	DependsOnJobIDs       []string `json:"depends_on_job_ids,omitempty"`
+	CallbackURL           string   `json:"callback_url,omitempty"`
+	LiveURL               string   `json:"live_url,omitempty"`
+	CreatedAt             string   `json:"created_at"`
 }
 
 // BindStoryRequest is the payload for PATCH /api/v1/jobs/{id}/story-binding.
@@ -684,6 +1146,9 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		"target_agent":              targetAgent,
 		"target_host":               targetHost,
 		"trace_id":                  traceID,
+		"depends_on_job_id":         strings.TrimSpace(req.DependsOnJobID),
+		"depends_on_job_ids":        req.DependsOnJobIDs,
+		"callback_url":              strings.TrimSpace(req.CallbackURL),
 	})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to marshal execution payload: %v", err))
@@ -707,6 +1172,9 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		TraceID:                 traceID,
 		ParentID:                span.ID,
 		SearchID:                strings.TrimSpace(req.SearchID),
+		DependsOnJobID:          strings.TrimSpace(req.DependsOnJobID),
+		DependsOnJobIDs:         req.DependsOnJobIDs,
+		CallbackURL:             strings.TrimSpace(req.CallbackURL),
 		Payload:                 execPayload,
 	})
 	if err != nil {
@@ -753,6 +1221,9 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		PriorityRankSelected:  priorityRankSelected,
 		NormalizedPrompt:      normalizedPrompt,
 		EffectiveAction:       action,
+		DependsOnJobID:        job.DependsOnJobID,
+		DependsOnJobIDs:       job.DependsOnJobIDs,
+		CallbackURL:           job.CallbackURL,
 		LiveURL:               liveURL,
 		CreatedAt:             job.CreatedAt.Format(time.RFC3339),
 	}
@@ -894,7 +1365,7 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 	diag := j.DispatchDiagnostics
 	if diag != nil {
 		stLower := strings.ToLower(strings.TrimSpace(j.Status))
-		if stLower == dispatch.JobStatusRunning || stLower == dispatch.JobStatusCompleted || stLower == dispatch.JobStatusFailed || stLower == dispatch.JobStatusCanceled || stLower == "cancelled" {
+		if stLower == dispatch.JobStatusRunning || stLower == dispatch.JobStatusCompleted || stLower == dispatch.JobStatusFailed || stLower == dispatch.JobStatusCanceled || stLower == "cancelled" || stLower == dispatch.JobStatusBlockedByDependency {
 			diagCopy := *diag
 			diagCopy.QueueState = stLower
 			diag = &diagCopy
@@ -946,6 +1417,9 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		FinalTranscriptSHA256:   j.FinalTranscriptSHA256,
 		AgentAffinity:           j.AgentAffinity,
 		DispatchDiagnostics:     diag,
+		DependsOnJobID:          j.DependsOnJobID,
+		DependsOnJobIDs:         j.DependsOnJobIDs,
+		CallbackURL:             j.CallbackURL,
 		CreatedAt:               j.CreatedAt.Format(time.RFC3339),
 	}
 

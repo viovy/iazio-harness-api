@@ -177,8 +177,15 @@ CREATE TABLE IF NOT EXISTS harness_dispatch_jobs (
   heartbeat_at timestamp with time zone,
   lease_expires_at timestamp with time zone,
   completed_at timestamp with time zone,
+  depends_on_job_id text NOT NULL DEFAULT '',
+  depends_on_job_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+  callback_url text NOT NULL DEFAULT '',
   updated_at timestamp with time zone NOT NULL DEFAULT now()
 );
+
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS depends_on_job_id text NOT NULL DEFAULT '';
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS depends_on_job_ids jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS callback_url text NOT NULL DEFAULT '';
 
 CREATE INDEX IF NOT EXISTS harness_dispatch_jobs_status_idx ON harness_dispatch_jobs (status);
 CREATE INDEX IF NOT EXISTS harness_dispatch_jobs_host_idx ON harness_dispatch_jobs (claimed_host, status);

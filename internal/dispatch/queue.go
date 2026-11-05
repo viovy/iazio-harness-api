@@ -31,14 +31,15 @@ const (
 
 // Standard job statuses.
 const (
-	JobStatusPending   = "pending"
-	JobStatusLeased    = "leased"
-	JobStatusClaimed   = "claimed"
-	JobStatusRunning   = "running"
-	JobStatusCompleted = "completed"
-	JobStatusFailed    = "failed"
-	JobStatusCanceled  = "canceled"
-	JobStatusRequeued  = "requeued"
+	JobStatusPending             = "pending"
+	JobStatusBlockedByDependency = "blocked_by_dependency"
+	JobStatusLeased              = "leased"
+	JobStatusClaimed             = "claimed"
+	JobStatusRunning             = "running"
+	JobStatusCompleted           = "completed"
+	JobStatusFailed              = "failed"
+	JobStatusCanceled            = "canceled"
+	JobStatusRequeued            = "requeued"
 )
 
 // Canonical Failure Taxonomy
@@ -52,6 +53,7 @@ const (
 	FailureCategoryASEGateIncomplete      = "ASE_GATE_INCOMPLETE"
 	FailureCategoryCircuitBreakerTripped  = "CIRCUIT_BREAKER_TRIPPED"
 	FailureCategoryStoryNotFound          = "STORY_NOT_FOUND"
+	FailureCategoryDependencyFailed       = "DEPENDENCY_FAILED"
 
 	FailureStageIngress         = "INGRESS"
 	FailureStageQueueDispatch   = "QUEUE_DISPATCH"
@@ -201,6 +203,9 @@ type Job struct {
 	InitialConversationID   string               `json:"initial_conversation_id,omitempty"`
 	ActiveConversationID    string               `json:"active_conversation_id,omitempty"`
 	ConversationIDs         []string             `json:"conversation_ids,omitempty"`
+	DependsOnJobID          string               `json:"depends_on_job_id,omitempty"`
+	DependsOnJobIDs         []string             `json:"depends_on_job_ids,omitempty"`
+	CallbackURL             string               `json:"callback_url,omitempty"`
 
 	// doneCh signals when the job has been completed or failed.
 	doneCh chan struct{}
@@ -274,6 +279,224 @@ type InMemoryQueue struct {
 	startupGrace   time.Duration
 	store          QueueStore
 	nowFunc        func() time.Time
+	terminalHooks  []func(job *Job, promoted []*Job)
+}
+
+// AddTerminalHook registers a callback invoked whenever a job transitions to a terminal state (completed, failed, canceled).
+func (q *InMemoryQueue) AddTerminalHook(fn func(job *Job, promoted []*Job)) {
+	if fn == nil {
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.terminalHooks = append(q.terminalHooks, fn)
+}
+
+// SetTerminalHook sets the primary terminal transition callback on the queue.
+func (q *InMemoryQueue) SetTerminalHook(fn func(job *Job, promoted []*Job)) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if fn == nil {
+		q.terminalHooks = nil
+		return
+	}
+	q.terminalHooks = []func(job *Job, promoted []*Job){fn}
+}
+
+func cloneJobSnapshot(j *Job) *Job {
+	if j == nil {
+		return nil
+	}
+	cp := *j
+	if len(j.DependsOnJobIDs) > 0 {
+		cp.DependsOnJobIDs = append([]string(nil), j.DependsOnJobIDs...)
+	}
+	if len(j.PromotedMemories) > 0 {
+		cp.PromotedMemories = append([]string(nil), j.PromotedMemories...)
+	}
+	if len(j.ConversationIDs) > 0 {
+		cp.ConversationIDs = append([]string(nil), j.ConversationIDs...)
+	}
+	if len(j.Payload) > 0 {
+		cp.Payload = append(json.RawMessage(nil), j.Payload...)
+	}
+	if len(j.Result) > 0 {
+		cp.Result = append(json.RawMessage(nil), j.Result...)
+	}
+	return &cp
+}
+
+func (q *InMemoryQueue) fireTerminalHooks(job *Job, promoted []*Job) {
+	if job == nil {
+		return
+	}
+	q.mu.Lock()
+	hooks := make([]func(job *Job, promoted []*Job), len(q.terminalHooks))
+	copy(hooks, q.terminalHooks)
+	q.mu.Unlock()
+	for _, fn := range hooks {
+		if fn != nil {
+			fn(job, promoted)
+		}
+	}
+}
+
+func normalizeJobDependencies(job *Job) {
+	if job == nil {
+		return
+	}
+	if len(job.Payload) > 0 && (job.DependsOnJobID == "" && len(job.DependsOnJobIDs) == 0 || job.CallbackURL == "") {
+		var pm map[string]any
+		if json.Unmarshal(job.Payload, &pm) == nil && pm != nil {
+			if job.DependsOnJobID == "" {
+				if v, ok := pm["depends_on_job_id"].(string); ok && strings.TrimSpace(v) != "" {
+					job.DependsOnJobID = strings.TrimSpace(v)
+				}
+			}
+			if len(job.DependsOnJobIDs) == 0 {
+				if arr, ok := pm["depends_on_job_ids"].([]any); ok {
+					for _, raw := range arr {
+						if s, ok := raw.(string); ok && strings.TrimSpace(s) != "" {
+							job.DependsOnJobIDs = append(job.DependsOnJobIDs, strings.TrimSpace(s))
+						}
+					}
+				}
+			}
+			if job.CallbackURL == "" {
+				if v, ok := pm["callback_url"].(string); ok && strings.TrimSpace(v) != "" {
+					job.CallbackURL = strings.TrimSpace(v)
+				}
+			}
+		}
+	}
+
+	job.DependsOnJobID = strings.TrimSpace(job.DependsOnJobID)
+	job.CallbackURL = strings.TrimSpace(job.CallbackURL)
+
+	seen := make(map[string]bool)
+	var normalized []string
+	if job.DependsOnJobID != "" && job.DependsOnJobID != job.ID {
+		seen[job.DependsOnJobID] = true
+		normalized = append(normalized, job.DependsOnJobID)
+	}
+	for _, raw := range job.DependsOnJobIDs {
+		d := strings.TrimSpace(raw)
+		if d != "" && d != job.ID && !seen[d] {
+			seen[d] = true
+			normalized = append(normalized, d)
+		}
+	}
+	if len(normalized) > 0 {
+		job.DependsOnJobIDs = normalized
+		if job.DependsOnJobID == "" {
+			job.DependsOnJobID = normalized[0]
+		}
+	} else {
+		job.DependsOnJobID = ""
+		job.DependsOnJobIDs = nil
+	}
+}
+
+func (q *InMemoryQueue) areDependenciesSatisfiedLocked(job *Job) (satisfied bool, failedDep *Job) {
+	if job == nil {
+		return true, nil
+	}
+	normalizeJobDependencies(job)
+	if len(job.DependsOnJobIDs) == 0 {
+		return true, nil
+	}
+	for _, depID := range job.DependsOnJobIDs {
+		dep, exists := q.jobs[depID]
+		if !exists || dep == nil {
+			return false, nil
+		}
+		if dep.Status == JobStatusFailed || dep.Status == JobStatusCanceled {
+			return false, dep
+		}
+		if dep.Status != JobStatusCompleted {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (q *InMemoryQueue) resolveDependentJobsLocked(ctx context.Context, now time.Time) (promoted []*Job, cascadedFailed []*Job, doneChs []chan struct{}) {
+	if now.IsZero() {
+		now = q.now()
+	}
+	for {
+		changed := false
+		for _, child := range q.jobs {
+			if child == nil {
+				continue
+			}
+			normalizeJobDependencies(child)
+			if len(child.DependsOnJobIDs) == 0 {
+				continue
+			}
+			if child.Status != JobStatusBlockedByDependency && child.Status != JobStatusPending {
+				continue
+			}
+			satisfied, failedDep := q.areDependenciesSatisfiedLocked(child)
+			if failedDep != nil {
+				child.Status = JobStatusFailed
+				reason := strings.TrimSpace(failedDep.Error)
+				if reason != "" {
+					child.Error = fmt.Sprintf("DEPENDENCY_FAILED: upstream job %s %s (%s)", failedDep.ID, failedDep.Status, reason)
+				} else {
+					child.Error = fmt.Sprintf("DEPENDENCY_FAILED: upstream job %s %s", failedDep.ID, failedDep.Status)
+				}
+				child.FailureCategory = FailureCategoryDependencyFailed
+				child.FailureStage = FailureStageQueueDispatch
+				child.FailureDirection = FailureDirectionUpstream
+				child.FailureService = "iazio-harness-api"
+				child.FailureReasonSummary = child.Error
+				child.Retriable = false
+				compAt := now
+				child.CompletedAt = &compAt
+				if child.DispatchDiagnostics != nil {
+					child.DispatchDiagnostics.QueueState = "failed"
+				} else {
+					child.DispatchDiagnostics = &DispatchDiagnostics{QueueState: "failed"}
+				}
+				if child.doneCh != nil {
+					doneChs = append(doneChs, child.doneCh)
+				}
+				if q.store != nil {
+					_ = q.store.SaveQueueJob(ctx, child)
+				}
+				cascadedFailed = append(cascadedFailed, cloneJobSnapshot(child))
+				changed = true
+			} else if satisfied && child.Status == JobStatusBlockedByDependency {
+				child.Status = JobStatusPending
+				if child.DispatchDiagnostics != nil {
+					child.DispatchDiagnostics.QueueState = "queued"
+				} else {
+					child.DispatchDiagnostics = &DispatchDiagnostics{QueueState: "queued"}
+				}
+				if q.store != nil {
+					_ = q.store.SaveQueueJob(ctx, child)
+				}
+				promoted = append(promoted, cloneJobSnapshot(child))
+				changed = true
+			} else if !satisfied && child.Status == JobStatusPending {
+				child.Status = JobStatusBlockedByDependency
+				if child.DispatchDiagnostics != nil {
+					child.DispatchDiagnostics.QueueState = JobStatusBlockedByDependency
+				} else {
+					child.DispatchDiagnostics = &DispatchDiagnostics{QueueState: JobStatusBlockedByDependency}
+				}
+				if q.store != nil {
+					_ = q.store.SaveQueueJob(ctx, child)
+				}
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	return promoted, cascadedFailed, doneChs
 }
 
 // SetStore binds a durable database backing store to the queue and re-hydrates in-flight jobs.
@@ -291,6 +514,7 @@ func (q *InMemoryQueue) SetStore(s QueueStore) error {
 		defer q.mu.Unlock()
 		now := q.now()
 		for _, j := range persisted {
+			normalizeJobDependencies(j)
 			if j.FencingToken > q.fencingSeq {
 				q.fencingSeq = j.FencingToken
 			}
@@ -322,6 +546,14 @@ func (q *InMemoryQueue) SetStore(s QueueStore) error {
 					}
 				}
 				q.jobs[j.ID] = j
+			}
+		}
+		_, _, depDoneChs := q.resolveDependentJobsLocked(context.Background(), now)
+		for _, ch := range depDoneChs {
+			select {
+			case <-ch:
+			default:
+				close(ch)
 			}
 		}
 	}
@@ -537,6 +769,11 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 		}
 	}
 
+	if len(expiredIDs) > 0 {
+		_, _, depDoneChs := q.resolveDependentJobsLocked(context.Background(), now)
+		doneChannels = append(doneChannels, depDoneChs...)
+	}
+
 	for _, ch := range doneChannels {
 		select {
 		case <-ch:
@@ -596,23 +833,57 @@ func (q *InMemoryQueue) Enqueue(ctx context.Context, job *Job) (*Job, error) {
 	}
 
 	q.mu.Lock()
-	defer q.mu.Unlock()
 
 	if job.ID == "" {
 		job.ID = generateJobID()
-	}
-	if job.Status == "" {
-		job.Status = JobStatusPending
 	}
 	if job.CreatedAt.IsZero() {
 		job.CreatedAt = q.now()
 	}
 	job.doneCh = make(chan struct{})
 
+	normalizeJobDependencies(job)
+	var failedOnEnqueue *Job
+	if len(job.DependsOnJobIDs) > 0 {
+		satisfied, failedDep := q.areDependenciesSatisfiedLocked(job)
+		if failedDep != nil {
+			now := q.now()
+			job.Status = JobStatusFailed
+			reason := strings.TrimSpace(failedDep.Error)
+			if reason != "" {
+				job.Error = fmt.Sprintf("DEPENDENCY_FAILED: upstream job %s %s (%s)", failedDep.ID, failedDep.Status, reason)
+			} else {
+				job.Error = fmt.Sprintf("DEPENDENCY_FAILED: upstream job %s %s", failedDep.ID, failedDep.Status)
+			}
+			job.FailureCategory = FailureCategoryDependencyFailed
+			job.FailureStage = FailureStageQueueDispatch
+			job.FailureDirection = FailureDirectionUpstream
+			job.FailureService = "iazio-harness-api"
+			job.FailureReasonSummary = job.Error
+			job.Retriable = false
+			job.CompletedAt = &now
+			job.DispatchDiagnostics = &DispatchDiagnostics{QueueState: "failed"}
+			close(job.doneCh)
+			failedOnEnqueue = cloneJobSnapshot(job)
+		} else if !satisfied {
+			job.Status = JobStatusBlockedByDependency
+			job.DispatchDiagnostics = &DispatchDiagnostics{QueueState: JobStatusBlockedByDependency}
+		} else {
+			job.Status = JobStatusPending
+		}
+	} else if job.Status == "" {
+		job.Status = JobStatusPending
+	}
+
 	// Store copy
 	q.jobs[job.ID] = job
 	if q.store != nil {
 		_ = q.store.SaveQueueJob(ctx, job)
+	}
+	q.mu.Unlock()
+
+	if failedOnEnqueue != nil {
+		q.fireTerminalHooks(failedOnEnqueue, nil)
 	}
 
 	var spanOpts []telemetry.SpanOption
@@ -644,6 +915,15 @@ func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []str
 	for _, j := range q.jobs {
 		if j.Status != JobStatusPending {
 			continue
+		}
+		if j.DependsOnJobID != "" || len(j.DependsOnJobIDs) > 0 {
+			satisfied, failedDep := q.areDependenciesSatisfiedLocked(j)
+			if failedDep != nil || !satisfied {
+				if failedDep == nil && !satisfied {
+					j.Status = JobStatusBlockedByDependency
+				}
+				continue
+			}
 		}
 		if len(typeFilter) > 0 && !typeFilter[j.Type] {
 			continue
@@ -1183,14 +1463,28 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 		_ = q.store.SaveQueueJob(ctx, job)
 	}
 
+	promotedJobs, cascadedFailed, depDoneChs := q.resolveDependentJobsLocked(ctx, now)
+	jobSnapshot := cloneJobSnapshot(job)
 	done := job.doneCh
 	q.mu.Unlock()
 
 	if done != nil {
 		close(done)
 	}
+	for _, ch := range depDoneChs {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	}
 
-	if (searchID != "" && job.Status == JobStatusCompleted) || len(promoted) > 0 {
+	q.fireTerminalHooks(jobSnapshot, promotedJobs)
+	for _, cf := range cascadedFailed {
+		q.fireTerminalHooks(cf, nil)
+	}
+
+	if (searchID != "" && jobSnapshot.Status == JobStatusCompleted) || len(promoted) > 0 {
 		go q.dispatchAttribution(searchID, traceID, promoted)
 	}
 
@@ -1310,6 +1604,8 @@ func matchesJobStatusFilter(jobStatus, filterStatus string) bool {
 	switch f {
 	case "queued", "pending":
 		return s == JobStatusPending || s == "queued"
+	case "blocked", "blocked_by_dependency":
+		return s == JobStatusBlockedByDependency || s == "blocked"
 	case "claimed":
 		return s == JobStatusClaimed || s == JobStatusLeased || s == JobStatusRunning
 	case "cancelled", "canceled":
@@ -1403,6 +1699,8 @@ func (q *InMemoryQueue) Cancel(ctx context.Context, jobID string, reason string)
 	if q.store != nil {
 		_ = q.store.SaveQueueJob(ctx, job)
 	}
+	promotedJobs, cascadedFailed, depDoneChs := q.resolveDependentJobsLocked(ctx, now)
+	jobSnapshot := cloneJobSnapshot(job)
 	done := job.doneCh
 	q.mu.Unlock()
 
@@ -1412,6 +1710,18 @@ func (q *InMemoryQueue) Cancel(ctx context.Context, jobID string, reason string)
 		default:
 			close(done)
 		}
+	}
+	for _, ch := range depDoneChs {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	}
+
+	q.fireTerminalHooks(jobSnapshot, promotedJobs)
+	for _, cf := range cascadedFailed {
+		q.fireTerminalHooks(cf, nil)
 	}
 	return job, nil
 }
@@ -1446,10 +1756,19 @@ func (q *InMemoryQueue) Retry(ctx context.Context, jobID string) (*Job, error) {
 		TraceID:                 orig.TraceID,
 		SearchID:                orig.SearchID,
 		ParentID:                orig.ID,
+		DependsOnJobID:          orig.DependsOnJobID,
+		DependsOnJobIDs:         append([]string(nil), orig.DependsOnJobIDs...),
+		CallbackURL:             orig.CallbackURL,
 		Retriable:               orig.Retriable,
 		Status:                  JobStatusPending,
 		CreatedAt:               q.now(),
 		doneCh:                  make(chan struct{}),
+	}
+	normalizeJobDependencies(newJob)
+	if len(newJob.DependsOnJobIDs) > 0 {
+		if satisfied, _ := q.areDependenciesSatisfiedLocked(newJob); !satisfied {
+			newJob.Status = JobStatusBlockedByDependency
+		}
 	}
 	q.jobs[newJob.ID] = newJob
 	if q.store != nil {
@@ -1632,10 +1951,10 @@ func (q *InMemoryQueue) UpdateRuntimeMetadata(jobID, worktreePath, activeConvID 
 // Failover records an attempt failure and resets the job to pending for re-dispatch.
 func (q *InMemoryQueue) Failover(ctx context.Context, jobID string, req AttemptFailure) (*Job, error) {
 	q.mu.Lock()
-	defer q.mu.Unlock()
 
 	job, exists := q.jobs[jobID]
 	if !exists {
+		q.mu.Unlock()
 		return nil, ErrJobNotFound
 	}
 
@@ -1680,6 +1999,20 @@ func (q *InMemoryQueue) Failover(ctx context.Context, jobID string, req AttemptF
 		}
 		if q.store != nil {
 			_ = q.store.SaveQueueJob(ctx, job)
+		}
+		promotedJobs, cascadedFailed, depDoneChs := q.resolveDependentJobsLocked(ctx, completedAt)
+		jobSnapshot := cloneJobSnapshot(job)
+		q.mu.Unlock()
+		for _, ch := range depDoneChs {
+			select {
+			case <-ch:
+			default:
+				close(ch)
+			}
+		}
+		q.fireTerminalHooks(jobSnapshot, promotedJobs)
+		for _, cf := range cascadedFailed {
+			q.fireTerminalHooks(cf, nil)
 		}
 		return job, nil
 	}
@@ -1742,6 +2075,7 @@ func (q *InMemoryQueue) Failover(ctx context.Context, jobID string, req AttemptF
 	if q.store != nil {
 		_ = q.store.SaveQueueJob(ctx, job)
 	}
+	q.mu.Unlock()
 
 	return job, nil
 }
@@ -1780,8 +2114,17 @@ func (q *InMemoryQueue) RetryRetriable(ctx context.Context) ([]*Job, error) {
 				ZipkinTraceURL:          job.ZipkinTraceURL,
 				SearchID:                job.SearchID,
 				ParentID:                job.ID,
+				DependsOnJobID:          job.DependsOnJobID,
+				DependsOnJobIDs:         append([]string(nil), job.DependsOnJobIDs...),
+				CallbackURL:             job.CallbackURL,
 				Retriable:               true,
 				doneCh:                  make(chan struct{}),
+			}
+			normalizeJobDependencies(newJob)
+			if len(newJob.DependsOnJobIDs) > 0 {
+				if satisfied, _ := q.areDependenciesSatisfiedLocked(newJob); !satisfied {
+					newJob.Status = JobStatusBlockedByDependency
+				}
 			}
 			q.jobs[newJob.ID] = newJob
 			if q.store != nil {

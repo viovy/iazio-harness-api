@@ -44,6 +44,7 @@ func NewRouter(cfg RouterConfig) http.Handler {
 	searchHandler := handlers.NewCodebaseSearchHandler(cfg.Store)
 	promptsHandler := handlers.NewPromptsHandler(cfg.Store, cfg.Queue, cfg.Idempotency)
 	storiesHandler := handlers.NewStoriesHandler(cfg.Store, cfg.Queue, cfg.Idempotency)
+	jobLifecycle := handlers.NewJobLifecycleHandler(cfg.Queue, cfg.Store)
 	agentJobsHandler := handlers.NewAgentJobsHandler(cfg.Queue)
 	agentSyncHandler := handlers.NewAgentSyncHandler(cfg.Store, cfg.Ingestor)
 
@@ -51,6 +52,8 @@ func NewRouter(cfg RouterConfig) http.Handler {
 	mux.Handle("/api/v1/codebase/search", searchHandler)
 	mux.Handle("/api/v1/prompts", promptsHandler)
 	mux.Handle("/api/v1/stories", storiesHandler)
+	mux.HandleFunc("/v1/notifications", jobLifecycle.ServeNotifications)
+	mux.HandleFunc("/api/v1/notifications", jobLifecycle.ServeNotifications)
 	mux.HandleFunc("/api/v1/agent/repos/sync", agentSyncHandler.SyncRepos)
 	mux.HandleFunc("/api/v1/agent/codebase/sync", agentSyncHandler.SyncCodebase)
 	mux.HandleFunc("/api/v1/agent/jobs/claim", agentJobsHandler.ClaimHandler)

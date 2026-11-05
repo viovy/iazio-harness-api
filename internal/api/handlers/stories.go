@@ -45,21 +45,27 @@ type CreateStoryRequest struct {
 	TargetAgent          string   `json:"target_agent,omitempty"`
 	TraceID              string   `json:"trace_id,omitempty"`
 	SearchID             string   `json:"search_id,omitempty"`
+	DependsOnJobID       string   `json:"depends_on_job_id,omitempty"`
+	DependsOnJobIDs      []string `json:"depends_on_job_ids,omitempty"`
+	CallbackURL          string   `json:"callback_url,omitempty"`
 }
 
 // CreateStoryResponse is the response emitted by POST /api/v1/stories.
 type CreateStoryResponse struct {
-	HarnessJobID     string `json:"harness_job_id"`
-	Status           string `json:"status"`
-	StoryID          string `json:"story_id,omitempty"`
-	Submodule        string `json:"submodule"`
-	StoryPath        string `json:"story_path,omitempty"`
-	IndexUpdated     bool   `json:"index_updated,omitempty"`
-	SyncState        string `json:"sync_state,omitempty"`
-	ExecutionJobID   string `json:"execution_job_id,omitempty"`
-	ExecutionStatus  string `json:"execution_status,omitempty"`
-	CreatedAt        string `json:"created_at"`
-	IdempotentReplay bool   `json:"idempotent_replay"`
+	HarnessJobID     string   `json:"harness_job_id"`
+	Status           string   `json:"status"`
+	StoryID          string   `json:"story_id,omitempty"`
+	Submodule        string   `json:"submodule"`
+	StoryPath        string   `json:"story_path,omitempty"`
+	IndexUpdated     bool     `json:"index_updated,omitempty"`
+	SyncState        string   `json:"sync_state,omitempty"`
+	ExecutionJobID   string   `json:"execution_job_id,omitempty"`
+	ExecutionStatus  string   `json:"execution_status,omitempty"`
+	DependsOnJobID   string   `json:"depends_on_job_id,omitempty"`
+	DependsOnJobIDs  []string `json:"depends_on_job_ids,omitempty"`
+	CallbackURL      string   `json:"callback_url,omitempty"`
+	CreatedAt        string   `json:"created_at"`
+	IdempotentReplay bool     `json:"idempotent_replay"`
 }
 
 // StoryResultPayload matches the JSON result emitted by iazio-harness upon story creation.
@@ -324,6 +330,9 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var execJobID string
 	var executionStatus string
+	var outDependsOnID string
+	var outDependsOnIDs []string
+	var outCallbackURL string
 	if req.Enqueue || storyID == "" {
 		targetAgent := strings.TrimSpace(req.TargetAgent)
 		var alloc control.ToolPriorityAllocation
@@ -382,6 +391,9 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"acceptance_criteria":   req.AcceptanceCriteria,
 			"target_files":          req.TargetFiles,
 			"depends_on":            req.DependsOn,
+			"depends_on_job_id":     strings.TrimSpace(req.DependsOnJobID),
+			"depends_on_job_ids":    req.DependsOnJobIDs,
+			"callback_url":          strings.TrimSpace(req.CallbackURL),
 			"verification_commands": req.VerificationCommands,
 		})
 		if h.queue != nil {
@@ -408,10 +420,19 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				TraceID:               jobTraceID,
 				ParentID:              span.ID,
 				SearchID:              strings.TrimSpace(req.SearchID),
+				DependsOnJobID:        strings.TrimSpace(req.DependsOnJobID),
+				DependsOnJobIDs:       req.DependsOnJobIDs,
+				CallbackURL:           strings.TrimSpace(req.CallbackURL),
 			})
 			if ej != nil {
 				execJobID = ej.ID
-				executionStatus = "pending"
+				executionStatus = ej.Status
+				if executionStatus == "" {
+					executionStatus = "pending"
+				}
+				outDependsOnID = ej.DependsOnJobID
+				outDependsOnIDs = ej.DependsOnJobIDs
+				outCallbackURL = ej.CallbackURL
 			}
 		} else if h.scheduler != nil {
 			sch, err := h.scheduler.EnqueueGlobalStorySchedule(storyID, req.Submodule, targetAgent, promptText)
@@ -432,6 +453,9 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		SyncState:        "PENDING_WORKSPACE_MATERIALIZATION",
 		ExecutionJobID:   execJobID,
 		ExecutionStatus:  executionStatus,
+		DependsOnJobID:   outDependsOnID,
+		DependsOnJobIDs:  outDependsOnIDs,
+		CallbackURL:      outCallbackURL,
 		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
 		IdempotentReplay: false,
 	}

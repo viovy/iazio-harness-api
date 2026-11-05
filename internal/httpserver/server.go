@@ -187,6 +187,20 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/v1/prompts", promptsHandler)
 
 	jobLifecycle := handlers.NewJobLifecycleHandler(queue, codebaseStore)
+	jobLifecycle.SetNotificationRecorder(func(n handlers.NotificationRecord) {
+		s.RecordNotification(NotificationRecord{
+			ID:        n.ID,
+			Title:     n.Title,
+			Message:   n.Message,
+			Category:  n.Category,
+			Event:     n.Event,
+			Timestamp: n.Timestamp,
+			Source:    n.Source,
+			JobID:     n.JobID,
+			HostID:    n.HostID,
+			Metadata:  n.Metadata,
+		})
+	})
 	if s.Engine != nil {
 		jobLifecycle.SetEngine(s.Engine)
 		jobLifecycle.SetScheduler(s.Engine)

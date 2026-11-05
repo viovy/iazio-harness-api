@@ -17,26 +17,32 @@ import (
 
 // CreatePromptRequest is the payload accepted by POST /api/v1/prompts.
 type CreatePromptRequest struct {
-	PromptID    string `json:"prompt_id,omitempty"`
-	Repo        string `json:"repo"`
-	Branch      string `json:"branch,omitempty"`
-	Title       string `json:"title"`
-	Prompt      string `json:"prompt"`
-	TargetAgent string `json:"target_agent,omitempty"`
-	TargetHost  string `json:"target_host,omitempty"`
-	Enqueue     bool   `json:"enqueue,omitempty"`
-	TraceID     string `json:"trace_id,omitempty"`
-	SearchID    string `json:"search_id,omitempty"`
+	PromptID        string   `json:"prompt_id,omitempty"`
+	Repo            string   `json:"repo"`
+	Branch          string   `json:"branch,omitempty"`
+	Title           string   `json:"title"`
+	Prompt          string   `json:"prompt"`
+	TargetAgent     string   `json:"target_agent,omitempty"`
+	TargetHost      string   `json:"target_host,omitempty"`
+	Enqueue         bool     `json:"enqueue,omitempty"`
+	TraceID         string   `json:"trace_id,omitempty"`
+	SearchID        string   `json:"search_id,omitempty"`
+	DependsOnJobID  string   `json:"depends_on_job_id,omitempty"`
+	DependsOnJobIDs []string `json:"depends_on_job_ids,omitempty"`
+	CallbackURL     string   `json:"callback_url,omitempty"`
 }
 
 // CreatePromptResponse is the response emitted by POST /api/v1/prompts.
 type CreatePromptResponse struct {
-	PromptID         string `json:"prompt_id"`
-	Repo             string `json:"repo"`
-	HarnessJobID     string `json:"harness_job_id,omitempty"`
-	Status           string `json:"status"`
-	CreatedAt        string `json:"created_at"`
-	IdempotentReplay bool   `json:"idempotent_replay"`
+	PromptID         string   `json:"prompt_id"`
+	Repo             string   `json:"repo"`
+	HarnessJobID     string   `json:"harness_job_id,omitempty"`
+	Status           string   `json:"status"`
+	DependsOnJobID   string   `json:"depends_on_job_id,omitempty"`
+	DependsOnJobIDs  []string `json:"depends_on_job_ids,omitempty"`
+	CallbackURL      string   `json:"callback_url,omitempty"`
+	CreatedAt        string   `json:"created_at"`
+	IdempotentReplay bool     `json:"idempotent_replay"`
 }
 
 // PromptsHandler handles prompt creation and dispatch.
@@ -186,6 +192,9 @@ func (h *PromptsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	status := "created"
 	harnessJobID := ""
+	var outDependsOnID string
+	var outDependsOnIDs []string
+	var outCallbackURL string
 
 	if req.Enqueue && h.queue != nil {
 		payloadBytes, err := json.Marshal(req)
@@ -208,13 +217,23 @@ func (h *PromptsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			TraceID:              jobTraceID,
 			ParentID:             span.ID,
 			SearchID:             strings.TrimSpace(req.SearchID),
+			DependsOnJobID:       strings.TrimSpace(req.DependsOnJobID),
+			DependsOnJobIDs:      req.DependsOnJobIDs,
+			CallbackURL:          strings.TrimSpace(req.CallbackURL),
 		})
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to enqueue prompt: %v", err))
 			return
 		}
-		status = "queued"
+		if job.Status == dispatch.JobStatusBlockedByDependency || job.Status == dispatch.JobStatusFailed {
+			status = job.Status
+		} else {
+			status = "queued"
+		}
 		harnessJobID = job.ID
+		outDependsOnID = job.DependsOnJobID
+		outDependsOnIDs = job.DependsOnJobIDs
+		outCallbackURL = job.CallbackURL
 	}
 
 	resp := CreatePromptResponse{
@@ -222,6 +241,9 @@ func (h *PromptsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Repo:             req.Repo,
 		HarnessJobID:     harnessJobID,
 		Status:           status,
+		DependsOnJobID:   outDependsOnID,
+		DependsOnJobIDs:  outDependsOnIDs,
+		CallbackURL:      outCallbackURL,
 		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
 		IdempotentReplay: false,
 	}
