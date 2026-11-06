@@ -782,9 +782,12 @@ func dispatchScheduleView(j *dispatch.Job) map[string]any {
 	}
 	iterRem := 1
 	iterComp := 0
-	if status == "COMPLETED" {
+	switch status {
+	case "COMPLETED":
 		iterRem = 0
 		iterComp = 1
+	case "REQUEUED", "FAILED", "CANCELLED", "CANCELED", "DEAD_LETTER", "TIMED_OUT", "ABANDONED", "DECLINED":
+		iterRem = 0
 	}
 	schedID := dispatchJobScheduleID(j.ID)
 	zID, zURL := resolveDispatchZipkinTrace(j)

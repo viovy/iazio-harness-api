@@ -2054,15 +2054,18 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 			AuthCheckedAt:     t.AuthCheckedAt,
 		})
 	}
+	hostID := r.PathValue("id")
 	var activeJobs []control.ActiveJob
 	for _, aj := range raw.ActiveJobs {
+		if !s.shouldAcceptHeartbeatActiveJob(r.Context(), hostID, aj.JobID, aj.WorktreePath) {
+			continue
+		}
 		activeJobs = append(activeJobs, control.ActiveJob{
 			JobID:        aj.JobID,
 			WorktreePath: aj.WorktreePath,
 			PID:          aj.PID,
 		})
 	}
-	hostID := r.PathValue("id")
 	if err := s.Engine.HeartbeatWithCapabilities(hostID, raw.Presence, tools, raw.FetchFailed, raw.SupportedCapabilities, raw.Version, raw.CommitSHA, activeJobs...); err != nil {
 		writeErr(w, http.StatusNotFound, err)
 		return
@@ -2101,6 +2104,53 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		res["pending_commands"] = pendingCmds
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) shouldAcceptHeartbeatActiveJob(ctx context.Context, hostID, jobID, worktreePath string) bool {
+	id := strings.TrimSpace(jobID)
+	if id == "" {
+		return false
+	}
+	if id == "job-cp-fallback" || strings.HasPrefix(id, "job-reap-") || strings.HasPrefix(id, "job-missing-") ||
+		strings.Contains(worktreePath, "TestExecuteJob_") || strings.Contains(worktreePath, "/T/Test") || strings.Contains(worktreePath, `\Temp\Test`) {
+		if s.Queue != nil {
+			_, _ = s.Queue.Cancel(ctx, id, "synthetic_test_job")
+		}
+		if s.Engine != nil {
+			s.Engine.ReleaseRepoLockIfMatchingJob(hostID, id)
+		}
+		return false
+	}
+	if s.Engine != nil {
+		if ej, ok := s.Engine.GetJob(id); ok {
+			st := strings.ToUpper(strings.TrimSpace(ej.Status))
+			if st == "COMPLETED" || st == "FINISHED" || st == "FAILED" || st == "CANCELLED" || st == "CANCELED" || st == "ABANDONED" || st == "DECLINED" {
+				if s.Queue != nil {
+					_, _ = s.Queue.Cancel(ctx, id, "terminal_engine_job")
+				}
+				s.Engine.ReleaseRepoLockIfMatchingJob(hostID, id)
+				return false
+			}
+		}
+	}
+	if s.Queue != nil {
+		if qj, ok := s.Queue.Get(id); ok && qj != nil {
+			if qj.Status == dispatch.JobStatusCompleted || qj.Status == dispatch.JobStatusCanceled || qj.Status == dispatch.JobStatusRequeued {
+				if s.Engine != nil {
+					s.Engine.ReleaseRepoLockIfMatchingJob(hostID, id)
+				}
+				return false
+			}
+			if qj.Type == "" && qj.NormalizedPrompt == "" && len(qj.Payload) == 0 && !qj.CreatedAt.IsZero() && time.Since(qj.CreatedAt) > 10*time.Minute {
+				_, _ = s.Queue.Cancel(ctx, id, "phantom_empty_job")
+				if s.Engine != nil {
+					s.Engine.ReleaseRepoLockIfMatchingJob(hostID, id)
+				}
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (s *Server) getAgentTools(w http.ResponseWriter, r *http.Request) {

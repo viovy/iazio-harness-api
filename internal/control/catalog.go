@@ -370,6 +370,14 @@ func (e *Engine) HeartbeatWithCapabilities(id, presence string, tools []Tool, fe
 	}
 	for _, r := range e.repos {
 		if r != nil && r.HostID == id && r.Lock == LockRunning && r.RunningJobID != "" {
+			if !activeMap[r.RunningJobID] {
+				if j, ok := e.jobs[r.RunningJobID]; ok && j != nil && j.Status != "RUNNING" && j.Status != "LEASED" && j.Status != "QUEUED" && j.Status != "PENDING" {
+					r.Lock = LockIdle
+					r.RunningJobID = ""
+					r.LockHolder = ""
+					continue
+				}
+			}
 			h.HarnessActive = true
 		}
 	}
@@ -392,6 +400,22 @@ func (e *Engine) HeartbeatWithCapabilities(id, presence string, tools []Tool, fe
 // Heartbeat stores the tool inventory, marks the host online, and reconciles active jobs.
 func (e *Engine) Heartbeat(id string, tools []Tool, fetchFailed bool, activeJobs ...ActiveJob) error {
 	return e.HeartbeatDetailed(id, "ONLINE", tools, fetchFailed, activeJobs...)
+}
+
+// ReleaseRepoLockIfMatchingJob clears LockRunning on any repo of hostID whose RunningJobID equals jobID.
+func (e *Engine) ReleaseRepoLockIfMatchingJob(hostID, jobID string) {
+	if strings.TrimSpace(jobID) == "" {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, r := range e.repos {
+		if r != nil && (hostID == "" || r.HostID == hostID) && r.RunningJobID == jobID {
+			r.Lock = LockIdle
+			r.RunningJobID = ""
+			r.LockHolder = ""
+		}
+	}
 }
 
 // SetHostEagerUpdate updates the eager update telemetry reported by the agent.
