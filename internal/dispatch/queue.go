@@ -71,7 +71,121 @@ const (
 
 const (
 	DefaultLeaseAckDeadline = 20 * time.Second
+	// DefaultWebBaseURL is the canonical public base URL for iazio-web deep links.
+	DefaultWebBaseURL = "https://tian.go.ro/iazio-web"
 )
+
+// ResolveWebBaseURL returns the configured iazio-web base URL (from IAZIO_WEB_BASE_URL
+// or PUBLIC_WEB_URL), defaulting to https://tian.go.ro/iazio-web and never example.com.
+func ResolveWebBaseURL() string {
+	for _, envKey := range []string{"IAZIO_WEB_BASE_URL", "PUBLIC_WEB_URL"} {
+		if val := strings.TrimSpace(os.Getenv(envKey)); val != "" && !strings.Contains(strings.ToLower(val), "example.com") {
+			return strings.TrimRight(val, "/")
+		}
+	}
+	return DefaultWebBaseURL
+}
+
+// BuildConversationURL computes the persistent iazio-web deep link for a conversation ID.
+func BuildConversationURL(webBaseURL, conversationID string) string {
+	cid := strings.TrimSpace(conversationID)
+	if cid == "" {
+		return ""
+	}
+	base := strings.TrimSpace(webBaseURL)
+	if base == "" || strings.Contains(strings.ToLower(base), "example.com") {
+		base = ResolveWebBaseURL()
+	}
+	return strings.TrimRight(base, "/") + "/conversation/" + cid
+}
+
+// ResolveJobConversationID resolves the canonical conversation ID for a job from its
+// first-class fields, Result JSON, or Payload JSON.
+func ResolveJobConversationID(j *Job) string {
+	if j == nil {
+		return ""
+	}
+	for _, cand := range []string{
+		j.ActiveConversationID,
+		j.ConversationID,
+		j.ResumeConversationID,
+		j.InitialConversationID,
+	} {
+		if trimmed := strings.TrimSpace(cand); trimmed != "" {
+			return trimmed
+		}
+	}
+	for _, raw := range j.ConversationIDs {
+		if trimmed := strings.TrimSpace(raw); trimmed != "" {
+			return trimmed
+		}
+	}
+	for _, blob := range []json.RawMessage{j.Result, j.Payload} {
+		if len(blob) == 0 {
+			continue
+		}
+		var m map[string]any
+		if json.Unmarshal(blob, &m) == nil && m != nil {
+			for _, key := range []string{"active_conversation_id", "conversation_id", "resume_conversation_id", "initial_conversation_id"} {
+				if v, ok := m[key].(string); ok && strings.TrimSpace(v) != "" {
+					return strings.TrimSpace(v)
+				}
+			}
+			if arr, ok := m["conversation_ids"].([]any); ok {
+				for _, item := range arr {
+					if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+						return strings.TrimSpace(s)
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// PopulateJobConversationFields synchronizes ConversationID, ActiveConversationID,
+// ConversationIDs, and ConversationURL on a Job record.
+func PopulateJobConversationFields(j *Job) {
+	if j == nil {
+		return
+	}
+	for _, blob := range []json.RawMessage{j.Result, j.Payload} {
+		if len(blob) == 0 {
+			continue
+		}
+		var m map[string]any
+		if json.Unmarshal(blob, &m) == nil && m != nil {
+			if arr, ok := m["conversation_ids"].([]any); ok {
+				for _, item := range arr {
+					if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+						addConversationIDLocked(j, strings.TrimSpace(s))
+					}
+				}
+			}
+			for _, key := range []string{"active_conversation_id", "conversation_id"} {
+				if v, ok := m[key].(string); ok && strings.TrimSpace(v) != "" {
+					cid := strings.TrimSpace(v)
+					if j.ActiveConversationID == "" {
+						j.ActiveConversationID = cid
+					}
+					addConversationIDLocked(j, cid)
+				}
+			}
+		}
+	}
+	resolved := ResolveJobConversationID(j)
+	if resolved != "" {
+		if j.ConversationID == "" {
+			j.ConversationID = resolved
+		}
+		if j.ActiveConversationID == "" {
+			j.ActiveConversationID = resolved
+		}
+		addConversationIDLocked(j, resolved)
+		j.ConversationID = j.ActiveConversationID
+		j.ConversationURL = BuildConversationURL("", j.ConversationID)
+	}
+}
 
 // AttemptFailure models one failed dispatch or execution attempt.
 type AttemptFailure struct {
@@ -201,8 +315,10 @@ type Job struct {
 	ElapsedSeconds          int64                `json:"elapsed_seconds,omitempty"`
 	ResumeConversationID    string               `json:"resume_conversation_id,omitempty"`
 	InitialConversationID   string               `json:"initial_conversation_id,omitempty"`
+	ConversationID          string               `json:"conversation_id,omitempty"`
 	ActiveConversationID    string               `json:"active_conversation_id,omitempty"`
 	ConversationIDs         []string             `json:"conversation_ids,omitempty"`
+	ConversationURL         string               `json:"conversation_url,omitempty"`
 	DependsOnJobID          string               `json:"depends_on_job_id,omitempty"`
 	DependsOnJobIDs         []string             `json:"depends_on_job_ids,omitempty"`
 	CallbackURL             string               `json:"callback_url,omitempty"`
@@ -515,6 +631,7 @@ func (q *InMemoryQueue) SetStore(s QueueStore) error {
 		now := q.now()
 		for _, j := range persisted {
 			normalizeJobDependencies(j)
+			PopulateJobConversationFields(j)
 			if j.FencingToken > q.fencingSeq {
 				q.fencingSeq = j.FencingToken
 			}
@@ -843,6 +960,7 @@ func (q *InMemoryQueue) Enqueue(ctx context.Context, job *Job) (*Job, error) {
 	job.doneCh = make(chan struct{})
 
 	normalizeJobDependencies(job)
+	PopulateJobConversationFields(job)
 	var failedOnEnqueue *Job
 	if len(job.DependsOnJobIDs) > 0 {
 		satisfied, failedDep := q.areDependenciesSatisfiedLocked(job)
@@ -983,6 +1101,7 @@ func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []str
 	oldest.LeaseExpiresAt = &expires
 	oldest.LeaseOwner = hostID
 	oldest.LeaseVersion = oldest.FencingToken
+	PopulateJobConversationFields(oldest)
 	if q.store != nil {
 		if err := q.store.SaveQueueJob(ctx, oldest); err != nil {
 			log.Printf("[dispatch-queue] ERROR: failed to persist claimed job %s: %v", oldest.ID, err)
@@ -1080,6 +1199,7 @@ func (q *InMemoryQueue) HeartbeatWithStory(ctx context.Context, jobID string, fe
 	job.HeartbeatAt = &now
 	expires := now.Add(DefaultHeartbeatTimeout)
 	job.LeaseExpiresAt = &expires
+	PopulateJobConversationFields(job)
 	if q.store != nil {
 		sctx, cancel := storeContext(ctx)
 		defer cancel()
@@ -1525,6 +1645,7 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 	if searchID != "" && job.Status == JobStatusCompleted {
 		job.RelevanceEmitted = true
 	}
+	PopulateJobConversationFields(job)
 	if q.store != nil {
 		sctx, cancel := storeContext(ctx)
 		_ = q.store.SaveQueueJob(sctx, job)
@@ -1660,6 +1781,9 @@ func (q *InMemoryQueue) Get(jobID string) (*Job, bool) {
 	defer q.mu.Unlock()
 	q.reapExpiredLocked(q.now())
 	j, ok := q.jobs[jobID]
+	if ok && j != nil {
+		PopulateJobConversationFields(j)
+	}
 	return j, ok
 }
 
@@ -1731,6 +1855,7 @@ func (q *InMemoryQueue) List(ctx context.Context, filter JobFilter) ([]*Job, err
 		if filter.Type != "" && j.Type != filter.Type {
 			continue
 		}
+		PopulateJobConversationFields(j)
 		matched = append(matched, j)
 	}
 
@@ -1899,11 +2024,14 @@ func (q *InMemoryQueue) AckLease(ctx context.Context, jobID, leaseToken string, 
 	}
 	if activeConvID != "" {
 		job.ActiveConversationID = activeConvID
+		job.ConversationID = activeConvID
 		addConversationIDLocked(job, activeConvID)
 	}
+	PopulateJobConversationFields(job)
 	job.HeartbeatAt = &now
 	expires := now.Add(DefaultHeartbeatTimeout)
 	job.LeaseExpiresAt = &expires
+	PopulateJobConversationFields(job)
 	if q.store != nil {
 		sctx, cancel := storeContext(ctx)
 		defer cancel()
@@ -1927,6 +2055,10 @@ func addConversationIDLocked(job *Job, convID string) {
 	if job.ResumeConversationID == "" {
 		job.ResumeConversationID = cid
 	}
+	if job.ConversationID == "" {
+		job.ConversationID = cid
+	}
+	job.ConversationURL = BuildConversationURL("", cid)
 	if len(job.Payload) > 0 {
 		var payloadMap map[string]any
 		if err := json.Unmarshal(job.Payload, &payloadMap); err == nil && payloadMap != nil {
@@ -1979,6 +2111,10 @@ func (q *InMemoryQueue) UpdateRuntimeMetadata(jobID, worktreePath, activeConvID 
 			job.ActiveConversationID = cid
 			changed = true
 		}
+		if job.ConversationID != cid {
+			job.ConversationID = cid
+			changed = true
+		}
 		if job.InitialConversationID == "" || job.ResumeConversationID == "" {
 			changed = true
 		}
@@ -1988,6 +2124,7 @@ func (q *InMemoryQueue) UpdateRuntimeMetadata(jobID, worktreePath, activeConvID 
 			changed = true
 		}
 	}
+	PopulateJobConversationFields(job)
 	if harnessPID > 0 {
 		if job.AgentPID == 0 && toolPID == 0 {
 			job.AgentPID = harnessPID

@@ -39,6 +39,13 @@ func scheduleView(s control.Schedule) map[string]any {
 	if keys == nil {
 		keys = []string{}
 	}
+	cid := strings.TrimSpace(s.ActiveConversationID)
+	if cid == "" {
+		cid = strings.TrimSpace(s.ResumeConversationID)
+	}
+	if cid == "" {
+		cid = strings.TrimSpace(s.InitialConversationID)
+	}
 	return map[string]any{
 		"id":                          s.ID,
 		"prompt_id":                   s.PromptID,
@@ -55,6 +62,8 @@ func scheduleView(s control.Schedule) map[string]any {
 		"status":                      s.Status,
 		"engine":                      s.Engine,
 		"resume_conversation_id":      s.ResumeConversationID,
+		"conversation_id":             cid,
+		"conversation_url":            dispatch.BuildConversationURL("", cid),
 		"story_id":                    s.StoryID,
 		"is_global":                   s.IsGlobal,
 		"parent_job_id":               s.ParentJobID,
@@ -409,6 +418,15 @@ func populateJobResumptionFields(
 	m["root_job_id"] = rootJobID
 	m["initial_conversation_id"] = initialCID
 	m["active_conversation_id"] = activeCID
+	resolvedCID := strings.TrimSpace(activeCID)
+	if resolvedCID == "" {
+		resolvedCID = strings.TrimSpace(initialCID)
+	}
+	if resolvedCID == "" && len(conversationIDs) > 0 {
+		resolvedCID = strings.TrimSpace(conversationIDs[0])
+	}
+	m["conversation_id"] = resolvedCID
+	m["conversation_url"] = dispatch.BuildConversationURL("", resolvedCID)
 	m["resume_mode"] = resumeMode
 	m["resume_fallback_reason"] = resumeFallbackReason
 	m["same_conversation_confirmed"] = sameConvConfirmed || resumeMode == "same_conversation"
@@ -716,6 +734,9 @@ func dispatchScheduleView(j *dispatch.Job) map[string]any {
 	if j == nil {
 		return map[string]any{}
 	}
+	cp := *j
+	dispatch.PopulateJobConversationFields(&cp)
+	j = &cp
 	title, _, storyID := parseDispatchPayload(j.Payload)
 	if j.StoryID != "" {
 		storyID = j.StoryID
@@ -792,6 +813,10 @@ func dispatchScheduleView(j *dispatch.Job) map[string]any {
 		"status":                 status,
 		"engine":                 engine,
 		"resume_conversation_id": j.ResumeConversationID,
+		"conversation_id":        j.ConversationID,
+		"active_conversation_id": j.ActiveConversationID,
+		"conversation_ids":       j.ConversationIDs,
+		"conversation_url":       j.ConversationURL,
 		"story_id":               storyID,
 		"is_global":              true,
 		"trace_id":               j.TraceID,
@@ -814,6 +839,9 @@ func dispatchJobToHistoryRow(j *dispatch.Job) control.HistoryRow {
 	if j == nil {
 		return control.HistoryRow{}
 	}
+	cp := *j
+	dispatch.PopulateJobConversationFields(&cp)
+	j = &cp
 	title, _, storyID := parseDispatchPayload(j.Payload)
 	if j.StoryID != "" {
 		storyID = j.StoryID
@@ -894,6 +922,9 @@ func dispatchHistoryView(j *dispatch.Job) map[string]any {
 	if j == nil {
 		return map[string]any{}
 	}
+	cp := *j
+	dispatch.PopulateJobConversationFields(&cp)
+	j = &cp
 	title, _, storyID := parseDispatchPayload(j.Payload)
 	if j.StoryID != "" {
 		storyID = j.StoryID
@@ -953,7 +984,9 @@ func dispatchHistoryView(j *dispatch.Job) map[string]any {
 		"clean":                  clean,
 		"ase_complete":           clean,
 		"conversation_ids":       convIDs,
+		"conversation_id":        j.ConversationID,
 		"active_conversation_id": j.ActiveConversationID,
+		"conversation_url":       j.ConversationURL,
 		"reason":                 j.Error,
 		"error_message":          j.Error,
 		"diagnostic_code":        "",
@@ -981,6 +1014,9 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 	if j == nil {
 		return map[string]any{}
 	}
+	cp := *j
+	dispatch.PopulateJobConversationFields(&cp)
+	j = &cp
 	title, promptText, storyID := parseDispatchPayload(j.Payload)
 	if j.StoryID != "" {
 		storyID = j.StoryID
@@ -1096,8 +1132,10 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 		"env_vars":                       map[string]string{},
 		"max_execution_duration_seconds": 0,
 		"resume_conversation_id":         j.ResumeConversationID,
+		"conversation_id":                j.ConversationID,
 		"active_conversation_id":         j.ActiveConversationID,
 		"conversation_ids":               convIDs,
+		"conversation_url":               j.ConversationURL,
 		"harness_pid":                    harnessPID,
 		"tool_pid":                       j.ToolPID,
 		"agent_pid":                      j.AgentPID,

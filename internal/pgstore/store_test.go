@@ -547,6 +547,8 @@ func TestSaveQueueJobUpsertSQL_IncludesAllColumns(t *testing.T) {
 		"depends_on_job_id = EXCLUDED.depends_on_job_id",
 		"depends_on_job_ids = EXCLUDED.depends_on_job_ids",
 		"callback_url = EXCLUDED.callback_url",
+		"conversation_id = EXCLUDED.conversation_id",
+		"conversation_ids = EXCLUDED.conversation_ids",
 	}
 	for _, col := range requiredColumns {
 		if !strings.Contains(SaveQueueJobUpsertSQL, col) {
