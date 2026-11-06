@@ -317,7 +317,9 @@ CREATE TABLE IF NOT EXISTS harness_dispatch_jobs (
   source_conversation_title text NOT NULL DEFAULT '',
   agent_affinity text NOT NULL DEFAULT '',
   agent_pid integer NOT NULL DEFAULT 0,
+  conversation_id text NOT NULL DEFAULT '',
   active_conversation_id text NOT NULL DEFAULT '',
+  conversation_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
   lease_ack_deadline_at timestamp with time zone,
   depends_on_job_id text NOT NULL DEFAULT '',
   depends_on_job_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
@@ -343,7 +345,9 @@ ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS effective_action text
 ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS source_conversation_title text NOT NULL DEFAULT '';
 ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS agent_affinity text NOT NULL DEFAULT '';
 ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS agent_pid integer NOT NULL DEFAULT 0;
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS conversation_id text NOT NULL DEFAULT '';
 ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS active_conversation_id text NOT NULL DEFAULT '';
+ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS conversation_ids jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS lease_ack_deadline_at timestamp with time zone;
 ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS depends_on_job_id text NOT NULL DEFAULT '';
 ALTER TABLE harness_dispatch_jobs ADD COLUMN IF NOT EXISTS depends_on_job_ids jsonb NOT NULL DEFAULT '[]'::jsonb;
@@ -1276,7 +1280,7 @@ INSERT INTO harness_dispatch_jobs (
   parent_id, final_turn_count, final_transcript_sha256, allocation_source,
   priority_rank_selected, effective_action, source_conversation_title,
   agent_affinity, agent_pid, active_conversation_id, lease_ack_deadline_at,
-  depends_on_job_id, depends_on_job_ids, callback_url, updated_at
+  depends_on_job_id, depends_on_job_ids, callback_url, conversation_id, conversation_ids, updated_at
 ) VALUES (
   $1, $2, $3, $4, $5, $6, $7, $8,
   $9, $10, $11, $12, $13, $14, $15, $16,
@@ -1286,7 +1290,7 @@ INSERT INTO harness_dispatch_jobs (
   $34, $35, $36, $37,
   $38, $39, $40,
   $41, $42, $43, $44,
-  $45, $46, $47, now()
+  $45, $46, $47, $48, $49, now()
 )
 ON CONFLICT (id) DO UPDATE SET
   type = EXCLUDED.type,
@@ -1334,6 +1338,8 @@ ON CONFLICT (id) DO UPDATE SET
   depends_on_job_id = EXCLUDED.depends_on_job_id,
   depends_on_job_ids = EXCLUDED.depends_on_job_ids,
   callback_url = EXCLUDED.callback_url,
+  conversation_id = EXCLUDED.conversation_id,
+  conversation_ids = EXCLUDED.conversation_ids,
   updated_at = now();
 `
 
@@ -1342,6 +1348,7 @@ func (s *Store) SaveQueueJob(ctx context.Context, job *dispatch.Job) error {
 	if s == nil || s.db == nil || job == nil {
 		return nil
 	}
+	dispatch.PopulateJobConversationFields(job)
 	payloadBytes := job.Payload
 	if len(payloadBytes) == 0 {
 		payloadBytes = []byte("{}")
@@ -1358,6 +1365,10 @@ func (s *Store) SaveQueueJob(ctx context.Context, job *dispatch.Job) error {
 	if err != nil || len(dependsOnIDsBytes) == 0 || string(dependsOnIDsBytes) == "null" {
 		dependsOnIDsBytes = []byte("[]")
 	}
+	convIDsBytes, err := json.Marshal(job.ConversationIDs)
+	if err != nil || len(convIDsBytes) == 0 || string(convIDsBytes) == "null" {
+		convIDsBytes = []byte("[]")
+	}
 	affinityJSON := ""
 	if job.AgentAffinity != nil {
 		if b, mErr := json.Marshal(job.AgentAffinity); mErr == nil && string(b) != "null" {
@@ -1373,7 +1384,7 @@ func (s *Store) SaveQueueJob(ctx context.Context, job *dispatch.Job) error {
 		job.ParentID, job.FinalTurnCount, job.FinalTranscriptSHA256, job.AllocationSource,
 		job.PriorityRankSelected, job.EffectiveAction, job.SourceConversationTitle,
 		affinityJSON, job.AgentPID, job.ActiveConversationID, job.LeaseAckDeadlineAt,
-		job.DependsOnJobID, string(dependsOnIDsBytes), job.CallbackURL,
+		job.DependsOnJobID, string(dependsOnIDsBytes), job.CallbackURL, job.ConversationID, string(convIDsBytes),
 	)
 	return err
 }
@@ -1450,7 +1461,7 @@ SELECT id, type, repo, target_host, claimed_host, host_id, target_agent, story_i
        parent_id, final_turn_count, final_transcript_sha256, allocation_source,
        priority_rank_selected, effective_action, source_conversation_title,
        agent_affinity, agent_pid, active_conversation_id, lease_ack_deadline_at,
-       depends_on_job_id, depends_on_job_ids, callback_url
+       depends_on_job_id, depends_on_job_ids, callback_url, conversation_id, conversation_ids
 FROM harness_dispatch_jobs
 ORDER BY created_at ASC;
 `)
@@ -1462,7 +1473,7 @@ ORDER BY created_at ASC;
 	var jobs []*dispatch.Job
 	for rows.Next() {
 		var j dispatch.Job
-		var payloadBytes, resultBytes, attemptHistBytes, dependsOnIDsBytes []byte
+		var payloadBytes, resultBytes, attemptHistBytes, dependsOnIDsBytes, convIDsBytes []byte
 		var affinityJSON string
 		var claimedAt, heartbeatAt, leaseExpiresAt, completedAt, leaseAckDeadlineAt *time.Time
 		if err := rows.Scan(
@@ -1475,7 +1486,7 @@ ORDER BY created_at ASC;
 			&j.ParentID, &j.FinalTurnCount, &j.FinalTranscriptSHA256, &j.AllocationSource,
 			&j.PriorityRankSelected, &j.EffectiveAction, &j.SourceConversationTitle,
 			&affinityJSON, &j.AgentPID, &j.ActiveConversationID, &leaseAckDeadlineAt,
-			&j.DependsOnJobID, &dependsOnIDsBytes, &j.CallbackURL,
+			&j.DependsOnJobID, &dependsOnIDsBytes, &j.CallbackURL, &j.ConversationID, &convIDsBytes,
 		); err != nil {
 			return nil, err
 		}
@@ -1488,6 +1499,9 @@ ORDER BY created_at ASC;
 		j.LeaseAckDeadlineAt = leaseAckDeadlineAt
 		if len(dependsOnIDsBytes) > 0 {
 			_ = json.Unmarshal(dependsOnIDsBytes, &j.DependsOnJobIDs)
+		}
+		if len(convIDsBytes) > 0 {
+			_ = json.Unmarshal(convIDsBytes, &j.ConversationIDs)
 		}
 		if strings.TrimSpace(affinityJSON) != "" {
 			var aff dispatch.AgentAffinity
@@ -1505,6 +1519,9 @@ ORDER BY created_at ASC;
 			var resMap map[string]any
 			if json.Unmarshal(resultBytes, &resMap) == nil {
 				if cid, _ := resMap["active_conversation_id"].(string); strings.TrimSpace(cid) != "" && j.ActiveConversationID == "" {
+					j.ActiveConversationID = strings.TrimSpace(cid)
+				}
+				if cid, _ := resMap["conversation_id"].(string); strings.TrimSpace(cid) != "" && j.ActiveConversationID == "" {
 					j.ActiveConversationID = strings.TrimSpace(cid)
 				}
 				if cids, ok := resMap["conversation_ids"].([]any); ok {
@@ -1528,6 +1545,7 @@ ORDER BY created_at ASC;
 		if j.ActiveConversationID != "" && len(j.ConversationIDs) == 0 {
 			j.ConversationIDs = []string{j.ActiveConversationID}
 		}
+		dispatch.PopulateJobConversationFields(&j)
 		if j.ElapsedSeconds <= 0 && j.CompletedAt != nil {
 			start := j.CreatedAt
 			if j.ClaimedAt != nil && !j.ClaimedAt.IsZero() {

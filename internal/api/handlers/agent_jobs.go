@@ -29,15 +29,17 @@ type CompleteJobRequest struct {
 
 // HeartbeatJobRequest is sent by an iazio-agent daemon to extend its execution lease.
 type HeartbeatJobRequest struct {
-	FencingToken         int64  `json:"fencing_token"`
-	LeaseToken           string `json:"lease_token,omitempty"`
-	StoryID              string `json:"story_id,omitempty"`
-	WorktreePath         string `json:"worktree_path,omitempty"`
-	Repo                 string `json:"repo,omitempty"`
-	AgentPID             int    `json:"agent_pid,omitempty"`
-	ToolPID              int    `json:"tool_pid,omitempty"`
-	ActiveConversationID string `json:"active_conversation_id,omitempty"`
-	ElapsedSeconds       int64  `json:"elapsed_seconds,omitempty"`
+	FencingToken         int64    `json:"fencing_token"`
+	LeaseToken           string   `json:"lease_token,omitempty"`
+	StoryID              string   `json:"story_id,omitempty"`
+	WorktreePath         string   `json:"worktree_path,omitempty"`
+	Repo                 string   `json:"repo,omitempty"`
+	AgentPID             int      `json:"agent_pid,omitempty"`
+	ToolPID              int      `json:"tool_pid,omitempty"`
+	ConversationID       string   `json:"conversation_id,omitempty"`
+	ActiveConversationID string   `json:"active_conversation_id,omitempty"`
+	ConversationIDs      []string `json:"conversation_ids,omitempty"`
+	ElapsedSeconds       int64    `json:"elapsed_seconds,omitempty"`
 }
 
 // AgentJobsHandler manages agent job claims and completion reports.
@@ -207,7 +209,10 @@ func (h *AgentJobsHandler) CompleteHandler(w http.ResponseWriter, r *http.Reques
 				}
 			}
 			resWT, _ := resMap["worktree_path"].(string)
-			resConv, _ := resMap["conversation_id"].(string)
+			resConv, _ := resMap["active_conversation_id"].(string)
+			if strings.TrimSpace(resConv) == "" {
+				resConv, _ = resMap["conversation_id"].(string)
+			}
 			if (resWT != "" || resConv != "") && h.queue != nil {
 				if updater, ok := h.queue.(interface {
 					UpdateRuntimeMetadata(jobID, worktreePath, activeConvID string, harnessPID, toolPID int, elapsedSec int64) (*dispatch.Job, bool)
@@ -277,6 +282,13 @@ func (h *AgentJobsHandler) HeartbeatHandler(w http.ResponseWriter, r *http.Reque
 	var req HeartbeatJobRequest
 	if r.Body != nil {
 		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req)
+	}
+	if strings.TrimSpace(req.ActiveConversationID) == "" {
+		if strings.TrimSpace(req.ConversationID) != "" {
+			req.ActiveConversationID = strings.TrimSpace(req.ConversationID)
+		} else if len(req.ConversationIDs) > 0 && strings.TrimSpace(req.ConversationIDs[0]) != "" {
+			req.ActiveConversationID = strings.TrimSpace(req.ConversationIDs[0])
+		}
 	}
 
 	if h.queue == nil {
@@ -372,7 +384,9 @@ func (h *AgentJobsHandler) HeartbeatHandler(w http.ResponseWriter, r *http.Reque
 		if updater, ok := h.queue.(interface {
 			UpdateRuntimeMetadata(jobID, worktreePath, activeConvID string, harnessPID, toolPID int, elapsedSec int64) (*dispatch.Job, bool)
 		}); ok {
-			updater.UpdateRuntimeMetadata(job.ID, effectiveWT, req.ActiveConversationID, req.AgentPID, req.ToolPID, req.ElapsedSeconds)
+			if updated, okU := updater.UpdateRuntimeMetadata(job.ID, effectiveWT, req.ActiveConversationID, req.AgentPID, req.ToolPID, req.ElapsedSeconds); okU && updated != nil {
+				job = updated
+			}
 		}
 	}
 
@@ -392,12 +406,18 @@ func (h *AgentJobsHandler) HeartbeatHandler(w http.ResponseWriter, r *http.Reque
 		updateIndexStoryStatus(resolveStoriesRootForWrite(h.repoRoot), boundStoryID, "IN_PROGRESS")
 	}
 
+	dispatch.PopulateJobConversationFields(job)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status":           "ok",
-		"job_id":           job.ID,
-		"fencing_token":    job.FencingToken,
-		"lease_expires_at": job.LeaseExpiresAt,
+		"status":                 "ok",
+		"job_id":                 job.ID,
+		"fencing_token":          job.FencingToken,
+		"lease_expires_at":       job.LeaseExpiresAt,
+		"story_id":               job.StoryID,
+		"conversation_id":        job.ConversationID,
+		"active_conversation_id": job.ActiveConversationID,
+		"conversation_ids":       job.ConversationIDs,
+		"conversation_url":       job.ConversationURL,
 	})
 }

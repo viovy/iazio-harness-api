@@ -66,6 +66,8 @@ type TerminalJobCallbackPayload struct {
 	Status          string   `json:"status"`
 	TargetAgent     string   `json:"target_agent,omitempty"`
 	TargetHost      string   `json:"target_host,omitempty"`
+	ConversationID  string   `json:"conversation_id,omitempty"`
+	ConversationURL string   `json:"conversation_url,omitempty"`
 	DurationMs      int64    `json:"duration_ms"`
 	GitHeadSHA      string   `json:"git_head_sha"`
 	Error           string   `json:"error"`
@@ -260,6 +262,7 @@ func BuildTerminalJobCallbackPayload(job *dispatch.Job, promoted []*dispatch.Job
 		effectiveHost = strings.TrimSpace(job.TargetHost)
 	}
 
+	dispatch.PopulateJobConversationFields(job)
 	return TerminalJobCallbackPayload{
 		Event:           "job." + strings.ToLower(strings.TrimSpace(job.Status)),
 		JobID:           job.ID,
@@ -269,6 +272,8 @@ func BuildTerminalJobCallbackPayload(job *dispatch.Job, promoted []*dispatch.Job
 		Status:          job.Status,
 		TargetAgent:     job.TargetAgent,
 		TargetHost:      effectiveHost,
+		ConversationID:  job.ConversationID,
+		ConversationURL: job.ConversationURL,
 		DurationMs:      durationMs,
 		GitHeadSHA:      gitHeadSHA,
 		Error:           job.Error,
@@ -615,8 +620,10 @@ type JobDetailResponse struct {
 	NormalizedPrompt        string                        `json:"normalized_prompt,omitempty"`
 	EffectiveAction         string                        `json:"effective_action,omitempty"`
 	SourceConversationTitle string                        `json:"source_conversation_title,omitempty"`
+	ConversationID          string                        `json:"conversation_id,omitempty"`
 	ActiveConversationID    string                        `json:"active_conversation_id,omitempty"`
 	ConversationIDs         []string                      `json:"conversation_ids,omitempty"`
+	ConversationURL         string                        `json:"conversation_url,omitempty"`
 	AgentPID                int                           `json:"agent_pid,omitempty"`
 	HarnessPID              int                           `json:"harness_pid,omitempty"`
 	ToolPID                 int                           `json:"tool_pid,omitempty"`
@@ -711,6 +718,8 @@ type ExecuteStoryResponse struct {
 	DependsOnJobID        string   `json:"depends_on_job_id,omitempty"`
 	DependsOnJobIDs       []string `json:"depends_on_job_ids,omitempty"`
 	CallbackURL           string   `json:"callback_url,omitempty"`
+	ConversationID        string   `json:"conversation_id,omitempty"`
+	ConversationURL       string   `json:"conversation_url,omitempty"`
 	LiveURL               string   `json:"live_url,omitempty"`
 	CreatedAt             string   `json:"created_at"`
 }
@@ -1210,13 +1219,11 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		if liveRepo == "" || liveRepo == "." {
 			liveRepo = "root"
 		}
-		webBase := os.Getenv("IAZIO_WEB_BASE_URL")
-		if webBase == "" {
-			webBase = "https://example.com/iazio-web"
-		}
+		webBase := dispatch.ResolveWebBaseURL()
 		liveURL = fmt.Sprintf("%s/agents/%s/%s/live?job=%s", strings.TrimRight(webBase, "/"), targetHost, liveRepo, job.ID)
 	}
 
+	dispatch.PopulateJobConversationFields(job)
 	resp := ExecuteStoryResponse{
 		JobID:                 job.ID,
 		StoryID:               storyID,
@@ -1235,6 +1242,8 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		DependsOnJobID:        job.DependsOnJobID,
 		DependsOnJobIDs:       job.DependsOnJobIDs,
 		CallbackURL:           job.CallbackURL,
+		ConversationID:        job.ConversationID,
+		ConversationURL:       job.ConversationURL,
 		LiveURL:               liveURL,
 		CreatedAt:             job.CreatedAt.Format(time.RFC3339),
 	}
@@ -1308,6 +1317,17 @@ func formatHistoryRowToJobDetail(row control.HistoryRow, host, path string) JobD
 	if schedID == "" && strings.HasPrefix(row.JobID, "job_") {
 		schedID = "sch-" + strings.TrimPrefix(row.JobID, "job_")
 	}
+	activeCID := strings.TrimSpace(row.ActiveConversationID)
+	if activeCID == "" {
+		activeCID = strings.TrimSpace(row.InitialConversationID)
+	}
+	convIDs := row.ConversationIDs
+	if activeCID == "" && len(convIDs) > 0 {
+		activeCID = strings.TrimSpace(convIDs[0])
+	}
+	if len(convIDs) == 0 && activeCID != "" {
+		convIDs = []string{activeCID}
+	}
 	return JobDetailResponse{
 		ID:                    row.JobID,
 		ScheduleID:            schedID,
@@ -1319,6 +1339,10 @@ func formatHistoryRowToJobDetail(row control.HistoryRow, host, path string) JobD
 		StoryAllocationStatus: row.StoryAllocationStatus,
 		AllocationSource:      row.AllocationSource,
 		PriorityRankSelected:  row.PriorityRankSelected,
+		ConversationID:        activeCID,
+		ActiveConversationID:  activeCID,
+		ConversationIDs:       convIDs,
+		ConversationURL:       dispatch.BuildConversationURL("", activeCID),
 		Status:                row.Status,
 		Error:                 row.ErrorMessage,
 		TraceID:               row.TraceID,
@@ -1333,6 +1357,9 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 	if j == nil {
 		return JobDetailResponse{}
 	}
+	cp := *j
+	dispatch.PopulateJobConversationFields(&cp)
+	j = &cp
 
 	promoted := j.PromotedMemories
 	if promoted == nil {
@@ -1432,8 +1459,10 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		NormalizedPrompt:        j.NormalizedPrompt,
 		EffectiveAction:         j.EffectiveAction,
 		SourceConversationTitle: j.SourceConversationTitle,
+		ConversationID:          j.ConversationID,
 		ActiveConversationID:    j.ActiveConversationID,
 		ConversationIDs:         convIDs,
+		ConversationURL:         j.ConversationURL,
 		AgentPID:                j.AgentPID,
 		HarnessPID:              harnessPID,
 		ToolPID:                 j.ToolPID,
@@ -1473,10 +1502,7 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		if liveRepo == "" || liveRepo == "." {
 			liveRepo = "root"
 		}
-		webBase := os.Getenv("IAZIO_WEB_BASE_URL")
-		if webBase == "" {
-			webBase = "https://example.com/iazio-web"
-		}
+		webBase := dispatch.ResolveWebBaseURL()
 		resp.LiveURL = fmt.Sprintf("%s/agents/%s/%s/live?job=%s", strings.TrimRight(webBase, "/"), effectiveHost, liveRepo, j.ID)
 	}
 
@@ -1532,6 +1558,7 @@ type AckLeaseRequest struct {
 	LeaseToken           string `json:"lease_token"`
 	AgentPID             int    `json:"agent_pid"`
 	ToolPID              int    `json:"tool_pid,omitempty"`
+	ConversationID       string `json:"conversation_id,omitempty"`
 	ActiveConversationID string `json:"active_conversation_id"`
 	WorktreePath         string `json:"worktree_path,omitempty"`
 	Repo                 string `json:"repo,omitempty"`
@@ -1556,6 +1583,9 @@ func (h *JobLifecycleHandler) AckLease(w http.ResponseWriter, r *http.Request) {
 		if len(bodyBytes) > 0 {
 			_ = json.Unmarshal(bodyBytes, &req)
 		}
+	}
+	if strings.TrimSpace(req.ActiveConversationID) == "" && strings.TrimSpace(req.ConversationID) != "" {
+		req.ActiveConversationID = strings.TrimSpace(req.ConversationID)
 	}
 
 	var qJob *dispatch.Job
