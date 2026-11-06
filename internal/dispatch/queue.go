@@ -1341,6 +1341,23 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 	}
 
 	for jobID := range activeSet {
+		if jobID == "job-cp-fallback" || strings.HasPrefix(jobID, "job-reap-") || strings.HasPrefix(jobID, "job-missing-") {
+			delete(q.jobs, jobID)
+			continue
+		}
+		if existing, exists := q.jobs[jobID]; exists {
+			if existing != nil && existing.Type == "" && existing.NormalizedPrompt == "" && len(existing.Payload) == 0 && !existing.CreatedAt.IsZero() && now.Sub(existing.CreatedAt) > 10*time.Minute {
+				existing.Status = JobStatusCanceled
+				CompletedAt := now
+				existing.CompletedAt = &CompletedAt
+				if q.store != nil {
+					sctx, cancel := storeContext(ctx)
+					_ = q.store.SaveQueueJob(sctx, existing)
+					cancel()
+				}
+			}
+			continue
+		}
 		if _, exists := q.jobs[jobID]; !exists {
 			var rehydrated *Job
 			if q.store != nil {
@@ -1354,6 +1371,9 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 					}
 				}
 				cancel()
+			}
+			if rehydrated != nil && (rehydrated.Status == JobStatusCompleted || rehydrated.Status == JobStatusCanceled || rehydrated.Status == JobStatusRequeued) {
+				continue
 			}
 			expires := now.Add(DefaultHeartbeatTimeout)
 			if rehydrated != nil {
