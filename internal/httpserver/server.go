@@ -599,6 +599,8 @@ func withAuthWithOAuth(next http.Handler, token string, introspector *oauth.Intr
 				writeJSON(w, http.StatusForbidden, map[string]string{
 					"error":          "insufficient_scope",
 					"required_scope": reqScope,
+					"granted_scope":  res.Scope,
+					"client_id":      res.ClientID,
 				})
 				return
 			}

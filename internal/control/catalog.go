@@ -1121,39 +1121,58 @@ func (e *Engine) RetryCorrelation(jobID string) error {
 	return nil
 }
 
+func isSupervisorHeartbeatChunk(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	return trimmed != "" &&
+		!strings.Contains(trimmed, "\n") &&
+		strings.Contains(trimmed, "[ASE-SUPERVISOR] Execution active (")
+}
+
 // AppendLog stores a chunk and wakes stream subscribers. The ring keeps 500.
 func (e *Engine) AppendLog(jobID string, chunk LogChunk) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	chunk.Seq = len(e.logs[jobID]) + 1
+	existing := e.logs[jobID]
+	nextSeq := len(existing) + 1
+	if len(existing) > 0 && existing[len(existing)-1].Seq >= nextSeq {
+		nextSeq = existing[len(existing)-1].Seq + 1
+	}
+	chunk.Seq = nextSeq
 	if chunk.Type == "" {
 		chunk.Type = "OUTPUT_CHUNK"
 	}
 	if chunk.Type != "OUTPUT_TICK" {
-		e.logs[jobID] = append(e.logs[jobID], chunk)
-		if len(e.logs[jobID]) > RingCap {
-			e.logs[jobID] = trimLogsPreservingHead(e.logs[jobID], RingCap)
+		if len(existing) > 0 && isSupervisorHeartbeatChunk(existing[len(existing)-1].Text) && isSupervisorHeartbeatChunk(chunk.Text) {
+			e.logs[jobID][len(existing)-1] = chunk
+		} else {
+			e.logs[jobID] = append(existing, chunk)
+			if len(e.logs[jobID]) > RingCap {
+				e.logs[jobID] = trimLogsPreservingHead(e.logs[jobID], RingCap)
+			}
 		}
 	}
 	if job, ok := e.jobs[jobID]; ok {
-		extendLeaseExpiry(job, e.now(), ActiveLeaseDuration)
-		job.LastChunkAt = e.now()
-		if chunk.Type != "OUTPUT_TICK" {
-			job.LastOutputAt = e.now()
-		} else if chunk.SilentForMs > 0 {
-			job.LastOutputAt = e.now().Add(-time.Duration(chunk.SilentForMs) * time.Millisecond)
-		}
-		if chunk.HarnessPID > 0 {
-			job.HarnessPID = chunk.HarnessPID
-		}
-		if chunk.ToolPID > 0 {
-			job.ToolPID = chunk.ToolPID
-		}
-		if chunk.ElapsedSeconds > 0 {
-			job.ElapsedSeconds = chunk.ElapsedSeconds
-		}
-		if chunk.ActiveChildTasks != "" {
-			job.ActiveChildTasks = chunk.ActiveChildTasks
+		upperStatus := strings.ToUpper(strings.TrimSpace(job.Status))
+		if upperStatus != "COMPLETED" && upperStatus != "CANCELLED" && upperStatus != "CANCELED" && upperStatus != "FAILED" {
+			extendLeaseExpiry(job, e.now(), ActiveLeaseDuration)
+			job.LastChunkAt = e.now()
+			if chunk.Type != "OUTPUT_TICK" {
+				job.LastOutputAt = e.now()
+			} else if chunk.SilentForMs > 0 {
+				job.LastOutputAt = e.now().Add(-time.Duration(chunk.SilentForMs) * time.Millisecond)
+			}
+			if chunk.HarnessPID > 0 {
+				job.HarnessPID = chunk.HarnessPID
+			}
+			if chunk.ToolPID > 0 {
+				job.ToolPID = chunk.ToolPID
+			}
+			if chunk.ElapsedSeconds > 0 {
+				job.ElapsedSeconds = chunk.ElapsedSeconds
+			}
+			if chunk.ActiveChildTasks != "" {
+				job.ActiveChildTasks = chunk.ActiveChildTasks
+			}
 		}
 		if chunk.Type == "TURN_AUTO_CONTINUED" {
 			if chunk.ContinuationTurn > 0 {

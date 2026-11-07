@@ -5592,3 +5592,97 @@ func TestGov3838_DirtyWorktreePostExitAutoHealAndNoProcessDiedOverwrite(t *testi
 		t.Fatalf("expected schedule status to remain QUEUED after ignored process_died abandon, got %q", schAfterAbandon.Status)
 	}
 }
+
+func TestStory0193_BindStoryToJobNormalizesChainedStoryPrefixes(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("debian", "permanent")
+	if err := e.UpsertRepo(Repo{HostID: "debian", WorktreePath: "/home/romeo/work/meta-repo", CloneURL: "https://github.com/viovy/meta-repo.git"}); err != nil {
+		t.Fatalf("UpsertRepo: %v", err)
+	}
+	p := e.PutPrompt(Prompt{
+		Title:  "Execute story STORY-GOV-5176: Remediate All 10 Findings",
+		Body:   "/autonomous-story-execution",
+		Status: "READY",
+	})
+	sch, err := e.ExecutePrompt(p.ID, "debian", "/home/romeo/work/meta-repo", 1, nil)
+	if err != nil {
+		t.Fatalf("ExecutePrompt: %v", err)
+	}
+	job, _, _, ok := e.PollHost("debian")
+	if !ok {
+		t.Fatal("expected leased job")
+	}
+
+	// Simulate repeated/chained story bindings across different story IDs
+	e.BindStoryToJob(job.ID, "STORY-EXPLICIT-111", "Execute story STORY-GOV-5176: Remediate All 10 Findings", "docs/stories/s.story.md")
+	e.BindStoryToJob(job.ID, "STORY-DETECTED-222", "Execute story STORY-EXPLICIT-111: Execute story STORY-GOV-5176: Remediate All 10 Findings", "docs/stories/s.story.md")
+	e.BindStoryToJob(job.ID, "STORY-GOV-5176", "Execute story STORY-DETECTED-222: Execute story STORY-EXPLICIT-111: Execute story STORY-GOV-5176: Remediate All 10 Findings", "docs/stories/s.story.md")
+
+	gotJob, ok := e.GetJob(job.ID)
+	if !ok {
+		t.Fatal("expected job to exist")
+	}
+	if gotJob.StoryTitle != "Remediate All 10 Findings" {
+		t.Fatalf("expected job StoryTitle 'Remediate All 10 Findings', got %q", gotJob.StoryTitle)
+	}
+	wantTitle := "Execute story STORY-GOV-5176: Remediate All 10 Findings"
+	gotSch, ok := e.GetSchedule(sch.ID)
+	if !ok {
+		t.Fatal("expected schedule to exist")
+	}
+	if gotSch.PromptTitle != wantTitle {
+		t.Fatalf("expected schedule PromptTitle %q, got %q", wantTitle, gotSch.PromptTitle)
+	}
+}
+
+func TestGov5177_AppendLogMonotonicSeqAndSupervisorHeartbeatCoalescing(t *testing.T) {
+	e := NewEngine(time.Now)
+	jobID := "job_bbd74e1ad21fbc40"
+
+	for i := 1; i <= 505; i++ {
+		e.AppendLog(jobID, LogChunk{
+			Type:   "OUTPUT_CHUNK",
+			Stream: "stdout",
+			Text:   "[agy step #" + itoa(i) + "] output: step log\n",
+		})
+	}
+	page := e.JobLogs(jobID, 1, "", 1, 10000)
+	if len(page.Chunks) != RingCap {
+		t.Fatalf("expected RingCap=%d chunks, got %d", RingCap, len(page.Chunks))
+	}
+	lastSeq := page.Chunks[len(page.Chunks)-1].Seq
+	if lastSeq != 505 {
+		t.Fatalf("expected lastSeq=505, got %d", lastSeq)
+	}
+	prevSeq := page.Chunks[len(page.Chunks)-2].Seq
+	if prevSeq != 504 {
+		t.Fatalf("expected prevSeq=504, got %d", prevSeq)
+	}
+
+	for i := 1; i <= 50; i++ {
+		e.AppendLog(jobID, LogChunk{
+			Type:   "OUTPUT_CHUNK",
+			Stream: "stdout",
+			Text:   "[2026-11-07T00:00:00Z] [ASE-SUPERVISOR] Execution active (elapsed: " + itoa(i*20) + "s, HarnessPID=100, ToolPID=200, Story=STORY-GOV-5176, Conv=0092d1cb)\n",
+		})
+	}
+	pageAfterHB := e.JobLogs(jobID, 1, "", 1, 10000)
+	foundStep505 := false
+	hbCount := 0
+	for _, ch := range pageAfterHB.Chunks {
+		if strings.Contains(ch.Text, "[agy step #505]") {
+			foundStep505 = true
+		}
+		if strings.Contains(ch.Text, "[ASE-SUPERVISOR] Execution active (") {
+			hbCount++
+		}
+	}
+	if !foundStep505 {
+		t.Fatalf("expected [agy step #505] to be preserved in ring buffer after 50 consecutive supervisor heartbeats")
+	}
+	if hbCount != 1 {
+		t.Fatalf("expected consecutive supervisor heartbeats to coalesce into 1 entry, got %d", hbCount)
+	}
+}
+
+
