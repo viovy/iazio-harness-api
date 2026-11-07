@@ -46,7 +46,7 @@ func scheduleView(s control.Schedule) map[string]any {
 	if cid == "" {
 		cid = strings.TrimSpace(s.InitialConversationID)
 	}
-	return map[string]any{
+	m := map[string]any{
 		"id":                          s.ID,
 		"prompt_id":                   s.PromptID,
 		"prompt_title":                s.PromptTitle,
@@ -90,6 +90,10 @@ func scheduleView(s control.Schedule) map[string]any {
 		"traceparent":                 s.Traceparent,
 		"infra_requeue_count":         s.InfraRequeueCount,
 	}
+	if strings.TrimSpace(s.ID) != "" {
+		m["live_url"] = dispatch.BuildLiveURL("", s.ID)
+	}
+	return m
 }
 
 func hostView(h control.Host, paused int) map[string]any {
@@ -302,6 +306,7 @@ func repoDetailView(d control.RepoDetail) map[string]any {
 		}
 		running = map[string]any{
 			"id":                 d.Running.ID,
+			"live_url":           dispatch.BuildLiveURL("", d.Running.ID),
 			"status":             d.Running.Status,
 			"prompt_title":       d.RunningTitle,
 			"engine":             d.RunningEngine,
@@ -459,6 +464,7 @@ func historyRowView(h control.HistoryRow) map[string]any {
 	}
 	m := map[string]any{
 		"job_id":                    h.JobID,
+		"live_url":                  dispatch.BuildLiveURL("", h.JobID),
 		"schedule_id":               h.ScheduleID,
 		"story_id":                  h.StoryID,
 		"prompt_title":              h.PromptTitle,
@@ -525,6 +531,7 @@ func jobDetailView(j control.JobDetail) map[string]any {
 	}
 	m := map[string]any{
 		"id":                             j.ID,
+		"live_url":                       dispatch.BuildLiveURL("", j.ID),
 		"schedule_id":                    j.ScheduleID,
 		"kind":                           j.Kind,
 		"status":                         j.Status,
@@ -800,6 +807,7 @@ func dispatchScheduleView(j *dispatch.Job) map[string]any {
 		"id":                     j.ID,
 		"schedule_id":            schedID,
 		"job_id":                 j.ID,
+		"live_url":               dispatch.BuildLiveURL("", j.ID),
 		"associated_jobs":        assocJobs,
 		"prompt_id":              "",
 		"prompt_title":           title,
@@ -980,6 +988,7 @@ func dispatchHistoryView(j *dispatch.Job) map[string]any {
 		"target_host":            targetHost,
 		"repo_path":              j.Repo,
 		"job_id":                 j.ID,
+		"live_url":               dispatch.BuildLiveURL("", j.ID),
 		"schedule_id":            dispatchJobScheduleID(j.ID),
 		"prompt_title":           title,
 		"engine":                 engine,
@@ -1111,6 +1120,7 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 	zID, zURL := resolveDispatchZipkinTrace(j)
 	res := map[string]any{
 		"id":                             j.ID,
+		"live_url":                       dispatch.BuildLiveURL("", j.ID),
 		"schedule_id":                    dispatchJobScheduleID(j.ID),
 		"kind":                           j.Type,
 		"status":                         strings.ToUpper(j.Status),

@@ -318,8 +318,8 @@ func TestStory0190_RealTimeAndCompletedConversationIDAndURL(t *testing.T) {
 	if detail.ConversationURL != "https://tian.go.ro/iazio-web/conversation/aff9bb70-6c84-4121-ba1e-68745328700a" {
 		t.Fatalf("expected conversation_url https://tian.go.ro/iazio-web/conversation/aff9bb70-6c84-4121-ba1e-68745328700a, got %q", detail.ConversationURL)
 	}
-	if detail.LiveURL != "https://tian.go.ro/iazio-web/agents/tian/iazio-mcp/live?job="+job.ID {
-		t.Fatalf("expected live_url to use https://tian.go.ro/iazio-web, got %q", detail.LiveURL)
+	if detail.LiveURL != "https://tian.go.ro/iazio-web/jobs/"+job.ID {
+		t.Fatalf("expected live_url to use canonical https://tian.go.ro/iazio-web/jobs/<job_id>, got %q", detail.LiveURL)
 	}
 
 	// Also verify a completed job whose conversation_id is only in Result JSON

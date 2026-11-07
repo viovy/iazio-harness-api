@@ -1046,6 +1046,8 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 
 	if submodule == "" {
 		submodule = "."
+	} else if strings.EqualFold(submodule, "root") {
+		submodule = "meta-repo"
 	}
 
 	storyAllocationStatus := "allocated"
@@ -1116,16 +1118,23 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 	priorityRankSelected := 0
 
 	if h.engine != nil {
-		alloc := h.engine.ResolveToolPriorityAllocation(targetAgent, targetHost, submodule)
+		allocRepo := submodule
+		if allocRepo == "meta-repo" {
+			allocRepo = "."
+		}
+		alloc := h.engine.ResolveToolPriorityAllocation(targetAgent, targetHost, allocRepo)
 		targetAgent = alloc.TargetAgent
 		targetHost = alloc.TargetHost
-		if alloc.TargetRepo != "" && alloc.TargetRepo != "root" && (submodule == "" || submodule == "." || submodule == "root") {
+		if alloc.TargetRepo != "" && alloc.TargetRepo != "root" && (submodule == "" || submodule == "." || submodule == "root" || submodule == "meta-repo") {
 			targetRepo = alloc.TargetRepo
 		}
 		allocationSource = alloc.AllocationSource
 		priorityRankSelected = alloc.PriorityRankSelected
 	} else if targetAgent == "" {
 		targetAgent = "agy"
+	}
+	if strings.EqualFold(targetRepo, "root") {
+		targetRepo = "meta-repo"
 	}
 
 	if t := strings.TrimSpace(req.TraceID); t != "" {
@@ -1213,15 +1222,7 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		_, _ = h.scheduler.EnqueueGlobalStorySchedule(storyID, submodule, targetAgent, normalizedPrompt)
 	}
 
-	liveURL := ""
-	if targetHost != "" {
-		liveRepo := submodule
-		if liveRepo == "" || liveRepo == "." {
-			liveRepo = "root"
-		}
-		webBase := dispatch.ResolveWebBaseURL()
-		liveURL = fmt.Sprintf("%s/agents/%s/%s/live?job=%s", strings.TrimRight(webBase, "/"), targetHost, liveRepo, job.ID)
-	}
+	liveURL := dispatch.BuildLiveURL("", job.ID)
 
 	dispatch.PopulateJobConversationFields(job)
 	resp := ExecuteStoryResponse{
@@ -1343,6 +1344,7 @@ func formatHistoryRowToJobDetail(row control.HistoryRow, host, path string) JobD
 		ActiveConversationID:  activeCID,
 		ConversationIDs:       convIDs,
 		ConversationURL:       dispatch.BuildConversationURL("", activeCID),
+		LiveURL:               dispatch.BuildLiveURL("", row.JobID),
 		Status:                row.Status,
 		Error:                 row.ErrorMessage,
 		TraceID:               row.TraceID,
@@ -1497,13 +1499,8 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		CreatedAt:               j.CreatedAt.Format(time.RFC3339),
 	}
 
-	if effectiveHost != "" && !strings.EqualFold(effectiveHost, "auto") {
-		liveRepo := j.Repo
-		if liveRepo == "" || liveRepo == "." {
-			liveRepo = "root"
-		}
-		webBase := dispatch.ResolveWebBaseURL()
-		resp.LiveURL = fmt.Sprintf("%s/agents/%s/%s/live?job=%s", strings.TrimRight(webBase, "/"), effectiveHost, liveRepo, j.ID)
+	if j.ID != "" {
+		resp.LiveURL = dispatch.BuildLiveURL("", j.ID)
 	}
 
 	if j.HeartbeatAt != nil {

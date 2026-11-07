@@ -587,8 +587,8 @@ func TestJobLifecycleHandler_GetJob_ClaimedHostAndFailureDetails(t *testing.T) {
 	if detail.ClaimedHost != "mac-mini" || detail.TargetHost != "mac-mini" {
 		t.Fatalf("expected ClaimedHost and fallback TargetHost to be mac-mini, got ClaimedHost=%q TargetHost=%q", detail.ClaimedHost, detail.TargetHost)
 	}
-	if !strings.Contains(detail.LiveURL, "/agents/mac-mini/iazio-mcp/live?job="+job.ID) {
-		t.Fatalf("expected LiveURL to use claimed host mac-mini, got %q", detail.LiveURL)
+	if detail.LiveURL != "https://tian.go.ro/iazio-web/jobs/"+job.ID {
+		t.Fatalf("expected LiveURL to use canonical https://tian.go.ro/iazio-web/jobs/<job_id>, got %q", detail.LiveURL)
 	}
 	if detail.FailureCategory != "git_conflict" || detail.FailureStage != "git_push" || !detail.Retriable {
 		t.Fatalf("expected failure classification fields in JobDetailResponse, got %+v", detail)
@@ -1088,4 +1088,112 @@ func TestJobLifecycleHandler_JobChaining_Webhook_Email_And_Notifications(t *test
 		t.Fatalf("expected GET /v1/notifications to return notification for %s, got %d: %s", exec1.JobID, rrNotif.Code, rrNotif.Body.String())
 	}
 }
+
+func TestStory0194_CanonicalJobsLiveURLAndRepoNormalization(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	h := NewJobLifecycleHandler(q)
+	v := &mockStoryValidator{
+		availableStories: map[string]bool{
+			"STORY-IAZIO-0194": true,
+		},
+	}
+	h.SetStoryValidator(v)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/stories/{id}/execute", h.ExecuteStory)
+	mux.HandleFunc("GET /api/v1/jobs/{id}", h.GetJob)
+	mux.HandleFunc("GET /api/v1/queue", h.ListQueue)
+
+	// 1. ExecuteStory with submodule="." and host="debian" emits canonical /jobs/<job_id> and never /root/live
+	execReq := httptest.NewRequest(http.MethodPost, "/api/v1/stories/STORY-IAZIO-0194/execute", bytes.NewBufferString(`{
+		"submodule": ".",
+		"host": "debian",
+		"target_agent": "agy"
+	}`))
+	execRr := httptest.NewRecorder()
+	mux.ServeHTTP(execRr, execReq)
+	if execRr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d: %s", execRr.Code, execRr.Body.String())
+	}
+	var execResp ExecuteStoryResponse
+	if err := json.Unmarshal(execRr.Body.Bytes(), &execResp); err != nil {
+		t.Fatalf("unmarshal ExecuteStoryResponse: %v", err)
+	}
+	wantLive := "https://tian.go.ro/iazio-web/jobs/" + execResp.JobID
+	if execResp.LiveURL != wantLive {
+		t.Fatalf("expected ExecuteStory LiveURL=%q, got %q", wantLive, execResp.LiveURL)
+	}
+	if strings.Contains(execResp.LiveURL, "/root/live") || strings.Contains(execResp.LiveURL, "/agents/") {
+		t.Fatalf("ExecuteStory LiveURL must not contain /root/live or /agents/: %q", execResp.LiveURL)
+	}
+
+	// 2. ExecuteStory with submodule="root" normalizes submodule/target_repo to "meta-repo" and emits canonical LiveURL
+	execRootReq := httptest.NewRequest(http.MethodPost, "/api/v1/stories/STORY-IAZIO-0194/execute", bytes.NewBufferString(`{
+		"submodule": "root",
+		"host": "auto",
+		"target_agent": "agy"
+	}`))
+	execRootRr := httptest.NewRecorder()
+	mux.ServeHTTP(execRootRr, execRootReq)
+	if execRootRr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for root submodule, got %d: %s", execRootRr.Code, execRootRr.Body.String())
+	}
+	var execRootResp ExecuteStoryResponse
+	_ = json.Unmarshal(execRootRr.Body.Bytes(), &execRootResp)
+	if execRootResp.Submodule != "meta-repo" || execRootResp.TargetRepo != "meta-repo" {
+		t.Fatalf("expected root submodule normalized to meta-repo, got submodule=%q target_repo=%q", execRootResp.Submodule, execRootResp.TargetRepo)
+	}
+	if execRootResp.LiveURL != "https://tian.go.ro/iazio-web/jobs/"+execRootResp.JobID {
+		t.Fatalf("expected canonical LiveURL even when host='auto', got %q", execRootResp.LiveURL)
+	}
+
+	// 3. Job with filesystem worktree path (e.g. /home/romeo/work/meta-repo) never leaks filesystem paths into LiveURL on GetJob or ListQueue
+	wtJob, err := q.Enqueue(context.Background(), &dispatch.Job{
+		ID:          "job_3a5ffef87ff013f2",
+		Type:        dispatch.JobTypePromptExecute,
+		Repo:        "/home/romeo/work/meta-repo",
+		ClaimedHost: "debian",
+		HostID:      "debian",
+		TargetAgent: "agy",
+	})
+	if err != nil {
+		t.Fatalf("enqueue wtJob: %v", err)
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/"+wtJob.ID, nil)
+	getRr := httptest.NewRecorder()
+	mux.ServeHTTP(getRr, getReq)
+	if getRr.Code != http.StatusOK {
+		t.Fatalf("GetJob failed: %d", getRr.Code)
+	}
+	var detail JobDetailResponse
+	_ = json.Unmarshal(getRr.Body.Bytes(), &detail)
+	if detail.LiveURL != "https://tian.go.ro/iazio-web/jobs/job_3a5ffef87ff013f2" {
+		t.Fatalf("expected canonical LiveURL for worktree job, got %q", detail.LiveURL)
+	}
+	if strings.Contains(detail.LiveURL, "/home/romeo") || strings.Contains(detail.LiveURL, "/agents/") {
+		t.Fatalf("LiveURL leaked filesystem worktree path or /agents/: %q", detail.LiveURL)
+	}
+
+	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/queue", nil)
+	listRr := httptest.NewRecorder()
+	mux.ServeHTTP(listRr, listReq)
+	var listResp ListQueueResponse
+	_ = json.Unmarshal(listRr.Body.Bytes(), &listResp)
+	for _, item := range listResp.Items {
+		if item.LiveURL != "https://tian.go.ro/iazio-web/jobs/"+item.ID {
+			t.Fatalf("ListQueue item %s has non-canonical LiveURL %q", item.ID, item.LiveURL)
+		}
+	}
+
+	// 4. formatHistoryRowToJobDetail emits canonical LiveURL
+	histDetail := formatHistoryRowToJobDetail(control.HistoryRow{
+		JobID:     "job_hist_0194",
+		CreatedAt: time.Now().UTC(),
+	}, "debian", "/home/romeo/work/meta-repo")
+	if histDetail.LiveURL != "https://tian.go.ro/iazio-web/jobs/job_hist_0194" {
+		t.Fatalf("expected canonical LiveURL on history row detail, got %q", histDetail.LiveURL)
+	}
+}
+
 

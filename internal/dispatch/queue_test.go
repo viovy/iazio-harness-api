@@ -2507,5 +2507,87 @@ func TestStory0193_NormalizeStoryTitleChainedPrefixesAndFilterTestConversations(
 	}
 }
 
+func TestStory0194_BuildNormalizeLiveURLAndNormalizeRepoName(t *testing.T) {
+	// 1. BuildLiveURL
+	if got := BuildLiveURL("", ""); got != "" {
+		t.Fatalf("expected empty URL for empty jobID, got %q", got)
+	}
+	if got := BuildLiveURL("", "job_3a5ffef87ff013f2"); got != "https://tian.go.ro/iazio-web/jobs/job_3a5ffef87ff013f2" {
+		t.Fatalf("unexpected BuildLiveURL default: %q", got)
+	}
+	if got := BuildLiveURL("https://example.com/iazio-web", "job_3a5ffef87ff013f2"); got != "https://tian.go.ro/iazio-web/jobs/job_3a5ffef87ff013f2" {
+		t.Fatalf("expected example.com rejected in BuildLiveURL, got %q", got)
+	}
+	if got := BuildLiveURL("https://custom.host/iazio-web/", "job_123"); got != "https://custom.host/iazio-web/jobs/job_123" {
+		t.Fatalf("unexpected BuildLiveURL custom base: %q", got)
+	}
+
+	// 2. NormalizeLiveURL
+	liveCases := []struct {
+		raw   string
+		jobID string
+		want  string
+	}{
+		{
+			raw:   "",
+			jobID: "job_3a5ffef87ff013f2",
+			want:  "https://tian.go.ro/iazio-web/jobs/job_3a5ffef87ff013f2",
+		},
+		{
+			raw:   "https://tian.go.ro/iazio-web/agents/debian/root/live?job=job_3a5ffef87ff013f2",
+			jobID: "job_3a5ffef87ff013f2",
+			want:  "https://tian.go.ro/iazio-web/jobs/job_3a5ffef87ff013f2",
+		},
+		{
+			raw:   "https://tian.go.ro/iazio-web/agents/debian//home/romeo/work/meta-repo/live?job=job_3a5ffef87ff013f2",
+			jobID: "",
+			want:  "https://tian.go.ro/iazio-web/jobs/job_3a5ffef87ff013f2",
+		},
+		{
+			raw:   "https://example.com/iazio-web/jobs/job_3a5ffef87ff013f2",
+			jobID: "job_3a5ffef87ff013f2",
+			want:  "https://tian.go.ro/iazio-web/jobs/job_3a5ffef87ff013f2",
+		},
+		{
+			raw:   "https://tian.go.ro/iazio-web/jobs/job_3a5ffef87ff013f2",
+			jobID: "job_3a5ffef87ff013f2",
+			want:  "https://tian.go.ro/iazio-web/jobs/job_3a5ffef87ff013f2",
+		},
+	}
+	for _, tc := range liveCases {
+		if got := NormalizeLiveURL(tc.raw, tc.jobID); got != tc.want {
+			t.Fatalf("NormalizeLiveURL(%q, %q) = %q, want %q", tc.raw, tc.jobID, got, tc.want)
+		}
+	}
+
+	// 3. NormalizeRepoName
+	repoCases := map[string]string{
+		"":                           "meta-repo",
+		".":                          "meta-repo",
+		"root":                       "meta-repo",
+		"ROOT":                       "meta-repo",
+		"metarepo":                   "meta-repo",
+		"/":                          "meta-repo",
+		"/home/romeo/work/meta-repo": "meta-repo",
+		"/home/romeo/work/root":      "meta-repo",
+		"/home/romeo/work/iazio-mcp": "iazio-mcp",
+		"iazio-mcp":                  "iazio-mcp",
+		"iazio-web":                  "iazio-web",
+	}
+	for in, want := range repoCases {
+		if got := NormalizeRepoName(in); got != want {
+			t.Fatalf("NormalizeRepoName(%q) = %q, want %q", in, got, want)
+		}
+	}
+
+	// 4. PopulateJobConversationFields normalizes Repo="root" to "meta-repo"
+	j := &Job{ID: "job_root_test", Repo: "root"}
+	PopulateJobConversationFields(j)
+	if j.Repo != "meta-repo" {
+		t.Fatalf("expected PopulateJobConversationFields to normalize Repo='root' to 'meta-repo', got %q", j.Repo)
+	}
+}
+
+
 
 
