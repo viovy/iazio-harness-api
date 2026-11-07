@@ -213,9 +213,15 @@ func (s *Server) Handler() http.Handler {
 		jobLifecycle.SetStoryValidator(s.StoryValidator)
 	}
 	mux.HandleFunc("GET /api/v1/jobs/{id}", jobLifecycle.GetJob)
+	mux.HandleFunc("GET /api/v1/global-queue/jobs/{id}", jobLifecycle.GetJob)
+	mux.HandleFunc("GET /v1/global-queue/jobs/{id}", jobLifecycle.GetJob)
 	mux.HandleFunc("GET /api/v1/jobs/{id}/attribution", jobLifecycle.GetJobAttribution)
 	mux.HandleFunc("GET /api/v1/queue", jobLifecycle.ListQueue)
+	mux.HandleFunc("GET /v1/queue", jobLifecycle.ListQueue)
 	mux.HandleFunc("GET /api/v1/jobs", jobLifecycle.ListQueue)
+	mux.HandleFunc("GET /v1/jobs", jobLifecycle.ListQueue)
+	mux.HandleFunc("GET /api/v1/global-queue/jobs", jobLifecycle.ListQueue)
+	mux.HandleFunc("GET /v1/global-queue/jobs", jobLifecycle.ListQueue)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/cancel", jobLifecycle.CancelJob)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/retry", jobLifecycle.RetryJob)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/ack-lease", jobLifecycle.AckLease)
@@ -3381,10 +3387,14 @@ func (s *Server) repoDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) isDispatchJobActive(jobID string) bool {
-	if s.Queue == nil || strings.TrimSpace(jobID) == "" {
+	cleanID := strings.TrimSpace(jobID)
+	if s.Queue == nil || cleanID == "" {
 		return false
 	}
-	qJob, ok := s.Queue.Get(strings.TrimSpace(jobID))
+	if checker, ok := s.Queue.(interface{ IsJobActive(string) bool }); ok {
+		return checker.IsJobActive(cleanID)
+	}
+	qJob, ok := s.Queue.Get(cleanID)
 	if !ok || qJob == nil {
 		return false
 	}

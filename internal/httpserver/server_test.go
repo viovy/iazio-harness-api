@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -3528,4 +3529,117 @@ func TestOAuthInsufficientScopeIncludesGrantedScopeAndClientID(t *testing.T) {
 	}
 }
 
+func TestConcurrentEngineHostDetailAndQueueClaim_NoDeadlock_StoryGOV5192(t *testing.T) {
+	now := time.Now().UTC()
+	engine := control.NewEngine(func() time.Time { return now })
+	queue := dispatch.NewInMemoryQueue()
+
+	srv := &Server{
+		Engine: engine,
+		Queue:  queue,
+	}
+	handler := srv.Handler()
+
+	_ = engine.RegisterHost("mac-mini", "permanent")
+	_ = engine.UpsertRepo(control.Repo{
+		HostID:                       "mac-mini",
+		WorktreePath:                 "/Users/romeo/work/meta-repo",
+		Queue:                        control.QueueOpen,
+		Lock:                         control.LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	for i := 0; i < 10; i++ {
+		_, err := queue.Enqueue(context.Background(), &dispatch.Job{
+			ID:      fmt.Sprintf("job_gov5192_%d", i),
+			Type:    dispatch.JobTypePromptExecute,
+			Repo:    "iazio-web",
+			Payload: json.RawMessage(`{"submodule":"iazio-web","prompt":"test deadlock prevention"}`),
+		})
+		if err != nil {
+			t.Fatalf("enqueue job %d: %v", i, err)
+		}
+	}
+
+	// Verify GET /api/v1/global-queue/jobs and GET /v1/global-queue/jobs route aliases
+	for _, listPath := range []string{"/api/v1/global-queue/jobs?limit=5", "/v1/global-queue/jobs?limit=5", "/v1/queue?limit=5"} {
+		req := httptest.NewRequest(http.MethodGet, listPath, nil)
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK on %s, got %d: %s", listPath, rr.Code, rr.Body.String())
+		}
+	}
+	for _, itemPath := range []string{"/api/v1/global-queue/jobs/job_gov5192_0", "/v1/global-queue/jobs/job_gov5192_0"} {
+		req := httptest.NewRequest(http.MethodGet, itemPath, nil)
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK on %s, got %d: %s", itemPath, rr.Code, rr.Body.String())
+		}
+	}
+
+	// Concurrently hammer Engine.GetHostDetail / ReconcileStaleWorkspaceSlots (Lock Order A)
+	// and Queue.ClaimWithWorktrees / ReconcileGlobalQueueSlots / GET /api/v1/global-queue/jobs (Lock Order B)
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(4)
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			req := httptest.NewRequest(http.MethodGet, "/v1/hosts/mac-mini", nil)
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, req)
+			_ = engine.ReconcileStaleWorkspaceSlots(now.Add(time.Duration(i)*time.Second), 45*time.Second)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			claimBody := strings.NewReader(`{"host_id":"mac-mini","idle_worktrees":["/Users/romeo/work/meta-repo"]}`)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/agent/jobs/claim", claimBody)
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, req)
+			jobID := fmt.Sprintf("job_gov5192_%d", i%10)
+			if i%2 == 0 {
+				_, _ = queue.HeartbeatWithStory(context.Background(), jobID, 0, "STORY-GOV-5192")
+			}
+			if i%3 == 0 {
+				_, _ = queue.Decline(context.Background(), jobID, "REPO_BUSY")
+			}
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			_ = queue.ReconcileGlobalQueueSlots(now.Add(time.Duration(i)*time.Second), 45*time.Second)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/global-queue/jobs?limit=20", nil)
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Errorf("unexpected status %d on /api/v1/global-queue/jobs", rr.Code)
+			}
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("deadlock detected between Engine.mu and InMemoryQueue.mu")
+	}
+}
 

@@ -571,3 +571,136 @@ func TestE2E_GlobalQueue_MockAgyBufferedStdoutLiveStreamingAndRepoLiveView(t *te
 		t.Fatalf("expected non-null running_job with id=%s on repo detail, got %v", job.ID, repoData["running_job"])
 	}
 }
+
+func TestE2E_GlobalQueue_JobsEndpointAndConcurrentHostDetailReconcile_StoryGOV5192(t *testing.T) {
+	now := time.Date(2026, 11, 7, 20, 0, 0, 0, time.UTC)
+	eng := control.NewEngine(func() time.Time { return now })
+	queue := dispatch.NewInMemoryQueue()
+	eng.BindDispatchQueue(queue)
+
+	_ = eng.RegisterHost("mac-mini", "permanent")
+	_ = eng.UpsertRepo(control.Repo{
+		HostID:                       "mac-mini",
+		WorktreePath:                 "/Users/romeo/work/meta-repo",
+		CloneURL:                     "https://github.com/viovy/meta-repo.git",
+		Queue:                        control.QueueOpen,
+		Lock:                         control.LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	srv := &httpserver.Server{Engine: eng, Queue: queue}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	job, err := queue.Enqueue(context.Background(), &dispatch.Job{
+		ID:          "job_e2e_gov5192",
+		Type:        dispatch.JobTypePromptExecute,
+		Repo:        "meta-repo",
+		StoryID:     "STORY-GOV-5192",
+		StoryTitle:  "Global Queue E2E Deadlock Regression",
+		TargetAgent: "agy",
+		Payload:     []byte(`{"prompt":"/autonomous-story-execution STORY-GOV-5192"}`),
+	})
+	if err != nil {
+		t.Fatalf("failed to enqueue job: %v", err)
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	for _, path := range []string{
+		"/api/v1/queue?limit=200",
+		"/v1/queue?limit=200",
+		"/api/v1/global-queue/jobs?limit=200",
+		"/v1/global-queue/jobs?limit=200",
+	} {
+		resp, err := client.Get(ts.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s failed: %v", path, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
+			t.Fatalf("GET %s status = %d, want 200", path, resp.StatusCode)
+		}
+		var payload struct {
+			Items []map[string]any `json:"items"`
+			Total int              `json:"total"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			_ = resp.Body.Close()
+			t.Fatalf("GET %s decode failed: %v", path, err)
+		}
+		_ = resp.Body.Close()
+		if len(payload.Items) != 1 || payload.Items[0]["id"] != job.ID || payload.Total != 1 {
+			t.Fatalf("GET %s unexpected jobs payload: %+v", path, payload)
+		}
+	}
+
+	// Verify /api/v1/global-queue/jobs/{id} and /v1/global-queue/jobs/{id}
+	for _, detailPath := range []string{
+		"/api/v1/global-queue/jobs/" + job.ID,
+		"/v1/global-queue/jobs/" + job.ID,
+	} {
+		resp, err := client.Get(ts.URL + detailPath)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s failed: err=%v status=%v", detailPath, err, resp.StatusCode)
+		}
+		_ = resp.Body.Close()
+	}
+
+	// Exercise bound Engine <-> Queue callbacks concurrently across HTTP endpoints
+	errCh := make(chan error, 4)
+	go func() {
+		for i := 0; i < 40; i++ {
+			resp, err := client.Get(ts.URL + "/v1/hosts/mac-mini")
+			if err != nil {
+				errCh <- err
+				return
+			}
+			_ = resp.Body.Close()
+			eng.ReconcileStaleWorkspaceSlots(now.Add(2*time.Minute), 45*time.Second)
+		}
+		errCh <- nil
+	}()
+	go func() {
+		for i := 0; i < 40; i++ {
+			claimBody := bytes.NewBufferString(`{"host_id":"mac-mini","job_types":["prompt.execute"],"idle_worktrees":["/Users/romeo/work/meta-repo"]}`)
+			resp, err := client.Post(ts.URL+"/api/v1/agent/jobs/claim", "application/json", claimBody)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			_ = resp.Body.Close()
+			_, _ = queue.Decline(context.Background(), job.ID, "REPO_BUSY")
+			queue.ReconcileGlobalQueueSlots(now.Add(2*time.Minute), 45*time.Second)
+		}
+		errCh <- nil
+	}()
+	go func() {
+		for i := 0; i < 40; i++ {
+			resp, err := client.Get(ts.URL + "/api/v1/global-queue/jobs?limit=200")
+			if err != nil {
+				errCh <- err
+				return
+			}
+			_ = resp.Body.Close()
+		}
+		errCh <- nil
+	}()
+	go func() {
+		for i := 0; i < 40; i++ {
+			resp, err := client.Get(ts.URL + "/v1/schedules")
+			if err != nil {
+				errCh <- err
+				return
+			}
+			_ = resp.Body.Close()
+		}
+		errCh <- nil
+	}()
+
+	for i := 0; i < 4; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("concurrent E2E request failed or timed out: %v", err)
+		}
+	}
+}
+

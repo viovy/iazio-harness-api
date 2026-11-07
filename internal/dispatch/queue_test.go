@@ -774,7 +774,9 @@ func TestInMemoryQueue_Failover_RetryRetriable_BindStory_Attribution(t *testing.
 	}
 
 	// 2. RetryRetriable
-	foJob.Status = JobStatusFailed
+	if err := q.Complete(ctx, job.ID, nil, "crash"); err != nil {
+		t.Fatalf("complete failed: %v", err)
+	}
 	retried, err := q.RetryRetriable(ctx)
 	if err != nil {
 		t.Fatalf("retry retriable failed: %v", err)
@@ -2716,7 +2718,79 @@ func TestStory0196_LateBindingGlobalQueue_DependencyGating_SubmoduleNormalizatio
 	}
 }
 
+func TestIsJobActiveLockFreeAndDeferredSlotRelease_StoryGOV5192(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
 
+	var releasedIDs []string
+	var releaseMu sync.Mutex
+	q.SetSlotReleaser(func(jobID string) {
+		// Verify q.mu is NOT held when slotReleaser runs by calling q.IsJobActive and q.Count without deadlocking
+		if q.IsJobActive(jobID) {
+			t.Errorf("expected IsJobActive(%s) == false when slotReleaser runs", jobID)
+		}
+		_, _ = q.Count(ctx, JobFilter{})
+		releaseMu.Lock()
+		releasedIDs = append(releasedIDs, jobID)
+		releaseMu.Unlock()
+	})
 
+	job, err := q.Enqueue(ctx, &Job{
+		ID:   "job_gov_5192_active",
+		Type: JobTypePromptExecute,
+		Repo: "iazio-web",
+	})
+	if err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
+	if q.IsJobActive(job.ID) {
+		t.Fatalf("expected pending job to not be active")
+	}
 
+	claimed, err := q.ClaimWithWorktrees(ctx, "mac-mini", nil, []string{"/Users/romeo/work/meta-repo"})
+	if err != nil || claimed == nil {
+		t.Fatalf("ClaimWithWorktrees failed: %v", err)
+	}
+	if !q.IsJobActive(job.ID) {
+		t.Fatalf("expected leased job to report IsJobActive=true")
+	}
+
+	// Advance clock past LeaseAckDeadlineAt so ReapExpired reaps the unacked lease and triggers deferred slotReleaser
+	now = now.Add(DefaultLeaseAckDeadline + 5*time.Second)
+	reaped := q.ReapExpired(now)
+	if len(reaped) != 1 || reaped[0] != job.ID {
+		t.Fatalf("expected job %s to be reaped, got %v", job.ID, reaped)
+	}
+	if q.IsJobActive(job.ID) {
+		t.Fatalf("expected reaped pending job to report IsJobActive=false")
+	}
+	releaseMu.Lock()
+	if len(releasedIDs) != 1 || releasedIDs[0] != job.ID {
+		t.Fatalf("expected slotReleaser called once outside lock for %s, got %v", job.ID, releasedIDs)
+	}
+	releaseMu.Unlock()
+
+	// Claim again, ack lease, then complete -> IsJobActive transitions true -> false
+	claimed2, err := q.ClaimWithWorktrees(ctx, "mac-mini", nil, []string{"/Users/romeo/work/meta-repo"})
+	if err != nil || claimed2 == nil {
+		t.Fatalf("second ClaimWithWorktrees failed: %v", err)
+	}
+	if !q.IsJobActive(job.ID) {
+		t.Fatalf("expected second claim to report IsJobActive=true")
+	}
+	if _, err := q.AckLease(ctx, job.ID, claimed2.LeaseToken, 1234, "conv-5192"); err != nil {
+		t.Fatalf("AckLease failed: %v", err)
+	}
+	if !q.IsJobActive(job.ID) {
+		t.Fatalf("expected running job after AckLease to report IsJobActive=true")
+	}
+	if err := q.CompleteWithFencing(ctx, job.ID, claimed2.FencingToken, json.RawMessage(`{"exit_code":0,"ase_complete":true}`), ""); err != nil {
+		t.Fatalf("CompleteWithFencing failed: %v", err)
+	}
+	if q.IsJobActive(job.ID) {
+		t.Fatalf("expected completed job to report IsJobActive=false")
+	}
+}
 
