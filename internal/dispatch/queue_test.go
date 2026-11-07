@@ -2465,4 +2465,47 @@ func TestForensicWaveJobs_ExtendLeasesResilienceAndIdempotentStoryTitle(t *testi
 	}
 }
 
+func TestStory0193_NormalizeStoryTitleChainedPrefixesAndFilterTestConversations(t *testing.T) {
+	// 1. Verify NormalizeStoryTitle strips chained "Execute story <ANY-ID>:" prefixes across different story IDs
+	chained := "Execute story STORY-GOV-5176: Execute story STORY-GOV-3688: Execute story STORY-HOOK-333: Execute story STORY-DETECTED-222: Execute story STORY-EXPLICIT-111: Remediate All 10 Findings"
+	clean, execTitle := NormalizeStoryTitle("STORY-GOV-5176", chained)
+	if clean != "Remediate All 10 Findings" {
+		t.Fatalf("expected clean title 'Remediate All 10 Findings', got %q", clean)
+	}
+	if execTitle != "Execute story STORY-GOV-5176: Remediate All 10 Findings" {
+		t.Fatalf("expected execTitle 'Execute story STORY-GOV-5176: Remediate All 10 Findings', got %q", execTitle)
+	}
+
+	// 1b. Verify free-form titles starting with "Execute story <word>" (not a STORY-* or PROJ-123 ID) are NOT stripped
+	freeFormClean, freeFormExec := NormalizeStoryTitle("STORY-GOV-5176", "Execute story migration for v2")
+	if freeFormClean != "Execute story migration for v2" {
+		t.Fatalf("expected free-form title to preserve 'migration', got %q", freeFormClean)
+	}
+	if freeFormExec != "Execute story STORY-GOV-5176: Execute story migration for v2" {
+		t.Fatalf("expected freeFormExec 'Execute story STORY-GOV-5176: Execute story migration for v2', got %q", freeFormExec)
+	}
+
+	// 2. Verify PopulateJobConversationFields strips synthetic unit-test UUIDs when a real conversation UUID exists
+	j := &Job{
+		ID:                    "job_bbd74e1ad21fbc40",
+		InitialConversationID: "0092d1cb-cc35-41ce-9143-a480dca5e283",
+		ResumeConversationID:  "0092d1cb-cc35-41ce-9143-a480dca5e283",
+		ActiveConversationID:  "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		ConversationID:        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		ConversationIDs: []string{
+			"0092d1cb-cc35-41ce-9143-a480dca5e283",
+			"11111111-2222-3333-4444-555555555555",
+			"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		},
+	}
+	PopulateJobConversationFields(j)
+	if j.ActiveConversationID != "0092d1cb-cc35-41ce-9143-a480dca5e283" || j.ConversationID != "0092d1cb-cc35-41ce-9143-a480dca5e283" {
+		t.Fatalf("expected real conversation 0092d1cb-cc35-41ce-9143-a480dca5e283, got active=%q conv=%q", j.ActiveConversationID, j.ConversationID)
+	}
+	if len(j.ConversationIDs) != 1 || j.ConversationIDs[0] != "0092d1cb-cc35-41ce-9143-a480dca5e283" {
+		t.Fatalf("expected synthetic test UUIDs removed from ConversationIDs, got %v", j.ConversationIDs)
+	}
+}
+
+
 

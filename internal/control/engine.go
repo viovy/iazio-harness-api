@@ -1716,16 +1716,30 @@ func (e *Engine) BindStoryToJob(jobID, storyID, storyTitle, storyPath string) er
 		return errors.New("story_id is required")
 	}
 
+	normStoryTitle, execStoryTitle := dispatch.NormalizeStoryTitle(cleanStoryID, storyTitle)
+
 	if job, ok := e.jobs[jobID]; ok {
 		job.StoryID = cleanStoryID
-		job.StoryTitle = storyTitle
-		job.StoryPath = storyPath
+		if normStoryTitle != "" {
+			job.StoryTitle = normStoryTitle
+		} else if job.StoryTitle != "" {
+			cleanedExisting, _ := dispatch.NormalizeStoryTitle(cleanStoryID, job.StoryTitle)
+			if cleanedExisting != "" {
+				job.StoryTitle = cleanedExisting
+			}
+		}
+		if storyPath != "" {
+			job.StoryPath = storyPath
+		}
 		job.StoryAllocationStatus = "allocated"
 		if job.ScheduleID != "" {
 			if sch, sOk := e.schedules[job.ScheduleID]; sOk {
 				sch.StoryID = cleanStoryID
 				if storyTitle != "" {
-					sch.PromptTitle = fmt.Sprintf("Execute story %s: %s", cleanStoryID, storyTitle)
+					sch.PromptTitle = execStoryTitle
+				} else if sch.PromptTitle != "" {
+					_, normExisting := dispatch.NormalizeStoryTitle(cleanStoryID, sch.PromptTitle)
+					sch.PromptTitle = normExisting
 				}
 			}
 		}
@@ -1737,7 +1751,10 @@ func (e *Engine) BindStoryToJob(jobID, storyID, storyTitle, storyPath string) er
 				rows[i].StoryID = cleanStoryID
 				rows[i].StoryAllocationStatus = "allocated"
 				if storyTitle != "" {
-					rows[i].PromptTitle = fmt.Sprintf("Execute story %s: %s", cleanStoryID, storyTitle)
+					rows[i].PromptTitle = execStoryTitle
+				} else if rows[i].PromptTitle != "" {
+					_, normExisting := dispatch.NormalizeStoryTitle(cleanStoryID, rows[i].PromptTitle)
+					rows[i].PromptTitle = normExisting
 				}
 			}
 		}
