@@ -1443,6 +1443,18 @@ func (e *Engine) areScheduleDependenciesSatisfiedLocked(sch *Schedule) bool {
 	return true
 }
 
+func normalizeWorktreePathForSlotMatch(p string) string {
+	trimmed := strings.TrimSpace(p)
+	if trimmed == "" {
+		return ""
+	}
+	slashed := strings.TrimRight(strings.ReplaceAll(trimmed, `\`, "/"), "/")
+	if len(slashed) >= 2 && slashed[1] == ':' {
+		return strings.ToLower(slashed)
+	}
+	return slashed
+}
+
 func repoMatchesTargetOrSlotFamily(r *Repo, reqRepo string) bool {
 	if r == nil {
 		return false
@@ -1532,6 +1544,9 @@ func (e *Engine) AllocateDispatchJobSlot(hostID, jobID, targetRepo, targetSubmod
 		if trimmed != "" {
 			idleFilter[trimmed] = true
 			idleFilter[filepath.Clean(trimmed)] = true
+			if norm := normalizeWorktreePathForSlotMatch(trimmed); norm != "" {
+				idleFilter[norm] = true
+			}
 		}
 	}
 
@@ -1561,7 +1576,8 @@ func (e *Engine) AllocateDispatchJobSlot(hostID, jobID, targetRepo, targetSubmod
 			continue
 		}
 		if len(idleFilter) > 0 {
-			if !idleFilter[r.WorktreePath] && !idleFilter[filepath.Clean(r.WorktreePath)] && !idleFilter[r.EffectiveAlias()] {
+			normWT := normalizeWorktreePathForSlotMatch(r.WorktreePath)
+			if !idleFilter[r.WorktreePath] && !idleFilter[filepath.Clean(r.WorktreePath)] && !idleFilter[normWT] && !idleFilter[r.EffectiveAlias()] {
 				continue
 			}
 		}
