@@ -5800,6 +5800,31 @@ func TestStory0196_EngineEagerUpdateBarrier_MultiHostSkip_DependencyGating_And_D
 	if leasedSch2.HostID != "mac-mini" || leasedSch2.WorktreePath != "/Users/romeo/work/meta-repo" || job2.ID == "" {
 		t.Fatalf("expected mac-mini:/Users/romeo/work/meta-repo lease, got %+v", leasedSch2)
 	}
+
+	// 5. DEFERRED_HARNESS_ACTIVE, DEFERRED_GIT_DIRTY, and BACKOFF_AFTER_FAILURE remain eligible for multi-repo claim,
+	// and Windows paths (C:\work\meta-repo-02 vs c:/work/meta-repo-02) normalize cleanly on Linux control plane.
+	for _, st := range []EagerUpdateState{StateDeferredHarnessActive, StateDeferredGitDirty, StateBackoffAfterFailure} {
+		e.UpdateEagerReadiness("mac-mini", EagerUpdateReadinessReport{
+			HostID:           "mac-mini",
+			EagerUpdateState: st,
+		})
+		if eligible, reason := e.IsHostEligibleForClaim("mac-mini"); !eligible {
+			t.Fatalf("expected mac-mini eligible for multi-repo claim when EagerUpdateState=%s, got reason=%q", st, reason)
+		}
+	}
+	_ = e.RegisterHost("pc1", "permanent", "generic")
+	_ = e.Heartbeat("pc1", []Tool{{Name: "agy", Installed: true, Path: `C:\bin\agy.exe`, Status: "ok"}}, false)
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "pc1",
+		WorktreePath:                 `C:\work\meta-repo-02`,
+		CloneURL:                     "https://github.com/viovy/meta-repo.git",
+		Lock:                         LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+	boundWT, slotOK := e.AllocateDispatchJobSlot("pc1", "job-win-1", "meta-repo", "iazio-agent", "agy", []string{"c:/work/meta-repo-02"})
+	if !slotOK || boundWT != `C:\work\meta-repo-02` {
+		t.Fatalf("expected Windows worktree slot C:\\work\\meta-repo-02 to match c:/work/meta-repo-02, got ok=%v wt=%q", slotOK, boundWT)
+	}
 }
 
 
