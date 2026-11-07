@@ -561,11 +561,8 @@ func TestJobLifecycleHandler_GetJob_ClaimedHostAndFailureDetails(t *testing.T) {
 	if err != nil || claimed == nil {
 		t.Fatalf("failed to claim: %v", err)
 	}
-	claimed.FailureCategory = "git_conflict"
-	claimed.FailureStage = "git_push"
-	claimed.FailureReasonSummary = "non-fast-forward"
-	claimed.Retriable = true
-	if err := q.Complete(context.Background(), claimed.ID, nil, "git push error"); err != nil {
+	failMeta := json.RawMessage(`{"failure_category":"git_conflict","failure_stage":"git_push","failure_reason_summary":"non-fast-forward"}`)
+	if err := q.Complete(context.Background(), claimed.ID, failMeta, "git push error"); err != nil {
 		t.Fatalf("Complete failed: %v", err)
 	}
 

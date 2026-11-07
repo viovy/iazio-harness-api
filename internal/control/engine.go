@@ -1357,7 +1357,7 @@ func (e *Engine) IsHostEligibleForClaim(hostID string) (bool, string) {
 }
 
 // BindDispatchQueue wires a dispatch.Queue (if *dispatch.InMemoryQueue) with Engine's host eligibility,
-// worktree slot reservation/release, and dependency satisfaction callbacks.
+// worktree slot reservation/release, dependency satisfaction callbacks, and lock-free active job check.
 func (e *Engine) BindDispatchQueue(q dispatch.Queue) {
 	if q == nil {
 		return
@@ -1367,6 +1367,11 @@ func (e *Engine) BindDispatchQueue(q dispatch.Queue) {
 		imq.SetSlotAllocator(e.AllocateDispatchJobSlot)
 		imq.SetSlotReleaser(e.ReleaseDispatchJobRepo)
 		imq.SetExternalDepChecker(e.IsJobDependencySatisfied)
+		e.mu.Lock()
+		if e.IsDispatchJobActive == nil {
+			e.IsDispatchJobActive = imq.IsJobActive
+		}
+		e.mu.Unlock()
 	}
 }
 
@@ -1872,6 +1877,9 @@ func (e *Engine) ReleaseDispatchJobRepo(jobID string) {
 
 	cleanJobID := strings.TrimSpace(jobID)
 	if cleanJobID == "" {
+		return
+	}
+	if e.IsDispatchJobActive != nil && e.IsDispatchJobActive(cleanJobID) {
 		return
 	}
 	affectedHosts := make(map[string]bool)
@@ -7657,8 +7665,8 @@ func (e *Engine) EnqueueGlobalSchedule(promptID string, iterations int, envVars 
 // SaveStory inserts or updates a story in memory and triggers OnStoryChange.
 func (e *Engine) SaveStory(s Story) error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if s.ID == "" {
+		e.mu.Unlock()
 		return errors.New("story id required")
 	}
 	if s.CreatedAt.IsZero() {
@@ -7672,9 +7680,11 @@ func (e *Engine) SaveStory(s Story) error {
 		s.Status = "pending"
 	}
 	e.stories[s.ID] = &s
-	if e.OnStoryChange != nil {
-		cp := s
-		go e.OnStoryChange(cp)
+	cp := s
+	cb := e.OnStoryChange
+	e.mu.Unlock()
+	if cb != nil {
+		cb(cp)
 	}
 	return nil
 }

@@ -644,6 +644,8 @@ type QueueStore interface {
 type InMemoryQueue struct {
 	mu                     sync.Mutex
 	jobs                   map[string]*Job
+	activeJobs             sync.Map
+	pendingSlotReleases    []string
 	fencingSeq             int64
 	attributionURL         string
 	httpClient             *http.Client
@@ -658,6 +660,67 @@ type InMemoryQueue struct {
 	slotAllocator          func(hostID, jobID, targetRepo, targetSubmodule, targetAgent string, idleWorktrees []string) (string, bool)
 	slotReleaser           func(jobID string)
 	externalDepChecker     func(depID string) (exists, satisfied, failed bool, reason string)
+}
+
+func isJobStatusActive(status string) bool {
+	st := strings.ToLower(strings.TrimSpace(status))
+	return st == JobStatusRunning || st == JobStatusClaimed || st == JobStatusLeased
+}
+
+func (q *InMemoryQueue) syncJobActiveStateLocked(j *Job) {
+	if j == nil || strings.TrimSpace(j.ID) == "" {
+		return
+	}
+	if isJobStatusActive(j.Status) {
+		q.activeJobs.Store(j.ID, true)
+	} else {
+		q.activeJobs.Delete(j.ID)
+	}
+}
+
+func (q *InMemoryQueue) rebuildActiveJobsLocked() {
+	activeSet := make(map[string]bool)
+	for id, j := range q.jobs {
+		if j != nil && isJobStatusActive(j.Status) {
+			activeSet[id] = true
+			q.activeJobs.Store(id, true)
+		}
+	}
+	q.activeJobs.Range(func(key, _ any) bool {
+		if id, ok := key.(string); ok && !activeSet[id] {
+			q.activeJobs.Delete(id)
+		}
+		return true
+	})
+}
+
+// IsJobActive reports whether jobID is currently in an active execution state (leased, claimed, or running)
+// using a lock-free snapshot so callers holding external mutexes (such as control.Engine) never contend on q.mu.
+func (q *InMemoryQueue) IsJobActive(jobID string) bool {
+	cleanID := strings.TrimSpace(jobID)
+	if cleanID == "" {
+		return false
+	}
+	_, ok := q.activeJobs.Load(cleanID)
+	return ok
+}
+
+func (q *InMemoryQueue) flushPendingSlotReleases() {
+	q.mu.Lock()
+	if len(q.pendingSlotReleases) == 0 {
+		q.mu.Unlock()
+		return
+	}
+	ids := append([]string(nil), q.pendingSlotReleases...)
+	q.pendingSlotReleases = nil
+	releaser := q.slotReleaser
+	q.mu.Unlock()
+
+	if releaser != nil {
+		for _, id := range ids {
+			releaser(id)
+		}
+	}
 }
 
 // SetHostEligibilityChecker sets an optional callback that gates Claim on host readiness (e.g., Eager Update Pre-Claim Barrier).
@@ -709,11 +772,48 @@ func (q *InMemoryQueue) SetTerminalHook(fn func(job *Job, promoted []*Job)) {
 	q.terminalHooks = []func(job *Job, promoted []*Job){fn}
 }
 
+func cloneTimePtr(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	v := *t
+	return &v
+}
+
 func cloneJobSnapshot(j *Job) *Job {
 	if j == nil {
 		return nil
 	}
 	cp := *j
+	cp.ClaimedAt = cloneTimePtr(j.ClaimedAt)
+	cp.AckedAt = cloneTimePtr(j.AckedAt)
+	cp.HeartbeatAt = cloneTimePtr(j.HeartbeatAt)
+	cp.LeaseExpiresAt = cloneTimePtr(j.LeaseExpiresAt)
+	cp.CompletedAt = cloneTimePtr(j.CompletedAt)
+	cp.LeaseAckDeadlineAt = cloneTimePtr(j.LeaseAckDeadlineAt)
+	if j.AgentAffinity != nil {
+		aff := *j.AgentAffinity
+		if len(j.AgentAffinity.RequiredCapabilities) > 0 {
+			aff.RequiredCapabilities = append([]string(nil), j.AgentAffinity.RequiredCapabilities...)
+		}
+		cp.AgentAffinity = &aff
+	}
+	if j.DispatchDiagnostics != nil {
+		diag := *j.DispatchDiagnostics
+		if len(j.DispatchDiagnostics.EligibleHosts) > 0 {
+			diag.EligibleHosts = append([]EligibleHost(nil), j.DispatchDiagnostics.EligibleHosts...)
+		}
+		if len(j.DispatchDiagnostics.BlockedReasonsByHost) > 0 {
+			diag.BlockedReasonsByHost = make(map[string]string, len(j.DispatchDiagnostics.BlockedReasonsByHost))
+			for k, v := range j.DispatchDiagnostics.BlockedReasonsByHost {
+				diag.BlockedReasonsByHost[k] = v
+			}
+		}
+		cp.DispatchDiagnostics = &diag
+	}
+	if len(j.AttemptHistory) > 0 {
+		cp.AttemptHistory = append([]AttemptFailure(nil), j.AttemptHistory...)
+	}
 	if len(j.DependsOnJobIDs) > 0 {
 		cp.DependsOnJobIDs = append([]string(nil), j.DependsOnJobIDs...)
 	}
@@ -991,6 +1091,7 @@ func (q *InMemoryQueue) SetStore(s QueueStore) error {
 			}
 		}
 		_, _, depDoneChs := q.resolveDependentJobsLocked(context.Background(), now)
+		q.rebuildActiveJobsLocked()
 		for _, ch := range depDoneChs {
 			select {
 			case <-ch:
@@ -1124,7 +1225,7 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 					QueueState: "queued",
 				}
 				if q.slotReleaser != nil {
-					q.slotReleaser(j.ID)
+					q.pendingSlotReleases = append(q.pendingSlotReleases, j.ID)
 				}
 				expiredIDs = append(expiredIDs, j.ID)
 				continue
@@ -1193,7 +1294,7 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 					j.LeaseExpiresAt = nil
 					j.LeaseAckDeadlineAt = nil
 					if q.slotReleaser != nil {
-						q.slotReleaser(j.ID)
+						q.pendingSlotReleases = append(q.pendingSlotReleases, j.ID)
 					}
 					expiredIDs = append(expiredIDs, j.ID)
 				} else {
@@ -1222,6 +1323,7 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 	if len(expiredIDs) > 0 {
 		_, _, depDoneChs := q.resolveDependentJobsLocked(context.Background(), now)
 		doneChannels = append(doneChannels, depDoneChs...)
+		q.rebuildActiveJobsLocked()
 	}
 
 	for _, ch := range doneChannels {
@@ -1235,7 +1337,9 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 	if q.store != nil && len(expiredIDs) > 0 {
 		for _, id := range expiredIDs {
 			if j, ok := q.jobs[id]; ok && j != nil {
-				_ = q.store.SaveQueueJob(context.Background(), j)
+				sctx, cancel := storeContext(context.Background())
+				_ = q.store.SaveQueueJob(sctx, j)
+				cancel()
 			}
 		}
 	}
@@ -1245,6 +1349,7 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 
 // ReapExpired runs an expiration sweep across all pending and claimed jobs.
 func (q *InMemoryQueue) ReapExpired(now time.Time) []string {
+	defer q.flushPendingSlotReleases()
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return q.reapExpiredLocked(now)
@@ -1363,10 +1468,14 @@ func (q *InMemoryQueue) Enqueue(ctx context.Context, job *Job) (*Job, error) {
 	}
 
 	// Store copy
-	q.jobs[job.ID] = job
+	storedJob := cloneJobSnapshot(job)
+	storedJob.doneCh = job.doneCh
+	q.jobs[job.ID] = storedJob
+	q.syncJobActiveStateLocked(storedJob)
 	if q.store != nil {
-		_ = q.store.SaveQueueJob(ctx, job)
+		_ = q.store.SaveQueueJob(ctx, storedJob)
 	}
+	jobSnapshot := cloneJobSnapshot(storedJob)
 	q.mu.Unlock()
 
 	if failedOnEnqueue != nil {
@@ -1374,16 +1483,16 @@ func (q *InMemoryQueue) Enqueue(ctx context.Context, job *Job) (*Job, error) {
 	}
 
 	var spanOpts []telemetry.SpanOption
-	spanOpts = append(spanOpts, telemetry.WithTag("job.id", job.ID))
-	if job.TraceID != "" {
-		spanOpts = append(spanOpts, telemetry.WithParentTrace(job.TraceID, ""))
+	spanOpts = append(spanOpts, telemetry.WithTag("job.id", jobSnapshot.ID))
+	if jobSnapshot.TraceID != "" {
+		spanOpts = append(spanOpts, telemetry.WithParentTrace(jobSnapshot.TraceID, ""))
 	}
 	_, span := telemetry.StartSpan(ctx, "global_queue.enqueue", spanOpts...)
 	if span != nil {
 		span.End()
 	}
 
-	return job, nil
+	return jobSnapshot, nil
 }
 
 // Claim finds the oldest pending job matching hostID and jobTypes, marking it claimed.
@@ -1395,6 +1504,18 @@ func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []str
 // enforcing the Eager Update Pre-Claim Barrier, dependency gating, submodule slot family normalization,
 // concurrent submodule mutation guard, and atomic worktree slot reservation.
 func (q *InMemoryQueue) ClaimWithWorktrees(ctx context.Context, hostID string, jobTypes []string, idleWorktrees []string) (*Job, error) {
+	if hostID != "" {
+		q.mu.Lock()
+		checker := q.hostEligibilityChecker
+		q.mu.Unlock()
+		if checker != nil {
+			if eligible, _ := checker(hostID); !eligible {
+				return nil, nil
+			}
+		}
+	}
+
+	defer q.flushPendingSlotReleases()
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -1406,12 +1527,6 @@ func (q *InMemoryQueue) ClaimWithWorktrees(ctx context.Context, hostID string, j
 		case <-ch:
 		default:
 			close(ch)
-		}
-	}
-
-	if hostID != "" && q.hostEligibilityChecker != nil {
-		if eligible, _ := q.hostEligibilityChecker(hostID); !eligible {
-			return nil, nil
 		}
 	}
 
@@ -1568,6 +1683,7 @@ func (q *InMemoryQueue) ClaimWithWorktrees(ctx context.Context, hostID string, j
 	oldest.LeaseOwner = hostID
 	oldest.LeaseVersion = oldest.FencingToken
 	PopulateJobConversationFields(oldest)
+	q.syncJobActiveStateLocked(oldest)
 	if q.store != nil {
 		if err := q.store.SaveQueueJob(ctx, oldest); err != nil {
 			log.Printf("[dispatch-queue] ERROR: failed to persist claimed job %s: %v", oldest.ID, err)
@@ -1585,7 +1701,7 @@ func (q *InMemoryQueue) ClaimWithWorktrees(ctx context.Context, hostID string, j
 		claimSpan.End()
 	}
 
-	return oldest, nil
+	return cloneJobSnapshot(oldest), nil
 }
 
 // Decline resets a leased, claimed, or busy-abandoned job back to PENDING with HostID == "" and WorktreePath == ""
@@ -1598,8 +1714,9 @@ func (q *InMemoryQueue) Decline(ctx context.Context, jobID string, reason string
 		return nil, ErrJobNotFound
 	}
 	if job.Status == JobStatusCompleted || job.Status == JobStatusFailed || job.Status == JobStatusCanceled {
+		snap := cloneJobSnapshot(job)
 		q.mu.Unlock()
-		return job, nil
+		return snap, nil
 	}
 
 	if job.Attempts > 0 && (job.Status == JobStatusLeased || strings.EqualFold(strings.TrimSpace(reason), "REPO_BUSY") || strings.Contains(strings.ToUpper(reason), "DECLINE")) {
@@ -1635,16 +1752,18 @@ func (q *InMemoryQueue) Decline(ctx context.Context, jobID string, reason string
 		job.DispatchDiagnostics = &DispatchDiagnostics{}
 	}
 	job.DispatchDiagnostics.QueueState = "queued"
+	q.syncJobActiveStateLocked(job)
 	if q.store != nil {
 		_ = q.store.SaveQueueJob(ctx, job)
 	}
+	jobSnapshot := cloneJobSnapshot(job)
 	releaser := q.slotReleaser
 	q.mu.Unlock()
 
 	if releaser != nil {
 		releaser(jobID)
 	}
-	return job, nil
+	return jobSnapshot, nil
 }
 
 // Heartbeat extends the lease expiration of an in-flight claimed job, validating the worker's fencing token.
@@ -1725,6 +1844,7 @@ func (q *InMemoryQueue) HeartbeatWithStory(ctx context.Context, jobID string, fe
 	expires := now.Add(DefaultHeartbeatTimeout)
 	job.LeaseExpiresAt = &expires
 	PopulateJobConversationFields(job)
+	q.syncJobActiveStateLocked(job)
 	if q.store != nil {
 		sctx, cancel := storeContext(ctx)
 		defer cancel()
@@ -1736,7 +1856,7 @@ func (q *InMemoryQueue) HeartbeatWithStory(ctx context.Context, jobID string, fe
 			_ = q.store.SaveQueueJob(sctx, job)
 		}
 	}
-	return job, nil
+	return cloneJobSnapshot(job), nil
 }
 
 func storeContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -1955,6 +2075,7 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 		}
 	}
 
+	q.rebuildActiveJobsLocked()
 	return extended, nil
 }
 
@@ -2103,6 +2224,15 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 		if spath, ok := resMap["story_path"].(string); ok && strings.TrimSpace(spath) != "" {
 			job.StoryPath = strings.TrimSpace(spath)
 		}
+		if resFailCat, ok := resMap["failure_category"].(string); ok && strings.TrimSpace(resFailCat) != "" && !strings.EqualFold(resFailCat, FailureCategoryNone) {
+			job.FailureCategory = strings.TrimSpace(resFailCat)
+		}
+		if resFailStage, ok := resMap["failure_stage"].(string); ok && strings.TrimSpace(resFailStage) != "" {
+			job.FailureStage = strings.TrimSpace(resFailStage)
+		}
+		if resFailSummary, ok := resMap["failure_reason_summary"].(string); ok && strings.TrimSpace(resFailSummary) != "" {
+			job.FailureReasonSummary = strings.TrimSpace(resFailSummary)
+		}
 		if errStr == "" {
 			resStatus, _ := resMap["status"].(string)
 			resFailCat, _ := resMap["failure_category"].(string)
@@ -2162,6 +2292,7 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 			job.DispatchDiagnostics.QueueState = "completed"
 		}
 	}
+	q.syncJobActiveStateLocked(job)
 
 	if q.store != nil && job.CompletedAt != nil {
 		sctx, cancel := storeContext(ctx)
@@ -2204,6 +2335,7 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 	}
 
 	promotedJobs, cascadedFailed, depDoneChs := q.resolveDependentJobsLocked(ctx, now)
+	q.rebuildActiveJobsLocked()
 	jobSnapshot := cloneJobSnapshot(job)
 	done := job.doneCh
 	q.mu.Unlock()
@@ -2246,7 +2378,9 @@ func (q *InMemoryQueue) SetFinalHarvest(jobID string, turnCount int, sha string)
 			updated = true
 		}
 		if updated && q.store != nil {
-			_ = q.store.SaveQueueJob(context.Background(), job)
+			sctx, cancel := storeContext(context.Background())
+			_ = q.store.SaveQueueJob(sctx, job)
+			cancel()
 		}
 	}
 }
@@ -2328,14 +2462,16 @@ func (q *InMemoryQueue) dispatchAttribution(searchID, traceID string, promoted [
 
 // Get retrieves a job by ID, lazily reaping any expired jobs.
 func (q *InMemoryQueue) Get(jobID string) (*Job, bool) {
+	defer q.flushPendingSlotReleases()
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.reapExpiredLocked(q.now())
 	j, ok := q.jobs[jobID]
 	if ok && j != nil {
 		PopulateJobConversationFields(j)
+		return cloneJobSnapshot(j), true
 	}
-	return j, ok
+	return nil, false
 }
 
 func matchesJobStatusFilter(jobStatus, filterStatus string) bool {
@@ -2360,6 +2496,7 @@ func matchesJobStatusFilter(jobStatus, filterStatus string) bool {
 
 // Count returns the total number of jobs matching the filter before limit truncation.
 func (q *InMemoryQueue) Count(ctx context.Context, filter JobFilter) (int, error) {
+	defer q.flushPendingSlotReleases()
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -2383,6 +2520,7 @@ func (q *InMemoryQueue) Count(ctx context.Context, filter JobFilter) (int, error
 
 // List returns jobs matching the filter, sorted by CreatedAt descending, lazily reaping expired jobs.
 func (q *InMemoryQueue) List(ctx context.Context, filter JobFilter) ([]*Job, error) {
+	defer q.flushPendingSlotReleases()
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -2407,7 +2545,7 @@ func (q *InMemoryQueue) List(ctx context.Context, filter JobFilter) ([]*Job, err
 			continue
 		}
 		PopulateJobConversationFields(j)
-		matched = append(matched, j)
+		matched = append(matched, cloneJobSnapshot(j))
 	}
 
 	sort.Slice(matched, func(i, j int) bool {
@@ -2440,10 +2578,12 @@ func (q *InMemoryQueue) Cancel(ctx context.Context, jobID string, reason string)
 	}
 	job.Error = reason
 	job.CompletedAt = &now
+	q.syncJobActiveStateLocked(job)
 	if q.store != nil {
 		_ = q.store.SaveQueueJob(ctx, job)
 	}
 	promotedJobs, cascadedFailed, depDoneChs := q.resolveDependentJobsLocked(ctx, now)
+	q.rebuildActiveJobsLocked()
 	jobSnapshot := cloneJobSnapshot(job)
 	done := job.doneCh
 	q.mu.Unlock()
@@ -2467,7 +2607,7 @@ func (q *InMemoryQueue) Cancel(ctx context.Context, jobID string, reason string)
 	for _, cf := range cascadedFailed {
 		q.fireTerminalHooks(cf, nil)
 	}
-	return job, nil
+	return jobSnapshot, nil
 }
 
 // Retry re-enqueues a job by creating a fresh pending job with the same parameters.
@@ -2480,6 +2620,7 @@ func (q *InMemoryQueue) Retry(ctx context.Context, jobID string) (*Job, error) {
 	}
 
 	orig.Status = JobStatusRequeued
+	q.syncJobActiveStateLocked(orig)
 	newJob := &Job{
 		ID:                      generateJobID(),
 		Type:                    orig.Type,
@@ -2515,13 +2656,15 @@ func (q *InMemoryQueue) Retry(ctx context.Context, jobID string) (*Job, error) {
 		}
 	}
 	q.jobs[newJob.ID] = newJob
+	q.syncJobActiveStateLocked(newJob)
 	if q.store != nil {
 		_ = q.store.SaveQueueJob(ctx, orig)
 		_ = q.store.SaveQueueJob(ctx, newJob)
 	}
+	newJobSnapshot := cloneJobSnapshot(newJob)
 	q.mu.Unlock()
 
-	return newJob, nil
+	return newJobSnapshot, nil
 }
 
 // AckLease completes Phase 2 of the two-phase lease handshake, transitioning the job to running.
@@ -2583,6 +2726,7 @@ func (q *InMemoryQueue) AckLease(ctx context.Context, jobID, leaseToken string, 
 	expires := now.Add(DefaultHeartbeatTimeout)
 	job.LeaseExpiresAt = &expires
 	PopulateJobConversationFields(job)
+	q.syncJobActiveStateLocked(job)
 	if q.store != nil {
 		sctx, cancel := storeContext(ctx)
 		defer cancel()
@@ -2592,7 +2736,7 @@ func (q *InMemoryQueue) AckLease(ctx context.Context, jobID, leaseToken string, 
 		}
 		_ = q.store.SaveQueueJob(sctx, job)
 	}
-	return job, nil
+	return cloneJobSnapshot(job), nil
 }
 
 func addConversationIDLocked(job *Job, convID string) {
@@ -2724,10 +2868,13 @@ func (q *InMemoryQueue) UpdateRuntimeMetadata(jobID, worktreePath, activeConvID 
 		job.LeaseExpiresAt = &expires
 		changed = true
 	}
+	q.syncJobActiveStateLocked(job)
 	if changed && q.store != nil {
-		_ = q.store.SaveQueueJob(context.Background(), job)
+		sctx, cancel := storeContext(context.Background())
+		_ = q.store.SaveQueueJob(sctx, job)
+		cancel()
 	}
-	return job, true
+	return cloneJobSnapshot(job), true
 }
 
 // Failover records an attempt failure and resets the job to pending for re-dispatch.
@@ -2772,6 +2919,7 @@ func (q *InMemoryQueue) Failover(ctx context.Context, jobID string, req AttemptF
 		job.Retriable = false
 		completedAt := q.now()
 		job.CompletedAt = &completedAt
+		q.syncJobActiveStateLocked(job)
 		if job.doneCh != nil {
 			select {
 			case <-job.doneCh:
@@ -2783,6 +2931,7 @@ func (q *InMemoryQueue) Failover(ctx context.Context, jobID string, req AttemptF
 			_ = q.store.SaveQueueJob(ctx, job)
 		}
 		promotedJobs, cascadedFailed, depDoneChs := q.resolveDependentJobsLocked(ctx, completedAt)
+		q.rebuildActiveJobsLocked()
 		jobSnapshot := cloneJobSnapshot(job)
 		q.mu.Unlock()
 		for _, ch := range depDoneChs {
@@ -2796,7 +2945,7 @@ func (q *InMemoryQueue) Failover(ctx context.Context, jobID string, req AttemptF
 		for _, cf := range cascadedFailed {
 			q.fireTerminalHooks(cf, nil)
 		}
-		return job, nil
+		return jobSnapshot, nil
 	}
 
 	failedTool := strings.ToLower(strings.TrimSpace(req.Tool))
@@ -2854,12 +3003,14 @@ func (q *InMemoryQueue) Failover(ctx context.Context, jobID string, req AttemptF
 	job.LeaseToken = ""
 	job.LeaseAckDeadlineAt = nil
 	job.Retriable = true
+	q.syncJobActiveStateLocked(job)
 	if q.store != nil {
 		_ = q.store.SaveQueueJob(ctx, job)
 	}
+	jobSnapshot := cloneJobSnapshot(job)
 	q.mu.Unlock()
 
-	return job, nil
+	return jobSnapshot, nil
 }
 
 // RetryRetriable retries all failed jobs that are marked retriable.
@@ -2871,6 +3022,7 @@ func (q *InMemoryQueue) RetryRetriable(ctx context.Context) ([]*Job, error) {
 	for _, job := range q.jobs {
 		if (job.Status == JobStatusFailed || job.Status == JobStatusCanceled) && job.Retriable {
 			job.Status = JobStatusRequeued
+			q.syncJobActiveStateLocked(job)
 			newJob := &Job{
 				ID:                      generateJobID(),
 				Type:                    job.Type,
@@ -2909,11 +3061,12 @@ func (q *InMemoryQueue) RetryRetriable(ctx context.Context) ([]*Job, error) {
 				}
 			}
 			q.jobs[newJob.ID] = newJob
+			q.syncJobActiveStateLocked(newJob)
 			if q.store != nil {
 				_ = q.store.SaveQueueJob(ctx, job)
 				_ = q.store.SaveQueueJob(ctx, newJob)
 			}
-			retried = append(retried, newJob)
+			retried = append(retried, cloneJobSnapshot(newJob))
 		}
 	}
 	return retried, nil
@@ -2946,6 +3099,7 @@ func (q *InMemoryQueue) BindStoryWithFencing(ctx context.Context, jobID, storyID
 		job.FailureReasonSummary = ""
 		job.Retriable = false
 		job.CompletedAt = nil
+		q.syncJobActiveStateLocked(job)
 	}
 	if job.FencingToken > 0 && fencingToken != job.FencingToken {
 		return nil, ErrLeaseFenced
@@ -2956,7 +3110,7 @@ func (q *InMemoryQueue) BindStoryWithFencing(ctx context.Context, jobID, storyID
 		return nil, errors.New("story_id is required")
 	}
 	if isUnitTestDummyStoryID(cleanStoryID) && strings.TrimSpace(job.StoryID) != "" && !isUnitTestDummyStoryID(job.StoryID) {
-		return job, nil
+		return cloneJobSnapshot(job), nil
 	}
 
 	cleanStoryTitle, execTitle := NormalizeStoryTitle(cleanStoryID, storyTitle)
@@ -2992,7 +3146,7 @@ func (q *InMemoryQueue) BindStoryWithFencing(ctx context.Context, jobID, storyID
 		cancel()
 	}
 
-	return job, nil
+	return cloneJobSnapshot(job), nil
 }
 
 // Await blocks until the specified job completes, the context is cancelled, or the timeout expires.
@@ -3009,14 +3163,18 @@ func (q *InMemoryQueue) Await(ctx context.Context, jobID string, timeout time.Du
 	job, exists := q.jobs[jobID]
 	if !exists {
 		q.mu.Unlock()
+		q.flushPendingSlotReleases()
 		return nil, ErrJobNotFound
 	}
 	if job.Status == JobStatusCompleted || job.Status == JobStatusFailed {
+		snap := cloneJobSnapshot(job)
 		q.mu.Unlock()
-		return job, nil
+		q.flushPendingSlotReleases()
+		return snap, nil
 	}
 	done := job.doneCh
 	q.mu.Unlock()
+	q.flushPendingSlotReleases()
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -3029,7 +3187,7 @@ func (q *InMemoryQueue) Await(ctx context.Context, jobID string, timeout time.Du
 	case <-done:
 		q.mu.Lock()
 		defer q.mu.Unlock()
-		return q.jobs[jobID], nil
+		return cloneJobSnapshot(q.jobs[jobID]), nil
 	}
 }
 
@@ -3077,15 +3235,17 @@ func (q *InMemoryQueue) ForceDispatch(ctx context.Context, jobID string) (*Job, 
 	}
 	job.DispatchDiagnostics.QueueState = "dispatching"
 	job.DispatchDiagnostics.LastDispatchEvaluationAt = now.Format(time.RFC3339)
+	q.syncJobActiveStateLocked(job)
 	if q.store != nil {
 		_ = q.store.SaveQueueJob(ctx, job)
 	}
 
-	return job, nil
+	return cloneJobSnapshot(job), nil
 }
 
 // ReconcileGlobalQueueSlots detects and reclaims stale leases (> staleGrace) across all claimed jobs.
 func (q *InMemoryQueue) ReconcileGlobalQueueSlots(now time.Time, staleGrace time.Duration) []string {
+	defer q.flushPendingSlotReleases()
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -3132,6 +3292,9 @@ func (q *InMemoryQueue) ReconcileGlobalQueueSlots(now time.Time, staleGrace time
 						j.DispatchDiagnostics.BlockedReasonsByHost = make(map[string]string)
 					}
 					j.DispatchDiagnostics.BlockedReasonsByHost["lease"] = fmt.Sprintf("reclaimed from %s after heartbeat timeout > %v", prevHost, staleGrace)
+					if q.slotReleaser != nil {
+						q.pendingSlotReleases = append(q.pendingSlotReleases, j.ID)
+					}
 					reclaimedIDs = append(reclaimedIDs, j.ID)
 				} else {
 					j.Status = JobStatusFailed
@@ -3151,8 +3314,11 @@ func (q *InMemoryQueue) ReconcileGlobalQueueSlots(now time.Time, staleGrace time
 						}
 					}
 				}
+				q.syncJobActiveStateLocked(j)
 				if q.store != nil {
-					_ = q.store.SaveQueueJob(context.Background(), j)
+					sctx, cancel := storeContext(context.Background())
+					_ = q.store.SaveQueueJob(sctx, j)
+					cancel()
 				}
 			}
 		}
