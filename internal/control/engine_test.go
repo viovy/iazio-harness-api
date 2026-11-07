@@ -5711,3 +5711,95 @@ func TestAppendLog_TickDoesNotReuseBroadcastSeq(t *testing.T) {
 	}
 }
 
+func TestStory0196_EngineEagerUpdateBarrier_MultiHostSkip_DependencyGating_And_DeclineReset(t *testing.T) {
+	now := time.Date(2026, 11, 7, 14, 0, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return now })
+
+	_ = e.RegisterHost("debian", "permanent", "generic")
+	_ = e.RegisterHost("mac-mini", "permanent", "generic")
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "debian",
+		WorktreePath:                 "/home/romeo/work/meta-repo",
+		CloneURL:                     "https://github.com/viovy/meta-repo.git",
+		Lock:                         LockRunning,
+		RunningJobID:                 "job-active-debian",
+		GlobalQueueAllocationEnabled: true,
+	})
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "debian",
+		WorktreePath:                 "/home/romeo/work/meta-repo-02",
+		CloneURL:                     "https://github.com/viovy/meta-repo.git",
+		Lock:                         LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "mac-mini",
+		WorktreePath:                 "/Users/romeo/work/meta-repo",
+		CloneURL:                     "https://github.com/viovy/meta-repo.git",
+		Lock:                         LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+	_ = e.Heartbeat("debian", []Tool{{Name: "agy", Installed: true, Path: "/usr/bin/agy", Status: "ok"}}, false)
+	_ = e.Heartbeat("mac-mini", []Tool{{Name: "agy", Installed: true, Path: "/usr/bin/agy", Status: "ok"}}, false)
+
+	// 1. Enqueue global story schedule targeting submodule "iazio-mcp": must stay unassigned (HostID="", WorktreePath="") while QUEUED
+	sch, err := e.EnqueueGlobalStorySchedule("STORY-IAZIO-0196", "iazio-mcp", "agy", "/autonomous-story-execution STORY-IAZIO-0196")
+	if err != nil {
+		t.Fatalf("EnqueueGlobalStorySchedule: %v", err)
+	}
+	if sch.HostID != "" || sch.WorktreePath != "" {
+		t.Fatalf("expected global story schedule unassigned while QUEUED (HostID='', WorktreePath=''), got HostID=%q WorktreePath=%q", sch.HostID, sch.WorktreePath)
+	}
+
+	// 2. Eager Update Pre-Claim Barrier on mac-mini (DRIFT_DETECTED, UPDATING, RESTART_PENDING, ONLINE_UPDATING_TOOLS)
+	for _, st := range []EagerUpdateState{StateDriftDetected, StateUpdating, StateRestartPending} {
+		e.UpdateEagerReadiness("mac-mini", EagerUpdateReadinessReport{
+			HostID:           "mac-mini",
+			EagerUpdateState: st,
+		})
+		if ok, _ := e.IsHostEligibleForClaim("mac-mini"); ok {
+			t.Fatalf("expected mac-mini ineligible for claim when EagerUpdateState=%s", st)
+		}
+		if _, _, _, ok := e.PollHost("mac-mini"); ok {
+			t.Fatalf("expected PollHost(mac-mini) to return false when EagerUpdateState=%s", st)
+		}
+	}
+	e.UpdateEagerReadiness("mac-mini", EagerUpdateReadinessReport{
+		HostID:           "mac-mini",
+		EagerUpdateState: StateUpToDate,
+	})
+	_ = e.HeartbeatWithCapabilities("mac-mini", "ONLINE_UPDATING_TOOLS", []Tool{{Name: "agy", Installed: true, Path: "/usr/bin/agy", Status: "ok"}}, false, nil, "1.0.0", "abc")
+	if ok, _ := e.IsHostEligibleForClaim("mac-mini"); ok {
+		t.Fatalf("expected mac-mini ineligible when Presence=ONLINE_UPDATING_TOOLS")
+	}
+
+	// 3. Debian primary worktree (/home/romeo/work/meta-repo) is BUSY, so PollHostWithWorktrees on debian selects secondary IDLE worktree (/home/romeo/work/meta-repo-02)
+	job1, leasedSch, _, ok := e.PollHostWithWorktrees("debian", []string{"/home/romeo/work/meta-repo-02"})
+	if !ok {
+		t.Fatalf("expected debian secondary worktree /home/romeo/work/meta-repo-02 to claim global schedule")
+	}
+	if leasedSch.HostID != "debian" || leasedSch.WorktreePath != "/home/romeo/work/meta-repo-02" {
+		t.Fatalf("expected leased schedule bound to debian:/home/romeo/work/meta-repo-02, got %s:%s", leasedSch.HostID, leasedSch.WorktreePath)
+	}
+
+	// 4. DeclineJob resets global schedule back to unassigned (HostID="", WorktreePath="") so mac-mini can claim it once StateUpToDate
+	if err := e.DeclineJob(job1.ID, "REPO_BUSY"); err != nil {
+		t.Fatalf("DeclineJob: %v", err)
+	}
+	schAfterDecline, _ := e.GetSchedule(sch.ID)
+	if schAfterDecline.Status != "QUEUED" || schAfterDecline.HostID != "" || schAfterDecline.WorktreePath != "" {
+		t.Fatalf("expected global schedule reset to QUEUED with HostID='' and WorktreePath='' after DeclineJob, got %+v", schAfterDecline)
+	}
+
+	// Restore mac-mini to ONLINE + StateUpToDate and poll from mac-mini
+	_ = e.HeartbeatWithCapabilities("mac-mini", "ONLINE", []Tool{{Name: "agy", Installed: true, Path: "/usr/bin/agy", Status: "ok"}}, false, nil, "1.0.0", "abc")
+	job2, leasedSch2, _, ok := e.PollHostWithWorktrees("mac-mini", []string{"/Users/romeo/work/meta-repo"})
+	if !ok {
+		t.Fatalf("expected mac-mini to claim global schedule after DeclineJob reset")
+	}
+	if leasedSch2.HostID != "mac-mini" || leasedSch2.WorktreePath != "/Users/romeo/work/meta-repo" || job2.ID == "" {
+		t.Fatalf("expected mac-mini:/Users/romeo/work/meta-repo lease, got %+v", leasedSch2)
+	}
+}
+
+

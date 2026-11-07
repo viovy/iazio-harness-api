@@ -215,6 +215,9 @@ type Schedule struct {
 	ResumeConversationID      string
 	LeaseRetries              int
 	StoryID                   string
+	TargetSubmodule           string
+	DependsOnJobID            string
+	DependsOnJobIDs           []string
 	IsGlobal                  bool
 	CustomPrompt              string
 	TraceID                   string
@@ -748,7 +751,9 @@ type EagerUpdateState string
 
 const (
 	StateUpToDate              EagerUpdateState = "UP_TO_DATE"
+	StateDriftDetected         EagerUpdateState = "DRIFT_DETECTED"
 	StateUpdating              EagerUpdateState = "UPDATING"
+	StateRestartPending        EagerUpdateState = "RESTART_PENDING"
 	StateDeferredHarnessActive EagerUpdateState = "DEFERRED_HARNESS_ACTIVE"
 	StateDeferredGitDirty      EagerUpdateState = "DEFERRED_GIT_DIRTY"
 	StateBackoffAfterFailure   EagerUpdateState = "BACKOFF_AFTER_FAILURE"
@@ -1311,6 +1316,277 @@ func isRepoSlotIdleForDispatch(r *Repo) bool {
 	return true
 }
 
+func (e *Engine) isHostBlockedByEagerUpdateLocked(h *Host) (bool, string) {
+	if h == nil {
+		return false, ""
+	}
+	pres := strings.ToUpper(strings.TrimSpace(h.Presence))
+	if pres == "ONLINE_UPDATING_TOOLS" || pres == "UPDATING_TOOLS" {
+		return true, fmt.Sprintf("host presence is %s", pres)
+	}
+	if h.EagerReadiness != nil {
+		st := EagerUpdateState(strings.ToUpper(strings.TrimSpace(string(h.EagerReadiness.EagerUpdateState))))
+		switch st {
+		case StateDriftDetected, StateUpdating, StateRestartPending:
+			return true, fmt.Sprintf("host eager update state is %s", st)
+		}
+	}
+	return false, ""
+}
+
+// IsHostEligibleForClaim returns whether hostID is eligible to claim or poll global queue jobs
+// (enforcing the Eager Update Pre-Claim Barrier and online presence check).
+func (e *Engine) IsHostEligibleForClaim(hostID string) (bool, string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cleanID := strings.TrimSpace(hostID)
+	if cleanID == "" {
+		return true, ""
+	}
+	h, ok := e.hosts[cleanID]
+	if !ok || h == nil {
+		return true, ""
+	}
+	if strings.EqualFold(h.Presence, "OFFLINE") {
+		return false, "host is OFFLINE"
+	}
+	if blocked, reason := e.isHostBlockedByEagerUpdateLocked(h); blocked {
+		return false, reason
+	}
+	return true, ""
+}
+
+// BindDispatchQueue wires a dispatch.Queue (if *dispatch.InMemoryQueue) with Engine's host eligibility,
+// worktree slot reservation/release, and dependency satisfaction callbacks.
+func (e *Engine) BindDispatchQueue(q dispatch.Queue) {
+	if q == nil {
+		return
+	}
+	if imq, ok := q.(*dispatch.InMemoryQueue); ok && imq != nil {
+		imq.SetHostEligibilityChecker(e.IsHostEligibleForClaim)
+		imq.SetSlotAllocator(e.AllocateDispatchJobSlot)
+		imq.SetSlotReleaser(e.ReleaseDispatchJobRepo)
+		imq.SetExternalDepChecker(e.IsJobDependencySatisfied)
+	}
+}
+
+func (e *Engine) isJobDependencySatisfiedLocked(depID string) (exists, satisfied, failed bool, reason string) {
+	cleanID := strings.TrimSpace(depID)
+	if cleanID == "" {
+		return false, true, false, ""
+	}
+	if job, ok := e.jobs[cleanID]; ok && job != nil {
+		st := strings.ToUpper(strings.TrimSpace(job.Status))
+		if st == "FAILED" || st == "CANCELLED" || st == "CANCELED" || st == "DECLINED" || st == "ABANDONED" {
+			return true, false, true, job.Reason
+		}
+		if (st == "COMPLETED" || st == "RUN_FINISHED") && job.ExitPosted {
+			if job.ExitCode != 0 {
+				return true, false, true, fmt.Sprintf("exit_code=%d", job.ExitCode)
+			}
+			if !job.ASEComplete {
+				return true, false, false, "ase_complete=false"
+			}
+			return true, true, false, ""
+		}
+		return true, false, false, fmt.Sprintf("status=%s", job.Status)
+	}
+	if sch, ok := e.schedules[cleanID]; ok && sch != nil {
+		st := strings.ToUpper(strings.TrimSpace(sch.Status))
+		if st == "FAILED" || st == "CANCELLED" || st == "CANCELED" || st == "DECLINED" || st == "ABANDONED" {
+			return true, false, true, sch.FailureReasonSummary
+		}
+		if st == "FINISHED" || st == "COMPLETED" {
+			return true, true, false, ""
+		}
+		return true, false, false, fmt.Sprintf("schedule_status=%s", sch.Status)
+	}
+	return false, false, false, "dependency_not_found"
+}
+
+// IsJobDependencySatisfied checks whether an upstream dependency job or schedule has reached terminal COMPLETED status
+// (exit_code == 0 and ase_complete == true).
+func (e *Engine) IsJobDependencySatisfied(depID string) (exists, satisfied, failed bool, reason string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.isJobDependencySatisfiedLocked(depID)
+}
+
+func (e *Engine) areScheduleDependenciesSatisfiedLocked(sch *Schedule) bool {
+	if sch == nil {
+		return true
+	}
+	var deps []string
+	if d := strings.TrimSpace(sch.DependsOnJobID); d != "" && d != sch.ID {
+		deps = append(deps, d)
+	}
+	for _, raw := range sch.DependsOnJobIDs {
+		d := strings.TrimSpace(raw)
+		if d != "" && d != sch.ID {
+			deps = append(deps, d)
+		}
+	}
+	if len(deps) == 0 {
+		return true
+	}
+	for _, depID := range deps {
+		exists, satisfied, failed, _ := e.isJobDependencySatisfiedLocked(depID)
+		if !exists || failed || !satisfied {
+			return false
+		}
+	}
+	return true
+}
+
+func repoMatchesTargetOrSlotFamily(r *Repo, reqRepo string) bool {
+	if r == nil {
+		return false
+	}
+	cleanReq := strings.TrimSpace(reqRepo)
+	if cleanReq == "" || cleanReq == "." || strings.EqualFold(cleanReq, "root") {
+		return true
+	}
+	if r.WorktreePath == cleanReq || r.EffectiveAlias() == cleanReq || strings.Contains(r.WorktreePath, cleanReq) {
+		return true
+	}
+	reqFamily := dispatch.NormalizeToSuperprojectSlotFamily(cleanReq)
+	wtFamily := dispatch.NormalizeToSuperprojectSlotFamily(r.WorktreePath)
+	aliasFamily := dispatch.NormalizeToSuperprojectSlotFamily(r.EffectiveAlias())
+	return reqFamily != "" && (wtFamily == reqFamily || aliasFamily == reqFamily)
+}
+
+// AllocateDispatchJobSlot evaluates whether hostID has a clean, idle worktree slot for targetRepo
+// (normalizing submodule names to their superproject worktree slot family), reserves the slot for jobID,
+// and returns the bound WorktreePath.
+func (e *Engine) AllocateDispatchJobSlot(hostID, jobID, targetRepo, targetSubmodule, targetAgent string, idleWorktrees []string) (string, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	cleanHostID := strings.TrimSpace(hostID)
+	cleanJobID := strings.TrimSpace(jobID)
+	if cleanHostID == "" || cleanJobID == "" {
+		return "", false
+	}
+
+	if h, ok := e.hosts[cleanHostID]; ok && h != nil {
+		if strings.EqualFold(h.Presence, "OFFLINE") {
+			return "", false
+		}
+		if blocked, _ := e.isHostBlockedByEagerUpdateLocked(h); blocked {
+			return "", false
+		}
+	}
+
+	// Enforce concurrent submodule mutation guard against active schedules on the engine
+	cleanSubmod := strings.ToLower(strings.TrimSpace(targetSubmodule))
+	if cleanSubmod != "" {
+		for _, sch := range e.schedules {
+			if sch == nil || (sch.Status != "RUNNING" && sch.Status != "LEASED" && sch.Status != "CLAIMED") {
+				continue
+			}
+			activeSub := strings.ToLower(strings.TrimSpace(sch.TargetSubmodule))
+			if activeSub == "" {
+				activeSub = dispatch.ExtractTargetSubmodule(sch.WorktreePath, nil)
+			}
+			if activeSub == cleanSubmod {
+				return "", false
+			}
+		}
+	}
+
+	var hostRepos []*Repo
+	for _, r := range e.repos {
+		if r != nil && r.HostID == cleanHostID {
+			hostRepos = append(hostRepos, r)
+		}
+	}
+	sort.Slice(hostRepos, func(a, b int) bool {
+		return hostRepos[a].WorktreePath < hostRepos[b].WorktreePath
+	})
+
+	if len(hostRepos) == 0 {
+		if len(idleWorktrees) > 0 {
+			reqFamily := dispatch.NormalizeToSuperprojectSlotFamily(targetRepo)
+			for _, wt := range idleWorktrees {
+				trimmed := strings.TrimSpace(wt)
+				if trimmed == "" {
+					continue
+				}
+				if reqFamily == "" || dispatch.NormalizeToSuperprojectSlotFamily(trimmed) == reqFamily {
+					return trimmed, true
+				}
+			}
+			return "", false
+		}
+		return "", true
+	}
+
+	idleFilter := make(map[string]bool, len(idleWorktrees))
+	for _, wt := range idleWorktrees {
+		trimmed := strings.TrimSpace(wt)
+		if trimmed != "" {
+			idleFilter[trimmed] = true
+			idleFilter[filepath.Clean(trimmed)] = true
+		}
+	}
+
+	// If jobID is already bound to a repo on this host, return it.
+	for _, r := range hostRepos {
+		if r.RunningJobID == cleanJobID {
+			r.Lock = LockRunning
+			r.LockHolder = cleanJobID
+			if h, ok := e.hosts[r.HostID]; ok && h != nil {
+				h.HarnessActive = true
+			}
+			return r.WorktreePath, true
+		}
+	}
+
+	anyGlobalEnabled := false
+	for _, r := range hostRepos {
+		if r.GlobalQueueAllocationEnabled {
+			anyGlobalEnabled = true
+			break
+		}
+	}
+
+	var matched *Repo
+	for _, r := range hostRepos {
+		if anyGlobalEnabled && !r.GlobalQueueAllocationEnabled {
+			continue
+		}
+		if len(idleFilter) > 0 {
+			if !idleFilter[r.WorktreePath] && !idleFilter[filepath.Clean(r.WorktreePath)] && !idleFilter[r.EffectiveAlias()] {
+				continue
+			}
+		}
+		if r.Queue == QueuePaused || r.Queue == QueueBlocked {
+			continue
+		}
+		if !isRepoSlotIdleForDispatch(r) {
+			continue
+		}
+		if repoMatchesTargetOrSlotFamily(r, targetRepo) {
+			matched = r
+			break
+		}
+	}
+
+	if matched == nil {
+		return "", false
+	}
+
+	matched.Lock = LockRunning
+	matched.RunningJobID = cleanJobID
+	matched.LockHolder = cleanJobID
+	matched.LastRuntimeCheck = e.now()
+	if h, ok := e.hosts[matched.HostID]; ok && h != nil {
+		h.HarnessActive = true
+	}
+	e.notifyRepoLocked(matched)
+	return matched.WorktreePath, true
+}
+
 // ResolveToolPriorityAllocation resolves the target agent, host, and workspace repo according to Global Queue Tool Priority.
 func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, requestedRepo string) ToolPriorityAllocation {
 	e.mu.Lock()
@@ -1318,6 +1594,9 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 
 	reqAgent := strings.ToLower(strings.TrimSpace(requestedAgent))
 	reqHost := strings.TrimSpace(requestedHost)
+	if strings.EqualFold(reqHost, "global") || strings.EqualFold(reqHost, "auto") {
+		reqHost = ""
+	}
 	reqRepo := strings.TrimSpace(requestedRepo)
 	if reqRepo == "" || reqRepo == "." {
 		reqRepo = "root"
@@ -1330,13 +1609,15 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 	sort.Strings(hostIDs)
 
 	if reqAgent != "" && reqAgent != "auto" {
-		firstEligibleHost := reqHost
 		for _, hostID := range hostIDs {
 			h := e.hosts[hostID]
 			if h == nil {
 				continue
 			}
 			if (!strings.EqualFold(h.Presence, "online") && !strings.EqualFold(h.Presence, "idle")) || (!h.LastSeen.IsZero() && e.now().Sub(h.LastSeen) > 5*time.Minute) {
+				continue
+			}
+			if blocked, _ := e.isHostBlockedByEagerUpdateLocked(h); blocked {
 				continue
 			}
 			if reqHost != "" && h.ID != reqHost {
@@ -1355,9 +1636,6 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 			if !hasTool && len(h.Tools) > 0 {
 				continue
 			}
-			if firstEligibleHost == "" {
-				firstEligibleHost = h.ID
-			}
 			var hostRepos []*Repo
 			for _, r := range e.repos {
 				if r != nil && r.HostID == h.ID {
@@ -1368,7 +1646,7 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 				return hostRepos[a].WorktreePath < hostRepos[b].WorktreePath
 			})
 			for _, r := range hostRepos {
-				repoMatches := r.GlobalQueueAllocationEnabled && (reqRepo == "" || reqRepo == "root" || r.WorktreePath == reqRepo || r.EffectiveAlias() == reqRepo || strings.Contains(r.WorktreePath, reqRepo))
+				repoMatches := r.GlobalQueueAllocationEnabled && repoMatchesTargetOrSlotFamily(r, reqRepo)
 				if repoMatches && isRepoSlotIdleForDispatch(r) {
 					return ToolPriorityAllocation{
 						TargetAgent:          reqAgent,
@@ -1383,11 +1661,11 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 		}
 		return ToolPriorityAllocation{
 			TargetAgent:          reqAgent,
-			TargetHost:           firstEligibleHost,
+			TargetHost:           reqHost,
 			TargetRepo:           reqRepo,
 			PriorityRankSelected: 0,
 			AllocationSource:     "explicit_override",
-			ImmediateClaimable:   true,
+			ImmediateClaimable:   false,
 		}
 	}
 
@@ -1405,6 +1683,9 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 				continue
 			}
 			if (!strings.EqualFold(h.Presence, "online") && !strings.EqualFold(h.Presence, "idle")) || (!h.LastSeen.IsZero() && e.now().Sub(h.LastSeen) > 5*time.Minute) {
+				continue
+			}
+			if blocked, _ := e.isHostBlockedByEagerUpdateLocked(h); blocked {
 				continue
 			}
 			if reqHost != "" && h.ID != reqHost {
@@ -1438,7 +1719,7 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 				return hostRepos[a].WorktreePath < hostRepos[b].WorktreePath
 			})
 			for _, r := range hostRepos {
-				repoMatches := r.GlobalQueueAllocationEnabled && (reqRepo == "" || reqRepo == "root" || r.WorktreePath == reqRepo || r.EffectiveAlias() == reqRepo || strings.Contains(r.WorktreePath, reqRepo))
+				repoMatches := r.GlobalQueueAllocationEnabled && repoMatchesTargetOrSlotFamily(r, reqRepo)
 				if repoMatches {
 					if isRepoSlotIdleForDispatch(r) {
 						return ToolPriorityAllocation{
@@ -1457,7 +1738,7 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 		if firstEligibleHost != "" {
 			return ToolPriorityAllocation{
 				TargetAgent:          candidateToolLower,
-				TargetHost:           firstEligibleHost,
+				TargetHost:           reqHost,
 				TargetRepo:           reqRepo,
 				PriorityRankSelected: i + 1,
 				AllocationSource:     "global_queue_tool_priority",
@@ -1508,7 +1789,7 @@ func (e *Engine) BindDispatchJobRepo(hostID, worktreePath, jobID string) string 
 	// 1. If already bound to this jobID on a specific repo and cleanWT is empty/generic or matches, return it.
 	for _, r := range hostRepos {
 		if r.RunningJobID == cleanJobID {
-			if cleanWT == "" || cleanWT == "." || cleanWT == "root" || r.WorktreePath == cleanWT || r.EffectiveAlias() == cleanWT {
+			if cleanWT == "" || cleanWT == "." || cleanWT == "root" || repoMatchesTargetOrSlotFamily(r, cleanWT) {
 				r.Lock = LockRunning
 				r.LockHolder = cleanJobID
 				if h, ok := e.hosts[r.HostID]; ok && h != nil {
@@ -1520,11 +1801,11 @@ func (e *Engine) BindDispatchJobRepo(hostID, worktreePath, jobID string) string 
 	}
 
 	var matched *Repo
-	// 2. Exact worktree path or alias match
+	// 2. Exact worktree path or alias match (must be idle or already bound to cleanJobID)
 	if cleanWT != "" && cleanWT != "." && cleanWT != "root" {
 		for _, r := range hostRepos {
 			if r.WorktreePath == cleanWT || r.EffectiveAlias() == cleanWT {
-				if r.RunningJobID == "" || r.RunningJobID == cleanJobID {
+				if isRepoSlotIdleForDispatch(r) || r.RunningJobID == cleanJobID {
 					matched = r
 					break
 				}
@@ -1532,7 +1813,7 @@ func (e *Engine) BindDispatchJobRepo(hostID, worktreePath, jobID string) string 
 		}
 		if matched == nil {
 			for _, r := range hostRepos {
-				if strings.HasSuffix(r.WorktreePath, "/"+cleanWT) && (r.RunningJobID == "" || r.RunningJobID == cleanJobID) {
+				if strings.HasSuffix(r.WorktreePath, "/"+cleanWT) && (isRepoSlotIdleForDispatch(r) || r.RunningJobID == cleanJobID) {
 					matched = r
 					break
 				}
@@ -1540,7 +1821,17 @@ func (e *Engine) BindDispatchJobRepo(hostID, worktreePath, jobID string) string 
 		}
 	}
 
-	// 3. Fallback to first IDLE repo on hostID when worktreePath is "." / "root" / submodule name
+	// 3. Match by superproject slot family on IDLE repos (e.g. iazio-mcp -> /home/romeo/work/meta-repo-02)
+	if matched == nil {
+		for _, r := range hostRepos {
+			if r.GlobalQueueAllocationEnabled && isRepoSlotIdleForDispatch(r) && repoMatchesTargetOrSlotFamily(r, cleanWT) {
+				matched = r
+				break
+			}
+		}
+	}
+
+	// 4. Fallback to first IDLE repo on hostID when worktreePath is "." / "root" / submodule name
 	if matched == nil {
 		for _, r := range hostRepos {
 			if r.GlobalQueueAllocationEnabled && isRepoSlotIdleForDispatch(r) {
@@ -1872,11 +2163,16 @@ func (e *Engine) EnqueueGlobalStorySchedule(storyID, submodule, targetAgent, pro
 		StoryID: cleanStoryID,
 		Status:  "ACTIVE",
 	}
+	targetSub := dispatch.ExtractTargetSubmodule(submodule, nil)
+	if targetSub == "" && strings.TrimSpace(submodule) != "" && strings.TrimSpace(submodule) != "." {
+		targetSub = strings.TrimSpace(submodule)
+	}
 	s := &Schedule{
 		ID:                  id,
 		PromptID:            promptID,
 		StoryID:             cleanStoryID,
-		WorktreePath:        submodule,
+		TargetSubmodule:     targetSub,
+		WorktreePath:        "",
 		PromptTitle:         fmt.Sprintf("Execute story %s", cleanStoryID),
 		Engine:              targetAgent,
 		Kind:                "story_execution",
@@ -2974,6 +3270,8 @@ func (e *Engine) DeclineJob(jobID, reason string) error {
 	job.ExitPosted = true
 	var changedRepo *Repo
 	if sch, ok := e.schedules[job.ScheduleID]; ok {
+		prevHost := sch.HostID
+		prevPath := sch.WorktreePath
 		sch.IterationsRemaining++
 		if sch.IterationsCompleted > 0 {
 			sch.IterationsCompleted--
@@ -2987,20 +3285,22 @@ func (e *Engine) DeclineJob(jobID, reason string) error {
 					// Re-queue the global schedule and unbind host assignment so alternate nodes can execute.
 					sch.Status = "QUEUED"
 					sch.HostID = ""
-					if prompt := e.prompts[sch.PromptID]; prompt != nil && prompt.StoryID != "" {
-						sch.WorktreePath = "."
-					}
+					sch.WorktreePath = ""
 				} else {
 					sch.Status = "DECLINED"
 				}
 			} else {
 				sch.Status = "QUEUED"
+				if sch.IsGlobal {
+					sch.HostID = ""
+					sch.WorktreePath = ""
+				}
 			}
 		}
 		if sch.CloneURL != "" {
 			delete(e.cloneLease, sch.CloneURL)
 		}
-		if repo := e.repos[repoKey(sch.HostID, sch.WorktreePath)]; repo != nil {
+		if repo := e.repos[repoKey(prevHost, prevPath)]; repo != nil {
 			hasActive := false
 			for _, other := range e.jobs {
 				if other.ID != jobID && !other.ExitPosted && (other.Status == "RUNNING" || other.Status == "CANCEL_REQUESTED") {
@@ -3017,10 +3317,11 @@ func (e *Engine) DeclineJob(jobID, reason string) error {
 					repo.Lock = LockIdle
 				}
 				repo.RunningJobID = ""
+				repo.LockHolder = ""
 			}
 			changedRepo = repo
 		}
-		key := repoKey(sch.HostID, sch.WorktreePath)
+		key := repoKey(prevHost, prevPath)
 		rows := e.history[key]
 		var deduplicated []HistoryRow
 		var droppedJobIDs []string
@@ -3032,9 +3333,9 @@ func (e *Engine) DeclineJob(jobID, reason string) error {
 			deduplicated = append(deduplicated, r)
 		}
 		e.history[key] = deduplicated
-		e.updateHistoryDeclineLocked(sch.HostID, sch.WorktreePath, jobID, reason)
+		e.updateHistoryDeclineLocked(prevHost, prevPath, jobID, reason)
 		for _, dropID := range droppedJobIDs {
-			e.notifyHistoryDeleteLocked(sch.HostID, sch.WorktreePath, dropID)
+			e.notifyHistoryDeleteLocked(prevHost, prevPath, dropID)
 		}
 	}
 	if changedRepo != nil {
@@ -3121,6 +3422,7 @@ func (e *Engine) ApplyFinish(host, path string, jobID string, in FinishInput) Fi
 	}
 	if job, ok := e.jobs[jobID]; ok {
 		job.ExitPosted = true
+		job.ASEComplete = in.ASEComplete
 		if job.Status != "CANCELLED" {
 			job.Status = "RUN_FINISHED"
 		}
@@ -3968,16 +4270,51 @@ func (e *Engine) reapExpiredLocked() {
 // PollHost leases the next queued schedule for the host.
 // The bool is false when nothing is waiting.
 func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
+	return e.PollHostWithWorktrees(host, nil)
+}
+
+// PollHostWithWorktrees leases the next queued schedule for the host, optionally filtering global queue allocation
+// to the host's advertised idle worktrees while enforcing the Eager Update Pre-Claim Barrier, dependency gating,
+// submodule slot family normalization, and concurrent submodule mutation guard.
+func (e *Engine) PollHostWithWorktrees(host string, idleWorktrees []string) (Job, Schedule, string, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.reapExpiredLocked()
 	now := e.now()
-	if h, ok := e.hosts[host]; ok && (h.Presence == "ONLINE_UPDATING_TOOLS" || h.Presence == "UPDATING_TOOLS") {
-		return Job{}, Schedule{}, "", false
+	if h, ok := e.hosts[host]; ok && h != nil {
+		if blocked, _ := e.isHostBlockedByEagerUpdateLocked(h); blocked {
+			return Job{}, Schedule{}, "", false
+		}
 	}
+
+	idleFilter := make(map[string]bool, len(idleWorktrees))
+	for _, wt := range idleWorktrees {
+		trimmed := strings.TrimSpace(wt)
+		if trimmed != "" {
+			idleFilter[trimmed] = true
+			idleFilter[filepath.Clean(trimmed)] = true
+		}
+	}
+
+	activeSubmodules := make(map[string]bool)
+	for _, s := range e.schedules {
+		if s != nil && (s.Status == "RUNNING" || s.Status == "LEASED" || s.Status == "CLAIMED") {
+			sub := strings.ToLower(strings.TrimSpace(s.TargetSubmodule))
+			if sub == "" {
+				sub = dispatch.ExtractTargetSubmodule(s.WorktreePath, nil)
+			}
+			if sub != "" {
+				activeSubmodules[sub] = true
+			}
+		}
+	}
+
 	var candidates []*Schedule
 	for _, sch := range e.schedules {
 		if sch.Status != "QUEUED" && sch.Status != "SCHEDULED" && sch.Status != "PENDING" {
+			continue
+		}
+		if !e.areScheduleDependenciesSatisfiedLocked(sch) {
 			continue
 		}
 		// Prevent duplicate/looping dispatch if an associated job is already active or leased
@@ -3997,25 +4334,21 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 		} else if sch.IsGlobal || sch.HostID == "global" || sch.HostID == "" {
 			// Level 2: Shared fleet global queue.
 			// Eligible if this host has any repo with GlobalQueueAllocationEnabled == true
-			// (matching the target submodule if specified, or any enabled repo on the host).
-			matched := false
-			if sch.WorktreePath != "" && sch.WorktreePath != "." {
-				for _, r := range e.repos {
-					if r.HostID == host && r.GlobalQueueAllocationEnabled {
-						if r.WorktreePath == sch.WorktreePath || strings.HasSuffix(r.WorktreePath, "/"+sch.WorktreePath) || filepath.Base(r.WorktreePath) == sch.WorktreePath {
-							candidates = append(candidates, sch)
-							matched = true
-							break
-						}
-					}
+			// (matching the target submodule/slot family if specified, or any enabled repo on the host).
+			if sch.TargetSubmodule == "" {
+				if sub := dispatch.ExtractTargetSubmodule(sch.WorktreePath, nil); sub != "" {
+					sch.TargetSubmodule = sub
 				}
 			}
-			if !matched {
-				for _, r := range e.repos {
-					if r.HostID == host && r.GlobalQueueAllocationEnabled {
-						candidates = append(candidates, sch)
-						break
-					}
+			submod := strings.ToLower(strings.TrimSpace(sch.TargetSubmodule))
+			allowConcurrent := sch.EnvVars != nil && (strings.EqualFold(sch.EnvVars["ALLOW_CONCURRENT_SUBMODULE_MUTATION"], "true") || sch.EnvVars["ALLOW_CONCURRENT_SUBMODULE_MUTATION"] == "1")
+			if submod != "" && activeSubmodules[submod] && !allowConcurrent {
+				continue
+			}
+			for _, r := range e.repos {
+				if r.HostID == host && r.GlobalQueueAllocationEnabled {
+					candidates = append(candidates, sch)
+					break
 				}
 			}
 		}
@@ -4040,40 +4373,82 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 		}
 		return candidates[i].ID < candidates[j].ID
 	})
+
+	var hostRepos []*Repo
+	for _, r := range e.repos {
+		if r != nil && r.HostID == host {
+			hostRepos = append(hostRepos, r)
+		}
+	}
+	sort.Slice(hostRepos, func(a, b int) bool {
+		return hostRepos[a].WorktreePath < hostRepos[b].WorktreePath
+	})
+
 	for _, sch := range candidates {
-		repo := e.repos[repoKey(host, sch.WorktreePath)]
-		if repo == nil && (sch.IsGlobal || sch.HostID == "global" || sch.HostID == "") {
-			// Dynamically allocate to an idle repo that has GlobalQueueAllocationEnabled == true
-			// First try to match target submodule if specified
-			if sch.WorktreePath != "" && sch.WorktreePath != "." {
-				for _, r := range e.repos {
-					if r.HostID == host && r.GlobalQueueAllocationEnabled && r.Lock == LockIdle && (r.Queue == QueueOpen || r.Queue == QueueHealing) && (r.Reason == "" || r.Reason == "REMEDIATED") {
-						if r.WorktreePath == sch.WorktreePath || strings.HasSuffix(r.WorktreePath, "/"+sch.WorktreePath) || filepath.Base(r.WorktreePath) == sch.WorktreePath {
+		isGlobalCandidate := sch.IsGlobal || sch.HostID == "global" || sch.HostID == ""
+		var repo *Repo
+		if !isGlobalCandidate {
+			repo = e.repos[repoKey(host, sch.WorktreePath)]
+		} else {
+			targetSpec := sch.WorktreePath
+			if sch.TargetSubmodule != "" && (targetSpec == "" || targetSpec == ".") {
+				targetSpec = sch.TargetSubmodule
+			}
+			// 1. Exact or suffix match on idle enabled repos
+			if targetSpec != "" && targetSpec != "." {
+				for _, r := range hostRepos {
+					if !r.GlobalQueueAllocationEnabled || !isRepoSlotIdleForDispatch(r) {
+						continue
+					}
+					if len(idleFilter) > 0 && !idleFilter[r.WorktreePath] && !idleFilter[filepath.Clean(r.WorktreePath)] && !idleFilter[r.EffectiveAlias()] {
+						continue
+					}
+					if (r.Queue == QueueOpen || r.Queue == QueueHealing) && (r.Reason == "" || r.Reason == "REMEDIATED") {
+						if r.WorktreePath == targetSpec || strings.HasSuffix(r.WorktreePath, "/"+targetSpec) || filepath.Base(r.WorktreePath) == targetSpec {
 							repo = r
-							sch.WorktreePath = r.WorktreePath
-							sch.HostID = host
 							break
 						}
 					}
 				}
 			}
-			// If not matched or target was generic, find any idle repo with GlobalQueueAllocationEnabled == true
+			// 2. Superproject slot family match (e.g. iazio-mcp -> /home/romeo/work/meta-repo*)
+			if repo == nil && targetSpec != "" && targetSpec != "." {
+				for _, r := range hostRepos {
+					if !r.GlobalQueueAllocationEnabled || !isRepoSlotIdleForDispatch(r) {
+						continue
+					}
+					if len(idleFilter) > 0 && !idleFilter[r.WorktreePath] && !idleFilter[filepath.Clean(r.WorktreePath)] && !idleFilter[r.EffectiveAlias()] {
+						continue
+					}
+					if (r.Queue == QueueOpen || r.Queue == QueueHealing) && (r.Reason == "" || r.Reason == "REMEDIATED") {
+						if repoMatchesTargetOrSlotFamily(r, targetSpec) {
+							repo = r
+							break
+						}
+					}
+				}
+			}
+			// 3. Fallback to any idle repo on this host with GlobalQueueAllocationEnabled == true
 			if repo == nil {
-				for _, r := range e.repos {
-					if r.HostID == host && r.GlobalQueueAllocationEnabled && r.Lock == LockIdle && (r.Queue == QueueOpen || r.Queue == QueueHealing) && (r.Reason == "" || r.Reason == "REMEDIATED") {
+				for _, r := range hostRepos {
+					if !r.GlobalQueueAllocationEnabled || !isRepoSlotIdleForDispatch(r) {
+						continue
+					}
+					if len(idleFilter) > 0 && !idleFilter[r.WorktreePath] && !idleFilter[filepath.Clean(r.WorktreePath)] && !idleFilter[r.EffectiveAlias()] {
+						continue
+					}
+					if (r.Queue == QueueOpen || r.Queue == QueueHealing) && (r.Reason == "" || r.Reason == "REMEDIATED") {
 						repo = r
-						sch.WorktreePath = r.WorktreePath
-						sch.HostID = host
 						break
 					}
 				}
 			}
 		}
-		if repo == nil && (sch.IsGlobal || sch.HostID == "global" || sch.HostID == "") {
+		if repo == nil && isGlobalCandidate {
 			continue
 		}
 		if repo != nil {
-			if (sch.IsGlobal || sch.HostID == "global" || sch.HostID == "") && !repo.GlobalQueueAllocationEnabled {
+			if isGlobalCandidate && !repo.GlobalQueueAllocationEnabled {
 				continue
 			}
 			if repo.Lock == LockRunning || repo.Lock == LockCooling || repo.Lock == LockCleaning {
@@ -4172,6 +4547,11 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 			}
 		}
 
+		if isGlobalCandidate && repo != nil {
+			sch.HostID = host
+			sch.WorktreePath = repo.WorktreePath
+		}
+
 		if sch.IterationsRemaining > 0 {
 			sch.IterationsRemaining--
 		}
@@ -4179,7 +4559,7 @@ func (e *Engine) PollHost(host string) (Job, Schedule, string, bool) {
 
 		id := e.next("job-")
 		targetHost := sch.HostID
-		if targetHost == "" || targetHost == "auto" {
+		if targetHost == "" || targetHost == "auto" || targetHost == "global" {
 			targetHost = host
 		}
 		traceID := sch.TraceID
@@ -5746,10 +6126,34 @@ func (e *Engine) AbandonJob(jobID, reason string) error {
 		job.ExitPosted = true
 		job.Reason = reason
 		if sch, ok := e.schedules[job.ScheduleID]; ok {
+			prevHost := sch.HostID
+			prevPath := sch.WorktreePath
 			sch.Status = "QUEUED"
 			sch.IterationsRemaining++
 			if sch.IterationsCompleted > 0 {
 				sch.IterationsCompleted--
+			}
+			if sch.IsGlobal || prevHost == "global" {
+				sch.HostID = ""
+				sch.WorktreePath = ""
+			}
+			if repo := e.repos[repoKey(prevHost, prevPath)]; repo != nil {
+				if repo.RunningJobID == jobID || repo.RunningJobID == "" {
+					if repo.Lock == LockRunning {
+						repo.Lock = LockIdle
+					}
+					repo.RunningJobID = ""
+					repo.LockHolder = ""
+					e.notifyRepoLocked(repo)
+				}
+			}
+		}
+		for _, r := range e.repos {
+			if r != nil && (r.RunningJobID == jobID || r.LockHolder == jobID) {
+				r.Lock = LockIdle
+				r.RunningJobID = ""
+				r.LockHolder = ""
+				e.notifyRepoLocked(r)
 			}
 		}
 		return nil
@@ -7151,6 +7555,10 @@ func (e *Engine) EvaluateDispatchDiagnostics(targetHost, targetAgent string) *di
 		host, hostExists := e.hosts[repo.HostID]
 		if !hostExists || host.Presence == "OFFLINE" {
 			diag.BlockedReasonsByHost[slotID] = "host offline or not registered"
+			continue
+		}
+		if blocked, reason := e.isHostBlockedByEagerUpdateLocked(host); blocked {
+			diag.BlockedReasonsByHost[slotID] = fmt.Sprintf("EAGER_UPDATE_BARRIER: %s", reason)
 			continue
 		}
 		if !host.LastSeen.IsZero() && now.Sub(host.LastSeen) > 45*time.Second {

@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/viovy/iazio-harness-api/internal/control"
 	"github.com/viovy/iazio-harness-api/internal/dispatch"
 )
 
@@ -355,3 +357,84 @@ func TestStory0190_RealTimeAndCompletedConversationIDAndURL(t *testing.T) {
 		t.Fatalf("completed job %s not found in ListQueue response", job2.ID)
 	}
 }
+
+func TestStory0196_ClaimHandlerWithIdleWorktrees_EagerUpdateBarrier_And_SubmoduleSlotReservation(t *testing.T) {
+	now := time.Date(2026, 11, 7, 14, 0, 0, 0, time.UTC)
+	q := dispatch.NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+	eng := control.NewEngine(func() time.Time { return now })
+
+	_ = eng.RegisterHost("debian", "permanent", "generic")
+	_ = eng.UpsertRepo(control.Repo{
+		HostID:                       "debian",
+		WorktreePath:                 "/home/romeo/work/meta-repo",
+		CloneURL:                     "https://github.com/viovy/meta-repo.git",
+		Lock:                         control.LockRunning,
+		RunningJobID:                 "job-busy",
+		GlobalQueueAllocationEnabled: true,
+	})
+	_ = eng.UpsertRepo(control.Repo{
+		HostID:                       "debian",
+		WorktreePath:                 "/home/romeo/work/meta-repo-02",
+		CloneURL:                     "https://github.com/viovy/meta-repo.git",
+		Lock:                         control.LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+	_ = eng.Heartbeat("debian", []control.Tool{{Name: "agy", Installed: true, Path: "/usr/bin/agy", Status: "ok"}}, false)
+
+	agentHandler := NewAgentJobsHandler(q)
+	agentHandler.SetEngine(eng)
+
+	job, err := q.Enqueue(context.Background(), &dispatch.Job{
+		Type:    dispatch.JobTypePromptExecute,
+		Repo:    "iazio-mcp",
+		Payload: json.RawMessage(`{"submodule":"iazio-mcp","title":"Execute story"}`),
+	})
+	if err != nil {
+		t.Fatalf("enqueue error: %v", err)
+	}
+	if job.HostID != "" || job.WorktreePath != "" {
+		t.Fatalf("expected unassigned PENDING job, got HostID=%q WorktreePath=%q", job.HostID, job.WorktreePath)
+	}
+
+	// 1. When host has DRIFT_DETECTED, ClaimHandler returns 204 No Content
+	eng.UpdateEagerReadiness("debian", control.EagerUpdateReadinessReport{
+		HostID:           "debian",
+		EagerUpdateState: control.StateDriftDetected,
+	})
+	claimBody1, _ := json.Marshal(ClaimJobRequest{
+		HostID:        "debian",
+		IdleWorktrees: []string{"/home/romeo/work/meta-repo-02"},
+	})
+	reqClaim1 := httptest.NewRequest(http.MethodPost, "/api/v1/agent/jobs/claim", bytes.NewReader(claimBody1))
+	wClaim1 := httptest.NewRecorder()
+	agentHandler.ClaimHandler(wClaim1, reqClaim1)
+	if wClaim1.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 No Content when host is in DRIFT_DETECTED, got %d", wClaim1.Code)
+	}
+
+	// 2. Once StateUpToDate, ClaimHandler matches "iazio-mcp" against idle superproject slot "/home/romeo/work/meta-repo-02"
+	eng.UpdateEagerReadiness("debian", control.EagerUpdateReadinessReport{
+		HostID:           "debian",
+		EagerUpdateState: control.StateUpToDate,
+	})
+	reqClaim2 := httptest.NewRequest(http.MethodPost, "/api/v1/agent/jobs/claim", bytes.NewReader(claimBody1))
+	wClaim2 := httptest.NewRecorder()
+	agentHandler.ClaimHandler(wClaim2, reqClaim2)
+	if wClaim2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK when host is StateUpToDate with idle worktree, got %d: %s", wClaim2.Code, wClaim2.Body.String())
+	}
+	var claimed dispatch.Job
+	if err := json.NewDecoder(wClaim2.Body).Decode(&claimed); err != nil {
+		t.Fatalf("decode claimed job: %v", err)
+	}
+	if claimed.ID != job.ID || claimed.HostID != "debian" || claimed.WorktreePath != "/home/romeo/work/meta-repo-02" {
+		t.Fatalf("expected claimed job bound to debian:/home/romeo/work/meta-repo-02, got ID=%q HostID=%q WorktreePath=%q",
+			claimed.ID, claimed.HostID, claimed.WorktreePath)
+	}
+	repoSlot, ok := eng.GetRepo("debian", "/home/romeo/work/meta-repo-02")
+	if !ok || repoSlot.Lock != control.LockRunning || repoSlot.RunningJobID != job.ID {
+		t.Fatalf("expected repo slot /home/romeo/work/meta-repo-02 locked by %s, got %+v", job.ID, repoSlot)
+	}
+}
+

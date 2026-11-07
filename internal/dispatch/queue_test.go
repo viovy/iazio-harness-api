@@ -2588,6 +2588,135 @@ func TestStory0194_BuildNormalizeLiveURLAndNormalizeRepoName(t *testing.T) {
 	}
 }
 
+func TestStory0196_LateBindingGlobalQueue_DependencyGating_SubmoduleNormalization_And_Decline(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 7, 14, 0, 0, 0, time.UTC)
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+
+	// 1. Submodule slot-family normalization
+	for _, sub := range []string{"iazio-mcp", "iazio-agent", "iazio-harness-api", "iazio-web", "iazio-infra", "/home/romeo/work/meta-repo-02"} {
+		if got := NormalizeToSuperprojectSlotFamily(sub); got != "meta-repo" {
+			t.Fatalf("NormalizeToSuperprojectSlotFamily(%q) = %q, want 'meta-repo'", sub, got)
+		}
+	}
+
+	// 2. Unassigned Global Queue Residency while PENDING
+	upstream, err := q.Enqueue(ctx, &Job{
+		ID:           "job_0196_up",
+		Type:         JobTypePromptExecute,
+		Repo:         "iazio-mcp",
+		HostID:       "debian",                  // premature host_id must be cleared while PENDING
+		ClaimedHost:  "debian",                  // premature claimed_host must be cleared while PENDING
+		WorktreePath: "/home/romeo/work/meta-repo", // premature worktree_path must be cleared while PENDING
+		Payload:      json.RawMessage(`{"submodule":"iazio-mcp"}`),
+	})
+	if err != nil {
+		t.Fatalf("enqueue upstream: %v", err)
+	}
+	if upstream.HostID != "" || upstream.ClaimedHost != "" || upstream.WorktreePath != "" || upstream.TargetHost != "" {
+		t.Fatalf("expected PENDING job unassigned in global queue, got HostID=%q ClaimedHost=%q WorktreePath=%q TargetHost=%q",
+			upstream.HostID, upstream.ClaimedHost, upstream.WorktreePath, upstream.TargetHost)
+	}
+
+	// 3. Dependency Gating: downstream job depends on upstream (must require exit_code == 0 && ase_complete == true)
+	downstream, err := q.Enqueue(ctx, &Job{
+		ID:             "job_0196_down",
+		Type:           JobTypePromptExecute,
+		Repo:           "iazio-agent",
+		DependsOnJobID: upstream.ID,
+		Payload:        json.RawMessage(`{"submodule":"iazio-agent"}`),
+	})
+	if err != nil {
+		t.Fatalf("enqueue downstream: %v", err)
+	}
+	if downstream.Status != JobStatusBlockedByDependency {
+		t.Fatalf("expected downstream status %q, got %q", JobStatusBlockedByDependency, downstream.Status)
+	}
+
+	// 4. Eager Update Pre-Claim Barrier via HostEligibilityChecker
+	hostBlocked := map[string]bool{"debian": true}
+	q.SetHostEligibilityChecker(func(hostID string) (bool, string) {
+		if hostBlocked[hostID] {
+			return false, "EAGER_UPDATE_BARRIER"
+		}
+		return true, ""
+	})
+
+	if claimed, err := q.ClaimWithWorktrees(ctx, "debian", nil, []string{"/home/romeo/work/meta-repo"}); err != nil || claimed != nil {
+		t.Fatalf("expected debian blocked by eager-update barrier to claim nil, got job=%+v err=%v", claimed, err)
+	}
+
+	// 5. Busy-host skip to free host (mac-mini claims upstream with advertised idle worktree)
+	claimedUp, err := q.ClaimWithWorktrees(ctx, "mac-mini", nil, []string{"/Users/romeo/work/meta-repo"})
+	if err != nil || claimedUp == nil || claimedUp.ID != upstream.ID {
+		t.Fatalf("expected mac-mini to claim upstream job, got job=%+v err=%v", claimedUp, err)
+	}
+	if claimedUp.HostID != "mac-mini" || claimedUp.WorktreePath != "/Users/romeo/work/meta-repo" {
+		t.Fatalf("expected claimedUp bound to mac-mini:/Users/romeo/work/meta-repo, got host=%q wt=%q", claimedUp.HostID, claimedUp.WorktreePath)
+	}
+
+	// 6. Concurrent same-submodule mutation guard: another job targeting the SAME submodule ("iazio-mcp")
+	// cannot be claimed on another host while upstream ("iazio-mcp") is active, unless allow_concurrent_submodule_mutation is set.
+	sameSubJob, err := q.Enqueue(ctx, &Job{
+		ID:      "job_0196_samesub",
+		Type:    JobTypePromptExecute,
+		Repo:    "iazio-mcp",
+		Payload: json.RawMessage(`{"submodule":"iazio-mcp"}`),
+	})
+	if err != nil {
+		t.Fatalf("enqueue sameSubJob: %v", err)
+	}
+	hostBlocked["debian"] = false
+	if claimedConflict, err := q.ClaimWithWorktrees(ctx, "debian", nil, []string{"/home/romeo/work/meta-repo-02"}); err != nil || claimedConflict != nil {
+		t.Fatalf("expected concurrent mutation on same submodule 'iazio-mcp' to be blocked while upstream is active, got %+v", claimedConflict)
+	}
+
+	// Different submodule ("iazio-web") CAN be claimed in parallel on debian's idle worktree slot!
+	diffSubJob, err := q.Enqueue(ctx, &Job{
+		ID:      "job_0196_diffsub",
+		Type:    JobTypePromptExecute,
+		Repo:    "iazio-web",
+		Payload: json.RawMessage(`{"submodule":"iazio-web"}`),
+	})
+	if err != nil {
+		t.Fatalf("enqueue diffSubJob: %v", err)
+	}
+	claimedParallel, err := q.ClaimWithWorktrees(ctx, "debian", nil, []string{"/home/romeo/work/meta-repo-02"})
+	if err != nil || claimedParallel == nil || claimedParallel.ID != diffSubJob.ID {
+		t.Fatalf("expected debian to claim parallel job for different submodule 'iazio-web', got job=%+v err=%v", claimedParallel, err)
+	}
+	if claimedParallel.HostID != "debian" || claimedParallel.WorktreePath != "/home/romeo/work/meta-repo-02" {
+		t.Fatalf("expected claimedParallel bound to debian:/home/romeo/work/meta-repo-02, got host=%q wt=%q", claimedParallel.HostID, claimedParallel.WorktreePath)
+	}
+
+	// 7. Decline / Abandon(REPO_BUSY) resets job back to PENDING with HostID="" and WorktreePath=""
+	declined, err := q.Decline(ctx, diffSubJob.ID, "REPO_BUSY")
+	if err != nil {
+		t.Fatalf("Decline failed: %v", err)
+	}
+	if declined.Status != JobStatusPending || declined.HostID != "" || declined.ClaimedHost != "" || declined.WorktreePath != "" {
+		t.Fatalf("expected declined job reset to unassigned PENDING, got status=%q host=%q claimed=%q wt=%q",
+			declined.Status, declined.HostID, declined.ClaimedHost, declined.WorktreePath)
+	}
+	_, _ = q.Cancel(ctx, diffSubJob.ID, "cleanup")
+	_, _ = q.Cancel(ctx, sameSubJob.ID, "cleanup")
+
+	// 8. Complete upstream with exit_code=0 and ase_complete=true -> downstream unblocks and can be claimed!
+	if err := q.CompleteWithFencing(ctx, upstream.ID, claimedUp.FencingToken, json.RawMessage(`{"exit_code":0,"ase_complete":true}`), ""); err != nil {
+		t.Fatalf("CompleteWithFencing upstream: %v", err)
+	}
+	downAfter, _ := q.Get(downstream.ID)
+	if downAfter.Status != JobStatusPending {
+		t.Fatalf("expected downstream promoted to pending after upstream completed with exit_code=0 & ase_complete=true, got %q", downAfter.Status)
+	}
+	claimedDown, err := q.ClaimWithWorktrees(ctx, "debian", nil, []string{"/home/romeo/work/meta-repo-02"})
+	if err != nil || claimedDown == nil || claimedDown.ID != downstream.ID {
+		t.Fatalf("expected debian to claim unblocked downstream job, got job=%+v err=%v", claimedDown, err)
+	}
+}
+
+
 
 
 

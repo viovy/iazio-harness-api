@@ -145,8 +145,11 @@ func (s *Server) Handler() http.Handler {
 		queue = dispatch.NewInMemoryQueue()
 		s.Queue = queue
 	}
-	if s.Engine != nil && s.Engine.IsDispatchJobActive == nil {
-		s.Engine.IsDispatchJobActive = s.isDispatchJobActive
+	if s.Engine != nil {
+		if s.Engine.IsDispatchJobActive == nil {
+			s.Engine.IsDispatchJobActive = s.isDispatchJobActive
+		}
+		s.Engine.BindDispatchQueue(queue)
 	}
 	idempotency := s.Idempotency
 	if idempotency == nil {
@@ -776,12 +779,36 @@ func (s *Server) abandonJob(w http.ResponseWriter, r *http.Request) {
 		Reason string `json:"reason"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&raw)
-	if err := s.Engine.AbandonJob(jobID, raw.Reason); err != nil {
+	errEngine := s.Engine.AbandonJob(jobID, raw.Reason)
+	var errQueue error
+	var handledByQueue bool
+	if s.Queue != nil {
+		if strings.EqualFold(strings.TrimSpace(raw.Reason), "REPO_BUSY") {
+			if _, qErr := s.Queue.Decline(r.Context(), jobID, raw.Reason); qErr == nil {
+				handledByQueue = true
+				if s.Engine != nil {
+					s.Engine.ReleaseDispatchJobRepo(jobID)
+				}
+			} else {
+				errQueue = qErr
+			}
+		} else if _, ok := s.Queue.Get(jobID); ok {
+			if _, qErr := s.Queue.Cancel(r.Context(), jobID, raw.Reason); qErr == nil {
+				handledByQueue = true
+				if s.Engine != nil {
+					s.Engine.ReleaseDispatchJobRepo(jobID)
+				}
+			} else {
+				errQueue = qErr
+			}
+		}
+	}
+	if errEngine != nil && !handledByQueue {
 		code := http.StatusConflict
-		if errors.Is(err, control.ErrNotFound) {
+		if errors.Is(errEngine, control.ErrNotFound) && (errQueue == nil || errors.Is(errQueue, dispatch.ErrJobNotFound)) {
 			code = http.StatusNotFound
 		}
-		writeErr(w, code, err)
+		writeErr(w, code, errEngine)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{
@@ -1791,12 +1818,25 @@ func (s *Server) declineJob(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	jobID := r.PathValue("id")
-	if err := s.Engine.DeclineJob(jobID, body.Reason); err != nil {
+	errEngine := s.Engine.DeclineJob(jobID, body.Reason)
+	var handledByQueue bool
+	var errQueue error
+	if s.Queue != nil {
+		if _, qErr := s.Queue.Decline(r.Context(), jobID, body.Reason); qErr == nil {
+			handledByQueue = true
+			if s.Engine != nil {
+				s.Engine.ReleaseDispatchJobRepo(jobID)
+			}
+		} else {
+			errQueue = qErr
+		}
+	}
+	if errEngine != nil && !handledByQueue {
 		code := http.StatusConflict
-		if errors.Is(err, control.ErrNotFound) {
+		if errors.Is(errEngine, control.ErrNotFound) && (errQueue == nil || errors.Is(errQueue, dispatch.ErrJobNotFound)) {
 			code = http.StatusNotFound
 		}
-		writeErr(w, code, err)
+		writeErr(w, code, errEngine)
 		return
 	}
 	if s.SaveRepo != nil {
@@ -1888,7 +1928,22 @@ func (s *Server) hostDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) pollHost(w http.ResponseWriter, r *http.Request) {
-	job, sch, docs, ok := s.Engine.PollHost(r.PathValue("id"))
+	var pollReq struct {
+		IdleWorktrees []string `json:"idle_worktrees"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&pollReq)
+	}
+	if len(pollReq.IdleWorktrees) == 0 {
+		if rawWT := strings.TrimSpace(r.URL.Query().Get("idle_worktrees")); rawWT != "" {
+			for _, p := range strings.Split(rawWT, ",") {
+				if trimmed := strings.TrimSpace(p); trimmed != "" {
+					pollReq.IdleWorktrees = append(pollReq.IdleWorktrees, trimmed)
+				}
+			}
+		}
+	}
+	job, sch, docs, ok := s.Engine.PollHostWithWorktrees(r.PathValue("id"), pollReq.IdleWorktrees)
 	if !ok {
 		w.WriteHeader(http.StatusNoContent)
 		return

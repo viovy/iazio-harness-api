@@ -765,12 +765,17 @@ func dispatchScheduleView(j *dispatch.Job) map[string]any {
 	if hostID == "" {
 		hostID = j.HostID
 	}
-	if hostID == "" {
+	isPendingUnassigned := strings.EqualFold(j.Status, dispatch.JobStatusPending) || strings.EqualFold(j.Status, dispatch.JobStatusBlockedByDependency)
+	if hostID == "" && !isPendingUnassigned {
 		hostID = j.TargetHost
 	}
 	targetHost := j.TargetHost
 	if targetHost == "" || targetHost == "auto" {
 		targetHost = hostID
+	}
+	worktreePath := j.WorktreePath
+	if worktreePath == "" && !isPendingUnassigned {
+		worktreePath = j.Repo
 	}
 	status := strings.ToUpper(j.Status)
 	switch status {
@@ -814,6 +819,7 @@ func dispatchScheduleView(j *dispatch.Job) map[string]any {
 		"host_id":                hostID,
 		"target_host":            targetHost,
 		"repo_path":              j.Repo,
+		"worktree_path":          worktreePath,
 		"iterations":             1,
 		"iterations_total":       1,
 		"iterations_remaining":   iterRem,
@@ -957,12 +963,17 @@ func dispatchHistoryView(j *dispatch.Job) map[string]any {
 	if hostID == "" {
 		hostID = j.HostID
 	}
-	if hostID == "" {
+	isPendingUnassigned := strings.EqualFold(j.Status, dispatch.JobStatusPending) || strings.EqualFold(j.Status, dispatch.JobStatusBlockedByDependency)
+	if hostID == "" && !isPendingUnassigned {
 		hostID = j.TargetHost
 	}
 	targetHost := j.TargetHost
 	if targetHost == "" || targetHost == "auto" {
 		targetHost = hostID
+	}
+	worktreePath := j.WorktreePath
+	if worktreePath == "" && !isPendingUnassigned {
+		worktreePath = j.Repo
 	}
 	status := strings.ToUpper(j.Status)
 	if status == "CANCELED" {
@@ -987,6 +998,7 @@ func dispatchHistoryView(j *dispatch.Job) map[string]any {
 		"host_id":                hostID,
 		"target_host":            targetHost,
 		"repo_path":              j.Repo,
+		"worktree_path":          worktreePath,
 		"job_id":                 j.ID,
 		"live_url":               dispatch.BuildLiveURL("", j.ID),
 		"schedule_id":            dispatchJobScheduleID(j.ID),
@@ -1057,12 +1069,17 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 	if hostID == "" {
 		hostID = j.HostID
 	}
-	if hostID == "" {
+	isPendingUnassigned := strings.EqualFold(j.Status, dispatch.JobStatusPending) || strings.EqualFold(j.Status, dispatch.JobStatusBlockedByDependency)
+	if hostID == "" && !isPendingUnassigned {
 		hostID = j.TargetHost
 	}
 	targetHost := j.TargetHost
 	if targetHost == "" || targetHost == "auto" {
 		targetHost = hostID
+	}
+	worktreePath := j.WorktreePath
+	if worktreePath == "" && !isPendingUnassigned {
+		worktreePath = j.Repo
 	}
 	convIDs := j.ConversationIDs
 	if len(convIDs) == 0 && j.ActiveConversationID != "" {
@@ -1140,7 +1157,7 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 		"story_allocation_status":        j.StoryAllocationStatus,
 		"allocation_source":              j.AllocationSource,
 		"priority_rank_selected":         j.PriorityRankSelected,
-		"worktree_path":                  j.Repo,
+		"worktree_path":                  worktreePath,
 		"docs_hub_path":                  "",
 		"env_vars":                       map[string]string{},
 		"max_execution_duration_seconds": 0,

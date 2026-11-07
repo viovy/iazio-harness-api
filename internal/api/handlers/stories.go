@@ -372,20 +372,17 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			title = fmt.Sprintf("Execute story %s: %s", storyID, req.Title)
 		}
 		targetRepo := req.Submodule
-		if alloc.TargetRepo != "" && alloc.TargetRepo != "root" && (req.Submodule == "" || req.Submodule == "." || req.Submodule == "root") {
-			targetRepo = alloc.TargetRepo
-		}
 		execPayload, _ := json.Marshal(map[string]any{
 			"prompt_id":             promptID,
 			"repo":                  targetRepo,
 			"submodule":             req.Submodule,
-			"worktree_path":         targetRepo,
+			"worktree_path":         "",
 			"story_id":              storyID,
 			"title":                 title,
 			"prompt":                normalizedPrompt,
 			"normalized_prompt":     normalizedPrompt,
 			"target_agent":          targetAgent,
-			"target_host":           alloc.TargetHost,
+			"target_host":           "",
 			"priority":              req.Priority,
 			"problem":               req.Problem,
 			"acceptance_criteria":   req.AcceptanceCriteria,
@@ -406,7 +403,8 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ej, _ := h.queue.Enqueue(r.Context(), &dispatch.Job{
 				Type:                  dispatch.JobTypePromptExecute,
 				Repo:                  targetRepo,
-				TargetHost:            alloc.TargetHost,
+				WorktreePath:          "",
+				TargetHost:            "",
 				TargetAgent:           targetAgent,
 				StoryID:               storyID,
 				StoryTitle:            req.Title,

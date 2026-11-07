@@ -176,8 +176,8 @@ func (h *PromptsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if alloc.TargetAgent != "" {
 			req.TargetAgent = alloc.TargetAgent
 		}
-		if alloc.TargetHost != "" && req.TargetHost == "" {
-			req.TargetHost = alloc.TargetHost
+		if strings.EqualFold(req.TargetHost, "auto") || strings.EqualFold(req.TargetHost, "global") {
+			req.TargetHost = ""
 		}
 		h.engine.PutPrompt(control.Prompt{
 			ID:     promptID,

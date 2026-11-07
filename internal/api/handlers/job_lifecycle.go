@@ -525,6 +525,9 @@ func (h *JobLifecycleHandler) SetRepoRoot(root string) {
 // SetEngine sets the control engine for dynamic tool priority allocation and story binding.
 func (h *JobLifecycleHandler) SetEngine(engine *control.Engine) {
 	h.engine = engine
+	if engine != nil && h.queue != nil {
+		engine.BindDispatchQueue(h.queue)
+	}
 }
 
 // SetScheduler sets the global scheduler.
@@ -607,9 +610,10 @@ type JobDetailResponse struct {
 	ScheduleID              string                        `json:"schedule_id,omitempty"`
 	Type                    string                        `json:"type"`
 	Repo                    string                        `json:"repo"`
+	WorktreePath            string                        `json:"worktree_path"`
 	TargetHost              string                        `json:"target_host,omitempty"`
 	ClaimedHost             string                        `json:"claimed_host,omitempty"`
-	HostID                  string                        `json:"host_id,omitempty"`
+	HostID                  string                        `json:"host_id"`
 	TargetAgent             string                        `json:"target_agent,omitempty"`
 	StoryID                 string                        `json:"story_id,omitempty"`
 	StoryTitle              string                        `json:"story_title,omitempty"`
@@ -1113,6 +1117,10 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 
 	targetAgent := strings.TrimSpace(req.TargetAgent)
 	targetHost := strings.TrimSpace(req.Host)
+	isGlobalQueue := targetHost == "" || strings.EqualFold(targetHost, "auto") || strings.EqualFold(targetHost, "global")
+	if isGlobalQueue {
+		targetHost = ""
+	}
 	targetRepo := submodule
 	allocationSource := "explicit_target"
 	priorityRankSelected := 0
@@ -1124,9 +1132,11 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		}
 		alloc := h.engine.ResolveToolPriorityAllocation(targetAgent, targetHost, allocRepo)
 		targetAgent = alloc.TargetAgent
-		targetHost = alloc.TargetHost
-		if alloc.TargetRepo != "" && alloc.TargetRepo != "root" && (submodule == "" || submodule == "." || submodule == "root" || submodule == "meta-repo") {
-			targetRepo = alloc.TargetRepo
+		if !isGlobalQueue {
+			targetHost = alloc.TargetHost
+			if alloc.TargetRepo != "" && alloc.TargetRepo != "root" && (submodule == "" || submodule == "." || submodule == "root" || submodule == "meta-repo") {
+				targetRepo = alloc.TargetRepo
+			}
 		}
 		allocationSource = alloc.AllocationSource
 		priorityRankSelected = alloc.PriorityRankSelected
@@ -1153,6 +1163,11 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		execTitle = "Autonomous Story Execution"
 	}
 
+	initialWorktreePath := ""
+	if !isGlobalQueue {
+		initialWorktreePath = targetRepo
+	}
+
 	execPayload, err := json.Marshal(map[string]any{
 		"prompt_id":                 promptID,
 		"repo":                      targetRepo,
@@ -1160,7 +1175,7 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		"backlog":                   backlog,
 		"mode":                      mode,
 		"command":                   action,
-		"worktree_path":             targetRepo,
+		"worktree_path":             initialWorktreePath,
 		"story_id":                  storyID,
 		"story_title":               storyTitle,
 		"story_path":                storyPath,
@@ -1187,6 +1202,7 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 	job, err := h.queue.Enqueue(r.Context(), &dispatch.Job{
 		Type:                    dispatch.JobTypePromptExecute,
 		Repo:                    targetRepo,
+		WorktreePath:            initialWorktreePath,
 		TargetHost:              targetHost,
 		TargetAgent:             targetAgent,
 		StoryID:                 storyID,
@@ -1448,6 +1464,7 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		ScheduleID:              schedID,
 		Type:                    j.Type,
 		Repo:                    j.Repo,
+		WorktreePath:            j.WorktreePath,
 		TargetHost:              effectiveHost,
 		ClaimedHost:             j.ClaimedHost,
 		HostID:                  j.HostID,
