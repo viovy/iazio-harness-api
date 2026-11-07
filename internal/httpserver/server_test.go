@@ -3494,3 +3494,38 @@ func TestForensicWaveJobs_ScheduleAndJobBidirectionalResolutionAndZipkinTrace(t 
 	}
 }
 
+func TestOAuthInsufficientScopeIncludesGrantedScopeAndClientID(t *testing.T) {
+	hydraSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"active":true,"scope":"openid offline nextid","client_id":"autopilot-nextid"}`))
+	}))
+	defer hydraSrv.Close()
+
+	srv := &Server{
+		Engine:            control.NewEngine(time.Now),
+		OAuthIntrospector: oauth.NewIntrospector(hydraSrv.URL),
+		RequireOAuth:      true,
+	}
+	handler := srv.Handler()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/hosts/mac-mini/repos?path=/Users/romeo/work/meta-repo", nil)
+	req.Header.Set("Authorization", "Bearer test-token-missing-harness-read")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected HTTP 403 Forbidden, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var body map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal 403 response: %v", err)
+	}
+	if body["error"] != "insufficient_scope" || body["required_scope"] != "harness:read" {
+		t.Fatalf("expected error=insufficient_scope and required_scope=harness:read, got %+v", body)
+	}
+	if body["granted_scope"] != "openid offline nextid" || body["client_id"] != "autopilot-nextid" {
+		t.Fatalf("expected granted_scope='openid offline nextid' and client_id='autopilot-nextid', got %+v", body)
+	}
+}
+
+

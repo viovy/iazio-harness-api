@@ -5685,4 +5685,29 @@ func TestGov5177_AppendLogMonotonicSeqAndSupervisorHeartbeatCoalescing(t *testin
 	}
 }
 
+func TestAppendLog_TickDoesNotReuseBroadcastSeq(t *testing.T) {
+	e := NewEngine(time.Now)
+	jobID := "job_tick_seq_test"
+
+	subCh, cancel := e.SubscribeLogs(jobID)
+	defer cancel()
+
+	e.AppendLog(jobID, LogChunk{Type: "OUTPUT_CHUNK", Stream: "stdout", Text: "first real chunk\n"})
+	e.AppendLog(jobID, LogChunk{Type: "OUTPUT_TICK", SilentForMs: 2000, HarnessPID: 100, ToolPID: 200})
+	e.AppendLog(jobID, LogChunk{Type: "OUTPUT_CHUNK", Stream: "stdout", Text: "second real chunk\n"})
+
+	var received []LogChunk
+	for i := 0; i < 3; i++ {
+		received = append(received, <-subCh)
+	}
+	if received[0].Seq != 1 {
+		t.Fatalf("expected first chunk Seq=1, got %d", received[0].Seq)
+	}
+	if received[1].Type != "OUTPUT_TICK" || received[1].Seq != 0 {
+		t.Fatalf("expected OUTPUT_TICK to broadcast with Seq=0, got Type=%q Seq=%d", received[1].Type, received[1].Seq)
+	}
+	if received[2].Seq != 2 {
+		t.Fatalf("expected second real chunk Seq=2 without collision, got %d", received[2].Seq)
+	}
+}
 

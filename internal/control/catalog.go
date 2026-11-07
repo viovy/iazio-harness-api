@@ -1121,28 +1121,38 @@ func (e *Engine) RetryCorrelation(jobID string) error {
 	return nil
 }
 
-func isSupervisorHeartbeatChunk(text string) bool {
-	trimmed := strings.TrimSpace(text)
+// SupervisorHeartbeatPrefix is the shared prefix for periodic supervisor liveness chunks.
+const SupervisorHeartbeatPrefix = "[ASE-SUPERVISOR] Execution active ("
+
+func isSupervisorHeartbeatChunk(chunk LogChunk) bool {
+	if chunk.Type == "SUPERVISOR_HEARTBEAT" {
+		return true
+	}
+	trimmed := strings.TrimSpace(chunk.Text)
 	return trimmed != "" &&
 		!strings.Contains(trimmed, "\n") &&
-		strings.Contains(trimmed, "[ASE-SUPERVISOR] Execution active (")
+		strings.Contains(trimmed, SupervisorHeartbeatPrefix)
 }
 
 // AppendLog stores a chunk and wakes stream subscribers. The ring keeps 500.
 func (e *Engine) AppendLog(jobID string, chunk LogChunk) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	existing := e.logs[jobID]
-	nextSeq := len(existing) + 1
-	if len(existing) > 0 && existing[len(existing)-1].Seq >= nextSeq {
-		nextSeq = existing[len(existing)-1].Seq + 1
-	}
-	chunk.Seq = nextSeq
 	if chunk.Type == "" {
 		chunk.Type = "OUTPUT_CHUNK"
 	}
-	if chunk.Type != "OUTPUT_TICK" {
-		if len(existing) > 0 && isSupervisorHeartbeatChunk(existing[len(existing)-1].Text) && isSupervisorHeartbeatChunk(chunk.Text) {
+	if chunk.Type == "OUTPUT_TICK" {
+		// OUTPUT_TICK is ephemeral liveness telemetry and is not stored in e.logs[jobID].
+		// Set Seq = 0 so SSE broadcast omits id: and never collides with the next real chunk's sequence number (A-02).
+		chunk.Seq = 0
+	} else {
+		existing := e.logs[jobID]
+		nextSeq := len(existing) + 1
+		if len(existing) > 0 && existing[len(existing)-1].Seq >= nextSeq {
+			nextSeq = existing[len(existing)-1].Seq + 1
+		}
+		chunk.Seq = nextSeq
+		if len(existing) > 0 && isSupervisorHeartbeatChunk(existing[len(existing)-1]) && isSupervisorHeartbeatChunk(chunk) {
 			e.logs[jobID][len(existing)-1] = chunk
 		} else {
 			e.logs[jobID] = append(existing, chunk)
