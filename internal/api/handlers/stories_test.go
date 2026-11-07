@@ -564,8 +564,8 @@ func TestStoriesHandlerCreateWithoutIDAlwaysEnqueuesASEPrompt(t *testing.T) {
 	if job.TargetAgent != "opencode" {
 		t.Fatalf("expected ResolveToolPriorityAllocation to assign TargetAgent=opencode, got %s", job.TargetAgent)
 	}
-	if job.TargetHost != "mac-mini" {
-		t.Fatalf("expected ResolveToolPriorityAllocation to assign TargetHost=mac-mini, got %s", job.TargetHost)
+	if job.TargetHost != "" || job.HostID != "" || job.WorktreePath != "" {
+		t.Fatalf("expected unassigned PENDING global queue residency (TargetHost='', HostID='', WorktreePath=''), got TargetHost=%q HostID=%q WorktreePath=%q", job.TargetHost, job.HostID, job.WorktreePath)
 	}
 }
 

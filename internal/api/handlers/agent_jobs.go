@@ -14,8 +14,9 @@ import (
 
 // ClaimJobRequest is sent by an iazio-agent daemon to claim pending jobs.
 type ClaimJobRequest struct {
-	HostID   string   `json:"host_id,omitempty"`
-	JobTypes []string `json:"job_types,omitempty"`
+	HostID        string   `json:"host_id,omitempty"`
+	JobTypes      []string `json:"job_types,omitempty"`
+	IdleWorktrees []string `json:"idle_worktrees,omitempty"`
 }
 
 // CompleteJobRequest is sent by an iazio-agent daemon to report job outcome.
@@ -57,6 +58,9 @@ func NewAgentJobsHandler(queue dispatch.Queue) *AgentJobsHandler {
 // SetEngine binds the control engine so story lifecycle transitions are synchronized.
 func (h *AgentJobsHandler) SetEngine(e *control.Engine) {
 	h.engine = e
+	if e != nil && h.queue != nil {
+		e.BindDispatchQueue(h.queue)
+	}
 }
 
 // SetRepoRoot overrides the workspace root directory used for story index resolution.
@@ -81,7 +85,14 @@ func (h *AgentJobsHandler) ClaimHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	job, err := h.queue.Claim(r.Context(), req.HostID, req.JobTypes)
+	if h.engine != nil && strings.TrimSpace(req.HostID) != "" {
+		if ok, _ := h.engine.IsHostEligibleForClaim(req.HostID); !ok {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+
+	job, err := h.queue.ClaimWithWorktrees(r.Context(), req.HostID, req.JobTypes, req.IdleWorktrees)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -93,8 +104,13 @@ func (h *AgentJobsHandler) ClaimHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if h.engine != nil {
-		boundWT := h.engine.BindDispatchJobRepo(req.HostID, job.Repo, job.ID)
-		if boundWT != "" && boundWT != "." && boundWT != "root" && (job.Repo == "" || job.Repo == "." || job.Repo == "root") {
+		effectiveWT := strings.TrimSpace(job.WorktreePath)
+		if effectiveWT == "" {
+			effectiveWT = job.Repo
+		}
+		boundWT := h.engine.BindDispatchJobRepo(req.HostID, effectiveWT, job.ID)
+		if boundWT != "" && boundWT != "." && boundWT != "root" {
+			job.WorktreePath = boundWT
 			if updater, ok := h.queue.(interface {
 				UpdateRuntimeMetadata(jobID, worktreePath, activeConvID string, harnessPID, toolPID int, elapsedSec int64) (*dispatch.Job, bool)
 			}); ok {

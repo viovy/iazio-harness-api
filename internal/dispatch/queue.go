@@ -204,6 +204,111 @@ func NormalizeRepoName(repo string) string {
 	return trimmed
 }
 
+// IsKnownMetaRepoSubmodule returns true when name refers to a submodule belonging to the meta-repo superproject.
+func IsKnownMetaRepoSubmodule(name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	if lower == "" || lower == "." || lower == "root" || lower == "metarepo" || strings.HasPrefix(lower, "meta-repo") {
+		return false
+	}
+	switch {
+	case lower == "iazio" || strings.HasPrefix(lower, "iazio-"),
+		strings.HasPrefix(lower, "autopilot"),
+		strings.HasPrefix(lower, "vigo"),
+		strings.HasPrefix(lower, "eye_habit") || lower == "eye-habit",
+		strings.HasPrefix(lower, "k8s"),
+		strings.HasPrefix(lower, "up_dividends"),
+		strings.HasPrefix(lower, "viovy-core"),
+		strings.HasPrefix(lower, "central-telemetry"),
+		lower == "home-infra",
+		lower == "vi-ansible-collection",
+		lower == "build-container-images",
+		lower == "vi-scripts",
+		lower == "auth-playground",
+		lower == "helm-charts",
+		lower == "isetup",
+		lower == "flutter-start-template",
+		lower == "thewebcafe",
+		lower == "local_agent":
+		return true
+	default:
+		return false
+	}
+}
+
+// NormalizeToSuperprojectSlotFamily normalizes submodule names (e.g. iazio-mcp, iazio-agent)
+// and meta-repo worktree paths (e.g. /home/romeo/work/meta-repo-02) to their superproject worktree slot family ("meta-repo").
+func NormalizeToSuperprojectSlotFamily(repo string) string {
+	norm := strings.ToLower(strings.TrimSpace(NormalizeRepoName(repo)))
+	if norm == "" || norm == "." || norm == "root" || norm == "metarepo" || strings.HasPrefix(norm, "meta-repo") {
+		return "meta-repo"
+	}
+	if IsKnownMetaRepoSubmodule(norm) {
+		return "meta-repo"
+	}
+	trimmed := strings.ToLower(filepath.ToSlash(strings.TrimSpace(repo)))
+	if strings.Contains(trimmed, "/meta-repo") {
+		return "meta-repo"
+	}
+	return norm
+}
+
+// ExtractTargetSubmodule returns the normalized target submodule name (e.g., "iazio-mcp", "iazio-agent")
+// if the job targets a specific submodule, or "" if the job targets the generic superproject root.
+func ExtractTargetSubmodule(repo string, payload json.RawMessage) string {
+	norm := strings.ToLower(strings.TrimSpace(NormalizeRepoName(repo)))
+	if IsKnownMetaRepoSubmodule(norm) {
+		return norm
+	}
+	if len(payload) > 0 {
+		var pm map[string]any
+		if json.Unmarshal(payload, &pm) == nil && pm != nil {
+			for _, key := range []string{"target_submodule", "submodule", "repo"} {
+				if v, ok := pm[key].(string); ok {
+					cand := strings.ToLower(strings.TrimSpace(NormalizeRepoName(v)))
+					if IsKnownMetaRepoSubmodule(cand) {
+						return cand
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// AllowConcurrentSubmoduleMutation inspects job payload for explicit opt-in to concurrent mutations on the same submodule.
+func AllowConcurrentSubmoduleMutation(payload json.RawMessage) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	var pm map[string]any
+	if json.Unmarshal(payload, &pm) != nil || pm == nil {
+		return false
+	}
+	if b, ok := pm["allow_concurrent_submodule_mutation"].(bool); ok && b {
+		return true
+	}
+	if s, ok := pm["allow_concurrent_submodule_mutation"].(string); ok {
+		lower := strings.ToLower(strings.TrimSpace(s))
+		if lower == "true" || lower == "1" || lower == "yes" {
+			return true
+		}
+	}
+	if envMap, ok := pm["env"].(map[string]any); ok && envMap != nil {
+		for _, k := range []string{"ALLOW_CONCURRENT_SUBMODULE_MUTATION", "allow_concurrent_submodule_mutation"} {
+			if b, ok := envMap[k].(bool); ok && b {
+				return true
+			}
+			if s, ok := envMap[k].(string); ok {
+				lower := strings.ToLower(strings.TrimSpace(s))
+				if lower == "true" || lower == "1" || lower == "yes" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // ResolveJobConversationID resolves the canonical conversation ID for a job from its
 // first-class fields, Result JSON, or Payload JSON.
 func ResolveJobConversationID(j *Job) string {
@@ -410,6 +515,7 @@ type Job struct {
 	ID                      string               `json:"id"`
 	Type                    string               `json:"type"`
 	Repo                    string               `json:"repo"`
+	WorktreePath            string               `json:"worktree_path,omitempty"`
 	TargetHost              string               `json:"target_host,omitempty"`
 	ClaimedHost             string               `json:"claimed_host,omitempty"`
 	HostID                  string               `json:"host_id,omitempty"`
@@ -489,6 +595,8 @@ type JobFilter struct {
 type Queue interface {
 	Enqueue(ctx context.Context, job *Job) (*Job, error)
 	Claim(ctx context.Context, hostID string, jobTypes []string) (*Job, error)
+	ClaimWithWorktrees(ctx context.Context, hostID string, jobTypes []string, idleWorktrees []string) (*Job, error)
+	Decline(ctx context.Context, jobID string, reason string) (*Job, error)
 	Heartbeat(ctx context.Context, jobID string, fencingToken int64) (*Job, error)
 	HeartbeatWithStory(ctx context.Context, jobID string, fencingToken int64, storyID string) (*Job, error)
 	Complete(ctx context.Context, jobID string, result json.RawMessage, errStr string) error
@@ -534,18 +642,50 @@ type QueueStore interface {
 
 // InMemoryQueue is a thread-safe in-memory implementation of Queue with optional database backing.
 type InMemoryQueue struct {
-	mu             sync.Mutex
-	jobs           map[string]*Job
-	fencingSeq     int64
-	attributionURL string
-	httpClient     *http.Client
-	claimTimeout   time.Duration
-	jobTimeout     time.Duration
-	startupTime    time.Time
-	startupGrace   time.Duration
-	store          QueueStore
-	nowFunc        func() time.Time
-	terminalHooks  []func(job *Job, promoted []*Job)
+	mu                     sync.Mutex
+	jobs                   map[string]*Job
+	fencingSeq             int64
+	attributionURL         string
+	httpClient             *http.Client
+	claimTimeout           time.Duration
+	jobTimeout             time.Duration
+	startupTime            time.Time
+	startupGrace           time.Duration
+	store                  QueueStore
+	nowFunc                func() time.Time
+	terminalHooks          []func(job *Job, promoted []*Job)
+	hostEligibilityChecker func(hostID string) (bool, string)
+	slotAllocator          func(hostID, jobID, targetRepo, targetSubmodule, targetAgent string, idleWorktrees []string) (string, bool)
+	slotReleaser           func(jobID string)
+	externalDepChecker     func(depID string) (exists, satisfied, failed bool, reason string)
+}
+
+// SetHostEligibilityChecker sets an optional callback that gates Claim on host readiness (e.g., Eager Update Pre-Claim Barrier).
+func (q *InMemoryQueue) SetHostEligibilityChecker(fn func(hostID string) (bool, string)) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.hostEligibilityChecker = fn
+}
+
+// SetSlotAllocator sets an optional callback that evaluates and atomically reserves a clean idle worktree slot on a host at claim time.
+func (q *InMemoryQueue) SetSlotAllocator(fn func(hostID, jobID, targetRepo, targetSubmodule, targetAgent string, idleWorktrees []string) (string, bool)) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.slotAllocator = fn
+}
+
+// SetSlotReleaser sets an optional callback invoked when a leased/claimed job is declined, reaped, or reset to pending.
+func (q *InMemoryQueue) SetSlotReleaser(fn func(jobID string)) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.slotReleaser = fn
+}
+
+// SetExternalDepChecker sets an optional callback to check dependency completion status in the control plane engine.
+func (q *InMemoryQueue) SetExternalDepChecker(fn func(depID string) (exists, satisfied, failed bool, reason string)) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.externalDepChecker = fn
 }
 
 // AddTerminalHook registers a callback invoked whenever a job transitions to a terminal state (completed, failed, canceled).
@@ -674,6 +814,18 @@ func (q *InMemoryQueue) areDependenciesSatisfiedLocked(job *Job) (satisfied bool
 	for _, depID := range job.DependsOnJobIDs {
 		dep, exists := q.jobs[depID]
 		if !exists || dep == nil {
+			if q.externalDepChecker != nil {
+				extExists, extSatisfied, extFailed, extReason := q.externalDepChecker(depID)
+				if extExists {
+					if extFailed {
+						return false, &Job{ID: depID, Status: JobStatusFailed, Error: extReason}
+					}
+					if !extSatisfied {
+						return false, nil
+					}
+					continue
+				}
+			}
 			return false, nil
 		}
 		if dep.Status == JobStatusFailed || dep.Status == JobStatusCanceled {
@@ -681,6 +833,29 @@ func (q *InMemoryQueue) areDependenciesSatisfiedLocked(job *Job) (satisfied bool
 		}
 		if dep.Status != JobStatusCompleted {
 			return false, nil
+		}
+		// Enforce terminal COMPLETED criteria (exit_code == 0 and ase_complete == true when present in Result)
+		if len(dep.Result) > 0 {
+			var rm map[string]any
+			if json.Unmarshal(dep.Result, &rm) == nil && rm != nil {
+				if rawEC, hasEC := rm["exit_code"]; hasEC {
+					switch ec := rawEC.(type) {
+					case float64:
+						if int(ec) != 0 {
+							return false, &Job{ID: dep.ID, Status: JobStatusFailed, Error: fmt.Sprintf("exit_code=%d", int(ec))}
+						}
+					case int:
+						if ec != 0 {
+							return false, &Job{ID: dep.ID, Status: JobStatusFailed, Error: fmt.Sprintf("exit_code=%d", ec)}
+						}
+					}
+				}
+				if rawASE, hasASE := rm["ase_complete"]; hasASE {
+					if aseBool, ok := rawASE.(bool); ok && !aseBool {
+						return false, nil
+					}
+				}
+			}
 		}
 	}
 	return true, nil
@@ -941,11 +1116,15 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 				j.LeaseAckDeadlineAt = nil
 				j.ClaimedHost = ""
 				j.HostID = ""
+				j.WorktreePath = ""
 				j.ClaimedAt = nil
 				j.HeartbeatAt = nil
 				j.LeaseExpiresAt = nil
 				j.DispatchDiagnostics = &DispatchDiagnostics{
 					QueueState: "queued",
+				}
+				if q.slotReleaser != nil {
+					q.slotReleaser(j.ID)
 				}
 				expiredIDs = append(expiredIDs, j.ID)
 				continue
@@ -1006,12 +1185,16 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 					j.Status = JobStatusPending
 					j.ClaimedHost = ""
 					j.HostID = ""
+					j.WorktreePath = ""
 					j.LeaseOwner = ""
 					j.LeaseToken = ""
 					j.ClaimedAt = nil
 					j.HeartbeatAt = nil
 					j.LeaseExpiresAt = nil
 					j.LeaseAckDeadlineAt = nil
+					if q.slotReleaser != nil {
+						q.slotReleaser(j.ID)
+					}
 					expiredIDs = append(expiredIDs, j.ID)
 				} else {
 					j.Status = JobStatusFailed
@@ -1109,6 +1292,13 @@ func (q *InMemoryQueue) Enqueue(ctx context.Context, job *Job) (*Job, error) {
 	}
 	job.doneCh = make(chan struct{})
 
+	if strings.EqualFold(strings.TrimSpace(job.TargetHost), "global") || strings.EqualFold(strings.TrimSpace(job.TargetHost), "auto") {
+		job.TargetHost = ""
+	}
+	if job.AgentAffinity != nil && (strings.EqualFold(strings.TrimSpace(job.AgentAffinity.HostID), "global") || strings.EqualFold(strings.TrimSpace(job.AgentAffinity.HostID), "auto")) {
+		job.AgentAffinity.HostID = ""
+	}
+
 	normalizeJobDependencies(job)
 	PopulateJobConversationFields(job)
 	var failedOnEnqueue *Job
@@ -1143,6 +1333,35 @@ func (q *InMemoryQueue) Enqueue(ctx context.Context, job *Job) (*Job, error) {
 		job.Status = JobStatusPending
 	}
 
+	// Enforce Unassigned Global Queue Residency: while PENDING or BLOCKED_BY_DEPENDENCY,
+	// global queue jobs must remain with HostID == "", ClaimedHost == "", and WorktreePath == "".
+	if job.Status == JobStatusPending || job.Status == JobStatusBlockedByDependency {
+		job.HostID = ""
+		job.ClaimedHost = ""
+		if strings.TrimSpace(job.TargetHost) == "" {
+			job.WorktreePath = ""
+			if len(job.Payload) > 0 {
+				var pm map[string]any
+				if json.Unmarshal(job.Payload, &pm) == nil && pm != nil {
+					if origRepo, ok := pm["repo"].(string); !ok || strings.TrimSpace(origRepo) == "" {
+						pm["repo"] = job.Repo
+					}
+					if sub := ExtractTargetSubmodule(job.Repo, job.Payload); sub != "" {
+						pm["target_submodule"] = sub
+					}
+					pm["worktree_path"] = ""
+					pm["host_id"] = ""
+					if th, ok := pm["target_host"].(string); ok && (strings.TrimSpace(th) != "" || strings.EqualFold(strings.TrimSpace(th), "global")) {
+						pm["target_host"] = ""
+					}
+					if updated, err := json.Marshal(pm); err == nil {
+						job.Payload = updated
+					}
+				}
+			}
+		}
+	}
+
 	// Store copy
 	q.jobs[job.ID] = job
 	if q.store != nil {
@@ -1169,21 +1388,70 @@ func (q *InMemoryQueue) Enqueue(ctx context.Context, job *Job) (*Job, error) {
 
 // Claim finds the oldest pending job matching hostID and jobTypes, marking it claimed.
 func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []string) (*Job, error) {
+	return q.ClaimWithWorktrees(ctx, hostID, jobTypes, nil)
+}
+
+// ClaimWithWorktrees finds the oldest eligible pending job matching hostID, jobTypes, and available idleWorktrees,
+// enforcing the Eager Update Pre-Claim Barrier, dependency gating, submodule slot family normalization,
+// concurrent submodule mutation guard, and atomic worktree slot reservation.
+func (q *InMemoryQueue) ClaimWithWorktrees(ctx context.Context, hostID string, jobTypes []string, idleWorktrees []string) (*Job, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	q.reapExpiredLocked(q.now())
+	now := q.now()
+	q.reapExpiredLocked(now)
+	_, _, depDoneChs := q.resolveDependentJobsLocked(ctx, now)
+	for _, ch := range depDoneChs {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	}
+
+	if hostID != "" && q.hostEligibilityChecker != nil {
+		if eligible, _ := q.hostEligibilityChecker(hostID); !eligible {
+			return nil, nil
+		}
+	}
 
 	typeFilter := make(map[string]bool)
 	for _, t := range jobTypes {
 		typeFilter[t] = true
 	}
 
-	var oldest *Job
-	for _, j := range q.jobs {
-		if j.Status != JobStatusPending {
+	// Track active submodule mutations across leased/claimed/running jobs so we do not
+	// concurrently mutate the exact same target submodule across hosts unless explicitly allowed.
+	activeSubmodules := make(map[string]bool)
+	for _, active := range q.jobs {
+		if active == nil {
 			continue
 		}
+		if active.Status == JobStatusLeased || active.Status == JobStatusClaimed || active.Status == JobStatusRunning {
+			if sub := ExtractTargetSubmodule(active.Repo, active.Payload); sub != "" {
+				activeSubmodules[sub] = true
+			}
+		}
+	}
+
+	// Sort pending candidates by CreatedAt ascending so FIFO order is deterministic.
+	var candidates []*Job
+	for _, j := range q.jobs {
+		if j == nil || j.Status != JobStatusPending {
+			continue
+		}
+		candidates = append(candidates, j)
+	}
+	sort.Slice(candidates, func(i, k int) bool {
+		if candidates[i].CreatedAt.Equal(candidates[k].CreatedAt) {
+			return candidates[i].ID < candidates[k].ID
+		}
+		return candidates[i].CreatedAt.Before(candidates[k].CreatedAt)
+	})
+
+	var oldest *Job
+	var boundWorktree string
+	for _, j := range candidates {
 		if j.DependsOnJobID != "" || len(j.DependsOnJobIDs) > 0 {
 			satisfied, failedDep := q.areDependenciesSatisfiedLocked(j)
 			if failedDep != nil || !satisfied {
@@ -1202,16 +1470,47 @@ func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []str
 		if j.AgentAffinity != nil && j.AgentAffinity.HostID != "" && hostID != "" && j.AgentAffinity.HostID != hostID {
 			continue
 		}
-		if oldest == nil || j.CreatedAt.Before(oldest.CreatedAt) {
-			oldest = j
+
+		submod := ExtractTargetSubmodule(j.Repo, j.Payload)
+		if submod != "" && activeSubmodules[submod] && !AllowConcurrentSubmoduleMutation(j.Payload) {
+			continue
 		}
+
+		slotFamily := NormalizeToSuperprojectSlotFamily(j.Repo)
+		matchedWT := ""
+		if q.slotAllocator != nil && hostID != "" {
+			wt, ok := q.slotAllocator(hostID, j.ID, slotFamily, submod, j.TargetAgent, idleWorktrees)
+			if !ok {
+				continue
+			}
+			matchedWT = wt
+		} else if len(idleWorktrees) > 0 {
+			found := false
+			for _, wt := range idleWorktrees {
+				trimmedWT := strings.TrimSpace(wt)
+				if trimmedWT == "" {
+					continue
+				}
+				if NormalizeToSuperprojectSlotFamily(trimmedWT) == slotFamily {
+					matchedWT = trimmedWT
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+		}
+
+		oldest = j
+		boundWorktree = matchedWT
+		break
 	}
 
 	if oldest == nil {
 		return nil, nil
 	}
 
-	now := q.now()
 	q.fencingSeq++
 	oldest.FencingToken = q.fencingSeq
 	oldest.Attempts++
@@ -1219,6 +1518,9 @@ func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []str
 	oldest.LeaseToken = fmt.Sprintf("lt-%s-%d", oldest.ID, now.UnixNano())
 	ackDeadline := now.Add(DefaultLeaseAckDeadline)
 	oldest.LeaseAckDeadlineAt = &ackDeadline
+	if boundWorktree != "" {
+		oldest.WorktreePath = boundWorktree
+	}
 	if oldest.ResumeConversationID == "" {
 		if oldest.InitialConversationID != "" {
 			oldest.ResumeConversationID = oldest.InitialConversationID
@@ -1228,13 +1530,27 @@ func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []str
 			oldest.ResumeConversationID = oldest.ConversationIDs[0]
 		}
 	}
-	if oldest.ResumeConversationID != "" && len(oldest.Payload) > 0 {
+	if len(oldest.Payload) > 0 {
 		var payloadMap map[string]any
 		if err := json.Unmarshal(oldest.Payload, &payloadMap); err == nil && payloadMap != nil {
-			payloadMap["resume_conversation_id"] = oldest.ResumeConversationID
-			payloadMap["conversation_id"] = oldest.ResumeConversationID
-			if updated, err := json.Marshal(payloadMap); err == nil {
-				oldest.Payload = updated
+			changedPayload := false
+			if oldest.ResumeConversationID != "" {
+				payloadMap["resume_conversation_id"] = oldest.ResumeConversationID
+				payloadMap["conversation_id"] = oldest.ResumeConversationID
+				changedPayload = true
+			}
+			if boundWorktree != "" {
+				payloadMap["worktree_path"] = boundWorktree
+				changedPayload = true
+			}
+			if hostID != "" {
+				payloadMap["host_id"] = hostID
+				changedPayload = true
+			}
+			if changedPayload {
+				if updated, err := json.Marshal(payloadMap); err == nil {
+					oldest.Payload = updated
+				}
 			}
 		}
 	}
@@ -1270,6 +1586,65 @@ func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []str
 	}
 
 	return oldest, nil
+}
+
+// Decline resets a leased, claimed, or busy-abandoned job back to PENDING with HostID == "" and WorktreePath == ""
+// so any free host can immediately claim it without consuming retry budget.
+func (q *InMemoryQueue) Decline(ctx context.Context, jobID string, reason string) (*Job, error) {
+	q.mu.Lock()
+	job, exists := q.jobs[jobID]
+	if !exists || job == nil {
+		q.mu.Unlock()
+		return nil, ErrJobNotFound
+	}
+	if job.Status == JobStatusCompleted || job.Status == JobStatusFailed || job.Status == JobStatusCanceled {
+		q.mu.Unlock()
+		return job, nil
+	}
+
+	if job.Attempts > 0 && (job.Status == JobStatusLeased || strings.EqualFold(strings.TrimSpace(reason), "REPO_BUSY") || strings.Contains(strings.ToUpper(reason), "DECLINE")) {
+		job.Attempts--
+	}
+	job.Status = JobStatusPending
+	job.HostID = ""
+	job.ClaimedHost = ""
+	job.WorktreePath = ""
+	job.TargetHost = ""
+	if job.AgentAffinity != nil {
+		job.AgentAffinity.HostID = ""
+	}
+	job.LeaseOwner = ""
+	job.LeaseToken = ""
+	job.ClaimedAt = nil
+	job.AckedAt = nil
+	job.HeartbeatAt = nil
+	job.LeaseExpiresAt = nil
+	job.LeaseAckDeadlineAt = nil
+	if len(job.Payload) > 0 {
+		var pm map[string]any
+		if json.Unmarshal(job.Payload, &pm) == nil && pm != nil {
+			pm["worktree_path"] = ""
+			pm["host_id"] = ""
+			pm["target_host"] = ""
+			if updated, err := json.Marshal(pm); err == nil {
+				job.Payload = updated
+			}
+		}
+	}
+	if job.DispatchDiagnostics == nil {
+		job.DispatchDiagnostics = &DispatchDiagnostics{}
+	}
+	job.DispatchDiagnostics.QueueState = "queued"
+	if q.store != nil {
+		_ = q.store.SaveQueueJob(ctx, job)
+	}
+	releaser := q.slotReleaser
+	q.mu.Unlock()
+
+	if releaser != nil {
+		releaser(jobID)
+	}
+	return job, nil
 }
 
 // Heartbeat extends the lease expiration of an in-flight claimed job, validating the worker's fencing token.

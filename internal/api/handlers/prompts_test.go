@@ -207,8 +207,8 @@ func TestPromptsHandlerPreservesBranchAndAllocatesTool(t *testing.T) {
 	if job.TargetAgent != "claude" {
 		t.Fatalf("expected allocated TargetAgent claude, got %s", job.TargetAgent)
 	}
-	if job.TargetHost != "mac-mini" {
-		t.Fatalf("expected allocated TargetHost mac-mini, got %s", job.TargetHost)
+	if job.TargetHost != "" || job.HostID != "" || job.WorktreePath != "" {
+		t.Fatalf("expected unassigned PENDING global queue residency (TargetHost='', HostID='', WorktreePath=''), got TargetHost=%q HostID=%q WorktreePath=%q", job.TargetHost, job.HostID, job.WorktreePath)
 	}
 	var savedPayload CreatePromptRequest
 	if err := json.Unmarshal(job.Payload, &savedPayload); err != nil {
