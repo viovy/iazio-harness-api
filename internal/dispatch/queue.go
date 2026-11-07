@@ -13,7 +13,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -124,6 +126,84 @@ func BuildConversationURL(webBaseURL, conversationID string) string {
 	return strings.TrimRight(base, "/") + "/conversation/" + cid
 }
 
+// BuildLiveURL computes the canonical iazio-web deep link for a job ID (/jobs/<job_id>).
+func BuildLiveURL(webBaseURL, jobID string) string {
+	id := strings.TrimSpace(jobID)
+	if id == "" {
+		return ""
+	}
+	base := strings.TrimSpace(webBaseURL)
+	if base == "" || strings.Contains(strings.ToLower(base), "example.com") {
+		base = ResolveWebBaseURL()
+	}
+	return strings.TrimRight(base, "/") + "/jobs/" + id
+}
+
+// NormalizeLiveURL rewrites legacy /agents/.../live?job=<id> or /hosts/.../live?job=<id>
+// or example.com URLs into the canonical <web_base_url>/jobs/<job_id> URL.
+func NormalizeLiveURL(rawURL, jobID string) string {
+	raw := strings.TrimSpace(rawURL)
+	id := strings.TrimSpace(jobID)
+	if id == "" && strings.Contains(raw, "job=") {
+		if parsed, err := url.Parse(raw); err == nil {
+			id = strings.TrimSpace(parsed.Query().Get("job"))
+		}
+		if id == "" {
+			if idx := strings.Index(raw, "job="); idx >= 0 {
+				rest := raw[idx+len("job="):]
+				if amp := strings.IndexByte(rest, '&'); amp >= 0 {
+					rest = rest[:amp]
+				}
+				if hash := strings.IndexByte(rest, '#'); hash >= 0 {
+					rest = rest[:hash]
+				}
+				id = strings.TrimSpace(rest)
+			}
+		}
+	}
+	if id != "" {
+		lowerRaw := strings.ToLower(raw)
+		if raw == "" ||
+			strings.Contains(lowerRaw, "example.com") ||
+			strings.Contains(raw, "/agents/") ||
+			strings.Contains(raw, "/hosts/") ||
+			strings.Contains(raw, "/live?job=") ||
+			!strings.Contains(raw, "/jobs/") {
+			return BuildLiveURL("", id)
+		}
+	}
+	for _, prefix := range []string{"https://example.com/iazio-web", "http://example.com/iazio-web"} {
+		if strings.HasPrefix(strings.ToLower(raw), prefix) {
+			raw = strings.TrimRight(ResolveWebBaseURL(), "/") + raw[len(prefix):]
+			break
+		}
+	}
+	return raw
+}
+
+// NormalizeRepoName normalizes root worktree indicators (".", "root", empty, or meta-repo worktree paths)
+// to "meta-repo" and extracts the base repository name from filesystem worktree paths.
+func NormalizeRepoName(repo string) string {
+	trimmed := strings.TrimSpace(repo)
+	lower := strings.ToLower(trimmed)
+	if trimmed == "" || trimmed == "." || trimmed == "/" || trimmed == `\` || lower == "root" || lower == "metarepo" {
+		return "meta-repo"
+	}
+	if strings.Contains(trimmed, "/") || strings.Contains(trimmed, `\`) {
+		slashed := strings.TrimRight(filepath.ToSlash(trimmed), "/")
+		if slashed == "" || slashed == "." {
+			return "meta-repo"
+		}
+		base := filepath.Base(slashed)
+		baseLower := strings.ToLower(base)
+		if base == "" || base == "." || base == "/" || baseLower == "root" || baseLower == "metarepo" {
+			return "meta-repo"
+		}
+		return base
+	}
+	return trimmed
+}
+
 // ResolveJobConversationID resolves the canonical conversation ID for a job from its
 // first-class fields, Result JSON, or Payload JSON.
 func ResolveJobConversationID(j *Job) string {
@@ -173,6 +253,9 @@ func ResolveJobConversationID(j *Job) string {
 func PopulateJobConversationFields(j *Job) {
 	if j == nil {
 		return
+	}
+	if strings.EqualFold(strings.TrimSpace(j.Repo), "root") {
+		j.Repo = "meta-repo"
 	}
 	for _, blob := range []json.RawMessage{j.Result, j.Payload} {
 		if len(blob) == 0 {
