@@ -3485,24 +3485,6 @@ func (s *Server) reconcileQueueWithEngine(ctx context.Context) {
 			}
 			continue
 		}
-		if st == dispatch.JobStatusPending && strings.EqualFold(strings.TrimSpace(qj.Type), "agent.tools.update") {
-			targetHost := strings.TrimSpace(qj.TargetHost)
-			if targetHost == "" && qj.AgentAffinity != nil {
-				targetHost = strings.TrimSpace(qj.AgentAffinity.HostID)
-			}
-			if targetHost == "" {
-				continue
-			}
-			hd, ok := s.Engine.GetHostDetail(targetHost)
-			if !ok || strings.EqualFold(hd.Host.Presence, "OFFLINE") || hd.Host.PendingToolUpdate != nil {
-				continue
-			}
-			if hd.Host.EagerReadiness != nil &&
-				hd.Host.EagerReadiness.EagerUpdateState == control.StateUpToDate &&
-				!hd.Host.EagerReadiness.LastEvaluatedAt.Before(qj.CreatedAt) {
-				_ = s.Queue.Complete(ctx, qj.ID, json.RawMessage(`{"status":"completed_via_eager_readiness"}`), "")
-			}
-		}
 	}
 }
 
@@ -4133,14 +4115,17 @@ func synthesizeDispatchJobFallbackChunk(qJob *dispatch.Job) control.LogChunk {
 	}
 	elapsedSec := qJob.ElapsedSeconds
 	if elapsedSec <= 0 {
-		startRef := qJob.CreatedAt
+		isActive := strings.EqualFold(qJob.Status, dispatch.JobStatusRunning) || strings.EqualFold(qJob.Status, dispatch.JobStatusClaimed) || strings.EqualFold(qJob.Status, dispatch.JobStatusLeased)
+		var startRef time.Time
 		if qJob.ClaimedAt != nil && !qJob.ClaimedAt.IsZero() {
 			startRef = *qJob.ClaimedAt
+		} else if isActive {
+			startRef = qJob.CreatedAt
 		}
 		if !startRef.IsZero() {
 			if qJob.CompletedAt != nil {
 				elapsedSec = int64(qJob.CompletedAt.Sub(startRef).Seconds())
-			} else if strings.EqualFold(qJob.Status, dispatch.JobStatusRunning) || strings.EqualFold(qJob.Status, dispatch.JobStatusClaimed) || strings.EqualFold(qJob.Status, dispatch.JobStatusLeased) {
+			} else if isActive {
 				elapsedSec = int64(time.Since(startRef).Seconds())
 			}
 			if elapsedSec < 0 {
@@ -4169,10 +4154,32 @@ func synthesizeDispatchJobFallbackChunk(qJob *dispatch.Job) control.LogChunk {
 	} else if len(qJob.Result) > 0 {
 		var resMap map[string]any
 		if json.Unmarshal(qJob.Result, &resMap) == nil {
+			wroteBody := false
 			if summary, ok := resMap["summary"].(string); ok && strings.TrimSpace(summary) != "" {
 				sb.WriteString(strings.TrimSpace(summary) + "\n")
+				wroteBody = true
+			}
+			if output, ok := resMap["output"].(string); ok && strings.TrimSpace(output) != "" && strings.TrimSpace(output) != strings.TrimSpace(fmt.Sprint(resMap["summary"])) {
+				sb.WriteString(strings.TrimSpace(output) + "\n")
+				wroteBody = true
+			}
+			if msg, ok := resMap["message"].(string); ok && strings.TrimSpace(msg) != "" && !wroteBody {
+				sb.WriteString(strings.TrimSpace(msg) + "\n")
+				wroteBody = true
+			}
+			if !wroteBody {
+				if updated, ok := resMap["updated"].(bool); ok {
+					fmt.Fprintf(&sb, "[ASE-SUPERVISOR] Tool Update Result: updated=%v\n", updated)
+					wroteBody = true
+				} else if stVal, ok := resMap["status"].(string); ok && strings.TrimSpace(stVal) != "" {
+					fmt.Fprintf(&sb, "[ASE-SUPERVISOR] Result Status: %s\n", strings.TrimSpace(stVal))
+					wroteBody = true
+				}
 			}
 		}
+	}
+	if strings.TrimSpace(qJob.Error) != "" {
+		fmt.Fprintf(&sb, "[ASE-SUPERVISOR] Error: %s\n", strings.TrimSpace(qJob.Error))
 	}
 	return control.LogChunk{
 		Seq:            0,

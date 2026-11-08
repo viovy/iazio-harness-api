@@ -3861,11 +3861,21 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 						if strings.EqualFold(strings.TrimSpace(r.ActiveTool), "") || r.ActiveTool != "NONE" {
 							r.ActiveTool = "NONE"
 						}
+						if hasHost && h != nil && h.RepoStatuses != nil {
+							cleanPath := filepath.Clean(st.RepoPath)
+							if curSt, ok := h.RepoStatuses[cleanPath]; ok {
+								curSt.ASEState = "IDLE"
+								curSt.ExecutionProvenance = "NONE"
+								curSt.ToolLiveness = "NONE"
+								curSt.ActiveTool = "NONE"
+								h.RepoStatuses[cleanPath] = curSt
+							}
+						}
 						changed = true
 					}
 					// Auto-recovery: if repo was HEALING or PAUSED(ReasonDirty/ReasonHealFailed/ReasonAdhocASE),
 					// and git status is now verified clean with no active running harness or ad-hoc ASE job:
-					if r.Queue == QueueHealing || (r.Queue == QueuePaused && (r.Reason == ReasonDirty || r.Reason == ReasonHealFailed || r.Reason == ReasonAdhocASE)) || r.DiscardPending {
+					if r.Queue == QueueHealing || (r.Queue == QueuePaused && (r.Reason == ReasonDirty || r.Reason == ReasonHealFailed || r.Reason == ReasonAdhocASE || (isDefaultBranchForRepo(r) && len(st.DirtySubmodules) == 0 && r.Reason == ""))) || r.DiscardPending {
 						r.Queue = QueueOpen
 						r.Reason = ""
 						r.Porcelain = ""

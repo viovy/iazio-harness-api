@@ -1094,14 +1094,17 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 	}
 	elapsedSec := j.ElapsedSeconds
 	if elapsedSec <= 0 {
-		startRef := j.CreatedAt
+		isActive := strings.EqualFold(j.Status, dispatch.JobStatusRunning) || strings.EqualFold(j.Status, dispatch.JobStatusClaimed) || strings.EqualFold(j.Status, dispatch.JobStatusLeased)
+		var startRef time.Time
 		if j.ClaimedAt != nil && !j.ClaimedAt.IsZero() {
 			startRef = *j.ClaimedAt
+		} else if isActive {
+			startRef = j.CreatedAt
 		}
 		if !startRef.IsZero() {
 			if j.CompletedAt != nil {
 				elapsedSec = int64(j.CompletedAt.Sub(startRef).Seconds())
-			} else if strings.EqualFold(j.Status, dispatch.JobStatusRunning) || strings.EqualFold(j.Status, dispatch.JobStatusClaimed) || strings.EqualFold(j.Status, dispatch.JobStatusLeased) {
+			} else if isActive {
 				elapsedSec = int64(time.Since(startRef).Seconds())
 			}
 			if elapsedSec < 0 {
@@ -1197,8 +1200,9 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 		res["started_at"] = j.CreatedAt.UTC().Format(time.RFC3339)
 		res["created_at"] = j.CreatedAt.UTC().Format(time.RFC3339)
 	}
-	if j.ClaimedAt != nil {
+	if j.ClaimedAt != nil && !j.ClaimedAt.IsZero() {
 		res["claimed_at"] = j.ClaimedAt.UTC().Format(time.RFC3339)
+		res["started_at"] = j.ClaimedAt.UTC().Format(time.RFC3339)
 	}
 	if j.AckedAt != nil {
 		res["acked_at"] = j.AckedAt.UTC().Format(time.RFC3339)
@@ -1211,8 +1215,14 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 	}
 	if j.CompletedAt != nil {
 		res["completed_at"] = j.CompletedAt.UTC().Format(time.RFC3339)
-		if !j.CreatedAt.IsZero() {
-			res["duration_ms"] = j.CompletedAt.Sub(j.CreatedAt).Milliseconds()
+		if j.ClaimedAt != nil && !j.ClaimedAt.IsZero() {
+			durMs := j.CompletedAt.Sub(*j.ClaimedAt).Milliseconds()
+			if durMs < 0 {
+				durMs = 0
+			}
+			res["duration_ms"] = durMs
+		} else if !j.CreatedAt.IsZero() && j.ElapsedSeconds > 0 {
+			res["duration_ms"] = j.ElapsedSeconds * 1000
 		}
 	}
 	return res

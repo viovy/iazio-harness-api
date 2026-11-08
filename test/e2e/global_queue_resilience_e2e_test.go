@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -831,6 +832,29 @@ func TestE2E_GlobalQueue_ToolsUpdateClaimReconcileAndEngineHeartbeatIsolation_St
 		if s.ID == claimed.ID || string(s.Kind) == "agent.tools.update" {
 			t.Fatalf("expected include_dispatch_jobs=false to exclude dispatch job %s (kind=%s)", s.ID, s.Kind)
 		}
+	}
+
+	// 5. Complete the claimed agent.tools.update job with telemetry and verify /v1/jobs/{id} + /v1/jobs/{id}/logs.
+	completeBody := bytes.NewBufferString(`{"fencing_token":` + fmt.Sprintf("%d", claimed.FencingToken) + `,"result":{"status":"completed","updated":true,"tools":["codex"],"host_id":"docker1","agent_pid":4242,"harness_pid":4242,"elapsed_seconds":3,"summary":"Updated tools [codex] on host docker1"}}`)
+	compResp, err := client.Post(ts.URL+"/api/v1/agent/jobs/"+claimed.ID+"/complete", "application/json", completeBody)
+	if err != nil {
+		t.Fatalf("POST complete failed: %v", err)
+	}
+	_ = compResp.Body.Close()
+
+	logsResp, err := client.Get(ts.URL + "/v1/jobs/" + claimed.ID + "/logs")
+	if err != nil {
+		t.Fatalf("GET /v1/jobs/%s/logs failed: %v", claimed.ID, err)
+	}
+	defer logsResp.Body.Close()
+	var logsBundle struct {
+		Chunks []control.LogChunk `json:"chunks"`
+	}
+	if err := json.NewDecoder(logsResp.Body).Decode(&logsBundle); err != nil {
+		t.Fatalf("decode logsBundle failed: %v", err)
+	}
+	if len(logsBundle.Chunks) == 0 || !bytes.Contains([]byte(logsBundle.Chunks[0].Text), []byte("Updated tools [codex] on host docker1")) {
+		t.Fatalf("expected logs chunk to include tool update summary, got %+v", logsBundle.Chunks)
 	}
 }
 
