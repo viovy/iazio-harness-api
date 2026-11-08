@@ -283,12 +283,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/hosts/all/tools/update", s.queueAllToolsUpdate)
 	mux.HandleFunc("POST /api/v1/hosts/all/tools/update", s.queueAllToolsUpdate)
 
+	s.reconcileQueueWithEngine(context.Background())
+
 	// Periodic 15s Global Queue Slot & Lease Reconciler (STORY-GOV-3690)
 	go func() {
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			now := time.Now().UTC()
+			s.reconcileQueueWithEngine(context.Background())
 			if s.Engine != nil {
 				_ = s.Engine.ReconcileStaleWorkspaceSlots(now, 45*time.Second)
 			}
@@ -1071,6 +1074,7 @@ func (s *Server) finish(w http.ResponseWriter, r *http.Request) {
 	}
 	host := r.PathValue("host")
 	report := s.Engine.ApplyFinish(host, body.Path, body.JobID, body.In)
+	s.completeOrReleaseEngineJobInQueue(r.Context(), body.JobID, 0, "")
 	if s.SaveRepo != nil {
 		if detail, ok := s.Engine.GetRepoDetail(host, body.Path); ok {
 			s.SaveRepo(detail.Repo)
@@ -1568,6 +1572,7 @@ func (s *Server) cancelSchedule(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listSchedules(w http.ResponseWriter, r *http.Request) {
+	s.reconcileQueueWithEngine(r.Context())
 	hostID := r.URL.Query().Get("host_id")
 	if hostID == "" {
 		hostID = r.URL.Query().Get("host")
@@ -1577,18 +1582,20 @@ func (s *Server) listSchedules(w http.ResponseWriter, r *http.Request) {
 		repoPath = r.URL.Query().Get("path")
 	}
 	status := r.URL.Query().Get("status")
+	includeDispatchRaw := strings.TrimSpace(r.URL.Query().Get("include_dispatch_jobs"))
+	includeDispatchJobs := !strings.EqualFold(includeDispatchRaw, "false") && includeDispatchRaw != "0"
 	schedules := s.Engine.ListSchedules(hostID, repoPath, status)
 	out := make([]map[string]any, 0, len(schedules))
 	for _, sch := range schedules {
 		out = append(out, scheduleView(sch))
 	}
-	if s.Queue != nil {
+	if s.Queue != nil && includeDispatchJobs {
 		qJobs, _ := s.Queue.List(r.Context(), dispatch.JobFilter{
 			Repo:  repoPath,
 			Limit: 250,
 		})
 		for _, qj := range qJobs {
-			if qj == nil {
+			if qj == nil || strings.HasPrefix(strings.TrimSpace(qj.ID), "job-") {
 				continue
 			}
 			if hostID != "" {
@@ -1789,6 +1796,7 @@ func (s *Server) postExit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, err)
 		return
 	}
+	s.completeOrReleaseEngineJobInQueue(r.Context(), jobID, body.ExitCode, body.TerminationReasonCode)
 	if body.ExitCode == 0 && (body.TerminationReasonCode == "" || body.TerminationReasonCode == "CLEAN") {
 		s.RecordNotification(NotificationRecord{
 			Timestamp: time.Now().UTC(),
@@ -2515,6 +2523,7 @@ func (s *Server) queueToolUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		if enqJob != nil {
 			jobID = enqJob.ID
+			s.supersedePendingToolUpdateJobsForHost(r.Context(), hostID, jobID)
 		}
 	}
 
@@ -2681,6 +2690,7 @@ func (s *Server) queueAllToolsUpdate(w http.ResponseWriter, r *http.Request) {
 			}
 			if enqJob, err := s.Queue.Enqueue(r.Context(), job); err == nil && enqJob != nil {
 				jobID = enqJob.ID
+				s.supersedePendingToolUpdateJobsForHost(r.Context(), hostID, jobID)
 			}
 		}
 		queuedHosts = append(queuedHosts, hostID)
@@ -3106,7 +3116,10 @@ func (s *Server) updateEagerReadiness(w http.ResponseWriter, r *http.Request) {
 	if report.HostID == "" {
 		report.HostID = hostID
 	}
-	s.Engine.UpdateEagerReadiness(hostID, report)
+	if s.Engine != nil {
+		s.Engine.UpdateEagerReadiness(hostID, report)
+	}
+	s.reconcileQueueWithEngine(r.Context())
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -3386,9 +3399,116 @@ func (s *Server) repoDetail(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, repoDetailView(detail))
 }
 
+func (s *Server) supersedePendingToolUpdateJobsForHost(ctx context.Context, hostID, excludeJobID string) {
+	cleanHost := strings.TrimSpace(hostID)
+	imq, ok := s.Queue.(*dispatch.InMemoryQueue)
+	if !ok || imq == nil || cleanHost == "" {
+		return
+	}
+	jobs, err := imq.List(ctx, dispatch.JobFilter{Type: "agent.tools.update", Status: dispatch.JobStatusPending, Limit: 250})
+	if err != nil {
+		return
+	}
+	for _, j := range jobs {
+		if j == nil || j.Status != dispatch.JobStatusPending || j.ID == excludeJobID {
+			continue
+		}
+		target := strings.TrimSpace(j.TargetHost)
+		if target == "" && j.AgentAffinity != nil {
+			target = strings.TrimSpace(j.AgentAffinity.HostID)
+		}
+		if strings.EqualFold(target, cleanHost) {
+			_, _ = imq.Cancel(ctx, j.ID, "superseded_by_newer_tool_update")
+		}
+	}
+}
+
+func (s *Server) completeOrReleaseEngineJobInQueue(ctx context.Context, jobID string, exitCode int, reason string) {
+	cleanID := strings.TrimSpace(jobID)
+	if cleanID == "" {
+		return
+	}
+	if s.Queue != nil {
+		if qJob, ok := s.Queue.Get(cleanID); ok && qJob != nil {
+			st := strings.ToLower(strings.TrimSpace(qJob.Status))
+			if st == dispatch.JobStatusPending || st == dispatch.JobStatusClaimed || st == dispatch.JobStatusLeased || st == dispatch.JobStatusRunning {
+				errMsg := ""
+				if exitCode != 0 {
+					errMsg = strings.TrimSpace(reason)
+					if errMsg == "" {
+						errMsg = fmt.Sprintf("exit_code=%d", exitCode)
+					}
+				}
+				_ = s.Queue.Complete(ctx, cleanID, json.RawMessage(`{"status":"reconciled_with_engine"}`), errMsg)
+			}
+		}
+	}
+	if s.Engine != nil {
+		s.Engine.ReleaseDispatchJobRepo(cleanID)
+	}
+}
+
+func (s *Server) reconcileQueueWithEngine(ctx context.Context) {
+	if s.Queue == nil || s.Engine == nil {
+		return
+	}
+	jobs, err := s.Queue.List(ctx, dispatch.JobFilter{Limit: 250})
+	if err != nil {
+		return
+	}
+	for _, qj := range jobs {
+		if qj == nil {
+			continue
+		}
+		st := strings.ToLower(strings.TrimSpace(qj.Status))
+		if st != dispatch.JobStatusPending && st != dispatch.JobStatusClaimed && st != dispatch.JobStatusLeased && st != dispatch.JobStatusRunning {
+			continue
+		}
+		if strings.HasPrefix(strings.TrimSpace(qj.ID), "job-") {
+			jd, ok := s.Engine.GetJob(qj.ID)
+			if !ok {
+				_ = s.Queue.Complete(ctx, qj.ID, json.RawMessage(`{"status":"reconciled_with_engine"}`), "")
+				s.Engine.ReleaseDispatchJobRepo(qj.ID)
+				continue
+			}
+			jdStatus := strings.ToUpper(strings.TrimSpace(jd.Status))
+			if jdStatus != "RUNNING" && jdStatus != "LEASED" && jdStatus != "CANCEL_REQUESTED" {
+				errMsg := ""
+				if jdStatus == "FAILED" || jdStatus == "CANCELLED" || jdStatus == "DECLINED" || jdStatus == "ABANDONED" {
+					errMsg = strings.TrimSpace(jd.TerminationReasonCode)
+					if errMsg == "" {
+						errMsg = jdStatus
+					}
+				}
+				_ = s.Queue.Complete(ctx, qj.ID, json.RawMessage(`{"status":"reconciled_with_engine"}`), errMsg)
+				s.Engine.ReleaseDispatchJobRepo(qj.ID)
+			}
+			continue
+		}
+		if st == dispatch.JobStatusPending && strings.EqualFold(strings.TrimSpace(qj.Type), "agent.tools.update") {
+			targetHost := strings.TrimSpace(qj.TargetHost)
+			if targetHost == "" && qj.AgentAffinity != nil {
+				targetHost = strings.TrimSpace(qj.AgentAffinity.HostID)
+			}
+			if targetHost == "" {
+				continue
+			}
+			hd, ok := s.Engine.GetHostDetail(targetHost)
+			if !ok || strings.EqualFold(hd.Host.Presence, "OFFLINE") || hd.Host.PendingToolUpdate != nil {
+				continue
+			}
+			if hd.Host.EagerReadiness != nil &&
+				hd.Host.EagerReadiness.EagerUpdateState == control.StateUpToDate &&
+				!hd.Host.EagerReadiness.LastEvaluatedAt.Before(qj.CreatedAt) {
+				_ = s.Queue.Complete(ctx, qj.ID, json.RawMessage(`{"status":"completed_via_eager_readiness"}`), "")
+			}
+		}
+	}
+}
+
 func (s *Server) isDispatchJobActive(jobID string) bool {
 	cleanID := strings.TrimSpace(jobID)
-	if s.Queue == nil || cleanID == "" {
+	if s.Queue == nil || cleanID == "" || strings.HasPrefix(cleanID, "job-") {
 		return false
 	}
 	if checker, ok := s.Queue.(interface{ IsJobActive(string) bool }); ok {
@@ -3425,7 +3545,7 @@ func (s *Server) findActiveDispatchJobForRepo(repo control.Repo) *dispatch.Job {
 	repoPath := strings.TrimRight(strings.TrimSpace(repo.WorktreePath), "/")
 	repoAlias := strings.TrimSpace(repo.EffectiveAlias())
 	for _, qJob := range jobs {
-		if qJob == nil {
+		if qJob == nil || strings.HasPrefix(strings.TrimSpace(qJob.ID), "job-") {
 			continue
 		}
 		st := strings.ToLower(strings.TrimSpace(qJob.Status))

@@ -704,3 +704,134 @@ func TestE2E_GlobalQueue_JobsEndpointAndConcurrentHostDetailReconcile_StoryGOV51
 	}
 }
 
+func TestE2E_GlobalQueue_ToolsUpdateClaimReconcileAndEngineHeartbeatIsolation_StoryGOV5195(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	eng := control.NewEngine(func() time.Time { return now })
+	queue := dispatch.NewInMemoryQueue()
+	eng.BindDispatchQueue(queue)
+
+	_ = eng.RegisterHost("docker1", "permanent")
+	_ = eng.RegisterHost("mac-mini", "permanent")
+	_ = eng.UpsertRepo(control.Repo{
+		HostID:                       "docker1",
+		WorktreePath:                 "/home/romeo/work/meta-repo",
+		CloneURL:                     "https://github.com/viovy/meta-repo.git",
+		Queue:                        control.QueueOpen,
+		Lock:                         control.LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+	_ = eng.UpsertRepo(control.Repo{
+		HostID:                       "mac-mini",
+		WorktreePath:                 "/Users/romeo/work/meta-repo",
+		CloneURL:                     "https://github.com/viovy/meta-repo.git",
+		Queue:                        control.QueueOpen,
+		Lock:                         control.LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+	_ = eng.Heartbeat("mac-mini", []control.Tool{{Name: "agy", Installed: true, Path: "/usr/bin/agy", Status: "ok"}}, false)
+	eng.UpdateEagerReadiness("docker1", control.EagerUpdateReadinessReport{
+		HostID:           "docker1",
+		EagerUpdateState: control.StateDriftDetected,
+	})
+
+	srv := &httpserver.Server{Engine: eng, Queue: queue}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	client := ts.Client()
+
+	// 1. Queue two tools-update jobs for docker1; the first should be superseded automatically.
+	for i := 0; i < 2; i++ {
+		body := bytes.NewBufferString(`{"host_id":"docker1","tools":["codex"]}`)
+		resp, err := client.Post(ts.URL+"/v1/hosts/docker1/tools/update", "application/json", body)
+		if err != nil {
+			t.Fatalf("POST /v1/hosts/docker1/tools/update failed: %v", err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("expected 200 OK or 202 Accepted, got %d", resp.StatusCode)
+		}
+	}
+
+	pendingBefore, err := queue.List(context.Background(), dispatch.JobFilter{Status: dispatch.JobStatusPending})
+	if err != nil {
+		t.Fatalf("queue.List failed: %v", err)
+	}
+	if len(pendingBefore) != 1 {
+		t.Fatalf("expected 1 active pending tools-update job after superseding older duplicate, got %d", len(pendingBefore))
+	}
+
+	// 2. Claim from docker1 with only ["agent.tools.update"] and empty idle_worktrees while DRIFT_DETECTED.
+	claimBody := bytes.NewBufferString(`{"host_id":"docker1","job_types":["agent.tools.update"]}`)
+	claimResp, err := client.Post(ts.URL+"/api/v1/agent/jobs/claim", "application/json", claimBody)
+	if err != nil {
+		t.Fatalf("POST /api/v1/agent/jobs/claim failed: %v", err)
+	}
+	defer claimResp.Body.Close()
+	if claimResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK claiming agent.tools.update on DRIFT_DETECTED host without idle worktrees, got %d", claimResp.StatusCode)
+	}
+	var claimed dispatch.Job
+	if err := json.NewDecoder(claimResp.Body).Decode(&claimed); err != nil {
+		t.Fatalf("decode claimed job failed: %v", err)
+	}
+	if claimed.ID != pendingBefore[0].ID {
+		t.Fatalf("expected claimed job %s, got %s", pendingBefore[0].ID, claimed.ID)
+	}
+
+	// 3. Engine schedule job exit + subsequent late agent heartbeat must NOT rehydrate job-<N> into dispatch queue.
+	sched, err := eng.EnqueueGlobalStorySchedule("STORY-GOV-5195", "meta-repo", "agy", "run verification")
+	if err != nil {
+		t.Fatalf("EnqueueGlobalStorySchedule failed: %v", err)
+	}
+	leasedJob, _, _, ok := eng.PollHostWithWorktrees("mac-mini", []string{"/Users/romeo/work/meta-repo"})
+	if !ok || leasedJob.ID == "" {
+		t.Fatalf("PollHostWithWorktrees failed: ok=%v", ok)
+	}
+	engineJobID := leasedJob.ID
+
+	// Simulate an already-rehydrated phantom entry in queue before exit, then post exit and confirm queue entry is completed.
+	_, _ = queue.Enqueue(context.Background(), &dispatch.Job{
+		ID:     engineJobID,
+		Type:   dispatch.JobTypePromptExecute,
+		Repo:   "/Users/romeo/work/meta-repo",
+		Status: dispatch.JobStatusRunning,
+	})
+	exitBody := bytes.NewBufferString(`{"job_id":"` + engineJobID + `","schedule_id":"` + sched.ID + `","host_id":"mac-mini","worktree_path":"/Users/romeo/work/meta-repo","exit_code":0,"clean":true,"output":"done"}`)
+	exitResp, err := client.Post(ts.URL+"/v1/jobs/"+engineJobID+"/exit", "application/json", exitBody)
+	if err != nil {
+		t.Fatalf("POST /v1/jobs/%s/exit failed: %v", engineJobID, err)
+	}
+	_ = exitResp.Body.Close()
+
+	// Send a late heartbeat for engineJobID and verify it does not rehydrate into dispatch queue as RUNNING.
+	hbBody := bytes.NewBufferString(`{"host_id":"mac-mini","conversation_id":"conv-late"}`)
+	hbResp, err := client.Post(ts.URL+"/api/v1/agent/jobs/"+engineJobID+"/heartbeat", "application/json", hbBody)
+	if err != nil {
+		t.Fatalf("POST heartbeat failed: %v", err)
+	}
+	_ = hbResp.Body.Close()
+
+	if qJob, ok := queue.Get(engineJobID); ok && qJob != nil && (qJob.Status == dispatch.JobStatusRunning || qJob.Status == dispatch.JobStatusClaimed || qJob.Status == dispatch.JobStatusPending) {
+		t.Fatalf("expected exited engine job %s not to remain active in dispatch queue, got status=%s", engineJobID, qJob.Status)
+	}
+
+	// 4. Verify GET /v1/schedules?include_dispatch_jobs=false excludes dispatch queue jobs.
+	schedResp, err := client.Get(ts.URL + "/v1/schedules?include_dispatch_jobs=false")
+	if err != nil {
+		t.Fatalf("GET /v1/schedules?include_dispatch_jobs=false failed: %v", err)
+	}
+	defer schedResp.Body.Close()
+	var schedPayload struct {
+		Schedules []control.Schedule `json:"schedules"`
+	}
+	if err := json.NewDecoder(schedResp.Body).Decode(&schedPayload); err != nil {
+		t.Fatalf("decode schedules failed: %v", err)
+	}
+	for _, s := range schedPayload.Schedules {
+		if s.ID == claimed.ID || string(s.Kind) == "agent.tools.update" {
+			t.Fatalf("expected include_dispatch_jobs=false to exclude dispatch job %s (kind=%s)", s.ID, s.Kind)
+		}
+	}
+}
+
+
