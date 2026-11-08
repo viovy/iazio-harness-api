@@ -3751,17 +3751,30 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 		if h.RepoStatuses == nil {
 			h.RepoStatuses = make(map[string]RepoRuntimeStatus)
 		}
-		for _, st := range statuses {
+		for i := range statuses {
+			st := statuses[i]
 			cleanPath := filepath.Clean(st.RepoPath)
+			if (strings.EqualFold(strings.TrimSpace(st.ASEState), "IDLE") || strings.EqualFold(strings.TrimSpace(st.ASEState), "FAILED_DIRTY")) &&
+				strings.EqualFold(strings.TrimSpace(st.ExecutionProvenance), "INDEPENDENT_USER_SESSION") {
+				st.ExecutionProvenance = "NONE"
+			}
 			st.LastCheckedAt = now // Always stamp server receive time to prevent client clock skew issues (G1)
 			if prev, exists := h.RepoStatuses[cleanPath]; exists && st.ASEState == "" && st.ExecutionProvenance == "" && st.ToolLiveness == "" && !st.IsClean {
-				st.ASEState = prev.ASEState
-				st.ActiveStoryID = prev.ActiveStoryID
-				st.ActiveTool = prev.ActiveTool
-				st.ToolLiveness = prev.ToolLiveness
-				st.ExecutionProvenance = prev.ExecutionProvenance
-				st.ActiveConversationID = prev.ActiveConversationID
+				if !prev.LastCheckedAt.IsZero() && now.Sub(prev.LastCheckedAt) <= 90*time.Second {
+					st.ASEState = prev.ASEState
+					st.ActiveStoryID = prev.ActiveStoryID
+					st.ActiveTool = prev.ActiveTool
+					st.ToolLiveness = prev.ToolLiveness
+					st.ExecutionProvenance = prev.ExecutionProvenance
+					st.ActiveConversationID = prev.ActiveConversationID
+					st.LastCheckedAt = prev.LastCheckedAt
+				} else {
+					st.ASEState = "IDLE"
+					st.ExecutionProvenance = "NONE"
+					st.ToolLiveness = "NONE"
+				}
 			}
+			statuses[i] = st
 			h.RepoStatuses[cleanPath] = st
 		}
 
