@@ -1217,7 +1217,9 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 		res["completed_at"] = j.CompletedAt.UTC().Format(time.RFC3339)
 		if j.ClaimedAt != nil && !j.ClaimedAt.IsZero() {
 			durMs := j.CompletedAt.Sub(*j.ClaimedAt).Milliseconds()
-			if durMs < 0 {
+			if durMs <= 0 && j.ElapsedSeconds > 0 {
+				durMs = j.ElapsedSeconds * 1000
+			} else if durMs < 0 {
 				durMs = 0
 			}
 			res["duration_ms"] = durMs
