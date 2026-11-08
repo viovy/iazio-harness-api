@@ -1855,10 +1855,10 @@ func (e *Engine) BindDispatchJobRepo(hostID, worktreePath, jobID string) string 
 	cleanJobID := strings.TrimSpace(jobID)
 	cleanHostID := strings.TrimSpace(hostID)
 	cleanWT := strings.TrimSpace(worktreePath)
-	if cleanJobID == "" || dispatch.IsHostLevelNonWorktreeJob("", cleanWT) {
+	if cleanJobID == "" {
 		return cleanWT
 	}
-	if strings.EqualFold(cleanWT, "fleet") {
+	if strings.EqualFold(cleanWT, "fleet") || dispatch.IsHostLevelNonWorktreeJob("", cleanWT) {
 		return ""
 	}
 
