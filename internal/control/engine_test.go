@@ -6016,5 +6016,58 @@ func TestStoryGOV5196_MultiWorktreeDefaultBranchPreferenceAndFleetToolsUpdate(t 
 	}
 }
 
+func TestUpdateRepoRuntimeStatus_StoryGov5197_AdhocASECarryForwardExpiryAndIdleNormalization(t *testing.T) {
+	now := time.Date(2026, 11, 8, 8, 0, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return now })
+	_ = e.RegisterHost("host-mac-1", "permanent", "generic")
+	wtPath := "/workspace/fleet/project-alpha"
+	_ = e.UpsertRepo(Repo{
+		HostID:        "host-mac-1",
+		WorktreePath:  wtPath,
+		DefaultBranch: "main",
+		Queue:         QueueOpen,
+		Lock:          LockIdle,
+	})
+
+	// 1. Report active ad-hoc ASE
+	e.UpdateRepoRuntimeStatus("host-mac-1", []RepoRuntimeStatus{
+		{
+			RepoPath:            wtPath,
+			Branch:              "fix/gov-5195-test",
+			IsClean:             false,
+			ASEState:            "RUNNING",
+			ActiveStoryID:       "STORY-GOV-5195",
+			ActiveTool:          "agy",
+			ToolLiveness:        "LIVE",
+			ExecutionProvenance: "INDEPENDENT_USER_SESSION",
+		},
+	})
+	e.mu.Lock()
+	r := e.repos[repoKey("host-mac-1", wtPath)]
+	if r == nil || r.Queue != QueuePaused || r.Reason != ReasonAdhocASE {
+		t.Fatalf("expected QueuePaused with ReasonAdhocASE, got %+v", r)
+	}
+	e.mu.Unlock()
+
+	// 2. Advance clock >90s and send blank ASEState (simulating probe timeout on dirty worktree):
+	// stale carry-forward must expire and transition repo from ReasonAdhocASE to ReasonDirty.
+	now = now.Add(2 * time.Minute)
+	e.UpdateRepoRuntimeStatus("host-mac-1", []RepoRuntimeStatus{
+		{
+			RepoPath: wtPath,
+			Branch:   "fix/gov-5195-test",
+			IsClean:  false,
+		},
+	})
+	e.mu.Lock()
+	r = e.repos[repoKey("host-mac-1", wtPath)]
+	if r.ASEState != "IDLE" || r.ExecutionProvenance != "NONE" || r.Reason != ReasonDirty {
+		t.Fatalf("expected expired carry-forward to clear ADHOC_ASE and set ReasonDirty, got state=%s prov=%s reason=%s",
+			r.ASEState, r.ExecutionProvenance, r.Reason)
+	}
+	e.mu.Unlock()
+}
+
+
 
 
