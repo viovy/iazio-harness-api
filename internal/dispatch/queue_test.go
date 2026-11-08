@@ -2794,3 +2794,62 @@ func TestIsJobActiveLockFreeAndDeferredSlotRelease_StoryGOV5192(t *testing.T) {
 	}
 }
 
+func TestStoryGOV5196_HostLevelToolsUpdateBypassesWorktreeSlotAllocation(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 8, 7, 10, 0, 0, time.UTC)
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+
+	if !IsHostLevelNonWorktreeJob("agent.tools.update", "fleet") {
+		t.Fatalf("expected IsHostLevelNonWorktreeJob('agent.tools.update', 'fleet') == true")
+	}
+	if !IsHostLevelNonWorktreeJob("prompt.execute", "fleet") {
+		t.Fatalf("expected IsHostLevelNonWorktreeJob('prompt.execute', 'fleet') == true")
+	}
+	if IsHostLevelNonWorktreeJob(JobTypePromptExecute, "iazio-agent") {
+		t.Fatalf("expected IsHostLevelNonWorktreeJob('prompt.execute', 'iazio-agent') == false")
+	}
+
+	slotAllocatorCalls := 0
+	q.SetSlotAllocator(func(hostID, jobID, targetRepo, targetSubmodule, targetAgent string, idleWorktrees []string) (string, bool) {
+		slotAllocatorCalls++
+		return "", false
+	})
+
+	for _, tc := range []struct {
+		id   string
+		host string
+		wt   []string
+	}{
+		{id: "job_f633dd5b34c16f08", host: "pc1", wt: []string{`C:\work\meta-repo`, `C:\work\meta-repo-02`}},
+		{id: "job_e28047b251eff446", host: "pc1-wsl", wt: nil},
+		{id: "job_9224339206904244", host: "debian", wt: []string{"/home/romeo/work/meta-repo"}},
+	} {
+		_, err := q.Enqueue(ctx, &Job{
+			ID:          tc.id,
+			Type:        "agent.tools.update",
+			Repo:        "fleet",
+			TargetAgent: "iazio-agent",
+			AgentAffinity: &AgentAffinity{
+				HostID:    tc.host,
+				AgentName: "iazio-agent",
+			},
+			Payload: json.RawMessage(`{"tools":["iazio-agent","iazio-harvester"],"force":true}`),
+		})
+		if err != nil {
+			t.Fatalf("enqueue %s: %v", tc.id, err)
+		}
+		claimed, err := q.ClaimWithWorktrees(ctx, tc.host, []string{"agent.tools.update"}, tc.wt)
+		if err != nil || claimed == nil || claimed.ID != tc.id {
+			t.Fatalf("expected %s to claim %s, got job=%+v err=%v", tc.host, tc.id, claimed, err)
+		}
+		if claimed.WorktreePath != "" {
+			t.Fatalf("expected host-level tools update job %s to have empty WorktreePath, got %q", tc.id, claimed.WorktreePath)
+		}
+	}
+	if slotAllocatorCalls != 0 {
+		t.Fatalf("expected slotAllocator not called for host-level tools update jobs, got %d calls", slotAllocatorCalls)
+	}
+}
+
+

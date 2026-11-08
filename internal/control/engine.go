@@ -1455,12 +1455,80 @@ func normalizeWorktreePathForSlotMatch(p string) string {
 	return slashed
 }
 
+func buildIdleWorktreeFilter(idleWorktrees []string) map[string]bool {
+	idleFilter := make(map[string]bool, len(idleWorktrees)*3)
+	for _, wt := range idleWorktrees {
+		trimmed := strings.TrimSpace(wt)
+		if trimmed != "" {
+			idleFilter[trimmed] = true
+			idleFilter[filepath.Clean(trimmed)] = true
+			if norm := normalizeWorktreePathForSlotMatch(trimmed); norm != "" {
+				idleFilter[norm] = true
+			}
+		}
+	}
+	return idleFilter
+}
+
+func repoMatchesIdleWorktreeFilter(r *Repo, idleFilter map[string]bool) bool {
+	if len(idleFilter) == 0 {
+		return true
+	}
+	if r == nil {
+		return false
+	}
+	normWT := normalizeWorktreePathForSlotMatch(r.WorktreePath)
+	return idleFilter[r.WorktreePath] || idleFilter[filepath.Clean(r.WorktreePath)] || (normWT != "" && idleFilter[normWT]) || idleFilter[r.EffectiveAlias()]
+}
+
+func isDefaultBranchForRepo(r *Repo) bool {
+	if r == nil {
+		return false
+	}
+	br := strings.TrimSpace(r.CurrentBranch)
+	if br == "" || strings.EqualFold(br, "main") || strings.EqualFold(br, "master") {
+		return true
+	}
+	def := strings.TrimSpace(r.DefaultBranch)
+	return def != "" && strings.EqualFold(br, def)
+}
+
+func repoDispatchPreferenceScore(r *Repo) int {
+	if r == nil {
+		return 100
+	}
+	onDefault := isDefaultBranchForRepo(r)
+	aseUpper := strings.ToUpper(strings.TrimSpace(r.ASEState))
+	cleanASE := aseUpper == "" || aseUpper == "IDLE" || aseUpper == "COMPLETED"
+	if onDefault && !r.DiscardPending && len(r.NonMainSubmodules) == 0 && cleanASE {
+		return 0
+	}
+	if onDefault && !r.DiscardPending {
+		return 1
+	}
+	if onDefault {
+		return 2
+	}
+	return 3
+}
+
+func sortHostReposForDispatch(hostRepos []*Repo) {
+	sort.Slice(hostRepos, func(a, b int) bool {
+		scoreA := repoDispatchPreferenceScore(hostRepos[a])
+		scoreB := repoDispatchPreferenceScore(hostRepos[b])
+		if scoreA != scoreB {
+			return scoreA < scoreB
+		}
+		return hostRepos[a].WorktreePath < hostRepos[b].WorktreePath
+	})
+}
+
 func repoMatchesTargetOrSlotFamily(r *Repo, reqRepo string) bool {
 	if r == nil {
 		return false
 	}
 	cleanReq := strings.TrimSpace(reqRepo)
-	if cleanReq == "" || cleanReq == "." || strings.EqualFold(cleanReq, "root") {
+	if cleanReq == "" || cleanReq == "." || strings.EqualFold(cleanReq, "root") || dispatch.IsHostLevelNonWorktreeJob("", cleanReq) {
 		return true
 	}
 	if r.WorktreePath == cleanReq || r.EffectiveAlias() == cleanReq || strings.Contains(r.WorktreePath, cleanReq) {
@@ -1494,6 +1562,10 @@ func (e *Engine) AllocateDispatchJobSlot(hostID, jobID, targetRepo, targetSubmod
 		}
 	}
 
+	if dispatch.IsHostLevelNonWorktreeJob("", targetRepo) {
+		return "", true
+	}
+
 	// Enforce concurrent submodule mutation guard against active schedules on the engine
 	cleanSubmod := strings.ToLower(strings.TrimSpace(targetSubmodule))
 	if cleanSubmod != "" {
@@ -1517,9 +1589,7 @@ func (e *Engine) AllocateDispatchJobSlot(hostID, jobID, targetRepo, targetSubmod
 			hostRepos = append(hostRepos, r)
 		}
 	}
-	sort.Slice(hostRepos, func(a, b int) bool {
-		return hostRepos[a].WorktreePath < hostRepos[b].WorktreePath
-	})
+	sortHostReposForDispatch(hostRepos)
 
 	if len(hostRepos) == 0 {
 		if len(idleWorktrees) > 0 {
@@ -1538,17 +1608,7 @@ func (e *Engine) AllocateDispatchJobSlot(hostID, jobID, targetRepo, targetSubmod
 		return "", true
 	}
 
-	idleFilter := make(map[string]bool, len(idleWorktrees))
-	for _, wt := range idleWorktrees {
-		trimmed := strings.TrimSpace(wt)
-		if trimmed != "" {
-			idleFilter[trimmed] = true
-			idleFilter[filepath.Clean(trimmed)] = true
-			if norm := normalizeWorktreePathForSlotMatch(trimmed); norm != "" {
-				idleFilter[norm] = true
-			}
-		}
-	}
+	idleFilter := buildIdleWorktreeFilter(idleWorktrees)
 
 	// If jobID is already bound to a repo on this host, return it.
 	for _, r := range hostRepos {
@@ -1575,11 +1635,8 @@ func (e *Engine) AllocateDispatchJobSlot(hostID, jobID, targetRepo, targetSubmod
 		if anyGlobalEnabled && !r.GlobalQueueAllocationEnabled {
 			continue
 		}
-		if len(idleFilter) > 0 {
-			normWT := normalizeWorktreePathForSlotMatch(r.WorktreePath)
-			if !idleFilter[r.WorktreePath] && !idleFilter[filepath.Clean(r.WorktreePath)] && !idleFilter[normWT] && !idleFilter[r.EffectiveAlias()] {
-				continue
-			}
+		if !repoMatchesIdleWorktreeFilter(r, idleFilter) {
+			continue
 		}
 		if r.Queue == QueuePaused || r.Queue == QueueBlocked {
 			continue
@@ -1663,9 +1720,7 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 					hostRepos = append(hostRepos, r)
 				}
 			}
-			sort.Slice(hostRepos, func(a, b int) bool {
-				return hostRepos[a].WorktreePath < hostRepos[b].WorktreePath
-			})
+			sortHostReposForDispatch(hostRepos)
 			for _, r := range hostRepos {
 				repoMatches := r.GlobalQueueAllocationEnabled && repoMatchesTargetOrSlotFamily(r, reqRepo)
 				if repoMatches && isRepoSlotIdleForDispatch(r) {
@@ -1736,9 +1791,7 @@ func (e *Engine) ResolveToolPriorityAllocation(requestedAgent, requestedHost, re
 					hostRepos = append(hostRepos, r)
 				}
 			}
-			sort.Slice(hostRepos, func(a, b int) bool {
-				return hostRepos[a].WorktreePath < hostRepos[b].WorktreePath
-			})
+			sortHostReposForDispatch(hostRepos)
 			for _, r := range hostRepos {
 				repoMatches := r.GlobalQueueAllocationEnabled && repoMatchesTargetOrSlotFamily(r, reqRepo)
 				if repoMatches {
@@ -1790,7 +1843,7 @@ func (e *Engine) BindDispatchJobRepo(hostID, worktreePath, jobID string) string 
 	cleanJobID := strings.TrimSpace(jobID)
 	cleanHostID := strings.TrimSpace(hostID)
 	cleanWT := strings.TrimSpace(worktreePath)
-	if cleanJobID == "" {
+	if cleanJobID == "" || dispatch.IsHostLevelNonWorktreeJob("", cleanWT) {
 		return cleanWT
 	}
 
@@ -1803,9 +1856,7 @@ func (e *Engine) BindDispatchJobRepo(hostID, worktreePath, jobID string) string 
 			hostRepos = append(hostRepos, r)
 		}
 	}
-	sort.Slice(hostRepos, func(a, b int) bool {
-		return hostRepos[a].WorktreePath < hostRepos[b].WorktreePath
-	})
+	sortHostReposForDispatch(hostRepos)
 
 	// 1. If already bound to this jobID on a specific repo and cleanWT is empty/generic or matches, return it.
 	for _, r := range hostRepos {
@@ -3728,7 +3779,9 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 			}
 		}
 		for _, r := range e.repos {
-			if r.HostID == hostID && (r.WorktreePath == st.RepoPath || r.EffectiveAlias() == st.Alias || filepath.Clean(r.WorktreePath) == filepath.Clean(st.RepoPath)) {
+			normRepoWT := normalizeWorktreePathForSlotMatch(r.WorktreePath)
+			normStWT := normalizeWorktreePathForSlotMatch(st.RepoPath)
+			if r.HostID == hostID && (r.WorktreePath == st.RepoPath || r.EffectiveAlias() == st.Alias || filepath.Clean(r.WorktreePath) == filepath.Clean(st.RepoPath) || (normRepoWT != "" && normRepoWT == normStWT)) {
 				if st.Branch != "" {
 					r.CurrentBranch = st.Branch
 				}
@@ -3771,6 +3824,23 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 						e.notifyRepoLocked(r)
 					}
 				} else if st.IsClean && r.Lock == LockIdle {
+					changed := false
+					if r.DiscardPending {
+						r.DiscardPending = false
+						changed = true
+					}
+					if isDefaultBranchForRepo(r) && len(st.DirtySubmodules) == 0 &&
+						(strings.EqualFold(strings.TrimSpace(r.ASEState), "ORPHANED") ||
+							strings.EqualFold(strings.TrimSpace(r.ExecutionProvenance), "COORDINATED_HARNESS_FAILED") ||
+							strings.EqualFold(strings.TrimSpace(r.ToolLiveness), "KILLED")) {
+						r.ASEState = "IDLE"
+						r.ExecutionProvenance = "NONE"
+						r.ToolLiveness = "NONE"
+						if strings.EqualFold(strings.TrimSpace(r.ActiveTool), "") || r.ActiveTool != "NONE" {
+							r.ActiveTool = "NONE"
+						}
+						changed = true
+					}
 					// Auto-recovery: if repo was HEALING or PAUSED(ReasonDirty/ReasonHealFailed/ReasonAdhocASE),
 					// and git status is now verified clean with no active running harness or ad-hoc ASE job:
 					if r.Queue == QueueHealing || (r.Queue == QueuePaused && (r.Reason == ReasonDirty || r.Reason == ReasonHealFailed || r.Reason == ReasonAdhocASE)) {
@@ -3784,6 +3854,9 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 						r.HealingReasonMessage = ""
 						r.LastHealingError = ""
 						r.ActiveHealerRunID = ""
+						changed = true
+					}
+					if changed {
 						e.notifyRepoLocked(r)
 					}
 				} else if !adhocActive && r.Lock == LockIdle && r.Queue == QueuePaused && r.Reason == ReasonAdhocASE && !st.IsClean {
@@ -4311,14 +4384,7 @@ func (e *Engine) PollHostWithWorktrees(host string, idleWorktrees []string) (Job
 		}
 	}
 
-	idleFilter := make(map[string]bool, len(idleWorktrees))
-	for _, wt := range idleWorktrees {
-		trimmed := strings.TrimSpace(wt)
-		if trimmed != "" {
-			idleFilter[trimmed] = true
-			idleFilter[filepath.Clean(trimmed)] = true
-		}
-	}
+	idleFilter := buildIdleWorktreeFilter(idleWorktrees)
 
 	activeSubmodules := make(map[string]bool)
 	for _, s := range e.schedules {
@@ -4404,9 +4470,7 @@ func (e *Engine) PollHostWithWorktrees(host string, idleWorktrees []string) (Job
 			hostRepos = append(hostRepos, r)
 		}
 	}
-	sort.Slice(hostRepos, func(a, b int) bool {
-		return hostRepos[a].WorktreePath < hostRepos[b].WorktreePath
-	})
+	sortHostReposForDispatch(hostRepos)
 
 	for _, sch := range candidates {
 		isGlobalCandidate := sch.IsGlobal || sch.HostID == "global" || sch.HostID == ""
@@ -4424,7 +4488,7 @@ func (e *Engine) PollHostWithWorktrees(host string, idleWorktrees []string) (Job
 					if !r.GlobalQueueAllocationEnabled || !isRepoSlotIdleForDispatch(r) {
 						continue
 					}
-					if len(idleFilter) > 0 && !idleFilter[r.WorktreePath] && !idleFilter[filepath.Clean(r.WorktreePath)] && !idleFilter[r.EffectiveAlias()] {
+					if !repoMatchesIdleWorktreeFilter(r, idleFilter) {
 						continue
 					}
 					if (r.Queue == QueueOpen || r.Queue == QueueHealing) && (r.Reason == "" || r.Reason == "REMEDIATED") {
@@ -4441,7 +4505,7 @@ func (e *Engine) PollHostWithWorktrees(host string, idleWorktrees []string) (Job
 					if !r.GlobalQueueAllocationEnabled || !isRepoSlotIdleForDispatch(r) {
 						continue
 					}
-					if len(idleFilter) > 0 && !idleFilter[r.WorktreePath] && !idleFilter[filepath.Clean(r.WorktreePath)] && !idleFilter[r.EffectiveAlias()] {
+					if !repoMatchesIdleWorktreeFilter(r, idleFilter) {
 						continue
 					}
 					if (r.Queue == QueueOpen || r.Queue == QueueHealing) && (r.Reason == "" || r.Reason == "REMEDIATED") {
@@ -4458,7 +4522,7 @@ func (e *Engine) PollHostWithWorktrees(host string, idleWorktrees []string) (Job
 					if !r.GlobalQueueAllocationEnabled || !isRepoSlotIdleForDispatch(r) {
 						continue
 					}
-					if len(idleFilter) > 0 && !idleFilter[r.WorktreePath] && !idleFilter[filepath.Clean(r.WorktreePath)] && !idleFilter[r.EffectiveAlias()] {
+					if !repoMatchesIdleWorktreeFilter(r, idleFilter) {
 						continue
 					}
 					if (r.Queue == QueueOpen || r.Queue == QueueHealing) && (r.Reason == "" || r.Reason == "REMEDIATED") {

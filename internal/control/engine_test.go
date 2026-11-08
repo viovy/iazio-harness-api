@@ -5827,4 +5827,77 @@ func TestStory0196_EngineEagerUpdateBarrier_MultiHostSkip_DependencyGating_And_D
 	}
 }
 
+func TestStoryGOV5196_MultiWorktreeDefaultBranchPreferenceAndFleetToolsUpdate(t *testing.T) {
+	now := time.Date(2026, 11, 8, 7, 15, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return now })
+
+	_ = e.RegisterHost("pc1", "permanent", "generic")
+	_ = e.Heartbeat("pc1", []Tool{{Name: "agy", Installed: true, Path: `C:\bin\agy.exe`, Status: "ok"}}, false)
+
+	// Register 3 worktrees on pc1:
+	// - C:\work\meta-repo-01 ( intentionally alphabetically after meta-repo-00 which is on a feature branch )
+	// - C:\work\meta-repo-02 ( clean on main, but initially has stale DiscardPending=true and ORPHANED telemetry )
+	// - C:\work\meta-repo-00 ( checked out on a feature branch )
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "pc1",
+		WorktreePath:                 `C:\work\meta-repo-00`,
+		CloneURL:                     "https://github.com/viovy/meta-repo.git",
+		CurrentBranch:                "chore/governance-pointers-20261107",
+		DefaultBranch:                "main",
+		Queue:                        QueueOpen,
+		Lock:                         LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "pc1",
+		WorktreePath:                 `C:\work\meta-repo-02`,
+		CloneURL:                     "https://github.com/viovy/meta-repo.git",
+		CurrentBranch:                "main",
+		DefaultBranch:                "main",
+		Queue:                        QueueOpen,
+		Lock:                         LockIdle,
+		DiscardPending:               true,
+		ASEState:                     "ORPHANED",
+		ExecutionProvenance:          "COORDINATED_HARNESS_FAILED",
+		ToolLiveness:                 "KILLED",
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	// 1. Host-level "fleet" job bypasses worktree slot locking
+	wtFleet, okFleet := e.AllocateDispatchJobSlot("pc1", "job_f633dd5b34c16f08", "fleet", "", "iazio-agent", nil)
+	if !okFleet || wtFleet != "" {
+		t.Fatalf("expected fleet job slot allocation to succeed with empty worktree, got ok=%v wt=%q", okFleet, wtFleet)
+	}
+
+	// 2. UpdateRepoRuntimeStatus clears stale DiscardPending and ORPHANED telemetry when clean on main
+	e.UpdateRepoRuntimeStatus("pc1", []RepoRuntimeStatus{
+		{
+			RepoPath:            `c:/work/meta-repo-02`,
+			Branch:              "main",
+			IsClean:             true,
+			SubmodulesClean:     true,
+			ASEState:            "ORPHANED",
+			ExecutionProvenance: "COORDINATED_HARNESS_FAILED",
+			ToolLiveness:        "KILLED",
+			LastCheckedAt:       now,
+		},
+	})
+	e.mu.Lock()
+	found02 := e.repos[repoKey("pc1", `C:\work\meta-repo-02`)]
+	e.mu.Unlock()
+	if found02 == nil {
+		t.Fatalf("expected C:\\work\\meta-repo-02 in e.repos")
+	}
+	if found02.DiscardPending || found02.ASEState != "IDLE" || found02.ExecutionProvenance != "NONE" || found02.ToolLiveness != "NONE" {
+		t.Fatalf("expected stale DiscardPending & ORPHANED cleared on clean main repo, got %+v", *found02)
+	}
+
+	// 3. AllocateDispatchJobSlot prefers clean main-branch worktree (C:\work\meta-repo-02) over feature-branch worktree (C:\work\meta-repo-00)
+	wtAlloc, okAlloc := e.AllocateDispatchJobSlot("pc1", "job-main-pref", "meta-repo", "iazio-agent", "agy", nil)
+	if !okAlloc || wtAlloc != `C:\work\meta-repo-02` {
+		t.Fatalf("expected clean main worktree C:\\work\\meta-repo-02 prioritized over feature-branch worktree, got ok=%v wt=%q", okAlloc, wtAlloc)
+	}
+}
+
+
 

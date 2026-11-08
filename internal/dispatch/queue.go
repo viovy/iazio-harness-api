@@ -235,6 +235,17 @@ func IsKnownMetaRepoSubmodule(name string) bool {
 	}
 }
 
+// IsHostLevelNonWorktreeJob returns true when a dispatch job operates on host-level binaries/tools
+// (such as "agent.tools.update" or repo "fleet") and does not require or lock a git worktree slot.
+func IsHostLevelNonWorktreeJob(jobType, repo string) bool {
+	cleanType := strings.ToLower(strings.TrimSpace(jobType))
+	if cleanType == "agent.tools.update" {
+		return true
+	}
+	cleanRepo := strings.ToLower(strings.TrimSpace(repo))
+	return cleanRepo == "fleet" || cleanRepo == "tools"
+}
+
 // NormalizeToSuperprojectSlotFamily normalizes submodule names (e.g. iazio-mcp, iazio-agent)
 // and meta-repo worktree paths (e.g. /home/romeo/work/meta-repo-02) to their superproject worktree slot family ("meta-repo").
 func NormalizeToSuperprojectSlotFamily(repo string) string {
@@ -1586,34 +1597,36 @@ func (q *InMemoryQueue) ClaimWithWorktrees(ctx context.Context, hostID string, j
 			continue
 		}
 
-		submod := ExtractTargetSubmodule(j.Repo, j.Payload)
-		if submod != "" && activeSubmodules[submod] && !AllowConcurrentSubmoduleMutation(j.Payload) {
-			continue
-		}
-
-		slotFamily := NormalizeToSuperprojectSlotFamily(j.Repo)
 		matchedWT := ""
-		if q.slotAllocator != nil && hostID != "" {
-			wt, ok := q.slotAllocator(hostID, j.ID, slotFamily, submod, j.TargetAgent, idleWorktrees)
-			if !ok {
+		if !IsHostLevelNonWorktreeJob(j.Type, j.Repo) {
+			submod := ExtractTargetSubmodule(j.Repo, j.Payload)
+			if submod != "" && activeSubmodules[submod] && !AllowConcurrentSubmoduleMutation(j.Payload) {
 				continue
 			}
-			matchedWT = wt
-		} else if len(idleWorktrees) > 0 {
-			found := false
-			for _, wt := range idleWorktrees {
-				trimmedWT := strings.TrimSpace(wt)
-				if trimmedWT == "" {
+
+			slotFamily := NormalizeToSuperprojectSlotFamily(j.Repo)
+			if q.slotAllocator != nil && hostID != "" {
+				wt, ok := q.slotAllocator(hostID, j.ID, slotFamily, submod, j.TargetAgent, idleWorktrees)
+				if !ok {
 					continue
 				}
-				if NormalizeToSuperprojectSlotFamily(trimmedWT) == slotFamily {
-					matchedWT = trimmedWT
-					found = true
-					break
+				matchedWT = wt
+			} else if len(idleWorktrees) > 0 {
+				found := false
+				for _, wt := range idleWorktrees {
+					trimmedWT := strings.TrimSpace(wt)
+					if trimmedWT == "" {
+						continue
+					}
+					if NormalizeToSuperprojectSlotFamily(trimmedWT) == slotFamily {
+						matchedWT = trimmedWT
+						found = true
+						break
+					}
 				}
-			}
-			if !found {
-				continue
+				if !found {
+					continue
+				}
 			}
 		}
 
