@@ -212,9 +212,15 @@ func (s *Server) Handler() http.Handler {
 	if s.StoryValidator != nil {
 		jobLifecycle.SetStoryValidator(s.StoryValidator)
 	}
+	byConvMux := http.NewServeMux()
+	byConvMux.HandleFunc("GET /v1/jobs/by-conversation/{conversation_id}", jobLifecycle.GetJobByConversation)
+	byConvMux.HandleFunc("GET /api/v1/jobs/by-conversation/{conversation_id}", jobLifecycle.GetJobByConversation)
+
 	mux.HandleFunc("GET /api/v1/jobs/{id}", jobLifecycle.GetJob)
 	mux.HandleFunc("GET /api/v1/global-queue/jobs/{id}", jobLifecycle.GetJob)
 	mux.HandleFunc("GET /v1/global-queue/jobs/{id}", jobLifecycle.GetJob)
+	mux.HandleFunc("POST /v1/jobs/by-conversations", jobLifecycle.GetJobsByConversations)
+	mux.HandleFunc("POST /api/v1/jobs/by-conversations", jobLifecycle.GetJobsByConversations)
 	mux.HandleFunc("GET /api/v1/jobs/{id}/attribution", jobLifecycle.GetJobAttribution)
 	mux.HandleFunc("GET /api/v1/queue", jobLifecycle.ListQueue)
 	mux.HandleFunc("GET /v1/queue", jobLifecycle.ListQueue)
@@ -525,7 +531,14 @@ func (s *Server) Handler() http.Handler {
 		introspector = oauth.NewIntrospector(s.HydraAdminURL)
 		s.OAuthIntrospector = introspector
 	}
-	return withTracing(withCORS(withAuthWithOAuth(mux, s.AuthToken, introspector, s.RequireOAuth)))
+	rootMux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v1/jobs/by-conversation/") || strings.HasPrefix(r.URL.Path, "/api/v1/jobs/by-conversation/") {
+			byConvMux.ServeHTTP(w, r)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+	return withTracing(withCORS(withAuthWithOAuth(rootMux, s.AuthToken, introspector, s.RequireOAuth)))
 }
 
 func withTracing(next http.Handler) http.Handler {

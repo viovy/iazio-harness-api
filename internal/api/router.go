@@ -10,6 +10,7 @@ import (
 
 	"github.com/viovy/iazio-harness-api/internal/api/handlers"
 	"github.com/viovy/iazio-harness-api/internal/codebase"
+	"github.com/viovy/iazio-harness-api/internal/control"
 	"github.com/viovy/iazio-harness-api/internal/dispatch"
 	"github.com/viovy/iazio-harness-api/internal/oauth"
 )
@@ -19,6 +20,7 @@ type RouterConfig struct {
 	Store             codebase.Store
 	Ingestor          codebase.Ingestor
 	Queue             dispatch.Queue
+	Engine            *control.Engine
 	Idempotency       *handlers.IdempotencyStore
 	AuthToken         string
 	HydraAdminURL     string
@@ -45,6 +47,11 @@ func NewRouter(cfg RouterConfig) http.Handler {
 	promptsHandler := handlers.NewPromptsHandler(cfg.Store, cfg.Queue, cfg.Idempotency)
 	storiesHandler := handlers.NewStoriesHandler(cfg.Store, cfg.Queue, cfg.Idempotency)
 	jobLifecycle := handlers.NewJobLifecycleHandler(cfg.Queue, cfg.Store)
+	if cfg.Engine != nil {
+		jobLifecycle.SetEngine(cfg.Engine)
+		jobLifecycle.SetScheduler(cfg.Engine)
+		jobLifecycle.SetHistoryFinder(cfg.Engine)
+	}
 	agentJobsHandler := handlers.NewAgentJobsHandler(cfg.Queue)
 	agentSyncHandler := handlers.NewAgentSyncHandler(cfg.Store, cfg.Ingestor)
 
@@ -54,6 +61,10 @@ func NewRouter(cfg RouterConfig) http.Handler {
 	mux.Handle("/api/v1/stories", storiesHandler)
 	mux.HandleFunc("/v1/notifications", jobLifecycle.ServeNotifications)
 	mux.HandleFunc("/api/v1/notifications", jobLifecycle.ServeNotifications)
+	mux.HandleFunc("GET /v1/jobs/by-conversation/{conversation_id}", jobLifecycle.GetJobByConversation)
+	mux.HandleFunc("GET /api/v1/jobs/by-conversation/{conversation_id}", jobLifecycle.GetJobByConversation)
+	mux.HandleFunc("POST /v1/jobs/by-conversations", jobLifecycle.GetJobsByConversations)
+	mux.HandleFunc("POST /api/v1/jobs/by-conversations", jobLifecycle.GetJobsByConversations)
 	mux.HandleFunc("/api/v1/agent/repos/sync", agentSyncHandler.SyncRepos)
 	mux.HandleFunc("/api/v1/agent/codebase/sync", agentSyncHandler.SyncCodebase)
 	mux.HandleFunc("/api/v1/agent/jobs/claim", agentJobsHandler.ClaimHandler)
