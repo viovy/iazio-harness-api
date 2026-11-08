@@ -5827,4 +5827,122 @@ func TestStory0196_EngineEagerUpdateBarrier_MultiHostSkip_DependencyGating_And_D
 	}
 }
 
+func TestEngine_DuplicateKindResumeAndPhantomJobReconcile_StoryGOV5195(t *testing.T) {
+	e := NewEngine(nil)
+	e.IsDispatchJobActive = func(jobID string) bool {
+		// Simulate a phantom job-1566 that was rehydrated as "running" in the external dispatch queue
+		return jobID == "job-1566"
+	}
+
+	_ = e.RegisterHost("mac-mini", "permanent", "generic")
+	_ = e.Heartbeat("mac-mini", []Tool{{Name: "agy", Installed: true, Path: "/usr/bin/agy", Status: "ok"}}, false)
+	repoPath := "/Users/romeo/work/meta-repo-05"
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "mac-mini",
+		WorktreePath:                 repoPath,
+		CloneURL:                     "https://github.com/viovy/meta-repo.git",
+		Lock:                         LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	// 1. AllocateDispatchJobSlot and BindDispatchJobRepo for repo="fleet" do not lock a git worktree slot
+	wt, ok := e.AllocateDispatchJobSlot("mac-mini", "job_tools_5195", "fleet", "", "iazio-agent", []string{repoPath})
+	if !ok || wt != "" {
+		t.Fatalf("expected AllocateDispatchJobSlot(fleet) to return ('', true), got (%q, %v)", wt, ok)
+	}
+	if bound := e.BindDispatchJobRepo("mac-mini", "fleet", "job_tools_5195"); bound != "" {
+		t.Fatalf("expected BindDispatchJobRepo(fleet) to return '', got %q", bound)
+	}
+	repoAfterFleet, _ := e.GetRepo("mac-mini", repoPath)
+	if repoAfterFleet.Lock != LockIdle || repoAfterFleet.RunningJobID != "" {
+		t.Fatalf("expected repo to remain IDLE after fleet tools update slot check, got lock=%s running=%s", repoAfterFleet.Lock, repoAfterFleet.RunningJobID)
+	}
+
+	// 2. Simulate parent job-1539 and sibling resume sch-1565 (job-1566) + duplicate queued sch-1567
+	e.mu.Lock()
+	e.jobs["job-1539"] = &Job{
+		ID:                    "job-1539",
+		HostID:                "mac-mini",
+		Status:                "FAILED",
+		ExitPosted:            true,
+		ExitCode:              1,
+		ActiveConversationID:  "b1f05305-50a8-4fe2-9161-0140219ee94b",
+		InitialConversationID: "b1f05305-50a8-4fe2-9161-0140219ee94b",
+	}
+	e.schedules["sch-1565"] = &Schedule{
+		ID:                  "sch-1565",
+		HostID:              "mac-mini",
+		WorktreePath:        repoPath,
+		Kind:                KindResume,
+		ParentJobID:         "job-1539",
+		Status:              "FINISHED",
+		IterationsTotal:     1,
+		IterationsRemaining: 0,
+		IterationsCompleted: 1,
+	}
+	e.jobs["job-1566"] = &Job{
+		ID:          "job-1566",
+		ScheduleID:  "sch-1565",
+		HostID:      "mac-mini",
+		ParentJobID: "job-1539",
+		Status:      "RUN_FINISHED",
+		ExitPosted:  true,
+		ExitCode:    0,
+	}
+	e.schedules["sch-1567"] = &Schedule{
+		ID:                  "sch-1567",
+		HostID:              "mac-mini",
+		WorktreePath:        repoPath,
+		Kind:                KindResume,
+		ParentJobID:         "job-1539",
+		Status:              "QUEUED",
+		IterationsTotal:     1,
+		IterationsRemaining: 1,
+	}
+	e.schedules["sch-timeout-legacy"] = &Schedule{
+		ID:                  "sch-timeout-legacy",
+		HostID:              "mac-mini",
+		WorktreePath:        repoPath,
+		Kind:                KindOrdinary,
+		Status:              "execution_timeout",
+		IterationsTotal:     1,
+		IterationsRemaining: 0,
+	}
+	if r := e.repos[repoKey("mac-mini", repoPath)]; r != nil {
+		r.Lock = LockRunning
+		r.RunningJobID = "job-1566"
+		r.LockHolder = "job-1566"
+		r.DiscardPending = true
+	}
+	e.reapExpiredLocked()
+	e.mu.Unlock()
+
+	sch1567, ok := e.GetSchedule("sch-1567")
+	if !ok || sch1567.Status != "FINISHED" || sch1567.IterationsRemaining != 0 {
+		t.Fatalf("expected duplicate KindResume sch-1567 to be reconciled to FINISHED once sibling sch-1565/job-1566 finished, got %+v", sch1567)
+	}
+	schTimeout, ok := e.GetSchedule("sch-timeout-legacy")
+	if !ok || schTimeout.Status != "FAILED" {
+		t.Fatalf("expected legacy execution_timeout schedule normalized to FAILED, got %+v", schTimeout)
+	}
+	repoAfterReap, _ := e.GetRepo("mac-mini", repoPath)
+	if repoAfterReap.Lock != LockIdle || repoAfterReap.RunningJobID != "" || repoAfterReap.LockHolder != "" {
+		t.Fatalf("expected exited engine job-1566 to not keep repo locked via phantom dispatch entry, got lock=%s running=%q holder=%q", repoAfterReap.Lock, repoAfterReap.RunningJobID, repoAfterReap.LockHolder)
+	}
+
+	// 3. UpdateRepoRuntimeStatus clears DiscardPending when clean and idle
+	e.UpdateRepoRuntimeStatus("mac-mini", []RepoRuntimeStatus{
+		{
+			RepoPath:     repoPath,
+			IsClean:      true,
+			ToolLiveness: "IDLE",
+		},
+	})
+	repoAfterClean, _ := e.GetRepo("mac-mini", repoPath)
+	if repoAfterClean.DiscardPending {
+		t.Fatalf("expected DiscardPending cleared when repo is clean and idle")
+	}
+}
+
+
 

@@ -890,6 +890,11 @@ func (e *Engine) isExternalDispatchJobActiveLocked(repo *Repo, jobID string) boo
 	if cleanID == "" {
 		return false
 	}
+	if j, ok := e.jobs[cleanID]; ok && j != nil {
+		if j.ExitPosted || (j.Status != "RUNNING" && j.Status != "LEASED" && j.Status != "CANCEL_REQUESTED") {
+			return false
+		}
+	}
 	if e.IsDispatchJobActive != nil && e.IsDispatchJobActive(cleanID) {
 		return true
 	}
@@ -1485,6 +1490,13 @@ func (e *Engine) AllocateDispatchJobSlot(hostID, jobID, targetRepo, targetSubmod
 		return "", false
 	}
 
+	if strings.EqualFold(strings.TrimSpace(targetRepo), "fleet") {
+		if h, ok := e.hosts[cleanHostID]; ok && h != nil && strings.EqualFold(h.Presence, "OFFLINE") {
+			return "", false
+		}
+		return "", true
+	}
+
 	if h, ok := e.hosts[cleanHostID]; ok && h != nil {
 		if strings.EqualFold(h.Presence, "OFFLINE") {
 			return "", false
@@ -1792,6 +1804,9 @@ func (e *Engine) BindDispatchJobRepo(hostID, worktreePath, jobID string) string 
 	cleanWT := strings.TrimSpace(worktreePath)
 	if cleanJobID == "" {
 		return cleanWT
+	}
+	if strings.EqualFold(cleanWT, "fleet") {
+		return ""
 	}
 
 	var hostRepos []*Repo
@@ -3195,8 +3210,9 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 					if repo.Lock == LockRunning {
 						repo.Lock = LockIdle
 					}
-					if repo.RunningJobID == jobID || repo.Lock == LockIdle {
+					if repo.RunningJobID == jobID || repo.LockHolder == jobID || repo.Lock == LockIdle {
 						repo.RunningJobID = ""
+						repo.LockHolder = ""
 					}
 					if isDirtyWorktreeAutoHeal {
 						repo.Queue = QueueOpen
@@ -3253,8 +3269,9 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 					if repo.Lock == LockRunning {
 						repo.Lock = LockIdle
 					}
-					if repo.RunningJobID == jobID || repo.Lock == LockIdle {
+					if repo.RunningJobID == jobID || repo.LockHolder == jobID || repo.Lock == LockIdle {
 						repo.RunningJobID = ""
+						repo.LockHolder = ""
 					}
 					changedRepo = repo
 				}
@@ -3263,11 +3280,12 @@ func (e *Engine) PostExit(jobID string, code int, opts ...ExitOptions) error {
 		}
 	}
 	for _, r := range e.repos {
-		if r.RunningJobID == jobID {
+		if r.RunningJobID == jobID || r.LockHolder == jobID {
 			if r.Lock == LockRunning {
 				r.Lock = LockIdle
 			}
 			r.RunningJobID = ""
+			r.LockHolder = ""
 			changedRepo = r
 		}
 	}
@@ -3417,6 +3435,10 @@ func (e *Engine) ApplyFinish(host, path string, jobID string, in FinishInput) Fi
 			repo.ActiveHealerRunID = ""
 		}
 		repo.Lock = LockIdle
+		if jobID == "" || repo.RunningJobID == jobID || repo.LockHolder == jobID {
+			repo.RunningJobID = ""
+			repo.LockHolder = ""
+		}
 		if strings.TrimSpace(in.WorkPorcelain) != "" {
 			repo.Porcelain = in.WorkPorcelain
 		}
@@ -3773,11 +3795,12 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 				} else if st.IsClean && r.Lock == LockIdle {
 					// Auto-recovery: if repo was HEALING or PAUSED(ReasonDirty/ReasonHealFailed/ReasonAdhocASE),
 					// and git status is now verified clean with no active running harness or ad-hoc ASE job:
-					if r.Queue == QueueHealing || (r.Queue == QueuePaused && (r.Reason == ReasonDirty || r.Reason == ReasonHealFailed || r.Reason == ReasonAdhocASE)) {
+					if r.Queue == QueueHealing || (r.Queue == QueuePaused && (r.Reason == ReasonDirty || r.Reason == ReasonHealFailed || r.Reason == ReasonAdhocASE)) || r.DiscardPending {
 						r.Queue = QueueOpen
 						r.Reason = ""
 						r.Porcelain = ""
 						r.DirtyStoryID = ""
+						r.DiscardPending = false
 						r.HealingAttempts = 0
 						r.HealingAttemptCount = 0
 						r.HealingReasonCode = ""
@@ -4069,6 +4092,51 @@ func (e *Engine) reapExpiredLocked() {
 		}
 	}
 	for _, sch := range e.schedules {
+		if sch == nil {
+			continue
+		}
+		if sch.Status == "QUEUED" && sch.Kind == KindResume && strings.TrimSpace(sch.ParentJobID) != "" {
+			parentCompletedBySibling := false
+			for _, other := range e.schedules {
+				if other != nil && other.ID != sch.ID && other.Kind == KindResume && other.ParentJobID == sch.ParentJobID &&
+					(other.Status == "FINISHED" || other.Status == "COMPLETED") {
+					parentCompletedBySibling = true
+					break
+				}
+			}
+			if !parentCompletedBySibling {
+				for _, j := range e.jobs {
+					if j != nil && j.ScheduleID != sch.ID && j.ParentJobID == sch.ParentJobID && j.ExitPosted && j.ExitCode == 0 &&
+						(j.Status == "RUN_FINISHED" || j.Status == "COMPLETED") {
+						parentCompletedBySibling = true
+						break
+					}
+				}
+			}
+			if parentCompletedBySibling {
+				sch.Status = "FINISHED"
+				sch.IterationsRemaining = 0
+				sch.LeaseToken = ""
+				sch.LeaseAckDeadlineAt = nil
+				if sch.CloneURL != "" {
+					delete(e.cloneLease, sch.CloneURL)
+				}
+				continue
+			}
+		}
+		upperSchStatus := strings.ToUpper(strings.TrimSpace(sch.Status))
+		if sch.IterationsRemaining <= 0 {
+			switch upperSchStatus {
+			case "EXECUTION_TIMEOUT", "EXECUTION_STALLED_TIMEOUT", "LEASE_EXPIRED", "PROCESS_DISAPPEARED_ON_HOST", "PROCESS_DIED", "HOST_OFFLINE", "ORPHANED_RUN_EXPIRED", "TIMED_OUT":
+				if sch.FailureReasonSummary == "" {
+					sch.FailureReasonSummary = sch.Status
+				}
+				sch.Status = "FAILED"
+				sch.LeaseToken = ""
+				sch.LeaseAckDeadlineAt = nil
+				continue
+			}
+		}
 		if sch.Status == "RUNNING" || sch.Status == "LEASED" || sch.Status == "COMPLETED" {
 			hasActive := false
 			for _, job := range e.jobs {
@@ -6589,9 +6657,41 @@ func (e *Engine) resumeRepoInPlaceLocked(host, path string, opts ...ResumeOption
 		parentEngine, requestedEngine, resumeConvID, isQuotaExhausted, opt.ResumeMode, opt.ResumeFallbackReason,
 	)
 
+	if parentJobID != "" {
+		for _, existing := range e.schedules {
+			if existing == nil || existing.Kind != KindResume || existing.ParentJobID != parentJobID {
+				continue
+			}
+			if existing.HostID == host && existing.WorktreePath == path {
+				if existing.Status == "RUNNING" || existing.Status == "LEASED" {
+					return *existing, nil
+				}
+				if existing.Status == "QUEUED" {
+					existing.Status = "FINISHED"
+					existing.IterationsRemaining = 0
+					existing.LeaseToken = ""
+					existing.LeaseAckDeadlineAt = nil
+				}
+			}
+		}
+	}
+
+	hasOtherRunningJob := false
+	for _, aj := range e.jobs {
+		if aj != nil && aj.ID != parentJobID && !aj.ExitPosted && (aj.Status == "RUNNING" || aj.Status == "LEASED") {
+			if asch := e.schedules[aj.ScheduleID]; asch != nil && asch.HostID == host && asch.WorktreePath == path {
+				hasOtherRunningJob = true
+				break
+			}
+		}
+	}
+
 	// Reset repo lock and clear halt state, retaining in-flight story and conversation bindings (F3)
-	repo.Lock = LockIdle
-	repo.RunningJobID = ""
+	if !hasOtherRunningJob {
+		repo.Lock = LockIdle
+		repo.RunningJobID = ""
+		repo.LockHolder = ""
+	}
 	repo.Queue = QueueOpen
 	repo.Reason = ""
 	repo.Porcelain = ""
@@ -6842,6 +6942,21 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 		targetStoryID = origSch.StoryID
 	}
 
+	for _, existing := range e.schedules {
+		if existing == nil || existing.Kind != KindResume || existing.ParentJobID != job.ID {
+			continue
+		}
+		if existing.Status == "RUNNING" || existing.Status == "LEASED" {
+			return *existing, nil
+		}
+		if existing.Status == "QUEUED" {
+			existing.Status = "FINISHED"
+			existing.IterationsRemaining = 0
+			existing.LeaseToken = ""
+			existing.LeaseAckDeadlineAt = nil
+		}
+	}
+
 	prevReason := job.Reason
 	// Mark previous job closed if still running.
 	if !job.ExitPosted {
@@ -6858,8 +6973,20 @@ func (e *Engine) ResumeJob(jobID string, opts ...ResumeOptions) (Schedule, error
 		if targetStoryID == "" && repo.DirtyStoryID != "" {
 			targetStoryID = repo.DirtyStoryID
 		}
-		repo.Lock = LockIdle
-		repo.RunningJobID = ""
+		hasOtherRunningJob := false
+		for _, aj := range e.jobs {
+			if aj != nil && aj.ID != job.ID && !aj.ExitPosted && (aj.Status == "RUNNING" || aj.Status == "LEASED") {
+				if asch := e.schedules[aj.ScheduleID]; asch != nil && asch.HostID == origSch.HostID && asch.WorktreePath == origSch.WorktreePath {
+					hasOtherRunningJob = true
+					break
+				}
+			}
+		}
+		if !hasOtherRunningJob {
+			repo.Lock = LockIdle
+			repo.RunningJobID = ""
+			repo.LockHolder = ""
+		}
 		repo.Queue = QueueOpen
 		repo.Reason = ""
 		repo.DirtyStoryID = ""

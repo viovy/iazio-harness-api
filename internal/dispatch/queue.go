@@ -1500,17 +1500,31 @@ func (q *InMemoryQueue) Claim(ctx context.Context, hostID string, jobTypes []str
 	return q.ClaimWithWorktrees(ctx, hostID, jobTypes, nil)
 }
 
+func isHostLevelToolsUpdateJob(j *Job) bool {
+	if j == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(j.Type), "agent.tools.update") ||
+		strings.EqualFold(strings.TrimSpace(j.Repo), "fleet")
+}
+
 // ClaimWithWorktrees finds the oldest eligible pending job matching hostID, jobTypes, and available idleWorktrees,
 // enforcing the Eager Update Pre-Claim Barrier, dependency gating, submodule slot family normalization,
 // concurrent submodule mutation guard, and atomic worktree slot reservation.
 func (q *InMemoryQueue) ClaimWithWorktrees(ctx context.Context, hostID string, jobTypes []string, idleWorktrees []string) (*Job, error) {
+	hostEligibleForRepoJobs := true
 	if hostID != "" {
 		q.mu.Lock()
 		checker := q.hostEligibilityChecker
 		q.mu.Unlock()
 		if checker != nil {
-			if eligible, _ := checker(hostID); !eligible {
-				return nil, nil
+			if eligible, reason := checker(hostID); !eligible {
+				upperReason := strings.ToUpper(strings.TrimSpace(reason))
+				if strings.Contains(upperReason, "DRIFT_DETECTED") {
+					hostEligibleForRepoJobs = false
+				} else {
+					return nil, nil
+				}
 			}
 		}
 	}
@@ -1567,6 +1581,10 @@ func (q *InMemoryQueue) ClaimWithWorktrees(ctx context.Context, hostID string, j
 	var oldest *Job
 	var boundWorktree string
 	for _, j := range candidates {
+		isToolsUpdate := isHostLevelToolsUpdateJob(j)
+		if !hostEligibleForRepoJobs && !isToolsUpdate {
+			continue
+		}
 		if j.DependsOnJobID != "" || len(j.DependsOnJobIDs) > 0 {
 			satisfied, failedDep := q.areDependenciesSatisfiedLocked(j)
 			if failedDep != nil || !satisfied {
@@ -1586,34 +1604,36 @@ func (q *InMemoryQueue) ClaimWithWorktrees(ctx context.Context, hostID string, j
 			continue
 		}
 
-		submod := ExtractTargetSubmodule(j.Repo, j.Payload)
-		if submod != "" && activeSubmodules[submod] && !AllowConcurrentSubmoduleMutation(j.Payload) {
-			continue
-		}
-
-		slotFamily := NormalizeToSuperprojectSlotFamily(j.Repo)
 		matchedWT := ""
-		if q.slotAllocator != nil && hostID != "" {
-			wt, ok := q.slotAllocator(hostID, j.ID, slotFamily, submod, j.TargetAgent, idleWorktrees)
-			if !ok {
+		if !isToolsUpdate {
+			submod := ExtractTargetSubmodule(j.Repo, j.Payload)
+			if submod != "" && activeSubmodules[submod] && !AllowConcurrentSubmoduleMutation(j.Payload) {
 				continue
 			}
-			matchedWT = wt
-		} else if len(idleWorktrees) > 0 {
-			found := false
-			for _, wt := range idleWorktrees {
-				trimmedWT := strings.TrimSpace(wt)
-				if trimmedWT == "" {
+
+			slotFamily := NormalizeToSuperprojectSlotFamily(j.Repo)
+			if q.slotAllocator != nil && hostID != "" {
+				wt, ok := q.slotAllocator(hostID, j.ID, slotFamily, submod, j.TargetAgent, idleWorktrees)
+				if !ok {
 					continue
 				}
-				if NormalizeToSuperprojectSlotFamily(trimmedWT) == slotFamily {
-					matchedWT = trimmedWT
-					found = true
-					break
+				matchedWT = wt
+			} else if len(idleWorktrees) > 0 {
+				found := false
+				for _, wt := range idleWorktrees {
+					trimmedWT := strings.TrimSpace(wt)
+					if trimmedWT == "" {
+						continue
+					}
+					if NormalizeToSuperprojectSlotFamily(trimmedWT) == slotFamily {
+						matchedWT = trimmedWT
+						found = true
+						break
+					}
 				}
-			}
-			if !found {
-				continue
+				if !found {
+					continue
+				}
 			}
 		}
 

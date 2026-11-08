@@ -2794,3 +2794,57 @@ func TestIsJobActiveLockFreeAndDeferredSlotRelease_StoryGOV5192(t *testing.T) {
 	}
 }
 
+func TestClaimWithWorktrees_ToolsUpdateFleetJob_BypassesWorktreeSlotAndDriftDetected_StoryGOV5195(t *testing.T) {
+	ctx := context.Background()
+	q := NewInMemoryQueue()
+
+	slotAllocatorCalls := 0
+	q.SetSlotAllocator(func(hostID, jobID, targetRepo, targetSubmodule, targetAgent string, idleWorktrees []string) (string, bool) {
+		slotAllocatorCalls++
+		return "", false
+	})
+	q.SetHostEligibilityChecker(func(hostID string) (bool, string) {
+		return false, "host eager update state is DRIFT_DETECTED"
+	})
+
+	repoJob, err := q.Enqueue(ctx, &Job{
+		ID:         "job_repo_blocked_5195",
+		Type:       JobTypePromptExecute,
+		Repo:       "meta-repo",
+		TargetHost: "debian",
+	})
+	if err != nil {
+		t.Fatalf("Enqueue repoJob failed: %v", err)
+	}
+	toolsJob, err := q.Enqueue(ctx, &Job{
+		ID:         "job_tools_update_5195",
+		Type:       "agent.tools.update",
+		Repo:       "fleet",
+		TargetHost: "debian",
+		Payload:    json.RawMessage(`{"host_id":"debian","tools":["iazio-agent"]}`),
+	})
+	if err != nil {
+		t.Fatalf("Enqueue toolsJob failed: %v", err)
+	}
+
+	// Only repoJob is requested -> blocked by DRIFT_DETECTED
+	claimedRepo, err := q.ClaimWithWorktrees(ctx, "debian", []string{JobTypePromptExecute}, []string{"/home/romeo/work/meta-repo"})
+	if err != nil || claimedRepo != nil {
+		t.Fatalf("expected repoJob to be blocked when host has DRIFT_DETECTED, got claimed=%+v err=%v", claimedRepo, err)
+	}
+	_ = repoJob
+
+	// Claim allowing agent.tools.update -> claims toolsJob without invoking slotAllocator or requiring a "fleet" worktree
+	claimedTools, err := q.ClaimWithWorktrees(ctx, "debian", []string{JobTypePromptExecute, "agent.tools.update"}, []string{"/home/romeo/work/meta-repo"})
+	if err != nil || claimedTools == nil {
+		t.Fatalf("expected agent.tools.update job to be claimed on debian despite DRIFT_DETECTED and meta-repo worktrees, got claimed=%+v err=%v", claimedTools, err)
+	}
+	if claimedTools.ID != toolsJob.ID {
+		t.Fatalf("expected claimed job ID %s, got %s", toolsJob.ID, claimedTools.ID)
+	}
+	if slotAllocatorCalls != 0 {
+		t.Fatalf("expected 0 slotAllocator calls for host-level agent.tools.update job, got %d", slotAllocatorCalls)
+	}
+}
+
+

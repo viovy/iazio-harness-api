@@ -834,12 +834,72 @@ func (h *JobLifecycleHandler) ForceDispatchJob(w http.ResponseWriter, r *http.Re
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+func (h *JobLifecycleHandler) reconcileQueueWithEngine(ctx context.Context) {
+	if h.queue == nil || h.engine == nil {
+		return
+	}
+	jobs, err := h.queue.List(ctx, dispatch.JobFilter{Limit: 250})
+	if err != nil {
+		return
+	}
+	for _, qj := range jobs {
+		if qj == nil {
+			continue
+		}
+		st := strings.ToLower(strings.TrimSpace(qj.Status))
+		if st != dispatch.JobStatusPending && st != dispatch.JobStatusClaimed && st != dispatch.JobStatusLeased && st != dispatch.JobStatusRunning {
+			continue
+		}
+		if strings.HasPrefix(strings.TrimSpace(qj.ID), "job-") {
+			jd, ok := h.engine.GetJob(qj.ID)
+			if !ok {
+				_ = h.queue.Complete(ctx, qj.ID, json.RawMessage(`{"status":"reconciled_with_engine"}`), "")
+				h.engine.ReleaseDispatchJobRepo(qj.ID)
+				continue
+			}
+			jdStatus := strings.ToUpper(strings.TrimSpace(jd.Status))
+			if jdStatus != "RUNNING" && jdStatus != "LEASED" && jdStatus != "CANCEL_REQUESTED" {
+				errMsg := ""
+				if jdStatus == "FAILED" || jdStatus == "CANCELLED" || jdStatus == "DECLINED" || jdStatus == "ABANDONED" {
+					errMsg = strings.TrimSpace(jd.TerminationReasonCode)
+					if errMsg == "" {
+						errMsg = jdStatus
+					}
+				}
+				_ = h.queue.Complete(ctx, qj.ID, json.RawMessage(`{"status":"reconciled_with_engine"}`), errMsg)
+				h.engine.ReleaseDispatchJobRepo(qj.ID)
+			}
+			continue
+		}
+		if st == dispatch.JobStatusPending && strings.EqualFold(strings.TrimSpace(qj.Type), "agent.tools.update") {
+			targetHost := strings.TrimSpace(qj.TargetHost)
+			if targetHost == "" && qj.AgentAffinity != nil {
+				targetHost = strings.TrimSpace(qj.AgentAffinity.HostID)
+			}
+			if targetHost == "" {
+				continue
+			}
+			hd, ok := h.engine.GetHostDetail(targetHost)
+			if !ok || strings.EqualFold(hd.Host.Presence, "OFFLINE") || hd.Host.PendingToolUpdate != nil {
+				continue
+			}
+			if hd.Host.EagerReadiness != nil &&
+				hd.Host.EagerReadiness.EagerUpdateState == control.StateUpToDate &&
+				!hd.Host.EagerReadiness.LastEvaluatedAt.Before(qj.CreatedAt) {
+				_ = h.queue.Complete(ctx, qj.ID, json.RawMessage(`{"status":"completed_via_eager_readiness"}`), "")
+			}
+		}
+	}
+}
+
 // ListQueue serves GET /api/v1/queue and GET /api/v1/jobs.
 func (h *JobLifecycleHandler) ListQueue(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+
+	h.reconcileQueueWithEngine(r.Context())
 
 	q := r.URL.Query()
 	repo := strings.TrimSpace(q.Get("repo"))
