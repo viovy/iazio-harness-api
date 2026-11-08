@@ -86,7 +86,7 @@ func (h *AgentJobsHandler) ClaimHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if h.engine != nil && strings.TrimSpace(req.HostID) != "" {
-		if ok, _ := h.engine.IsHostEligibleForClaim(req.HostID); !ok {
+		if ok, reason := h.engine.IsHostEligibleForClaim(req.HostID); !ok && !strings.Contains(strings.ToUpper(strings.TrimSpace(reason)), "DRIFT_DETECTED") {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -103,19 +103,31 @@ func (h *AgentJobsHandler) ClaimHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	isToolsUpdate := strings.EqualFold(strings.TrimSpace(job.Type), "agent.tools.update") ||
+		strings.EqualFold(strings.TrimSpace(job.Repo), "fleet")
 	if h.engine != nil {
-		effectiveWT := strings.TrimSpace(job.WorktreePath)
-		if effectiveWT == "" {
-			effectiveWT = job.Repo
-		}
-		boundWT := h.engine.BindDispatchJobRepo(req.HostID, effectiveWT, job.ID)
-		if boundWT != "" && boundWT != "." && boundWT != "root" {
-			job.WorktreePath = boundWT
-			if updater, ok := h.queue.(interface {
-				UpdateRuntimeMetadata(jobID, worktreePath, activeConvID string, harnessPID, toolPID int, elapsedSec int64) (*dispatch.Job, bool)
-			}); ok {
-				if updated, ok := updater.UpdateRuntimeMetadata(job.ID, boundWT, "", 0, 0, 0); ok && updated != nil {
-					job = updated
+		if isToolsUpdate {
+			targetHost := strings.TrimSpace(req.HostID)
+			if targetHost == "" {
+				targetHost = strings.TrimSpace(job.TargetHost)
+			}
+			if targetHost != "" {
+				_ = h.engine.ConsumePendingToolUpdate(targetHost)
+			}
+		} else {
+			effectiveWT := strings.TrimSpace(job.WorktreePath)
+			if effectiveWT == "" {
+				effectiveWT = job.Repo
+			}
+			boundWT := h.engine.BindDispatchJobRepo(req.HostID, effectiveWT, job.ID)
+			if boundWT != "" && boundWT != "." && boundWT != "root" {
+				job.WorktreePath = boundWT
+				if updater, ok := h.queue.(interface {
+					UpdateRuntimeMetadata(jobID, worktreePath, activeConvID string, harnessPID, toolPID int, elapsedSec int64) (*dispatch.Job, bool)
+				}); ok {
+					if updated, ok := updater.UpdateRuntimeMetadata(job.ID, boundWT, "", 0, 0, 0); ok && updated != nil {
+						job = updated
+					}
 				}
 			}
 		}
@@ -171,8 +183,15 @@ func (h *AgentJobsHandler) CompleteHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	isEngineJob := strings.HasPrefix(jobID, "job-")
+	if !isEngineJob && h.engine != nil {
+		if _, ok := h.engine.GetJob(jobID); ok {
+			isEngineJob = true
+		}
+	}
+
 	err := h.queue.CompleteWithFencing(r.Context(), jobID, req.FencingToken, req.Result, req.Error)
-	if err == dispatch.ErrJobNotFound && req.FencingToken > 0 && len(req.Result) > 0 {
+	if err == dispatch.ErrJobNotFound && !isEngineJob && req.FencingToken > 0 && len(req.Result) > 0 {
 		if rehydrated, enqErr := h.queue.Enqueue(r.Context(), &dispatch.Job{
 			ID:           jobID,
 			Type:         dispatch.JobTypePromptExecute,
@@ -208,6 +227,15 @@ func (h *AgentJobsHandler) CompleteHandler(w http.ResponseWriter, r *http.Reques
 	}
 
 	job, _ := h.queue.Get(jobID)
+	if job != nil && h.engine != nil && (strings.EqualFold(strings.TrimSpace(job.Type), "agent.tools.update") || strings.EqualFold(strings.TrimSpace(job.Repo), "fleet")) {
+		targetHost := strings.TrimSpace(job.ClaimedHost)
+		if targetHost == "" {
+			targetHost = strings.TrimSpace(job.TargetHost)
+		}
+		if targetHost != "" {
+			_ = h.engine.ConsumePendingToolUpdate(targetHost)
+		}
+	}
 	storyID := ""
 	storyTitle := ""
 	storySubmodule := ""
@@ -331,7 +359,38 @@ func (h *AgentJobsHandler) HeartbeatHandler(w http.ResponseWriter, r *http.Reque
 					err = nil
 				}
 			}
-		} else if err == dispatch.ErrJobNotFound && (req.AgentPID > 0 || req.ToolPID > 0 || strings.TrimSpace(req.ActiveConversationID) != "") {
+		} else if err == dispatch.ErrJobNotFound && h.engine != nil {
+			if jd, ok := h.engine.GetJob(jobID); ok {
+				lt := strings.TrimSpace(req.LeaseToken)
+				if lt == "" {
+					lt = jd.LeaseToken
+				}
+				_ = h.engine.HeartbeatJob(jobID, lt)
+				if cleanConv := strings.TrimSpace(req.ActiveConversationID); cleanConv != "" {
+					_ = h.engine.AddJobConversation(jobID, cleanConv)
+				}
+				if sID := strings.TrimSpace(req.StoryID); sID != "" && sID != "pending-allocation" && sID != "pending" {
+					_ = h.engine.BindStoryToJob(jobID, sID, "", "")
+					updateIndexStoryStatus(resolveStoriesRootForWrite(h.repoRoot), sID, "IN_PROGRESS")
+				}
+				if updatedJD, okU := h.engine.GetJob(jobID); okU {
+					jd = updatedJD
+				}
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"status":                 "ok",
+					"job_id":                 jd.ID,
+					"fencing_token":          req.FencingToken,
+					"story_id":               jd.StoryID,
+					"conversation_id":        jd.ActiveConversationID,
+					"active_conversation_id": jd.ActiveConversationID,
+					"conversation_ids":       jd.ConversationIDs,
+				})
+				return
+			}
+		}
+		if err == dispatch.ErrJobNotFound && !strings.HasPrefix(jobID, "job-") && (req.AgentPID > 0 || req.ToolPID > 0 || strings.TrimSpace(req.ActiveConversationID) != "") {
 			effectiveWT := strings.TrimSpace(req.WorktreePath)
 			if effectiveWT == "" {
 				effectiveWT = strings.TrimSpace(req.Repo)
