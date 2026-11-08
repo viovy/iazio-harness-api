@@ -1885,3 +1885,180 @@ func (h *JobLifecycleHandler) RetryRetriable(w http.ResponseWriter, r *http.Requ
 		"message":       fmt.Sprintf("Re-enqueued %d retriable failed jobs", total),
 	})
 }
+
+// ConversationJobProvenance aliases dispatch.ConversationJobProvenance for HTTP handlers.
+type ConversationJobProvenance = dispatch.ConversationJobProvenance
+
+// BatchConversationProvenanceRequest is the payload for POST /v1/jobs/by-conversations.
+type BatchConversationProvenanceRequest struct {
+	ConversationIDs []string `json:"conversation_ids"`
+}
+
+// BatchConversationProvenanceResponse is the response for POST /v1/jobs/by-conversations.
+type BatchConversationProvenanceResponse struct {
+	Items   map[string]ConversationJobProvenance `json:"items"`
+	Results []ConversationJobProvenance          `json:"results"`
+	Count   int                                  `json:"count"`
+}
+
+// ResolveConversationProvenance resolves conversation-to-job provenance across both
+// dispatch.Queue and control.Engine (including history rows and repo runtime state).
+func (h *JobLifecycleHandler) ResolveConversationProvenance(ctx context.Context, convID string) (ConversationJobProvenance, bool) {
+	cid := strings.TrimSpace(convID)
+	if h == nil || cid == "" {
+		return ConversationJobProvenance{}, false
+	}
+
+	if h.queue != nil {
+		if prov, found := dispatch.ResolveQueueProvenanceByConversationID(ctx, h.queue, cid); found {
+			if prov.ParentJobID != "" && h.engine != nil {
+				if eStory, _, eRoot, eHost, eRepo, eWT, ok := h.engine.FindJobMetadataByID(prov.ParentJobID); ok {
+					if prov.StoryID == "" && eStory != "" {
+						prov.StoryID = eStory
+					}
+					if (prov.RootJobID == "" || prov.RootJobID == prov.ParentJobID) && eRoot != "" {
+						prov.RootJobID = eRoot
+					}
+					if prov.HostID == "" && eHost != "" {
+						prov.HostID = eHost
+					}
+					if prov.WorktreePath == "" && eWT != "" {
+						prov.WorktreePath = eWT
+					}
+					if prov.Repo == "" && eRepo != "" {
+						prov.Repo = eRepo
+					}
+				}
+			}
+			return prov, true
+		}
+	}
+
+	if h.engine != nil {
+		if prov, found := h.engine.FindProvenanceByConversationID(cid); found {
+			if prov.ParentJobID != "" && h.queue != nil {
+				visited := map[string]bool{prov.JobID: true}
+				currID := prov.ParentJobID
+				for currID != "" && !visited[currID] && len(visited) < 32 {
+					visited[currID] = true
+					pJob, ok := h.queue.Get(currID)
+					if !ok || pJob == nil {
+						break
+					}
+					if prov.StoryID == "" && strings.TrimSpace(pJob.StoryID) != "" {
+						prov.StoryID = strings.TrimSpace(pJob.StoryID)
+					}
+					if prov.HostID == "" {
+						for _, hc := range []string{pJob.ClaimedHost, pJob.HostID, pJob.TargetHost} {
+							hc = strings.TrimSpace(hc)
+							if hc != "" && !strings.EqualFold(hc, "auto") && !strings.EqualFold(hc, "global") {
+								prov.HostID = hc
+								break
+							}
+						}
+					}
+					if prov.WorktreePath == "" && strings.TrimSpace(pJob.WorktreePath) != "" {
+						prov.WorktreePath = strings.TrimSpace(pJob.WorktreePath)
+					}
+					if prov.Repo == "" && strings.TrimSpace(pJob.Repo) != "" {
+						prov.Repo = dispatch.NormalizeRepoName(pJob.Repo)
+					}
+					prov.RootJobID = pJob.ID
+					nextParent := strings.TrimSpace(pJob.DependsOnJobID)
+					if nextParent == "" && strings.TrimSpace(pJob.ParentID) != "" {
+						if _, exists := h.queue.Get(strings.TrimSpace(pJob.ParentID)); exists {
+							nextParent = strings.TrimSpace(pJob.ParentID)
+						}
+					}
+					currID = nextParent
+				}
+			}
+			return prov, true
+		}
+	}
+
+	return ConversationJobProvenance{}, false
+}
+
+// GetJobByConversation serves GET /v1/jobs/by-conversation/{conversation_id} and GET /api/v1/jobs/by-conversation/{conversation_id}.
+func (h *JobLifecycleHandler) GetJobByConversation(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	convID := strings.TrimSpace(r.PathValue("conversation_id"))
+	if convID == "" {
+		convID = strings.TrimSpace(r.PathValue("id"))
+	}
+	if convID == "" {
+		const marker = "/by-conversation/"
+		if idx := strings.Index(r.URL.Path, marker); idx >= 0 {
+			convID = strings.Trim(strings.TrimSpace(r.URL.Path[idx+len(marker):]), "/")
+		}
+	}
+	if convID == "" {
+		writeJSONError(w, http.StatusBadRequest, "conversation_id is required")
+		return
+	}
+
+	prov, found := h.ResolveConversationProvenance(r.Context(), convID)
+	if !found {
+		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("job provenance for conversation %q not found", convID))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(prov)
+}
+
+// GetJobsByConversations serves POST /v1/jobs/by-conversations and POST /api/v1/jobs/by-conversations.
+func (h *JobLifecycleHandler) GetJobsByConversations(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req BatchConversationProvenanceRequest
+	if r.Body != nil {
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "failed to read request body")
+			return
+		}
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
+			if err := json.Unmarshal(bodyBytes, &req); err != nil {
+				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid JSON body: %v", err))
+				return
+			}
+		}
+	}
+
+	items := make(map[string]ConversationJobProvenance)
+	results := make([]ConversationJobProvenance, 0, len(req.ConversationIDs))
+	seen := make(map[string]bool, len(req.ConversationIDs))
+
+	for _, rawID := range req.ConversationIDs {
+		cid := strings.TrimSpace(rawID)
+		if cid == "" || seen[cid] {
+			continue
+		}
+		seen[cid] = true
+		if prov, found := h.ResolveConversationProvenance(r.Context(), cid); found {
+			items[cid] = prov
+			results = append(results, prov)
+		}
+	}
+
+	resp := BatchConversationProvenanceResponse{
+		Items:   items,
+		Results: results,
+		Count:   len(results),
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+

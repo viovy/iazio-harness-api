@@ -186,7 +186,8 @@ func RequiredScopeForRequest(method, path string) string {
 
 func isReadOnlyPostPath(path string) bool {
 	switch path {
-	case "/v1/codebase/search", "/api/v1/codebase/search", "/v1/rag/search", "/api/v1/rag/search":
+	case "/v1/codebase/search", "/api/v1/codebase/search", "/v1/rag/search", "/api/v1/rag/search",
+		"/v1/jobs/by-conversations", "/api/v1/jobs/by-conversations":
 		return true
 	}
 	return strings.HasPrefix(path, "/v1/search/") || strings.HasPrefix(path, "/api/v1/search/")
