@@ -2233,11 +2233,25 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 		if hp, ok := resMap["harness_pid"].(float64); ok && int(hp) > 0 && job.HarnessPID == 0 {
 			job.HarnessPID = int(hp)
 		}
+		if ap, ok := resMap["agent_pid"].(float64); ok && int(ap) > 0 && job.AgentPID == 0 {
+			job.AgentPID = int(ap)
+		}
 		if tp, ok := resMap["tool_pid"].(float64); ok && int(tp) > 0 && job.ToolPID == 0 {
 			job.ToolPID = int(tp)
 		}
 		if el, ok := resMap["elapsed_seconds"].(float64); ok && int64(el) > 0 && job.ElapsedSeconds == 0 {
 			job.ElapsedSeconds = int64(el)
+		}
+		if wt, ok := resMap["worktree_path"].(string); ok && strings.TrimSpace(wt) != "" && job.WorktreePath == "" {
+			job.WorktreePath = strings.TrimSpace(wt)
+		}
+		if ch, ok := resMap["host_id"].(string); ok && strings.TrimSpace(ch) != "" {
+			if job.ClaimedHost == "" {
+				job.ClaimedHost = strings.TrimSpace(ch)
+			}
+			if job.HostID == "" {
+				job.HostID = strings.TrimSpace(ch)
+			}
 		}
 		if sid, ok := resMap["story_id"].(string); ok {
 			cleanSID := strings.TrimSpace(sid)

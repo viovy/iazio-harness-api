@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -831,6 +832,212 @@ func TestE2E_GlobalQueue_ToolsUpdateClaimReconcileAndEngineHeartbeatIsolation_St
 		if s.ID == claimed.ID || string(s.Kind) == "agent.tools.update" {
 			t.Fatalf("expected include_dispatch_jobs=false to exclude dispatch job %s (kind=%s)", s.ID, s.Kind)
 		}
+	}
+
+	// 5. Complete the claimed agent.tools.update job with telemetry and verify /v1/jobs/{id} + /v1/jobs/{id}/logs.
+	completeBody := bytes.NewBufferString(`{"fencing_token":` + fmt.Sprintf("%d", claimed.FencingToken) + `,"result":{"status":"completed","updated":true,"tools":["codex"],"host_id":"docker1","agent_pid":4242,"harness_pid":4242,"elapsed_seconds":3,"summary":"Updated tools [codex] on host docker1"}}`)
+	compResp, err := client.Post(ts.URL+"/api/v1/agent/jobs/"+claimed.ID+"/complete", "application/json", completeBody)
+	if err != nil {
+		t.Fatalf("POST complete failed: %v", err)
+	}
+	_ = compResp.Body.Close()
+
+	logsResp, err := client.Get(ts.URL + "/v1/jobs/" + claimed.ID + "/logs")
+	if err != nil {
+		t.Fatalf("GET /v1/jobs/%s/logs failed: %v", claimed.ID, err)
+	}
+	defer logsResp.Body.Close()
+	var logsBundle struct {
+		Chunks []control.LogChunk `json:"chunks"`
+	}
+	if err := json.NewDecoder(logsResp.Body).Decode(&logsBundle); err != nil {
+		t.Fatalf("decode logsBundle failed: %v", err)
+	}
+	if len(logsBundle.Chunks) == 0 || !bytes.Contains([]byte(logsBundle.Chunks[0].Text), []byte("Updated tools [codex] on host docker1")) {
+		t.Fatalf("expected logs chunk to include tool update summary, got %+v", logsBundle.Chunks)
+	}
+}
+
+func TestE2E_StoryGOV5196_PC1MultiWorktreeAllocation_ToolsUpdateExecution_And_AccurateClaimedAtTelemetry(t *testing.T) {
+	now := time.Date(2026, 11, 8, 6, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	eng := control.NewEngine(clock)
+	queue := dispatch.NewInMemoryQueue()
+	queue.SetSlotAllocator(eng.AllocateDispatchJobSlot)
+	queue.SetSlotReleaser(eng.ReleaseDispatchJobRepo)
+
+	_ = eng.RegisterHost("pc1", "permanent", "generic")
+	_ = eng.Heartbeat("pc1", []control.Tool{{Name: "agy", Installed: true, Path: `C:\bin\agy.exe`, Status: "ok"}}, false)
+	_ = eng.RegisterHost("debian", "permanent", "generic")
+	_ = eng.Heartbeat("debian", []control.Tool{{Name: "agy", Installed: true, Path: "/usr/bin/agy", Status: "ok"}}, false)
+
+	// Register 3 clones on pc1:
+	// - C:\work\meta-repo-03 (feature branch)
+	// - C:\work\meta-repo (clean main, initially PAUSED with empty reason and ORPHANED telemetry)
+	// - C:\work\meta-repo-02 (clean main, initially DiscardPending=true)
+	_ = eng.UpsertRepo(control.Repo{
+		HostID:                       "pc1",
+		WorktreePath:                 `C:\work\meta-repo-03`,
+		CloneURL:                     "https://github.com/viovy/meta-repo.git",
+		CurrentBranch:                "fix/fix-pc1-queue-dispatch-and-multi-worktree-allocation",
+		DefaultBranch:                "main",
+		Queue:                        control.QueueOpen,
+		Lock:                         control.LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+	_ = eng.UpsertRepo(control.Repo{
+		HostID:                       "pc1",
+		WorktreePath:                 `C:\work\meta-repo`,
+		CloneURL:                     "https://github.com/viovy/meta-repo.git",
+		CurrentBranch:                "main",
+		DefaultBranch:                "main",
+		Queue:                        control.QueuePaused,
+		Reason:                       "",
+		Lock:                         control.LockIdle,
+		ASEState:                     "ORPHANED",
+		ExecutionProvenance:          "COORDINATED_HARNESS_FAILED",
+		ToolLiveness:                 "KILLED",
+		GlobalQueueAllocationEnabled: true,
+	})
+	_ = eng.UpsertRepo(control.Repo{
+		HostID:                       "pc1",
+		WorktreePath:                 `C:\work\meta-repo-02`,
+		CloneURL:                     "https://github.com/viovy/meta-repo.git",
+		CurrentBranch:                "main",
+		DefaultBranch:                "main",
+		Queue:                        control.QueueOpen,
+		Lock:                         control.LockIdle,
+		DiscardPending:               true,
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	srv := &httpserver.Server{Engine: eng, Queue: queue}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	client := ts.Client()
+
+	// 1. UpdateRepoRuntimeStatus clears ORPHANED/DiscardPending and reopens C:\work\meta-repo and C:\work\meta-repo-02.
+	eng.UpdateRepoRuntimeStatus("pc1", []control.RepoRuntimeStatus{
+		{
+			RepoPath:            `c:/work/meta-repo`,
+			Branch:              "main",
+			IsClean:             true,
+			SubmodulesClean:     true,
+			ASEState:            "ORPHANED",
+			ExecutionProvenance: "COORDINATED_HARNESS_FAILED",
+			ToolLiveness:        "KILLED",
+		},
+		{
+			RepoPath:        `c:/work/meta-repo-02`,
+			Branch:          "main",
+			IsClean:         true,
+			SubmodulesClean: true,
+			ASEState:        "IDLE",
+		},
+	})
+	r1, ok1 := eng.GetRepo("pc1", `C:\work\meta-repo`)
+	r2, ok2 := eng.GetRepo("pc1", `C:\work\meta-repo-02`)
+	if !ok1 || r1.Queue != control.QueueOpen || r1.ASEState != "IDLE" {
+		t.Fatalf("expected C:\\work\\meta-repo auto-recovered to QueueOpen/IDLE, got %+v", r1)
+	}
+	if !ok2 || r2.Queue != control.QueueOpen || r2.DiscardPending {
+		t.Fatalf("expected C:\\work\\meta-repo-02 DiscardPending cleared, got %+v", r2)
+	}
+
+	// 2. Enqueue agent.tools.update on debian; verify GET /v1/jobs does NOT fake-complete it while PENDING even when EagerUpdateState is UP_TO_DATE.
+	tuResp, err := client.Post(ts.URL+"/v1/hosts/debian/tools/update", "application/json", bytes.NewBufferString(`{"host_id":"debian","tools":["iazio-agent"]}`))
+	if err != nil {
+		t.Fatalf("POST /v1/hosts/debian/tools/update failed: %v", err)
+	}
+	_ = tuResp.Body.Close()
+	now = now.Add(10 * time.Minute)
+	eng.UpdateEagerReadiness("debian", control.EagerUpdateReadinessReport{
+		HostID:           "debian",
+		EagerUpdateState: control.StateUpToDate,
+		LastEvaluatedAt:  now,
+	})
+	jobsResp, err := client.Get(ts.URL + "/v1/jobs?status=pending")
+	if err != nil {
+		t.Fatalf("GET /v1/jobs?status=pending failed: %v", err)
+	}
+	_ = jobsResp.Body.Close()
+
+	pendingTools, err := queue.List(context.Background(), dispatch.JobFilter{Status: dispatch.JobStatusPending, Type: "agent.tools.update"})
+	if err != nil || len(pendingTools) != 1 {
+		t.Fatalf("expected agent.tools.update job to remain PENDING until claimed by agent (never fake-completed), got len=%d err=%v", len(pendingTools), err)
+	}
+	toolJobID := pendingTools[0].ID
+
+	// 3. Advance clock by 2 hours (simulating 2h queue wait time), claim the job on debian, advance 4s, and complete it.
+	now = now.Add(2 * time.Hour)
+	claimResp, err := client.Post(ts.URL+"/api/v1/agent/jobs/claim", "application/json", bytes.NewBufferString(`{"host_id":"debian","job_types":["agent.tools.update"]}`))
+	if err != nil {
+		t.Fatalf("POST claim failed: %v", err)
+	}
+	var claimedTool dispatch.Job
+	if err := json.NewDecoder(claimResp.Body).Decode(&claimedTool); err != nil {
+		t.Fatalf("decode claimedTool failed: %v", err)
+	}
+	_ = claimResp.Body.Close()
+
+	now = now.Add(4 * time.Second)
+	compBody := bytes.NewBufferString(fmt.Sprintf(`{"fencing_token":%d,"result":{"status":"completed","updated":true,"tools":["iazio-agent"],"host_id":"debian","agent_pid":9001,"harness_pid":9001,"elapsed_seconds":4,"summary":"Completed agent.tools.update on host debian (tools=iazio-agent, force=false)"}}`, claimedTool.FencingToken))
+	compResp, err := client.Post(ts.URL+"/api/v1/agent/jobs/"+toolJobID+"/complete", "application/json", compBody)
+	if err != nil {
+		t.Fatalf("POST complete failed: %v", err)
+	}
+	_ = compResp.Body.Close()
+
+	detailResp, err := client.Get(ts.URL + "/v1/jobs/" + toolJobID)
+	if err != nil {
+		t.Fatalf("GET /v1/jobs/%s failed: %v", toolJobID, err)
+	}
+	var detailMap map[string]any
+	if err := json.NewDecoder(detailResp.Body).Decode(&detailMap); err != nil {
+		t.Fatalf("decode detailMap failed: %v", err)
+	}
+	_ = detailResp.Body.Close()
+	if el, _ := detailMap["elapsed_seconds"].(float64); int64(el) != 4 {
+		t.Fatalf("expected elapsed_seconds=4 (computed from claimed_at, not 2h queue wait), got %v", detailMap["elapsed_seconds"])
+	}
+	if durMs, _ := detailMap["duration_ms"].(float64); int64(durMs) != 4000 {
+		t.Fatalf("expected duration_ms=4000 (computed from claimed_at), got %v", detailMap["duration_ms"])
+	}
+
+	// 4. Enqueue 2 prompt.execute jobs for meta-repo and claim both from pc1; verify C:\work\meta-repo and C:\work\meta-repo-02 are allocated ahead of feature-branch C:\work\meta-repo-03.
+	for i := 1; i <= 2; i++ {
+		_, err := queue.Enqueue(context.Background(), &dispatch.Job{
+			ID:          fmt.Sprintf("job_pc1_slot_%d", i),
+			Type:        dispatch.JobTypePromptExecute,
+			Repo:        "meta-repo",
+			TargetHost:  "pc1",
+			TargetAgent: "agy",
+			Payload:     json.RawMessage(`{"prompt":"run verification"}`),
+		})
+		if err != nil {
+			t.Fatalf("Enqueue job_pc1_slot_%d failed: %v", i, err)
+		}
+	}
+
+	allocatedWorktrees := map[string]bool{}
+	for i := 1; i <= 2; i++ {
+		cBody := bytes.NewBufferString(`{"host_id":"pc1","job_types":["prompt.execute"],"idle_worktrees":["C:\\work\\meta-repo","C:\\work\\meta-repo-02","C:\\work\\meta-repo-03"]}`)
+		cResp, err := client.Post(ts.URL+"/api/v1/agent/jobs/claim", "application/json", cBody)
+		if err != nil {
+			t.Fatalf("claim %d failed: %v", i, err)
+		}
+		if cResp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK on claim %d, got %d", i, cResp.StatusCode)
+		}
+		var cj dispatch.Job
+		if err := json.NewDecoder(cResp.Body).Decode(&cj); err != nil {
+			t.Fatalf("decode claim %d failed: %v", i, err)
+		}
+		_ = cResp.Body.Close()
+		allocatedWorktrees[cj.WorktreePath] = true
+	}
+	if !allocatedWorktrees[`C:\work\meta-repo`] || !allocatedWorktrees[`C:\work\meta-repo-02`] || allocatedWorktrees[`C:\work\meta-repo-03`] {
+		t.Fatalf("expected clean main worktrees C:\\work\\meta-repo and C:\\work\\meta-repo-02 to be allocated ahead of feature-branch C:\\work\\meta-repo-03, got %v", allocatedWorktrees)
 	}
 }
 

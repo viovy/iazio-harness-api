@@ -871,24 +871,6 @@ func (h *JobLifecycleHandler) reconcileQueueWithEngine(ctx context.Context) {
 			}
 			continue
 		}
-		if st == dispatch.JobStatusPending && strings.EqualFold(strings.TrimSpace(qj.Type), "agent.tools.update") {
-			targetHost := strings.TrimSpace(qj.TargetHost)
-			if targetHost == "" && qj.AgentAffinity != nil {
-				targetHost = strings.TrimSpace(qj.AgentAffinity.HostID)
-			}
-			if targetHost == "" {
-				continue
-			}
-			hd, ok := h.engine.GetHostDetail(targetHost)
-			if !ok || strings.EqualFold(hd.Host.Presence, "OFFLINE") || hd.Host.PendingToolUpdate != nil {
-				continue
-			}
-			if hd.Host.EagerReadiness != nil &&
-				hd.Host.EagerReadiness.EagerUpdateState == control.StateUpToDate &&
-				!hd.Host.EagerReadiness.LastEvaluatedAt.Before(qj.CreatedAt) {
-				_ = h.queue.Complete(ctx, qj.ID, json.RawMessage(`{"status":"completed_via_eager_readiness"}`), "")
-			}
-		}
 	}
 }
 
