@@ -787,4 +787,30 @@ func TestServer_EnterpriseToolUpdateAndCleanup(t *testing.T) {
 	if !foundCleanup {
 		t.Errorf("expected CLEANUP_BINARIES in pending commands for mac-mini, got %+v", cmds)
 	}
+
+	// 7. Verify subsequent heartbeat with empty discovered_dev_binaries clears the list
+	hbEmpty := `{
+		"presence": "ONLINE",
+		"version": "1.0.0",
+		"commit_sha": "abc1234",
+		"discovered_dev_binaries": [],
+		"tools": []
+	}`
+	recHBEmpty := httptest.NewRecorder()
+	handler.ServeHTTP(recHBEmpty, httptest.NewRequest("POST", "/v1/hosts/mac-mini/heartbeat", bytes.NewReader([]byte(hbEmpty))))
+	if recHBEmpty.Code != http.StatusOK {
+		t.Fatalf("expected 200 on empty heartbeat, got %d: %s", recHBEmpty.Code, recHBEmpty.Body.String())
+	}
+	recHost2 := httptest.NewRecorder()
+	handler.ServeHTTP(recHost2, httptest.NewRequest("GET", "/v1/hosts/mac-mini", nil))
+	var hostResp2 struct {
+		Host struct {
+			DiscoveredDevBinaries []string `json:"discovered_dev_binaries"`
+		} `json:"host"`
+	}
+	_ = json.Unmarshal(recHost2.Body.Bytes(), &hostResp2)
+	if len(hostResp2.Host.DiscoveredDevBinaries) != 0 {
+		t.Errorf("expected 0 discovered dev binaries after cleanup heartbeat, got %d: %+v",
+			len(hostResp2.Host.DiscoveredDevBinaries), hostResp2.Host.DiscoveredDevBinaries)
+	}
 }

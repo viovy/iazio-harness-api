@@ -2157,7 +2157,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		_, _ = s.Queue.ExtendLeasesForHost(r.Context(), hostID, activeJobIDs)
 	}
 	s.Engine.SetHostEagerUpdate(hostID, raw.EagerUpdateEnabled, raw.LastEagerUpdateAt)
-	if len(raw.DiscoveredDevBinaries) > 0 {
+	if raw.DiscoveredDevBinaries != nil {
 		s.Engine.SetHostDevBinaries(hostID, raw.DiscoveredDevBinaries)
 	}
 	if s.SaveHost != nil {
