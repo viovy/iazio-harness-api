@@ -6066,6 +6066,35 @@ func TestUpdateRepoRuntimeStatus_StoryGov5197_AdhocASECarryForwardExpiryAndIdleN
 			r.ASEState, r.ExecutionProvenance, r.Reason)
 	}
 	e.mu.Unlock()
+
+	// 3. Active ad-hoc ASE on a CLEAN main worktree (Phase 0/1 or Phase 5b-7) must ALSO preserve carry-forward within 90s
+	// when a partial git-only status report arrives with empty ASEState/ExecutionProvenance/ToolLiveness.
+	e.UpdateRepoRuntimeStatus("host-mac-1", []RepoRuntimeStatus{
+		{
+			RepoPath:            wtPath,
+			Branch:              "main",
+			IsClean:             true,
+			ASEState:            "RUNNING",
+			ActiveStoryID:       "STORY-IAZIO-0200",
+			ActiveTool:          "agy",
+			ToolLiveness:        "LIVE",
+			ExecutionProvenance: "INDEPENDENT_USER_SESSION",
+		},
+	})
+	now = now.Add(30 * time.Second)
+	e.UpdateRepoRuntimeStatus("host-mac-1", []RepoRuntimeStatus{
+		{
+			RepoPath: wtPath,
+			Branch:   "main",
+			IsClean:  true,
+		},
+	})
+	e.mu.Lock()
+	r = e.repos[repoKey("host-mac-1", wtPath)]
+	if r == nil || r.ASEState != "RUNNING" || r.ExecutionProvenance != "INDEPENDENT_USER_SESSION" || r.Reason != ReasonAdhocASE {
+		t.Fatalf("expected AdhocASE preserved on clean main within 90s carry-forward window, got %+v", r)
+	}
+	e.mu.Unlock()
 }
 
 
