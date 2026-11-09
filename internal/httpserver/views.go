@@ -1236,5 +1236,9 @@ func dispatchJobDetailView(j *dispatch.Job) map[string]any {
 			res["duration_ms"] = j.ElapsedSeconds * 1000
 		}
 	}
+	if diff := dispatch.CompareJobWithBaseline(j, nil, nil, nil); diff != nil {
+		res["run_comparison"] = diff
+		res["phase4_review_context"] = diff.Phase4ReviewContext
+	}
 	return res
 }

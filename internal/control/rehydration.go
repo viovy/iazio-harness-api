@@ -28,10 +28,12 @@ type RehydrationBundle struct {
 	InterruptedPhase       string              `json:"interrupted_phase,omitempty"`
 	InterruptedStep        string              `json:"interrupted_step,omitempty"`
 	RemainingChecklist     []string            `json:"remaining_checklist,omitempty"`
-	LastToolActions        []ToolActionSummary `json:"last_tool_actions,omitempty"`
-	WorkspaceStateManifest map[string]any      `json:"workspace_state_manifest,omitempty"`
-	BootstrapPrompt        string              `json:"bootstrap_prompt"`
-	GeneratedAt            time.Time           `json:"generated_at"`
+	LastToolActions        []ToolActionSummary         `json:"last_tool_actions,omitempty"`
+	WorkspaceStateManifest map[string]any              `json:"workspace_state_manifest,omitempty"`
+	RunComparison          *dispatch.RunComparisonDiff `json:"run_comparison,omitempty"`
+	Phase4ReviewContext    string                      `json:"phase4_review_context,omitempty"`
+	BootstrapPrompt        string                      `json:"bootstrap_prompt"`
+	GeneratedAt            time.Time                   `json:"generated_at"`
 }
 
 // GetRehydrationBundle synthesizes the recovery state bundle for conversationID
@@ -290,10 +292,64 @@ func (e *Engine) GetRehydrationBundle(convID string) (RehydrationBundle, error) 
 		sb.WriteString("\n\n")
 	}
 
+	var runComparison *dispatch.RunComparisonDiff
+	if matchedJobID != "" {
+		if cj, ok := e.jobs[matchedJobID]; ok && cj != nil {
+			synthJob := &dispatch.Job{
+				ID:                   cj.ID,
+				StoryID:              storyID,
+				Status:               strings.ToLower(cj.Status),
+				Attempts:             cj.ExecutionAttempt,
+				FailureCategory:      cj.FailureCategory,
+				FailureStage:         cj.FailureStage,
+				FailureReasonSummary: cj.FailureReasonSummary,
+				Error:                cj.Reason,
+				AttemptHistory:       cj.AttemptHistory,
+				TraceID:              cj.TraceID,
+				ZipkinTraceID:        cj.ZipkinTraceID,
+			}
+			runComparison = dispatch.CompareJobWithBaseline(synthJob, nil, nil, nil)
+		} else {
+			for _, repoHist := range e.history {
+				for _, row := range repoHist {
+					if row.JobID == matchedJobID {
+						synthJob := &dispatch.Job{
+							ID:                   row.JobID,
+							StoryID:              storyID,
+							Status:               strings.ToLower(row.Status),
+							Attempts:             row.ExecutionAttempt,
+							FailureCategory:      row.FailureCategory,
+							FailureStage:         row.FailureStage,
+							FailureReasonSummary: row.FailureReasonSummary,
+							Error:                row.Reason,
+							AttemptHistory:       row.AttemptHistory,
+							TraceID:              row.TraceID,
+							ZipkinTraceID:        row.ZipkinTraceID,
+						}
+						runComparison = dispatch.CompareJobWithBaseline(synthJob, nil, nil, nil)
+						break
+					}
+				}
+				if runComparison != nil {
+					break
+				}
+			}
+		}
+	}
+	if runComparison != nil && runComparison.Phase4ReviewContext != "" {
+		sb.WriteString(runComparison.Phase4ReviewContext)
+		sb.WriteString("\n\n")
+	}
+
 	sb.WriteString("CONTINUATION DIRECTIVE:\n")
 	sb.WriteString(fmt.Sprintf("You are resuming execution on a fallback conversation after session loss on %s.\n", convID))
 	sb.WriteString(fmt.Sprintf("Do NOT re-execute already completed phases. Continue directly from Phase: %s (Step: %s).\n", interruptedPhase, interruptedStep))
 	sb.WriteString("================================================================================\n")
+
+	var phase4ReviewContext string
+	if runComparison != nil {
+		phase4ReviewContext = runComparison.Phase4ReviewContext
+	}
 
 	return RehydrationBundle{
 		ConversationID:         convID,
@@ -307,6 +363,8 @@ func (e *Engine) GetRehydrationBundle(convID string) (RehydrationBundle, error) 
 		RemainingChecklist:     remainingChecklist,
 		LastToolActions:        toolActions,
 		WorkspaceStateManifest: workspaceManifest,
+		RunComparison:          runComparison,
+		Phase4ReviewContext:    phase4ReviewContext,
 		BootstrapPrompt:        sb.String(),
 		GeneratedAt:            e.now().UTC(),
 	}, nil
