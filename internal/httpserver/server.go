@@ -1541,13 +1541,13 @@ func resolveDispatchJobByScheduleOrJobID(q dispatch.Queue, id string) (*dispatch
 	if clean == "" {
 		return nil, false
 	}
-	if j, ok := q.Get(clean); ok && j != nil {
+	if j, ok := q.Get(clean); ok && j != nil && !dispatch.IsPhantomEmptyQueueJob(j) {
 		return j, true
 	}
 	if strings.HasPrefix(clean, "sch-") {
 		suffix := strings.TrimPrefix(clean, "sch-")
 		for _, cand := range []string{"job_" + suffix, "job-" + suffix} {
-			if j, ok := q.Get(cand); ok && j != nil {
+			if j, ok := q.Get(cand); ok && j != nil && !dispatch.IsPhantomEmptyQueueJob(j) {
 				return j, true
 			}
 		}
@@ -1777,9 +1777,18 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// 2. Pending jobs in dispatch queue take precedence over archived history
+	// 2. Pending/active jobs in dispatch queue take precedence over archived history,
+	// unless the queue entry is an unpopulated phantom shadowing a real Engine job.
 	if s.Queue != nil {
 		if qJob, found := resolveDispatchJobByScheduleOrJobID(s.Queue, id); found && qJob != nil {
+			isUnpopulatedPhantom := strings.TrimSpace(qJob.Type) == "" && strings.TrimSpace(qJob.NormalizedPrompt) == "" && len(qJob.Payload) == 0 && strings.TrimSpace(qJob.StoryID) == ""
+			if isUnpopulatedPhantom && s.Engine != nil {
+				if job, ok := s.Engine.GetJob(id); ok {
+					s.purgePhantomQueueJob(r.Context(), qJob.ID)
+					writeJSON(w, http.StatusOK, jobDetailView(job))
+					return
+				}
+			}
 			writeJSON(w, http.StatusOK, dispatchJobDetailView(qJob))
 			return
 		}
@@ -2160,11 +2169,27 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 			UpdateRuntimeMetadata(jobID, worktreePath, activeConvID string, harnessPID, toolPID int, elapsedSec int64) (*dispatch.Job, bool)
 		})
 		for _, aj := range activeJobs {
-			if aj.JobID != "" {
-				activeJobIDs = append(activeJobIDs, aj.JobID)
-				if hasUpdater && aj.WorktreePath != "" && aj.WorktreePath != "." {
-					updater.UpdateRuntimeMetadata(aj.JobID, aj.WorktreePath, "", aj.PID, 0, 0)
+			cleanID := strings.TrimSpace(aj.JobID)
+			if cleanID == "" {
+				continue
+			}
+			isEngineJob := false
+			if s.Engine != nil {
+				_, isEngineJob = s.Engine.GetJob(cleanID)
+			}
+			if isEngineJob || dispatch.IsControlPlaneScheduleJobID(cleanID) {
+				if qj, ok := s.Queue.Get(cleanID); ok && qj != nil {
+					if strings.TrimSpace(qj.Type) == "" && strings.TrimSpace(qj.NormalizedPrompt) == "" && len(qj.Payload) == 0 && strings.TrimSpace(qj.StoryID) == "" {
+						s.purgePhantomQueueJob(r.Context(), cleanID)
+						continue
+					}
+				} else {
+					continue
 				}
+			}
+			activeJobIDs = append(activeJobIDs, cleanID)
+			if hasUpdater && aj.WorktreePath != "" && aj.WorktreePath != "." {
+				updater.UpdateRuntimeMetadata(cleanID, aj.WorktreePath, "", aj.PID, 0, 0)
 			}
 		}
 		_, _ = s.Queue.ExtendLeasesForHost(r.Context(), hostID, activeJobIDs)
@@ -2190,6 +2215,17 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+func (s *Server) purgePhantomQueueJob(ctx context.Context, jobID string) {
+	if s == nil || s.Queue == nil || strings.TrimSpace(jobID) == "" {
+		return
+	}
+	if purger, ok := s.Queue.(interface {
+		PurgeJob(ctx context.Context, jobID string) bool
+	}); ok {
+		purger.PurgeJob(ctx, jobID)
+	}
+}
+
 func (s *Server) shouldAcceptHeartbeatActiveJob(ctx context.Context, hostID, jobID, worktreePath string) bool {
 	id := strings.TrimSpace(jobID)
 	if id == "" {
@@ -2199,6 +2235,7 @@ func (s *Server) shouldAcceptHeartbeatActiveJob(ctx context.Context, hostID, job
 		strings.Contains(worktreePath, "TestExecuteJob_") || strings.Contains(worktreePath, "/T/Test") || strings.Contains(worktreePath, `\Temp\Test`) {
 		if s.Queue != nil {
 			_, _ = s.Queue.Cancel(ctx, id, "synthetic_test_job")
+			s.purgePhantomQueueJob(ctx, id)
 		}
 		if s.Engine != nil {
 			s.Engine.ReleaseRepoLockIfMatchingJob(hostID, id)
@@ -2207,18 +2244,37 @@ func (s *Server) shouldAcceptHeartbeatActiveJob(ctx context.Context, hostID, job
 	}
 	if s.Engine != nil {
 		if ej, ok := s.Engine.GetJob(id); ok {
+			if s.Queue != nil {
+				if qj, qok := s.Queue.Get(id); qok && qj != nil && strings.TrimSpace(qj.Type) == "" && strings.TrimSpace(qj.NormalizedPrompt) == "" && len(qj.Payload) == 0 && strings.TrimSpace(qj.StoryID) == "" {
+					s.purgePhantomQueueJob(ctx, id)
+				}
+			}
 			st := strings.ToUpper(strings.TrimSpace(ej.Status))
-			if st == "COMPLETED" || st == "FINISHED" || st == "FAILED" || st == "CANCELLED" || st == "CANCELED" || st == "ABANDONED" || st == "DECLINED" {
+			if st == "COMPLETED" || st == "FINISHED" || st == "FAILED" || st == "CANCELLED" || st == "CANCELED" || st == "ABANDONED" || st == "DECLINED" || st == "LEASE_EXPIRED" {
 				if s.Queue != nil {
 					_, _ = s.Queue.Cancel(ctx, id, "terminal_engine_job")
 				}
 				s.Engine.ReleaseRepoLockIfMatchingJob(hostID, id)
 				return false
 			}
+			if s.Queue != nil {
+				if qj, qok := s.Queue.Get(id); !qok || qj == nil {
+					return true
+				}
+			} else {
+				return true
+			}
 		}
 	}
 	if s.Queue != nil {
 		if qj, ok := s.Queue.Get(id); ok && qj != nil {
+			if dispatch.IsPhantomEmptyQueueJob(qj) {
+				s.purgePhantomQueueJob(ctx, id)
+				if s.Engine != nil {
+					s.Engine.ReleaseRepoLockIfMatchingJob(hostID, id)
+				}
+				return false
+			}
 			if qj.Status == dispatch.JobStatusCompleted || qj.Status == dispatch.JobStatusCanceled || qj.Status == dispatch.JobStatusRequeued {
 				if s.Engine != nil {
 					s.Engine.ReleaseRepoLockIfMatchingJob(hostID, id)
@@ -2227,6 +2283,7 @@ func (s *Server) shouldAcceptHeartbeatActiveJob(ctx context.Context, hostID, job
 			}
 			if qj.Type == "" && qj.NormalizedPrompt == "" && len(qj.Payload) == 0 && !qj.CreatedAt.IsZero() && time.Since(qj.CreatedAt) > 10*time.Minute {
 				_, _ = s.Queue.Cancel(ctx, id, "phantom_empty_job")
+				s.purgePhantomQueueJob(ctx, id)
 				if s.Engine != nil {
 					s.Engine.ReleaseRepoLockIfMatchingJob(hostID, id)
 				}
@@ -3472,6 +3529,21 @@ func (s *Server) reconcileQueueWithEngine(ctx context.Context) {
 	for _, qj := range jobs {
 		if qj == nil {
 			continue
+		}
+		isUnpopulated := strings.TrimSpace(qj.Type) == "" && strings.TrimSpace(qj.NormalizedPrompt) == "" && len(qj.Payload) == 0 && strings.TrimSpace(qj.StoryID) == ""
+		if dispatch.IsPhantomEmptyQueueJob(qj) {
+			s.purgePhantomQueueJob(ctx, qj.ID)
+			continue
+		}
+		if isUnpopulated && strings.HasPrefix(strings.TrimSpace(qj.ID), "job-") {
+			if jd, ok := s.Engine.GetJob(qj.ID); ok {
+				s.purgePhantomQueueJob(ctx, qj.ID)
+				jdStatus := strings.ToUpper(strings.TrimSpace(jd.Status))
+				if jdStatus != "RUNNING" && jdStatus != "LEASED" && jdStatus != "CANCEL_REQUESTED" {
+					s.Engine.ReleaseDispatchJobRepo(qj.ID)
+				}
+				continue
+			}
 		}
 		st := strings.ToLower(strings.TrimSpace(qj.Status))
 		if st != dispatch.JobStatusPending && st != dispatch.JobStatusClaimed && st != dispatch.JobStatusLeased && st != dispatch.JobStatusRunning {
