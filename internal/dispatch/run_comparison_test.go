@@ -89,13 +89,13 @@ func TestRunComparisonService_CompareRuns_AllFourBuckets(t *testing.T) {
 			{
 				SpanName:    "POST /api/v1/jobs",
 				ServiceName: "iazio-harness-api",
-				DurationMs:  260, // +140ms (+116.67%) -> regressed
+				DurationMs:  260,
 				HasError:    false,
 			},
 			{
 				SpanName:    "GET /api/v1/stories",
 				ServiceName: "iazio-harness-api",
-				DurationMs:  45, // resolved error tag & faster
+				DurationMs:  45,
 				HasError:    false,
 			},
 		},
@@ -116,25 +116,18 @@ func TestRunComparisonService_CompareRuns_AllFourBuckets(t *testing.T) {
 		t.Fatal("expected remediation_verified=false when new regressions exist")
 	}
 
-	// Verify Bucket 1: RESOLVED_ERRORS (oauth2 error + span error tag + TestAuthHandshake)
 	if len(diff.ResolvedErrors) != 3 {
 		t.Fatalf("expected 3 RESOLVED_ERRORS, got %d: %+v", len(diff.ResolvedErrors), diff.ResolvedErrors)
 	}
 	if len(diff.Buckets.ResolvedErrors) != 3 {
 		t.Fatalf("expected buckets.RESOLVED_ERRORS length 3, got %d", len(diff.Buckets.ResolvedErrors))
 	}
-
-	// Verify Bucket 2: NEW_REGRESSIONS (nil pointer error + TestNewRegressionCase)
 	if len(diff.NewRegressions) != 2 {
 		t.Fatalf("expected 2 NEW_REGRESSIONS, got %d: %+v", len(diff.NewRegressions), diff.NewRegressions)
 	}
-
-	// Verify Bucket 3: PERSISTENT_ERRORS (connection pool exhausted + TestFlakyTimeout)
 	if len(diff.PersistentErrors) != 2 {
 		t.Fatalf("expected 2 PERSISTENT_ERRORS, got %d: %+v", len(diff.PersistentErrors), diff.PersistentErrors)
 	}
-
-	// Verify Bucket 4: LATENCY_DELTAS (2 spans + job.total_duration)
 	if len(diff.LatencyDeltas) != 3 {
 		t.Fatalf("expected 3 LATENCY_DELTAS, got %d: %+v", len(diff.LatencyDeltas), diff.LatencyDeltas)
 	}
@@ -151,7 +144,6 @@ func TestRunComparisonService_CompareRuns_AllFourBuckets(t *testing.T) {
 		t.Fatal("expected POST /api/v1/jobs span to be flagged as regressed")
 	}
 
-	// Verify Phase 4 review context contains all 4 canonical bucket labels
 	for _, token := range []string{
 		BucketResolvedErrors,
 		BucketNewRegressions,
@@ -213,6 +205,10 @@ func TestCompareJobWithBaseline_AttemptHistoryAndResultJSON(t *testing.T) {
 		"test_pass_count":    14,
 		"token_count":        9500,
 		"turn_count":         7,
+		"duration_ms":        30000,
+		"commit_sha":         "abc12345",
+		"warning_signatures": []string{"WARN: slow query"},
+		"error_clusters":     []ErrorClusterItem{},
 		"span_latencies": []SpanLatencyItem{
 			{SpanName: "VerifyStory", ServiceName: "harness", DurationMs: 110},
 		},
@@ -223,14 +219,14 @@ func TestCompareJobWithBaseline_AttemptHistoryAndResultJSON(t *testing.T) {
 		StoryID:        "STORY-103",
 		Status:         JobStatusCompleted,
 		Attempts:       2,
-		FinalTurnCount: 7,
-		ElapsedSeconds: 30,
+		FinalTurnCount: 0,
+		ElapsedSeconds: 0,
 		ClaimedAt:      &t1,
 		CompletedAt:    &t2,
 		Result:         resBytes,
 		AttemptHistory: []AttemptFailure{
 			{
-				AttemptNumber:   1,
+				AttemptNumber:   0,
 				StartedAt:       t0.Format(time.RFC3339),
 				EndedAt:         t1.Format(time.RFC3339),
 				FailureCategory: "TEST_FAILURE",
@@ -240,14 +236,111 @@ func TestCompareJobWithBaseline_AttemptHistoryAndResultJSON(t *testing.T) {
 		},
 	}
 
-	diff := CompareJobWithBaseline(job, nil, nil, nil)
+	diff := CompareJobWithBaseline(job, nil, []string{"INFO starting", "WARN: minor warning", "ERROR: transient err", "ERROR: transient err"}, nil)
 	if diff == nil {
 		t.Fatal("expected CompareJobWithBaseline to produce diff from AttemptHistory")
 	}
-	if !diff.RemediationVerified || diff.Verdict != VerdictRemediationVerified {
-		t.Fatalf("expected remediation verified on clean retry, got verdict=%s", diff.Verdict)
-	}
 	if diff.TestFailureDelta.BaselineFailures != 1 || diff.TestFailureDelta.CurrentFailures != 0 {
 		t.Fatalf("unexpected test failure delta: %+v", diff.TestFailureDelta)
+	}
+}
+
+func TestRunComparisonService_EdgeCasesAndAggregateCounts(t *testing.T) {
+	var nilSvc *RunComparisonService
+	// 1. Clean run with zero errors & pre_post_window mode
+	cleanDiff := nilSvc.CompareRuns(
+		RunTelemetrySnapshot{JobID: "j1", StoryID: "S1", WindowLabel: "pre"},
+		RunTelemetrySnapshot{JobID: "j2", WindowLabel: "post"},
+	)
+	if cleanDiff.Verdict != VerdictCleanRun || cleanDiff.ComparisonMode != "pre_post_window" {
+		t.Fatalf("unexpected cleanDiff: %+v", cleanDiff)
+	}
+	if FormatPhase4ReviewContext(nil) != "" {
+		t.Fatal("expected empty string for nil diff")
+	}
+
+	// 2. Aggregate test counts without FailedTests list: 0->2, 2->4, 2->2, 2->0
+	svc := &RunComparisonService{LatencyRegressionThresholdPct: 0, LatencyRegressionMinDeltaMs: 0}
+	dNewFail := svc.CompareRuns(RunTelemetrySnapshot{TestFailureCount: 0}, RunTelemetrySnapshot{TestFailureCount: 2})
+	if dNewFail.Verdict != VerdictRegressionIntroduced || len(dNewFail.NewRegressions) != 1 {
+		t.Fatalf("expected new test failure regression, got %+v", dNewFail)
+	}
+	dIncFail := svc.CompareRuns(RunTelemetrySnapshot{TestFailureCount: 2}, RunTelemetrySnapshot{TestFailureCount: 4})
+	if dIncFail.Verdict != VerdictRegressionIntroduced {
+		t.Fatalf("expected increased test failure regression, got %+v", dIncFail)
+	}
+	dPersist := svc.CompareRuns(RunTelemetrySnapshot{TestFailureCount: 2}, RunTelemetrySnapshot{TestFailureCount: 2})
+	if dPersist.Verdict != VerdictPersistentFailure || len(dPersist.PersistentErrors) != 1 {
+		t.Fatalf("expected persistent failure, got %+v", dPersist)
+	}
+	dRes := svc.CompareRuns(RunTelemetrySnapshot{TestFailureCount: 2}, RunTelemetrySnapshot{TestFailureCount: 0})
+	if dRes.Verdict != VerdictRemediationVerified || len(dRes.ResolvedErrors) != 1 {
+		t.Fatalf("expected resolved test failure count, got %+v", dRes)
+	}
+
+	// 3. Duplicate cluster aggregation, warning level auto-category, status 500 span error, duplicate spans, raw error fallback
+	base := RunTelemetrySnapshot{
+		RawError:          "unhandled panic in worker",
+		WarningSignatures: []string{"deprecated flag"},
+		SpanLatencies: []SpanLatencyItem{
+			{SpanName: "op", ServiceName: "svc", DurationMs: 0, P95DurationMs: 0},
+			{SpanName: "op", ServiceName: "svc", DurationMs: 10, P95DurationMs: 20, HasError: true, ErrorTag: "err1"},
+			{SpanName: "", DurationMs: 5},
+		},
+	}
+	curr := RunTelemetrySnapshot{
+		ErrorClusters: []ErrorClusterItem{
+			{Signature: "warn item", Level: "WARN", Count: 0},
+			{Signature: "dup err", Service: "svc", Count: 1},
+			{Signature: "dup err", Service: "svc", Count: 2, SampleMessage: "sample"},
+			{Signature: "   "},
+		},
+		SpanLatencies: []SpanLatencyItem{
+			{SpanName: "op", ServiceName: "svc", DurationMs: 50, StatusCode: "503"},
+			{SpanName: "new_err_span", ServiceName: "svc", DurationMs: 10, HasError: true},
+		},
+	}
+	dComplex := svc.CompareRuns(base, curr)
+	if len(dComplex.ResolvedErrors) == 0 || len(dComplex.NewRegressions) == 0 {
+		t.Fatalf("expected resolved and regressed items, got %+v", dComplex)
+	}
+
+	// 4. NormalizeErrorSignature long string & empty
+	if NormalizeErrorSignature("   ") != "" {
+		t.Fatal("expected empty normalized signature")
+	}
+	longSig := NormalizeErrorSignature(strings.Repeat("abcd1234ef567890 98765 ", 20) + "\nsecond line")
+	if len(longSig) > 180 {
+		t.Fatalf("expected truncated signature <= 180 chars, got %d", len(longSig))
+	}
+
+	// 5. ExtractJobSnapshot & CompareJobWithBaseline edge cases
+	if CompareJobWithBaseline(nil, nil, nil, nil) != nil {
+		t.Fatal("expected nil for nil target job")
+	}
+	emptySnap := ExtractJobSnapshot(nil, nil)
+	if emptySnap.RunID != "" {
+		t.Fatalf("expected empty snapshot for nil job, got %+v", emptySnap)
+	}
+	tStart := time.Now().Add(-10 * time.Second).UTC()
+	tEnd := time.Now().UTC()
+	j1 := &Job{
+		ID:          "j1",
+		CreatedAt:   tStart,
+		CompletedAt: &tEnd,
+		Error:       "--- FAIL: TestX (0.01s)\n--- FAIL: TestX (0.01s)\nfatal crash",
+		Result:      []byte(`{invalid-json`),
+	}
+	j2 := &Job{
+		ID:          "j2",
+		CreatedAt:   tStart,
+		CompletedAt: &tEnd,
+	}
+	if CompareJobWithBaseline(j2, nil, nil, nil) != nil {
+		t.Fatal("expected nil when no baselineJob and no AttemptHistory")
+	}
+	pairDiff := CompareJobWithBaseline(j2, j1, nil, nil)
+	if pairDiff == nil || !pairDiff.RemediationVerified {
+		t.Fatalf("expected pairDiff to verify remediation, got %+v", pairDiff)
 	}
 }

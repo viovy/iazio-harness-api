@@ -26,6 +26,23 @@ const (
 	VerdictCleanRun             = "CLEAN_RUN"
 )
 
+const (
+	levelError            = "ERROR"
+	levelWarn             = "WARN"
+	catErrorCluster       = "error_cluster"
+	catWarningSignature   = "warning_signature"
+	catSpanErrorTag       = "span_error_tag"
+	catTestFailure        = "test_failure"
+	catJobError           = "job_error"
+	svcTestRunner         = "test-runner"
+	svcHarnessJob         = "harness-job"
+	sigTestFailureCount   = "test_failure_count"
+	metricSpanLatency     = "span_latency"
+	metricJobDuration     = "job_duration"
+	spanTotalDuration     = "job.total_duration"
+	noneBulletLine        = "  - None\n"
+)
+
 // DefaultLatencyRegressionThresholdPct is the percentage increase at which a span or run duration is flagged as regressed.
 const DefaultLatencyRegressionThresholdPct = 20.0
 
@@ -37,7 +54,7 @@ type ErrorClusterItem struct {
 	Signature     string `json:"signature"`
 	Level         string `json:"level,omitempty"`
 	Service       string `json:"service,omitempty"`
-	Category      string `json:"category,omitempty"` // error_cluster, span_error_tag, test_failure, warning_signature, job_error
+	Category      string `json:"category,omitempty"`
 	Count         int    `json:"count"`
 	SampleMessage string `json:"sample_message,omitempty"`
 }
@@ -80,7 +97,7 @@ type RunTelemetrySnapshot struct {
 // ErrorDiffEntry describes a single error signature, span error tag, warning signature, or test failure diff between baseline and current runs.
 type ErrorDiffEntry struct {
 	Signature     string `json:"signature"`
-	Bucket        string `json:"bucket"` // RESOLVED_ERRORS, NEW_REGRESSIONS, PERSISTENT_ERRORS
+	Bucket        string `json:"bucket"`
 	Category      string `json:"category,omitempty"`
 	Service       string `json:"service,omitempty"`
 	Level         string `json:"level,omitempty"`
@@ -94,7 +111,7 @@ type ErrorDiffEntry struct {
 type LatencyDeltaEntry struct {
 	SpanName      string  `json:"span_name"`
 	ServiceName   string  `json:"service_name,omitempty"`
-	MetricType    string  `json:"metric_type,omitempty"` // span_latency, job_duration
+	MetricType    string  `json:"metric_type,omitempty"`
 	BaselineMs    float64 `json:"baseline_ms"`
 	CurrentMs     float64 `json:"current_ms"`
 	DeltaMs       float64 `json:"delta_ms"`
@@ -171,10 +188,10 @@ func NewRunComparisonService() *RunComparisonService {
 }
 
 var (
-	hexTokenRe  = regexp.MustCompile(`\b[0-9a-fA-F]{8,64}\b`)
-	numTokenRe  = regexp.MustCompile(`\b\d{4,}\b`)
-	goTestFail  = regexp.MustCompile(`(?m)^--- FAIL:\s+([A-Za-z0-9_/-]+)`)
-	wsCollapse  = regexp.MustCompile(`\s+`)
+	hexTokenRe = regexp.MustCompile(`\b[0-9a-fA-F]{8,64}\b`)
+	numTokenRe = regexp.MustCompile(`\b\d{4,}\b`)
+	goTestFail = regexp.MustCompile(`(?m)^--- FAIL:\s+([A-Za-z0-9_/-]+)`)
+	wsCollapse = regexp.MustCompile(`\s+`)
 )
 
 // NormalizeErrorSignature canonicalizes a raw error message or cluster signature for deterministic comparison.
@@ -195,6 +212,419 @@ func NormalizeErrorSignature(raw string) string {
 	return s
 }
 
+type aggCluster struct {
+	signature string
+	category  string
+	service   string
+	level     string
+	count     int
+	sample    string
+}
+
+func addClusterItem(m map[string]*aggCluster, sig, category, service, level, sample string, count int) {
+	norm := NormalizeErrorSignature(sig)
+	if norm == "" {
+		return
+	}
+	if count <= 0 {
+		count = 1
+	}
+	if category == "" {
+		category = catErrorCluster
+	}
+	if level == "" {
+		level = levelError
+	}
+	key := category + "|" + strings.ToLower(service) + "|" + norm
+	if existing, ok := m[key]; ok {
+		existing.count += count
+		if existing.sample == "" && sample != "" {
+			existing.sample = sample
+		}
+		return
+	}
+	m[key] = &aggCluster{
+		signature: norm,
+		category:  category,
+		service:   service,
+		level:     level,
+		count:     count,
+		sample:    sample,
+	}
+}
+
+func resolveClusterCategory(c ErrorClusterItem) string {
+	if c.Category != "" {
+		return c.Category
+	}
+	if strings.EqualFold(c.Level, levelWarn) || strings.EqualFold(c.Level, "WARNING") {
+		return catWarningSignature
+	}
+	return catErrorCluster
+}
+
+func resolveSpanErrorTag(sp SpanLatencyItem) (string, bool) {
+	errTag := strings.TrimSpace(sp.ErrorTag)
+	status := strings.TrimSpace(sp.StatusCode)
+	if !sp.HasError && errTag == "" && !strings.HasPrefix(status, "5") {
+		return "", false
+	}
+	if errTag != "" {
+		return errTag, true
+	}
+	if status != "" {
+		return "http.status_code=" + status, true
+	}
+	return "error=true", true
+}
+
+func buildSnapshotClusterMap(snap RunTelemetrySnapshot) map[string]*aggCluster {
+	m := make(map[string]*aggCluster)
+	for _, c := range snap.ErrorClusters {
+		addClusterItem(m, c.Signature, resolveClusterCategory(c), c.Service, c.Level, c.SampleMessage, c.Count)
+	}
+	for _, w := range snap.WarningSignatures {
+		addClusterItem(m, w, catWarningSignature, "", levelWarn, w, 1)
+	}
+	for _, sp := range snap.SpanLatencies {
+		if errTag, hasErr := resolveSpanErrorTag(sp); hasErr {
+			sig := fmt.Sprintf("span:%s (%s)", sp.SpanName, errTag)
+			addClusterItem(m, sig, catSpanErrorTag, sp.ServiceName, levelError, errTag, maxInt(1, sp.SpanCount))
+		}
+	}
+	for _, tf := range snap.FailedTests {
+		if tfTrim := strings.TrimSpace(tf); tfTrim != "" {
+			addClusterItem(m, "test:"+tfTrim, catTestFailure, svcTestRunner, levelError, "failed test: "+tfTrim, 1)
+		}
+	}
+	if len(snap.ErrorClusters) == 0 && len(snap.FailedTests) == 0 && strings.TrimSpace(snap.RawError) != "" {
+		addClusterItem(m, snap.RawError, catJobError, "harness", levelError, snap.RawError, 1)
+	}
+	return m
+}
+
+func sortedUnionKeys[V any](a, b map[string]V) []string {
+	keys := make([]string, 0, len(a)+len(b))
+	seen := make(map[string]bool, len(a)+len(b))
+	for k := range a {
+		seen[k] = true
+		keys = append(keys, k)
+	}
+	for k := range b {
+		if !seen[k] {
+			seen[k] = true
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func classifyClusterDiffs(baseMap, currMap map[string]*aggCluster) (resolved, regressions, persistent []ErrorDiffEntry) {
+	resolved = make([]ErrorDiffEntry, 0)
+	regressions = make([]ErrorDiffEntry, 0)
+	persistent = make([]ErrorDiffEntry, 0)
+
+	for _, k := range sortedUnionKeys(baseMap, currMap) {
+		bItem, inBase := baseMap[k]
+		cItem, inCurr := currMap[k]
+		if inBase && !inCurr {
+			resolved = append(resolved, ErrorDiffEntry{
+				Signature:     bItem.signature,
+				Bucket:        BucketResolvedErrors,
+				Category:      bItem.category,
+				Service:       bItem.service,
+				Level:         bItem.level,
+				BaselineCount: bItem.count,
+				CurrentCount:  0,
+				DeltaCount:    -bItem.count,
+				SampleMessage: bItem.sample,
+			})
+			continue
+		}
+		if !inBase && inCurr {
+			regressions = append(regressions, ErrorDiffEntry{
+				Signature:     cItem.signature,
+				Bucket:        BucketNewRegressions,
+				Category:      cItem.category,
+				Service:       cItem.service,
+				Level:         cItem.level,
+				BaselineCount: 0,
+				CurrentCount:  cItem.count,
+				DeltaCount:    cItem.count,
+				SampleMessage: cItem.sample,
+			})
+			continue
+		}
+		sample := cItem.sample
+		if sample == "" {
+			sample = bItem.sample
+		}
+		persistent = append(persistent, ErrorDiffEntry{
+			Signature:     cItem.signature,
+			Bucket:        BucketPersistentErrors,
+			Category:      cItem.category,
+			Service:       cItem.service,
+			Level:         cItem.level,
+			BaselineCount: bItem.count,
+			CurrentCount:  cItem.count,
+			DeltaCount:    cItem.count - bItem.count,
+			SampleMessage: sample,
+		})
+	}
+	return resolved, regressions, persistent
+}
+
+func computeTestFailureSummary(baseline, current RunTelemetrySnapshot) TestFailureDiffSummary {
+	baseFailures := maxInt(baseline.TestFailureCount, len(baseline.FailedTests))
+	currFailures := maxInt(current.TestFailureCount, len(current.FailedTests))
+
+	baseSet := toTrimmedSet(baseline.FailedTests)
+	currSet := toTrimmedSet(current.FailedTests)
+
+	var resolvedTests, newFailedTests, persistentTests []string
+	for t := range baseSet {
+		if currSet[t] {
+			persistentTests = append(persistentTests, t)
+		} else {
+			resolvedTests = append(resolvedTests, t)
+		}
+	}
+	for t := range currSet {
+		if !baseSet[t] {
+			newFailedTests = append(newFailedTests, t)
+		}
+	}
+	sort.Strings(resolvedTests)
+	sort.Strings(newFailedTests)
+	sort.Strings(persistentTests)
+
+	return TestFailureDiffSummary{
+		BaselineFailures: baseFailures,
+		CurrentFailures:  currFailures,
+		Delta:            currFailures - baseFailures,
+		ResolvedTests:    resolvedTests,
+		NewFailedTests:   newFailedTests,
+		PersistentTests:  persistentTests,
+	}
+}
+
+func toTrimmedSet(items []string) map[string]bool {
+	set := make(map[string]bool, len(items))
+	for _, it := range items {
+		if trimmed := strings.TrimSpace(it); trimmed != "" {
+			set[trimmed] = true
+		}
+	}
+	return set
+}
+
+func appendAggregateTestCountDiff(
+	baseline, current RunTelemetrySnapshot,
+	testSummary TestFailureDiffSummary,
+	resolved, regressions, persistent []ErrorDiffEntry,
+) ([]ErrorDiffEntry, []ErrorDiffEntry, []ErrorDiffEntry) {
+	if len(baseline.FailedTests) > 0 || len(current.FailedTests) > 0 {
+		return resolved, regressions, persistent
+	}
+	baseFailures := testSummary.BaselineFailures
+	currFailures := testSummary.CurrentFailures
+	if baseFailures == 0 && currFailures == 0 {
+		return resolved, regressions, persistent
+	}
+	if baseFailures > 0 && currFailures == 0 {
+		resolved = append(resolved, ErrorDiffEntry{
+			Signature:     sigTestFailureCount,
+			Bucket:        BucketResolvedErrors,
+			Category:      catTestFailure,
+			Service:       svcTestRunner,
+			Level:         levelError,
+			BaselineCount: baseFailures,
+			CurrentCount:  0,
+			DeltaCount:    -baseFailures,
+			SampleMessage: fmt.Sprintf("all %d baseline test failure(s) resolved", baseFailures),
+		})
+		return resolved, regressions, persistent
+	}
+	if baseFailures == 0 && currFailures > 0 {
+		regressions = append(regressions, ErrorDiffEntry{
+			Signature:     sigTestFailureCount,
+			Bucket:        BucketNewRegressions,
+			Category:      catTestFailure,
+			Service:       svcTestRunner,
+			Level:         levelError,
+			BaselineCount: 0,
+			CurrentCount:  currFailures,
+			DeltaCount:    currFailures,
+			SampleMessage: fmt.Sprintf("%d new test failure(s) introduced", currFailures),
+		})
+		return resolved, regressions, persistent
+	}
+	if currFailures > baseFailures {
+		regressions = append(regressions, ErrorDiffEntry{
+			Signature:     "test_failure_count_increase",
+			Bucket:        BucketNewRegressions,
+			Category:      catTestFailure,
+			Service:       svcTestRunner,
+			Level:         levelError,
+			BaselineCount: baseFailures,
+			CurrentCount:  currFailures,
+			DeltaCount:    currFailures - baseFailures,
+			SampleMessage: fmt.Sprintf("test failures increased from %d to %d", baseFailures, currFailures),
+		})
+		return resolved, regressions, persistent
+	}
+	persistent = append(persistent, ErrorDiffEntry{
+		Signature:     sigTestFailureCount,
+		Bucket:        BucketPersistentErrors,
+		Category:      catTestFailure,
+		Service:       svcTestRunner,
+		Level:         levelError,
+		BaselineCount: baseFailures,
+		CurrentCount:  currFailures,
+		DeltaCount:    currFailures - baseFailures,
+		SampleMessage: fmt.Sprintf("test failures: baseline=%d current=%d", baseFailures, currFailures),
+	})
+	return resolved, regressions, persistent
+}
+
+type spanAgg struct {
+	spanName    string
+	serviceName string
+	maxMs       float64
+	hasError    bool
+	errorTag    string
+}
+
+func buildSpanAggMap(items []SpanLatencyItem) map[string]*spanAgg {
+	m := make(map[string]*spanAgg, len(items))
+	for _, sp := range items {
+		name := strings.TrimSpace(sp.SpanName)
+		if name == "" {
+			continue
+		}
+		svc := strings.TrimSpace(sp.ServiceName)
+		key := strings.ToLower(svc) + "|" + strings.ToLower(name)
+		dur := math.Max(sp.DurationMs, sp.P95DurationMs)
+		if existing, ok := m[key]; ok {
+			existing.maxMs = math.Max(existing.maxMs, dur)
+			existing.hasError = existing.hasError || sp.HasError
+			if existing.errorTag == "" && sp.ErrorTag != "" {
+				existing.errorTag = sp.ErrorTag
+			}
+			continue
+		}
+		m[key] = &spanAgg{
+			spanName:    name,
+			serviceName: svc,
+			maxMs:       dur,
+			hasError:    sp.HasError,
+			errorTag:    sp.ErrorTag,
+		}
+	}
+	return m
+}
+
+func buildSingleSpanDelta(bSp *spanAgg, inB bool, cSp *spanAgg, inC bool, minDeltaMs, thresholdPct float64) LatencyDeltaEntry {
+	var entry LatencyDeltaEntry
+	entry.MetricType = metricSpanLatency
+	if inB {
+		entry.SpanName = bSp.spanName
+		entry.ServiceName = bSp.serviceName
+		entry.BaselineMs = round2(bSp.maxMs)
+		entry.BaselineError = bSp.hasError
+		entry.ErrorTag = bSp.errorTag
+	}
+	if inC {
+		entry.SpanName = cSp.spanName
+		if cSp.serviceName != "" {
+			entry.ServiceName = cSp.serviceName
+		}
+		entry.CurrentMs = round2(cSp.maxMs)
+		entry.CurrentError = cSp.hasError
+		if cSp.errorTag != "" {
+			entry.ErrorTag = cSp.errorTag
+		}
+	}
+	entry.DeltaMs = round2(entry.CurrentMs - entry.BaselineMs)
+	if entry.BaselineMs > 0 {
+		entry.DeltaPct = round2(((entry.CurrentMs - entry.BaselineMs) / entry.BaselineMs) * 100.0)
+	} else if entry.CurrentMs > 0 && inB {
+		entry.DeltaPct = 100.0
+	}
+	entry.Regressed = (inB && inC && entry.DeltaMs >= minDeltaMs && entry.DeltaPct >= thresholdPct) || (!entry.BaselineError && entry.CurrentError)
+	return entry
+}
+
+func computeLatencyDeltas(baseline, current RunTelemetrySnapshot, minDeltaMs, thresholdPct float64) ([]LatencyDeltaEntry, bool) {
+	baseSpans := buildSpanAggMap(baseline.SpanLatencies)
+	currSpans := buildSpanAggMap(current.SpanLatencies)
+	latencyDeltas := make([]LatencyDeltaEntry, 0, len(baseSpans)+len(currSpans)+1)
+	anySpanRegressed := false
+
+	for _, k := range sortedUnionKeys(baseSpans, currSpans) {
+		bSp, inB := baseSpans[k]
+		cSp, inC := currSpans[k]
+		delta := buildSingleSpanDelta(bSp, inB, cSp, inC, minDeltaMs, thresholdPct)
+		if delta.Regressed {
+			anySpanRegressed = true
+		}
+		latencyDeltas = append(latencyDeltas, delta)
+	}
+
+	if baseline.DurationMs > 0 || current.DurationMs > 0 {
+		deltaMs := round2(current.DurationMs - baseline.DurationMs)
+		var deltaPct float64
+		if baseline.DurationMs > 0 {
+			deltaPct = round2(((current.DurationMs - baseline.DurationMs) / baseline.DurationMs) * 100.0)
+		}
+		regressed := baseline.DurationMs > 0 && current.DurationMs > 0 && deltaMs >= minDeltaMs && deltaPct >= thresholdPct
+		latencyDeltas = append(latencyDeltas, LatencyDeltaEntry{
+			SpanName:   spanTotalDuration,
+			MetricType: metricJobDuration,
+			BaselineMs: round2(baseline.DurationMs),
+			CurrentMs:  round2(current.DurationMs),
+			DeltaMs:    deltaMs,
+			DeltaPct:   deltaPct,
+			Regressed:  regressed,
+		})
+	}
+	return latencyDeltas, anySpanRegressed
+}
+
+func determineComparisonVerdict(resolvedCount, regressionCount, persistentCount, currFailures int) (string, bool) {
+	if regressionCount > 0 {
+		return VerdictRegressionIntroduced, false
+	}
+	if resolvedCount > 0 {
+		return VerdictRemediationVerified, true
+	}
+	if persistentCount > 0 || currFailures > 0 {
+		return VerdictPersistentFailure, false
+	}
+	return VerdictCleanRun, true
+}
+
+func resolveRunIdentifier(runID, jobID, fallback string) string {
+	if s := strings.TrimSpace(runID); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(jobID); s != "" {
+		return s
+	}
+	return fallback
+}
+
+func resolveComparisonMode(baseline, current RunTelemetrySnapshot) string {
+	if baseline.AttemptNumber > 0 && current.AttemptNumber > 0 && baseline.JobID != "" && baseline.JobID == current.JobID {
+		return "attempt_to_attempt"
+	}
+	if baseline.WindowLabel != "" || current.WindowLabel != "" {
+		return "pre_post_window"
+	}
+	return "job_to_job"
+}
+
 // CompareRuns compares a baseline and current RunTelemetrySnapshot and classifies diffs into
 // RESOLVED_ERRORS, NEW_REGRESSIONS, PERSISTENT_ERRORS, and LATENCY_DELTAS.
 func (s *RunComparisonService) CompareRuns(baseline, current RunTelemetrySnapshot) *RunComparisonDiff {
@@ -210,433 +640,24 @@ func (s *RunComparisonService) CompareRuns(baseline, current RunTelemetrySnapsho
 		minDeltaMs = DefaultLatencyRegressionMinDeltaMs
 	}
 
-	resolved := make([]ErrorDiffEntry, 0)
-	regressions := make([]ErrorDiffEntry, 0)
-	persistent := make([]ErrorDiffEntry, 0)
-	latencyDeltas := make([]LatencyDeltaEntry, 0)
+	baseMap := buildSnapshotClusterMap(baseline)
+	currMap := buildSnapshotClusterMap(current)
+	resolved, regressions, persistent := classifyClusterDiffs(baseMap, currMap)
+	testSummary := computeTestFailureSummary(baseline, current)
+	resolved, regressions, persistent = appendAggregateTestCountDiff(baseline, current, testSummary, resolved, regressions, persistent)
+	latencyDeltas, anySpanRegressed := computeLatencyDeltas(baseline, current, minDeltaMs, thresholdPct)
+	verdict, remediationVerified := determineComparisonVerdict(len(resolved), len(regressions), len(persistent), testSummary.CurrentFailures)
 
-	type aggCluster struct {
-		signature string
-		category  string
-		service   string
-		level     string
-		count     int
-		sample    string
-	}
-
-	buildClusterMap := func(snap RunTelemetrySnapshot) map[string]*aggCluster {
-		m := make(map[string]*aggCluster)
-		add := func(sig, category, service, level, sample string, count int) {
-			norm := NormalizeErrorSignature(sig)
-			if norm == "" {
-				return
-			}
-			if count <= 0 {
-				count = 1
-			}
-			if category == "" {
-				category = "error_cluster"
-			}
-			if level == "" {
-				level = "ERROR"
-			}
-			key := category + "|" + strings.ToLower(service) + "|" + norm
-			if existing, ok := m[key]; ok {
-				existing.count += count
-				if existing.sample == "" && sample != "" {
-					existing.sample = sample
-				}
-				return
-			}
-			m[key] = &aggCluster{
-				signature: norm,
-				category:  category,
-				service:   service,
-				level:     level,
-				count:     count,
-				sample:    sample,
-			}
-		}
-
-		for _, c := range snap.ErrorClusters {
-			cat := c.Category
-			if cat == "" {
-				if strings.EqualFold(c.Level, "WARN") || strings.EqualFold(c.Level, "WARNING") {
-					cat = "warning_signature"
-				} else {
-					cat = "error_cluster"
-				}
-			}
-			add(c.Signature, cat, c.Service, c.Level, c.SampleMessage, c.Count)
-		}
-		for _, w := range snap.WarningSignatures {
-			add(w, "warning_signature", "", "WARN", w, 1)
-		}
-		for _, sp := range snap.SpanLatencies {
-			if sp.HasError || strings.TrimSpace(sp.ErrorTag) != "" || strings.HasPrefix(strings.TrimSpace(sp.StatusCode), "5") {
-				errTag := strings.TrimSpace(sp.ErrorTag)
-				if errTag == "" {
-					if sp.StatusCode != "" {
-						errTag = "http.status_code=" + sp.StatusCode
-					} else {
-						errTag = "error=true"
-					}
-				}
-				sig := fmt.Sprintf("span:%s (%s)", sp.SpanName, errTag)
-				add(sig, "span_error_tag", sp.ServiceName, "ERROR", errTag, maxInt(1, sp.SpanCount))
-			}
-		}
-		for _, tf := range snap.FailedTests {
-			tfTrim := strings.TrimSpace(tf)
-			if tfTrim != "" {
-				add("test:"+tfTrim, "test_failure", "test-runner", "ERROR", "failed test: "+tfTrim, 1)
-			}
-		}
-		if len(snap.ErrorClusters) == 0 && len(snap.FailedTests) == 0 && strings.TrimSpace(snap.RawError) != "" {
-			add(snap.RawError, "job_error", "harness", "ERROR", snap.RawError, 1)
-		}
-		return m
-	}
-
-	baseMap := buildClusterMap(baseline)
-	currMap := buildClusterMap(current)
-
-	allKeys := make([]string, 0, len(baseMap)+len(currMap))
-	seenKeys := make(map[string]bool, len(baseMap)+len(currMap))
-	for k := range baseMap {
-		seenKeys[k] = true
-		allKeys = append(allKeys, k)
-	}
-	for k := range currMap {
-		if !seenKeys[k] {
-			seenKeys[k] = true
-			allKeys = append(allKeys, k)
-		}
-	}
-	sort.Strings(allKeys)
-
-	for _, k := range allKeys {
-		bItem, inBase := baseMap[k]
-		cItem, inCurr := currMap[k]
-		switch {
-		case inBase && !inCurr:
-			resolved = append(resolved, ErrorDiffEntry{
-				Signature:     bItem.signature,
-				Bucket:        BucketResolvedErrors,
-				Category:      bItem.category,
-				Service:       bItem.service,
-				Level:         bItem.level,
-				BaselineCount: bItem.count,
-				CurrentCount:  0,
-				DeltaCount:    -bItem.count,
-				SampleMessage: bItem.sample,
-			})
-		case !inBase && inCurr:
-			regressions = append(regressions, ErrorDiffEntry{
-				Signature:     cItem.signature,
-				Bucket:        BucketNewRegressions,
-				Category:      cItem.category,
-				Service:       cItem.service,
-				Level:         cItem.level,
-				BaselineCount: 0,
-				CurrentCount:  cItem.count,
-				DeltaCount:    cItem.count,
-				SampleMessage: cItem.sample,
-			})
-		case inBase && inCurr:
-			sample := cItem.sample
-			if sample == "" {
-				sample = bItem.sample
-			}
-			persistent = append(persistent, ErrorDiffEntry{
-				Signature:     cItem.signature,
-				Bucket:        BucketPersistentErrors,
-				Category:      cItem.category,
-				Service:       cItem.service,
-				Level:         cItem.level,
-				BaselineCount: bItem.count,
-				CurrentCount:  cItem.count,
-				DeltaCount:    cItem.count - bItem.count,
-				SampleMessage: sample,
-			})
-		}
-	}
-
-	// Compare test failure counts even when individual test names are not enumerated
-	baseFailures := baseline.TestFailureCount
-	if len(baseline.FailedTests) > baseFailures {
-		baseFailures = len(baseline.FailedTests)
-	}
-	currFailures := current.TestFailureCount
-	if len(current.FailedTests) > currFailures {
-		currFailures = len(current.FailedTests)
-	}
-
-	baseTestSet := make(map[string]bool, len(baseline.FailedTests))
-	for _, t := range baseline.FailedTests {
-		if trimmed := strings.TrimSpace(t); trimmed != "" {
-			baseTestSet[trimmed] = true
-		}
-	}
-	currTestSet := make(map[string]bool, len(current.FailedTests))
-	for _, t := range current.FailedTests {
-		if trimmed := strings.TrimSpace(t); trimmed != "" {
-			currTestSet[trimmed] = true
-		}
-	}
-
-	var resolvedTests, newFailedTests, persistentTests []string
-	for t := range baseTestSet {
-		if currTestSet[t] {
-			persistentTests = append(persistentTests, t)
-		} else {
-			resolvedTests = append(resolvedTests, t)
-		}
-	}
-	for t := range currTestSet {
-		if !baseTestSet[t] {
-			newFailedTests = append(newFailedTests, t)
-		}
-	}
-	sort.Strings(resolvedTests)
-	sort.Strings(newFailedTests)
-	sort.Strings(persistentTests)
-
-	// If aggregate test failure count changed without named tests, synthesize a test_failure_count diff entry
-	if len(baseline.FailedTests) == 0 && len(current.FailedTests) == 0 && (baseFailures > 0 || currFailures > 0) {
-		switch {
-		case baseFailures > 0 && currFailures == 0:
-			resolved = append(resolved, ErrorDiffEntry{
-				Signature:     "test_failure_count",
-				Bucket:        BucketResolvedErrors,
-				Category:      "test_failure",
-				Service:       "test-runner",
-				Level:         "ERROR",
-				BaselineCount: baseFailures,
-				CurrentCount:  0,
-				DeltaCount:    -baseFailures,
-				SampleMessage: fmt.Sprintf("all %d baseline test failure(s) resolved", baseFailures),
-			})
-		case baseFailures == 0 && currFailures > 0:
-			regressions = append(regressions, ErrorDiffEntry{
-				Signature:     "test_failure_count",
-				Bucket:        BucketNewRegressions,
-				Category:      "test_failure",
-				Service:       "test-runner",
-				Level:         "ERROR",
-				BaselineCount: 0,
-				CurrentCount:  currFailures,
-				DeltaCount:    currFailures,
-				SampleMessage: fmt.Sprintf("%d new test failure(s) introduced", currFailures),
-			})
-		case currFailures > baseFailures:
-			regressions = append(regressions, ErrorDiffEntry{
-				Signature:     "test_failure_count_increase",
-				Bucket:        BucketNewRegressions,
-				Category:      "test_failure",
-				Service:       "test-runner",
-				Level:         "ERROR",
-				BaselineCount: baseFailures,
-				CurrentCount:  currFailures,
-				DeltaCount:    currFailures - baseFailures,
-				SampleMessage: fmt.Sprintf("test failures increased from %d to %d", baseFailures, currFailures),
-			})
-		case baseFailures > 0 && currFailures > 0:
-			persistent = append(persistent, ErrorDiffEntry{
-				Signature:     "test_failure_count",
-				Bucket:        BucketPersistentErrors,
-				Category:      "test_failure",
-				Service:       "test-runner",
-				Level:         "ERROR",
-				BaselineCount: baseFailures,
-				CurrentCount:  currFailures,
-				DeltaCount:    currFailures - baseFailures,
-				SampleMessage: fmt.Sprintf("test failures: baseline=%d current=%d", baseFailures, currFailures),
-			})
-		}
-	}
-
-	// Span latency comparison
-	type spanAgg struct {
-		spanName    string
-		serviceName string
-		maxMs       float64
-		hasError    bool
-		errorTag    string
-	}
-	buildSpanMap := func(items []SpanLatencyItem) map[string]*spanAgg {
-		m := make(map[string]*spanAgg, len(items))
-		for _, sp := range items {
-			name := strings.TrimSpace(sp.SpanName)
-			if name == "" {
-				continue
-			}
-			svc := strings.TrimSpace(sp.ServiceName)
-			key := strings.ToLower(svc) + "|" + strings.ToLower(name)
-			dur := sp.DurationMs
-			if sp.P95DurationMs > dur {
-				dur = sp.P95DurationMs
-			}
-			if existing, ok := m[key]; ok {
-				if dur > existing.maxMs {
-					existing.maxMs = dur
-				}
-				if sp.HasError {
-					existing.hasError = true
-				}
-				if existing.errorTag == "" && sp.ErrorTag != "" {
-					existing.errorTag = sp.ErrorTag
-				}
-				continue
-			}
-			m[key] = &spanAgg{
-				spanName:    name,
-				serviceName: svc,
-				maxMs:       dur,
-				hasError:    sp.HasError,
-				errorTag:    sp.ErrorTag,
-			}
-		}
-		return m
-	}
-
-	baseSpans := buildSpanMap(baseline.SpanLatencies)
-	currSpans := buildSpanMap(current.SpanLatencies)
-	spanKeys := make([]string, 0, len(baseSpans)+len(currSpans))
-	seenSpanKeys := make(map[string]bool)
-	for k := range baseSpans {
-		seenSpanKeys[k] = true
-		spanKeys = append(spanKeys, k)
-	}
-	for k := range currSpans {
-		if !seenSpanKeys[k] {
-			seenSpanKeys[k] = true
-			spanKeys = append(spanKeys, k)
-		}
-	}
-	sort.Strings(spanKeys)
-
-	anySpanLatencyRegressed := false
-	for _, k := range spanKeys {
-		bSp, inB := baseSpans[k]
-		cSp, inC := currSpans[k]
-		var spanName, svcName, errTag string
-		var baseMs, currMs float64
-		var baseErr, currErr bool
-		if inB {
-			spanName = bSp.spanName
-			svcName = bSp.serviceName
-			baseMs = bSp.maxMs
-			baseErr = bSp.hasError
-			errTag = bSp.errorTag
-		}
-		if inC {
-			spanName = cSp.spanName
-			if cSp.serviceName != "" {
-				svcName = cSp.serviceName
-			}
-			currMs = cSp.maxMs
-			currErr = cSp.hasError
-			if cSp.errorTag != "" {
-				errTag = cSp.errorTag
-			}
-		}
-		deltaMs := round2(currMs - baseMs)
-		var deltaPct float64
-		if baseMs > 0 {
-			deltaPct = round2(((currMs - baseMs) / baseMs) * 100.0)
-		} else if currMs > 0 && inB {
-			deltaPct = 100.0
-		}
-		regressed := inB && inC && deltaMs >= minDeltaMs && deltaPct >= thresholdPct
-		if !baseErr && currErr {
-			regressed = true
-		}
-		if regressed {
-			anySpanLatencyRegressed = true
-		}
-		latencyDeltas = append(latencyDeltas, LatencyDeltaEntry{
-			SpanName:      spanName,
-			ServiceName:   svcName,
-			MetricType:    "span_latency",
-			BaselineMs:    round2(baseMs),
-			CurrentMs:     round2(currMs),
-			DeltaMs:       deltaMs,
-			DeltaPct:      deltaPct,
-			BaselineError: baseErr,
-			CurrentError:  currErr,
-			ErrorTag:      errTag,
-			Regressed:     regressed,
-		})
-	}
-
-	if baseline.DurationMs > 0 || current.DurationMs > 0 {
-		deltaMs := round2(current.DurationMs - baseline.DurationMs)
-		var deltaPct float64
-		if baseline.DurationMs > 0 {
-			deltaPct = round2(((current.DurationMs - baseline.DurationMs) / baseline.DurationMs) * 100.0)
-		}
-		regressed := baseline.DurationMs > 0 && current.DurationMs > 0 && deltaMs >= minDeltaMs && deltaPct >= thresholdPct
-		latencyDeltas = append(latencyDeltas, LatencyDeltaEntry{
-			SpanName:   "job.total_duration",
-			MetricType: "job_duration",
-			BaselineMs: round2(baseline.DurationMs),
-			CurrentMs:  round2(current.DurationMs),
-			DeltaMs:    deltaMs,
-			DeltaPct:   deltaPct,
-			Regressed:  regressed,
-		})
-	}
-
-	verdict := VerdictCleanRun
-	remediationVerified := false
-	switch {
-	case len(regressions) > 0:
-		verdict = VerdictRegressionIntroduced
-	case len(resolved) > 0 && len(persistent) == 0 && currFailures == 0:
-		verdict = VerdictRemediationVerified
-		remediationVerified = true
-	case len(resolved) > 0 && len(regressions) == 0:
-		verdict = VerdictRemediationVerified
-		remediationVerified = true
-	case len(persistent) > 0 || currFailures > 0:
-		verdict = VerdictPersistentFailure
-	default:
-		verdict = VerdictCleanRun
-		remediationVerified = true
-	}
-
-	storyID := strings.TrimSpace(current.StoryID)
-	if storyID == "" {
-		storyID = strings.TrimSpace(baseline.StoryID)
-	}
-	baseRunID := strings.TrimSpace(baseline.RunID)
-	if baseRunID == "" {
-		baseRunID = strings.TrimSpace(baseline.JobID)
-	}
-	if baseRunID == "" {
-		baseRunID = "baseline"
-	}
-	currRunID := strings.TrimSpace(current.RunID)
-	if currRunID == "" {
-		currRunID = strings.TrimSpace(current.JobID)
-	}
-	if currRunID == "" {
-		currRunID = "current"
-	}
-
-	mode := "job_to_job"
-	if baseline.AttemptNumber > 0 && current.AttemptNumber > 0 && baseline.JobID != "" && baseline.JobID == current.JobID {
-		mode = "attempt_to_attempt"
-	} else if baseline.WindowLabel != "" || current.WindowLabel != "" {
-		mode = "pre_post_window"
-	}
+	storyID := firstNonEmptyTrimmed(current.StoryID, baseline.StoryID)
+	baseRunID := resolveRunIdentifier(baseline.RunID, baseline.JobID, "baseline")
+	currRunID := resolveRunIdentifier(current.RunID, current.JobID, "current")
+	mode := resolveComparisonMode(baseline, current)
 
 	summary := fmt.Sprintf(
 		"RunComparison [%s -> %s] verdict=%s: RESOLVED_ERRORS=%d, NEW_REGRESSIONS=%d, PERSISTENT_ERRORS=%d, LATENCY_DELTAS=%d (regressed_spans=%t), test_failures=%d->%d",
 		baseRunID, currRunID, verdict,
 		len(resolved), len(regressions), len(persistent), len(latencyDeltas),
-		anySpanLatencyRegressed, baseFailures, currFailures,
+		anySpanRegressed, testSummary.BaselineFailures, testSummary.CurrentFailures,
 	)
 
 	diff := &RunComparisonDiff{
@@ -656,14 +677,7 @@ func (s *RunComparisonService) CompareRuns(baseline, current RunTelemetrySnapsho
 			PersistentErrors: persistent,
 			LatencyDeltas:    latencyDeltas,
 		},
-		TestFailureDelta: TestFailureDiffSummary{
-			BaselineFailures: baseFailures,
-			CurrentFailures:  currFailures,
-			Delta:            currFailures - baseFailures,
-			ResolvedTests:    resolvedTests,
-			NewFailedTests:   newFailedTests,
-			PersistentTests:  persistentTests,
-		},
+		TestFailureDelta: testSummary,
 		EfficiencyDelta: EfficiencyDeltaSummary{
 			BaselineTurns:      baseline.TurnCount,
 			CurrentTurns:       current.TurnCount,
@@ -680,6 +694,17 @@ func (s *RunComparisonService) CompareRuns(baseline, current RunTelemetrySnapsho
 	}
 	diff.Phase4ReviewContext = FormatPhase4ReviewContext(diff)
 	return diff
+}
+
+func writeErrorBucketMarkdown(sb *strings.Builder, bucketName, emptyText string, entries []ErrorDiffEntry, formatEntry func(ErrorDiffEntry) string) {
+	fmt.Fprintf(sb, "- **`%s`** (%d):\n", bucketName, len(entries))
+	if len(entries) == 0 {
+		sb.WriteString(emptyText)
+		return
+	}
+	for _, e := range entries {
+		sb.WriteString(formatEntry(e))
+	}
 }
 
 // FormatPhase4ReviewContext renders a deterministic Markdown summary for injection into ASE Phase 4 review agent context.
@@ -699,40 +724,19 @@ func FormatPhase4ReviewContext(diff *RunComparisonDiff) string {
 		diff.EfficiencyDelta.BaselineDurationMs, diff.EfficiencyDelta.CurrentDurationMs, diff.EfficiencyDelta.DeltaDurationMs)
 	sb.WriteString("\n#### Diff Buckets\n")
 
-	// 1. RESOLVED_ERRORS
-	fmt.Fprintf(&sb, "- **`%s`** (%d):\n", BucketResolvedErrors, len(diff.ResolvedErrors))
-	if len(diff.ResolvedErrors) == 0 {
-		sb.WriteString("  - None\n")
-	} else {
-		for _, e := range diff.ResolvedErrors {
-			fmt.Fprintf(&sb, "  - `[%s]` `%s` (baseline=%d -> current=0)\n", e.Category, e.Signature, e.BaselineCount)
-		}
-	}
+	writeErrorBucketMarkdown(&sb, BucketResolvedErrors, noneBulletLine, diff.ResolvedErrors, func(e ErrorDiffEntry) string {
+		return fmt.Sprintf("  - `[%s]` `%s` (baseline=%d -> current=0)\n", e.Category, e.Signature, e.BaselineCount)
+	})
+	writeErrorBucketMarkdown(&sb, BucketNewRegressions, "  - None (0 new error signatures introduced)\n", diff.NewRegressions, func(e ErrorDiffEntry) string {
+		return fmt.Sprintf("  - `[%s]` `%s` (baseline=0 -> current=%d)\n", e.Category, e.Signature, e.CurrentCount)
+	})
+	writeErrorBucketMarkdown(&sb, BucketPersistentErrors, noneBulletLine, diff.PersistentErrors, func(e ErrorDiffEntry) string {
+		return fmt.Sprintf("  - `[%s]` `%s` (baseline=%d -> current=%d, delta=%+d)\n", e.Category, e.Signature, e.BaselineCount, e.CurrentCount, e.DeltaCount)
+	})
 
-	// 2. NEW_REGRESSIONS
-	fmt.Fprintf(&sb, "- **`%s`** (%d):\n", BucketNewRegressions, len(diff.NewRegressions))
-	if len(diff.NewRegressions) == 0 {
-		sb.WriteString("  - None (0 new error signatures introduced)\n")
-	} else {
-		for _, e := range diff.NewRegressions {
-			fmt.Fprintf(&sb, "  - `[%s]` `%s` (baseline=0 -> current=%d)\n", e.Category, e.Signature, e.CurrentCount)
-		}
-	}
-
-	// 3. PERSISTENT_ERRORS
-	fmt.Fprintf(&sb, "- **`%s`** (%d):\n", BucketPersistentErrors, len(diff.PersistentErrors))
-	if len(diff.PersistentErrors) == 0 {
-		sb.WriteString("  - None\n")
-	} else {
-		for _, e := range diff.PersistentErrors {
-			fmt.Fprintf(&sb, "  - `[%s]` `%s` (baseline=%d -> current=%d, delta=%+d)\n", e.Category, e.Signature, e.BaselineCount, e.CurrentCount, e.DeltaCount)
-		}
-	}
-
-	// 4. LATENCY_DELTAS
 	fmt.Fprintf(&sb, "- **`%s`** (%d):\n", BucketLatencyDeltas, len(diff.LatencyDeltas))
 	if len(diff.LatencyDeltas) == 0 {
-		sb.WriteString("  - None\n")
+		sb.WriteString(noneBulletLine)
 	} else {
 		for _, l := range diff.LatencyDeltas {
 			regTag := "OK"
@@ -746,6 +750,113 @@ func FormatPhase4ReviewContext(diff *RunComparisonDiff) string {
 	return strings.TrimSpace(sb.String())
 }
 
+type jobResultTelemetryPayload struct {
+	TestFailureCount  int                `json:"test_failure_count"`
+	TestPassCount     int                `json:"test_pass_count"`
+	FailedTests       []string           `json:"failed_tests"`
+	TokenCount        int                `json:"token_count"`
+	TurnCount         int                `json:"turn_count"`
+	DurationMs        float64            `json:"duration_ms"`
+	CommitSHA         string             `json:"commit_sha"`
+	ErrorClusters     []ErrorClusterItem `json:"error_clusters"`
+	WarningSignatures []string           `json:"warning_signatures"`
+	SpanLatencies     []SpanLatencyItem  `json:"span_latencies"`
+}
+
+func computeJobDurationMs(job *Job) float64 {
+	if job.ElapsedSeconds > 0 {
+		return float64(job.ElapsedSeconds) * 1000.0
+	}
+	if job.ClaimedAt != nil && job.CompletedAt != nil {
+		return float64(job.CompletedAt.Sub(*job.ClaimedAt).Milliseconds())
+	}
+	if !job.CreatedAt.IsZero() && job.CompletedAt != nil {
+		return float64(job.CompletedAt.Sub(job.CreatedAt).Milliseconds())
+	}
+	return 0
+}
+
+func applyJobResultTelemetry(snap *RunTelemetrySnapshot, rawResult []byte) {
+	if len(rawResult) == 0 {
+		return
+	}
+	var res jobResultTelemetryPayload
+	if err := json.Unmarshal(rawResult, &res); err != nil {
+		return
+	}
+	snap.TestFailureCount = maxInt(snap.TestFailureCount, res.TestFailureCount)
+	snap.TestPassCount = maxInt(snap.TestPassCount, res.TestPassCount)
+	snap.FailedTests = append(snap.FailedTests, res.FailedTests...)
+	snap.TokenCount = maxInt(snap.TokenCount, res.TokenCount)
+	if res.TurnCount > 0 && snap.TurnCount == 0 {
+		snap.TurnCount = res.TurnCount
+	}
+	if res.DurationMs > 0 && snap.DurationMs == 0 {
+		snap.DurationMs = res.DurationMs
+	}
+	if res.CommitSHA != "" {
+		snap.CommitSHA = res.CommitSHA
+	}
+	snap.ErrorClusters = append(snap.ErrorClusters, res.ErrorClusters...)
+	snap.WarningSignatures = append(snap.WarningSignatures, res.WarningSignatures...)
+	snap.SpanLatencies = append(snap.SpanLatencies, res.SpanLatencies...)
+}
+
+func extractFailedTestsFromText(existing []string, text string) []string {
+	for _, m := range goTestFail.FindAllStringSubmatch(text, -1) {
+		if len(m) > 1 {
+			existing = appendUniqueString(existing, m[1])
+		}
+	}
+	return existing
+}
+
+func parseLogLinesIntoSnapshot(snap *RunTelemetrySnapshot, logLines []string) {
+	clusterCounts := make(map[string]*ErrorClusterItem)
+	for _, line := range logLines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		snap.FailedTests = extractFailedTestsFromText(snap.FailedTests, trimmed)
+		upper := strings.ToUpper(trimmed)
+		if strings.Contains(upper, levelError) || strings.Contains(upper, "FATAL") || strings.Contains(upper, "PANIC:") {
+			addLogErrorCluster(clusterCounts, trimmed)
+		} else if strings.Contains(upper, levelWarn) {
+			if sig := NormalizeErrorSignature(trimmed); sig != "" {
+				snap.WarningSignatures = appendUniqueString(snap.WarningSignatures, sig)
+			}
+		}
+	}
+	keys := make([]string, 0, len(clusterCounts))
+	for k := range clusterCounts {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		snap.ErrorClusters = append(snap.ErrorClusters, *clusterCounts[k])
+	}
+}
+
+func addLogErrorCluster(clusterCounts map[string]*ErrorClusterItem, trimmed string) {
+	sig := NormalizeErrorSignature(trimmed)
+	if sig == "" {
+		return
+	}
+	if existing, ok := clusterCounts[sig]; ok {
+		existing.Count++
+		return
+	}
+	clusterCounts[sig] = &ErrorClusterItem{
+		Signature:     sig,
+		Level:         levelError,
+		Service:       "job-log",
+		Category:      catErrorCluster,
+		Count:         1,
+		SampleMessage: trimmed,
+	}
+}
+
 // ExtractJobSnapshot builds a RunTelemetrySnapshot from a dispatch.Job and optional log lines.
 func ExtractJobSnapshot(job *Job, logLines []string) RunTelemetrySnapshot {
 	if job == nil {
@@ -755,22 +866,13 @@ func ExtractJobSnapshot(job *Job, logLines []string) RunTelemetrySnapshot {
 	if job.Attempts > 0 {
 		runID = fmt.Sprintf("%s#attempt-%d", job.ID, job.Attempts)
 	}
-	var durationMs float64
-	if job.ElapsedSeconds > 0 {
-		durationMs = float64(job.ElapsedSeconds) * 1000.0
-	} else if job.ClaimedAt != nil && job.CompletedAt != nil {
-		durationMs = float64(job.CompletedAt.Sub(*job.ClaimedAt).Milliseconds())
-	} else if !job.CreatedAt.IsZero() && job.CompletedAt != nil {
-		durationMs = float64(job.CompletedAt.Sub(job.CreatedAt).Milliseconds())
-	}
-
 	snap := RunTelemetrySnapshot{
 		RunID:         runID,
 		JobID:         job.ID,
 		StoryID:       job.StoryID,
 		AttemptNumber: job.Attempts,
 		Status:        job.Status,
-		DurationMs:    durationMs,
+		DurationMs:    computeJobDurationMs(job),
 		TurnCount:     job.FinalTurnCount,
 		RawError:      strings.TrimSpace(job.Error),
 	}
@@ -783,123 +885,35 @@ func ExtractJobSnapshot(job *Job, logLines []string) RunTelemetrySnapshot {
 		snap.CompletedAt = job.CompletedAt.UTC().Format(time.RFC3339)
 	}
 
-	// Parse structured telemetry from Job.Result if present
-	if len(job.Result) > 0 {
-		var resPayload struct {
-			TestFailureCount  int                `json:"test_failure_count"`
-			TestPassCount     int                `json:"test_pass_count"`
-			FailedTests       []string           `json:"failed_tests"`
-			TokenCount        int                `json:"token_count"`
-			TurnCount         int                `json:"turn_count"`
-			DurationMs        float64            `json:"duration_ms"`
-			CommitSHA         string             `json:"commit_sha"`
-			ErrorClusters     []ErrorClusterItem `json:"error_clusters"`
-			WarningSignatures []string           `json:"warning_signatures"`
-			SpanLatencies     []SpanLatencyItem  `json:"span_latencies"`
-		}
-		if err := json.Unmarshal(job.Result, &resPayload); err == nil {
-			if resPayload.TestFailureCount > 0 {
-				snap.TestFailureCount = resPayload.TestFailureCount
-			}
-			if resPayload.TestPassCount > 0 {
-				snap.TestPassCount = resPayload.TestPassCount
-			}
-			if len(resPayload.FailedTests) > 0 {
-				snap.FailedTests = append(snap.FailedTests, resPayload.FailedTests...)
-			}
-			if resPayload.TokenCount > 0 {
-				snap.TokenCount = resPayload.TokenCount
-			}
-			if resPayload.TurnCount > 0 && snap.TurnCount == 0 {
-				snap.TurnCount = resPayload.TurnCount
-			}
-			if resPayload.DurationMs > 0 && snap.DurationMs == 0 {
-				snap.DurationMs = resPayload.DurationMs
-			}
-			if resPayload.CommitSHA != "" {
-				snap.CommitSHA = resPayload.CommitSHA
-			}
-			if len(resPayload.ErrorClusters) > 0 {
-				snap.ErrorClusters = append(snap.ErrorClusters, resPayload.ErrorClusters...)
-			}
-			if len(resPayload.WarningSignatures) > 0 {
-				snap.WarningSignatures = append(snap.WarningSignatures, resPayload.WarningSignatures...)
-			}
-			if len(resPayload.SpanLatencies) > 0 {
-				snap.SpanLatencies = append(snap.SpanLatencies, resPayload.SpanLatencies...)
-			}
-		}
-	}
-
+	applyJobResultTelemetry(&snap, job.Result)
 	if snap.RawError != "" {
-		for _, m := range goTestFail.FindAllStringSubmatch(snap.RawError, -1) {
-			if len(m) > 1 {
-				snap.FailedTests = appendUniqueString(snap.FailedTests, m[1])
-			}
-		}
+		snap.FailedTests = extractFailedTestsFromText(snap.FailedTests, snap.RawError)
 		if len(snap.ErrorClusters) == 0 {
 			snap.ErrorClusters = append(snap.ErrorClusters, ErrorClusterItem{
 				Signature:     NormalizeErrorSignature(snap.RawError),
-				Level:         "ERROR",
-				Service:       "harness-job",
-				Category:      "error_cluster",
+				Level:         levelError,
+				Service:       svcHarnessJob,
+				Category:      catErrorCluster,
 				Count:         1,
 				SampleMessage: snap.RawError,
 			})
 		}
 	}
-
-	// Parse error/warning clusters and test failures from log lines if provided
-	clusterCounts := make(map[string]*ErrorClusterItem)
-	for _, line := range logLines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
-		}
-		for _, m := range goTestFail.FindAllStringSubmatch(trimmed, -1) {
-			if len(m) > 1 {
-				snap.FailedTests = appendUniqueString(snap.FailedTests, m[1])
-			}
-		}
-		upper := strings.ToUpper(trimmed)
-		switch {
-		case strings.Contains(upper, "ERROR") || strings.Contains(upper, "FATAL") || strings.Contains(upper, "PANIC:"):
-			sig := NormalizeErrorSignature(trimmed)
-			if sig != "" {
-				if existing, ok := clusterCounts[sig]; ok {
-					existing.Count++
-				} else {
-					clusterCounts[sig] = &ErrorClusterItem{
-						Signature:     sig,
-						Level:         "ERROR",
-						Service:       "job-log",
-						Category:      "error_cluster",
-						Count:         1,
-						SampleMessage: trimmed,
-					}
-				}
-			}
-		case strings.Contains(upper, "WARN"):
-			sig := NormalizeErrorSignature(trimmed)
-			if sig != "" {
-				snap.WarningSignatures = appendUniqueString(snap.WarningSignatures, sig)
-			}
-		}
-	}
-	if len(clusterCounts) > 0 {
-		keys := make([]string, 0, len(clusterCounts))
-		for k := range clusterCounts {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			snap.ErrorClusters = append(snap.ErrorClusters, *clusterCounts[k])
-		}
-	}
-	if len(snap.FailedTests) > snap.TestFailureCount {
-		snap.TestFailureCount = len(snap.FailedTests)
-	}
+	parseLogLinesIntoSnapshot(&snap, logLines)
+	snap.TestFailureCount = maxInt(snap.TestFailureCount, len(snap.FailedTests))
 	return snap
+}
+
+func parseRFC3339DurationMs(startedAt, endedAt string) float64 {
+	if startedAt == "" || endedAt == "" {
+		return 0
+	}
+	tStart, err1 := time.Parse(time.RFC3339, startedAt)
+	tEnd, err2 := time.Parse(time.RFC3339, endedAt)
+	if err1 != nil || err2 != nil || !tEnd.After(tStart) {
+		return 0
+	}
+	return float64(tEnd.Sub(tStart).Milliseconds())
 }
 
 // ExtractBaselineSnapshotFromAttemptHistory builds a baseline RunTelemetrySnapshot from the prior AttemptFailure on a retried job.
@@ -912,24 +926,9 @@ func ExtractBaselineSnapshotFromAttemptHistory(job *Job) (RunTelemetrySnapshot, 
 	if attemptNum <= 0 {
 		attemptNum = len(job.AttemptHistory)
 	}
-	runID := fmt.Sprintf("%s#attempt-%d", job.ID, attemptNum)
-	var durationMs float64
-	if prev.StartedAt != "" && prev.EndedAt != "" {
-		if tStart, err1 := time.Parse(time.RFC3339, prev.StartedAt); err1 == nil {
-			if tEnd, err2 := time.Parse(time.RFC3339, prev.EndedAt); err2 == nil && tEnd.After(tStart) {
-				durationMs = float64(tEnd.Sub(tStart).Milliseconds())
-			}
-		}
-	}
-	rawErr := strings.TrimSpace(prev.StderrTail)
-	if rawErr == "" {
-		rawErr = strings.TrimSpace(prev.Reason)
-	}
-	if rawErr == "" {
-		rawErr = strings.TrimSpace(prev.OutcomeSummary)
-	}
+	rawErr := firstNonEmptyTrimmed(prev.StderrTail, prev.Reason, prev.OutcomeSummary)
 	snap := RunTelemetrySnapshot{
-		RunID:         runID,
+		RunID:         fmt.Sprintf("%s#attempt-%d", job.ID, attemptNum),
 		JobID:         job.ID,
 		StoryID:       job.StoryID,
 		AttemptNumber: attemptNum,
@@ -937,24 +936,18 @@ func ExtractBaselineSnapshotFromAttemptHistory(job *Job) (RunTelemetrySnapshot, 
 		WindowLabel:   fmt.Sprintf("attempt-%d-baseline", attemptNum),
 		StartedAt:     prev.StartedAt,
 		CompletedAt:   prev.EndedAt,
-		DurationMs:    durationMs,
+		DurationMs:    parseRFC3339DurationMs(prev.StartedAt, prev.EndedAt),
 		RawError:      rawErr,
+		FailedTests:   extractFailedTestsFromText(nil, rawErr),
 	}
-	for _, m := range goTestFail.FindAllStringSubmatch(rawErr, -1) {
-		if len(m) > 1 {
-			snap.FailedTests = appendUniqueString(snap.FailedTests, m[1])
-		}
-	}
-	if len(snap.FailedTests) > 0 {
-		snap.TestFailureCount = len(snap.FailedTests)
-	}
+	snap.TestFailureCount = len(snap.FailedTests)
 	if rawErr != "" {
 		snap.ErrorClusters = []ErrorClusterItem{
 			{
 				Signature:     NormalizeErrorSignature(rawErr),
-				Level:         "ERROR",
-				Service:       "harness-job",
-				Category:      "error_cluster",
+				Level:         levelError,
+				Service:       svcHarnessJob,
+				Category:      catErrorCluster,
 				Count:         1,
 				SampleMessage: rawErr,
 			},
@@ -978,6 +971,15 @@ func CompareJobWithBaseline(target *Job, baselineJob *Job, targetLogs, baselineL
 		return svc.CompareRuns(baseSnap, currSnap)
 	}
 	return nil
+}
+
+func firstNonEmptyTrimmed(vals ...string) string {
+	for _, v := range vals {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func appendUniqueString(slice []string, val string) []string {

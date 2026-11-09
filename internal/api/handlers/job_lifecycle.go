@@ -816,35 +816,56 @@ func (h *JobLifecycleHandler) GetJob(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+func (h *JobLifecycleHandler) findBaselineJobByCandidates(jobID string, candIDs ...string) *dispatch.Job {
+	if h == nil || h.queue == nil {
+		return nil
+	}
+	for _, raw := range candIDs {
+		candID := strings.TrimSpace(raw)
+		if candID == "" || candID == jobID {
+			continue
+		}
+		if bj, ok := h.queue.Get(candID); ok && bj != nil {
+			return bj
+		}
+	}
+	return nil
+}
+
+func (h *JobLifecycleHandler) findBaselineJobByStory(ctx context.Context, job *dispatch.Job) *dispatch.Job {
+	if h == nil || h.queue == nil || job == nil || len(job.AttemptHistory) > 0 {
+		return nil
+	}
+	storyID := strings.TrimSpace(job.StoryID)
+	if storyID == "" {
+		return nil
+	}
+	list, err := h.queue.List(ctx, dispatch.JobFilter{Limit: 100})
+	if err != nil {
+		return nil
+	}
+	for _, cand := range list {
+		if isEarlierSameStoryJob(job, cand, storyID) {
+			return cand
+		}
+	}
+	return nil
+}
+
+func isEarlierSameStoryJob(job, cand *dispatch.Job, storyID string) bool {
+	if cand == nil || cand.ID == job.ID || !strings.EqualFold(strings.TrimSpace(cand.StoryID), storyID) {
+		return false
+	}
+	return job.CreatedAt.IsZero() || cand.CreatedAt.IsZero() || !cand.CreatedAt.After(job.CreatedAt)
+}
+
 func (h *JobLifecycleHandler) resolveJobRunComparison(ctx context.Context, job *dispatch.Job, explicitBaselineID string) *dispatch.RunComparisonDiff {
 	if job == nil {
 		return nil
 	}
-	var baselineJob *dispatch.Job
-	if h != nil && h.queue != nil {
-		for _, candID := range []string{explicitBaselineID, strings.TrimSpace(job.ParentID), strings.TrimSpace(job.DependsOnJobID)} {
-			if candID == "" || candID == job.ID {
-				continue
-			}
-			if bj, ok := h.queue.Get(candID); ok && bj != nil {
-				baselineJob = bj
-				break
-			}
-		}
-		if baselineJob == nil && len(job.AttemptHistory) == 0 && strings.TrimSpace(job.StoryID) != "" {
-			if list, err := h.queue.List(ctx, dispatch.JobFilter{Limit: 100}); err == nil {
-				for _, cand := range list {
-					if cand == nil || cand.ID == job.ID || !strings.EqualFold(strings.TrimSpace(cand.StoryID), strings.TrimSpace(job.StoryID)) {
-						continue
-					}
-					if !job.CreatedAt.IsZero() && !cand.CreatedAt.IsZero() && cand.CreatedAt.After(job.CreatedAt) {
-						continue
-					}
-					baselineJob = cand
-					break
-				}
-			}
-		}
+	baselineJob := h.findBaselineJobByCandidates(job.ID, explicitBaselineID, job.ParentID, job.DependsOnJobID)
+	if baselineJob == nil {
+		baselineJob = h.findBaselineJobByStory(ctx, job)
 	}
 	return dispatch.CompareJobWithBaseline(job, baselineJob, nil, nil)
 }
@@ -860,7 +881,7 @@ type CompareRunsRequest struct {
 // GetJobComparison serves GET /api/v1/jobs/{id}/comparison and GET /v1/jobs/{id}/comparison.
 func (h *JobLifecycleHandler) GetJobComparison(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		writeJSONError(w, http.StatusMethodNotAllowed, errMethodNotAllowed)
 		return
 	}
 	jobID := strings.TrimSpace(r.PathValue("id"))
@@ -886,15 +907,38 @@ func (h *JobLifecycleHandler) GetJobComparison(w http.ResponseWriter, r *http.Re
 		}
 		diff = svc.CompareRuns(baseSnap, currSnap)
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set(headerContentType, contentTypeJSONUTF8)
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(diff)
+}
+
+const (
+	errMethodNotAllowed = "method not allowed"
+	headerContentType   = "Content-Type"
+	contentTypeJSONUTF8 = "application/json; charset=utf-8"
+)
+
+func (h *JobLifecycleHandler) resolveSnapshotParam(w http.ResponseWriter, explicit *dispatch.RunTelemetrySnapshot, jobID, fieldPrefix string) (dispatch.RunTelemetrySnapshot, bool) {
+	if explicit != nil {
+		return *explicit, true
+	}
+	trimmedID := strings.TrimSpace(jobID)
+	if trimmedID == "" || h == nil || h.queue == nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("%s or %s_job_id is required", fieldPrefix, fieldPrefix))
+		return dispatch.RunTelemetrySnapshot{}, false
+	}
+	job, ok := h.queue.Get(trimmedID)
+	if !ok || job == nil {
+		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("%s job %q not found", fieldPrefix, jobID))
+		return dispatch.RunTelemetrySnapshot{}, false
+	}
+	return dispatch.ExtractJobSnapshot(job, nil), true
 }
 
 // CompareRuns serves POST /api/v1/jobs/compare and POST /v1/jobs/compare.
 func (h *JobLifecycleHandler) CompareRuns(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		writeJSONError(w, http.StatusMethodNotAllowed, errMethodNotAllowed)
 		return
 	}
 	var req CompareRunsRequest
@@ -912,38 +956,18 @@ func (h *JobLifecycleHandler) CompareRuns(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	var baseSnap, currSnap dispatch.RunTelemetrySnapshot
-	if req.Baseline != nil {
-		baseSnap = *req.Baseline
-	} else if strings.TrimSpace(req.BaselineJobID) != "" && h.queue != nil {
-		bj, ok := h.queue.Get(strings.TrimSpace(req.BaselineJobID))
-		if !ok || bj == nil {
-			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("baseline job %q not found", req.BaselineJobID))
-			return
-		}
-		baseSnap = dispatch.ExtractJobSnapshot(bj, nil)
-	} else {
-		writeJSONError(w, http.StatusBadRequest, "baseline or baseline_job_id is required")
+	baseSnap, ok := h.resolveSnapshotParam(w, req.Baseline, req.BaselineJobID, "baseline")
+	if !ok {
 		return
 	}
-
-	if req.Current != nil {
-		currSnap = *req.Current
-	} else if strings.TrimSpace(req.CurrentJobID) != "" && h.queue != nil {
-		cj, ok := h.queue.Get(strings.TrimSpace(req.CurrentJobID))
-		if !ok || cj == nil {
-			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("current job %q not found", req.CurrentJobID))
-			return
-		}
-		currSnap = dispatch.ExtractJobSnapshot(cj, nil)
-	} else {
-		writeJSONError(w, http.StatusBadRequest, "current or current_job_id is required")
+	currSnap, ok := h.resolveSnapshotParam(w, req.Current, req.CurrentJobID, "current")
+	if !ok {
 		return
 	}
 
 	svc := dispatch.NewRunComparisonService()
 	diff := svc.CompareRuns(baseSnap, currSnap)
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set(headerContentType, contentTypeJSONUTF8)
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(diff)
 }

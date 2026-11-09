@@ -85,7 +85,56 @@ func TestJobLifecycleHandler_RunComparisonEndpoints(t *testing.T) {
 		t.Fatalf("expected 2->0 test failures, got %+v", compDiff.TestFailureDelta)
 	}
 
-	// 3. Verify POST /api/v1/jobs/compare with synthetic snapshots
+	// 2b. Verify GET /api/v1/jobs/{id}/comparison with standalone job (pre-job baseline fallback) and error statuses
+	standaloneJob, _ := q.Enqueue(ctx, &dispatch.Job{
+		Type:        dispatch.JobTypeStoryExecute,
+		Repo:        "iazio-harness-api",
+		StoryID:     "STORY-999-STANDALONE",
+		TargetAgent: "agy",
+	})
+	reqStandalone := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/"+standaloneJob.ID+"/comparison", nil)
+	reqStandalone.SetPathValue("id", standaloneJob.ID)
+	recStandalone := httptest.NewRecorder()
+	h.GetJobComparison(recStandalone, reqStandalone)
+	if recStandalone.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for standalone job comparison, got %d", recStandalone.Code)
+	}
+
+	// Story-matched baseline resolution (same story without ParentID)
+	storyFollowupJob, _ := q.Enqueue(ctx, &dispatch.Job{
+		Type:        dispatch.JobTypeStoryExecute,
+		Repo:        "iazio-harness-api",
+		StoryID:     "STORY-105",
+		TargetAgent: "agy",
+	})
+	reqStoryComp := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/"+storyFollowupJob.ID+"/comparison", nil)
+	reqStoryComp.SetPathValue("id", storyFollowupJob.ID)
+	recStoryComp := httptest.NewRecorder()
+	h.GetJobComparison(recStoryComp, reqStoryComp)
+	if recStoryComp.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for story-matched comparison, got %d", recStoryComp.Code)
+	}
+
+	// Error cases for GetJobComparison
+	recWrongMethod := httptest.NewRecorder()
+	h.GetJobComparison(recWrongMethod, httptest.NewRequest(http.MethodPost, "/api/v1/jobs/x/comparison", nil))
+	if recWrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405, got %d", recWrongMethod.Code)
+	}
+	recEmptyID := httptest.NewRecorder()
+	h.GetJobComparison(recEmptyID, httptest.NewRequest(http.MethodGet, "/api/v1/jobs//comparison", nil))
+	if recEmptyID.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", recEmptyID.Code)
+	}
+	reqNotFound := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/nonexistent/comparison", nil)
+	reqNotFound.SetPathValue("id", "nonexistent")
+	recNotFound := httptest.NewRecorder()
+	h.GetJobComparison(recNotFound, reqNotFound)
+	if recNotFound.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", recNotFound.Code)
+	}
+
+	// 3. Verify POST /api/v1/jobs/compare with synthetic snapshots and job IDs
 	postBody, _ := json.Marshal(CompareRunsRequest{
 		Baseline: &dispatch.RunTelemetrySnapshot{
 			RunID:            "base-snap",
@@ -111,5 +160,48 @@ func TestJobLifecycleHandler_RunComparisonEndpoints(t *testing.T) {
 	}
 	if !postDiff.RemediationVerified || len(postDiff.ResolvedErrors) != 2 {
 		t.Fatalf("expected 2 resolved errors and RemediationVerified=true, got %+v", postDiff)
+	}
+
+	// CompareRuns by job IDs
+	byIDBody, _ := json.Marshal(CompareRunsRequest{
+		BaselineJobID: baseJob.ID,
+		CurrentJobID:  targetJob.ID,
+	})
+	recByID := httptest.NewRecorder()
+	h.CompareRuns(recByID, httptest.NewRequest(http.MethodPost, "/api/v1/jobs/compare", bytes.NewReader(byIDBody)))
+	if recByID.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for CompareRuns by job IDs, got %d", recByID.Code)
+	}
+
+	// CompareRuns error cases (405, invalid JSON, missing baseline, missing current, 404 job IDs)
+	recPost405 := httptest.NewRecorder()
+	h.CompareRuns(recPost405, httptest.NewRequest(http.MethodGet, "/api/v1/jobs/compare", nil))
+	if recPost405.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405, got %d", recPost405.Code)
+	}
+	recBadJSON := httptest.NewRecorder()
+	h.CompareRuns(recBadJSON, httptest.NewRequest(http.MethodPost, "/api/v1/jobs/compare", strings.NewReader("{bad")))
+	if recBadJSON.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on bad JSON, got %d", recBadJSON.Code)
+	}
+	recMissingBase := httptest.NewRecorder()
+	h.CompareRuns(recMissingBase, httptest.NewRequest(http.MethodPost, "/api/v1/jobs/compare", strings.NewReader("{}")))
+	if recMissingBase.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on missing baseline, got %d", recMissingBase.Code)
+	}
+	recMissingBaseID := httptest.NewRecorder()
+	h.CompareRuns(recMissingBaseID, httptest.NewRequest(http.MethodPost, "/api/v1/jobs/compare", strings.NewReader(`{"baseline_job_id":"missing"}`)))
+	if recMissingBaseID.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 on missing baseline job, got %d", recMissingBaseID.Code)
+	}
+	recMissingCurr := httptest.NewRecorder()
+	h.CompareRuns(recMissingCurr, httptest.NewRequest(http.MethodPost, "/api/v1/jobs/compare", strings.NewReader(`{"baseline_job_id":"`+baseJob.ID+`"}`)))
+	if recMissingCurr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on missing current, got %d", recMissingCurr.Code)
+	}
+	recMissingCurrID := httptest.NewRecorder()
+	h.CompareRuns(recMissingCurrID, httptest.NewRequest(http.MethodPost, "/api/v1/jobs/compare", strings.NewReader(`{"baseline_job_id":"`+baseJob.ID+`","current_job_id":"missing"}`)))
+	if recMissingCurrID.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 on missing current job, got %d", recMissingCurrID.Code)
 	}
 }
