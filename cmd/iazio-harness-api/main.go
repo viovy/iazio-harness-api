@@ -302,6 +302,7 @@ func run(ctx context.Context, args []string) error {
 		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			log.Printf("shutdown error: %v", err)
 		}
+		<-serverErr
 	}
 	return nil
 }

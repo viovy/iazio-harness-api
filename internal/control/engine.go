@@ -33,11 +33,31 @@ func isHexString(s string) bool {
 
 var (
 	storyIDPattern       = regexp.MustCompile(`(?i)\b(STORY-[A-Z0-9]+(?:-[A-Z0-9]+)*-[0-9]+)\b`)
-	prefixStoryPattern   = regexp.MustCompile(`(?i)\b([a-z0-9]{2,10})-([0-9]{3,5})\b`)
+	prefixStoryPattern   = regexp.MustCompile(`(?i)\b([a-z][a-z0-9]{1,9})-([0-9]{3,5})\b`)
 	frontmatterIDPattern = regexp.MustCompile(`(?im)^id:\s*["']?([A-Za-z0-9_-]+)["']?`)
 )
 
+func isIgnoredStoryPrefix(prefix string) bool {
+	switch strings.ToLower(strings.TrimSpace(prefix)) {
+	case "review", "pointers", "governance", "submodule", "sha", "pr", "job", "sch",
+		"v0", "v1", "v2", "v3", "utf", "iso", "rfc", "cve", "http", "port", "pid":
+		return true
+	default:
+		return false
+	}
+}
+
+func isMaintenanceBranchOrStoryPath(s string) bool {
+	lower := strings.ToLower(strings.TrimSpace(s))
+	return strings.Contains(lower, "governance-pointers-") ||
+		strings.Contains(lower, "submodule-pointers-") ||
+		strings.Contains(lower, "auto-sync-")
+}
+
 func extractStoryIDFromString(s string) string {
+	if isMaintenanceBranchOrStoryPath(s) {
+		return ""
+	}
 	if m := frontmatterIDPattern.FindStringSubmatch(s); len(m) > 1 {
 		val := strings.TrimSpace(m[1])
 		if !strings.HasPrefix(strings.ToUpper(val), "STORY-") {
@@ -48,7 +68,18 @@ func extractStoryIDFromString(s string) string {
 	if m := storyIDPattern.FindStringSubmatch(s); len(m) > 1 {
 		return strings.ToUpper(m[1])
 	}
-	if m := prefixStoryPattern.FindStringSubmatch(s); len(m) > 2 {
+	matches := prefixStoryPattern.FindAllStringSubmatch(s, -1)
+	for _, m := range matches {
+		if len(m) <= 2 {
+			continue
+		}
+		prefix := strings.ToLower(m[1])
+		if isIgnoredStoryPrefix(prefix) {
+			continue
+		}
+		if prefix == "story" {
+			return "STORY-" + m[2]
+		}
 		return "STORY-" + strings.ToUpper(m[1]) + "-" + m[2]
 	}
 	return ""
@@ -62,36 +93,135 @@ func isStoryID(s string) bool {
 	return extractStoryIDFromString(s) != ""
 }
 
+func parsePorcelainLineStatusAndPath(rawLine string) (statusCode, pathPart string) {
+	trimmed := strings.TrimRight(rawLine, "\r\n")
+	if len(strings.TrimSpace(trimmed)) == 0 {
+		return "", ""
+	}
+	// Git status --porcelain=v2 formats:
+	// 1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>
+	// 2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path><tab><origPath>
+	// ? <path>
+	// ! <path>
+	if strings.HasPrefix(trimmed, "1 ") || strings.HasPrefix(trimmed, "2 ") {
+		fields := strings.Fields(trimmed)
+		if strings.HasPrefix(trimmed, "1 ") && len(fields) >= 9 {
+			statusCode = fields[1]
+			pathPart = strings.Join(fields[8:], " ")
+			return statusCode, strings.TrimSpace(pathPart)
+		}
+		if strings.HasPrefix(trimmed, "2 ") && len(fields) >= 10 {
+			statusCode = fields[1]
+			joined := strings.Join(fields[9:], " ")
+			if tabIdx := strings.IndexByte(joined, '\t'); tabIdx != -1 {
+				joined = joined[:tabIdx]
+			}
+			return statusCode, strings.TrimSpace(joined)
+		}
+	}
+	if strings.HasPrefix(trimmed, "? ") || strings.HasPrefix(trimmed, "! ") {
+		return trimmed[:1], strings.TrimSpace(trimmed[2:])
+	}
+	if len(trimmed) < 3 {
+		return "", ""
+	}
+	statusCode = strings.TrimSpace(trimmed[:2])
+	pathPart = strings.TrimSpace(trimmed[2:])
+	if idx := strings.Index(pathPart, " -> "); idx != -1 {
+		pathPart = strings.TrimSpace(pathPart[idx+4:])
+	}
+	return statusCode, pathPart
+}
+
 func extractStoryIDFromPorcelain(porcelain string) (storyID, reviewFile string) {
 	if strings.TrimSpace(porcelain) == "" {
 		return "", ""
 	}
-	lines := strings.Split(porcelain, "\n")
-	for _, l := range lines {
-		if len(l) < 3 {
+	type parsedEntry struct {
+		statusCode string
+		pathPart   string
+	}
+	rawLines := strings.Split(porcelain, "\n")
+	entries := make([]parsedEntry, 0, len(rawLines))
+	modifiedTrackedCount := 0
+	hasMaintenanceStory := false
+
+	for _, l := range rawLines {
+		sc, p := parsePorcelainLineStatusAndPath(l)
+		if p == "" {
 			continue
 		}
-		pathPart := strings.TrimSpace(l[2:])
-		if idx := strings.Index(pathPart, " -> "); idx != -1 {
-			pathPart = strings.TrimSpace(pathPart[idx+4:])
+		normPath := strings.ReplaceAll(p, "\\", "/")
+		entries = append(entries, parsedEntry{statusCode: sc, pathPart: normPath})
+		if strings.Contains(sc, "M") && !strings.Contains(sc, "?") && !strings.Contains(sc, "A") {
+			modifiedTrackedCount++
 		}
-		if (strings.HasPrefix(pathPart, "docs/reviews/") || strings.Contains(pathPart, "/docs/reviews/")) && strings.HasSuffix(pathPart, ".md") {
-			reviewFile = pathPart
+		if (strings.HasPrefix(normPath, "docs/stories/") || strings.Contains(normPath, "/docs/stories/")) &&
+			isMaintenanceBranchOrStoryPath(normPath) {
+			hasMaintenanceStory = true
+		}
+	}
+
+	// Pass 1: prioritize non-maintenance docs/stories/*.story.md (or *.md) files.
+	for _, entry := range entries {
+		pathPart := entry.pathPart
+		if (strings.HasPrefix(pathPart, "docs/stories/") || strings.Contains(pathPart, "/docs/stories/")) &&
+			strings.HasSuffix(strings.ToLower(pathPart), ".md") &&
+			!isMaintenanceBranchOrStoryPath(pathPart) {
 			if sid := extractStoryIDFromString(pathPart); sid != "" {
 				storyID = sid
-				return storyID, reviewFile
-			}
-		}
-		if storyID == "" && (strings.HasPrefix(pathPart, "docs/stories/") || strings.Contains(pathPart, "/docs/stories/")) {
-			if sid := extractStoryIDFromString(pathPart); sid != "" {
-				storyID = sid
+				break
 			}
 		}
 	}
-	if storyID == "" {
-		storyID = extractStoryIDFromString(porcelain)
+
+	// Pass 2: inspect docs/reviews/*.md files.
+	// Guard against false-positive story extraction from historical tracked reviews when a worktree
+	// is polluted by broken alternates (many modified tracked files) or a stranded maintenance rebase.
+	for _, entry := range entries {
+		pathPart := entry.pathPart
+		if (strings.HasPrefix(pathPart, "docs/reviews/") || strings.Contains(pathPart, "/docs/reviews/")) &&
+			strings.HasSuffix(strings.ToLower(pathPart), ".md") {
+			if reviewFile == "" {
+				reviewFile = pathPart
+			}
+			isNewOrRenamedReview := strings.Contains(entry.statusCode, "?") ||
+				strings.Contains(entry.statusCode, "A") ||
+				strings.Contains(entry.statusCode, "R")
+			if storyID == "" && (isNewOrRenamedReview || (!hasMaintenanceStory && modifiedTrackedCount <= 5)) {
+				if sid := extractStoryIDFromString(pathPart); sid != "" {
+					storyID = sid
+					reviewFile = pathPart
+					break
+				}
+			}
+		}
 	}
+
 	return storyID, reviewFile
+}
+
+func (e *Engine) isStoryCompletedLocked(id string) bool {
+	cleanID := strings.TrimSpace(id)
+	if cleanID == "" {
+		return false
+	}
+	check := func(s *Story) bool {
+		if s == nil {
+			return false
+		}
+		st := strings.ToUpper(strings.TrimSpace(s.Status))
+		return st == "DONE" || st == "COMPLETED"
+	}
+	if s, ok := e.stories[cleanID]; ok && check(s) {
+		return true
+	}
+	for k, s := range e.stories {
+		if strings.EqualFold(k, cleanID) && check(s) {
+			return true
+		}
+	}
+	return false
 }
 
 const (
@@ -2459,7 +2589,7 @@ func (e *Engine) ApplyPreflight(host, path string, p Preflight) Halt {
 		repo.DetectedVerdict = p.DetectedVerdict
 	} else if repo.Porcelain != "" {
 		sid, rfile := extractStoryIDFromPorcelain(repo.Porcelain)
-		if isStoryID(sid) {
+		if isStoryID(sid) && !e.isStoryCompletedLocked(sid) {
 			repo.DirtyStoryID = sid
 		} else {
 			repo.DirtyStoryID = ""
@@ -2469,7 +2599,7 @@ func (e *Engine) ApplyPreflight(host, path string, p Preflight) Halt {
 		}
 	}
 	if (repo.DirtyStoryID == "" || !isStoryID(repo.DirtyStoryID)) && repo.CurrentBranch != "" {
-		if sid := extractStoryIDFromString(repo.CurrentBranch); isStoryID(sid) {
+		if sid := extractStoryIDFromString(repo.CurrentBranch); isStoryID(sid) && !e.isStoryCompletedLocked(sid) {
 			repo.DirtyStoryID = sid
 		}
 	}
@@ -3499,7 +3629,7 @@ func (e *Engine) ApplyFinish(host, path string, jobID string, in FinishInput) Fi
 		}
 		if d.Reason == ReasonDirty {
 			if repo.DirtyStoryID == "" || !isStoryID(repo.DirtyStoryID) {
-				if sid, rfile := extractStoryIDFromPorcelain(in.WorkPorcelain); isStoryID(sid) {
+				if sid, rfile := extractStoryIDFromPorcelain(in.WorkPorcelain); isStoryID(sid) && !e.isStoryCompletedLocked(sid) {
 					repo.DirtyStoryID = sid
 					if rfile != "" {
 						repo.DirtyReviewFile = rfile
@@ -3507,7 +3637,7 @@ func (e *Engine) ApplyFinish(host, path string, jobID string, in FinishInput) Fi
 				}
 			}
 			if (repo.DirtyStoryID == "" || !isStoryID(repo.DirtyStoryID)) && repo.CurrentBranch != "" {
-				if sid := extractStoryIDFromString(repo.CurrentBranch); isStoryID(sid) {
+				if sid := extractStoryIDFromString(repo.CurrentBranch); isStoryID(sid) && !e.isStoryCompletedLocked(sid) {
 					repo.DirtyStoryID = sid
 				}
 			}

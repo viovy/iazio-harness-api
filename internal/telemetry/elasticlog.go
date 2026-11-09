@@ -172,11 +172,10 @@ func (s *ElasticSink) Log(level LogLevel, msg string, err error, jobID string, e
 		return
 	}
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.closed {
-		s.mu.RUnlock()
 		return
 	}
-	s.mu.RUnlock()
 
 	errMsg := ""
 	if err != nil {
