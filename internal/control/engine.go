@@ -2004,6 +2004,10 @@ func IsAdhocASEActive(prov, live, ase string, isCoordinatedHarness bool) bool {
 	if isCoordinatedHarness {
 		return false
 	}
+	l := strings.ToUpper(strings.TrimSpace(live))
+	if l == "TERMINATED" || l == "DEAD" || l == "KILLED" {
+		return false
+	}
 	p := strings.ToUpper(strings.TrimSpace(prov))
 	a := strings.ToUpper(strings.TrimSpace(ase))
 	if p == "COORDINATED_HARNESS" || p == "COORDINATED_HARNESS_FAILED" || p == "HARNESS" {
@@ -3907,8 +3911,15 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 						e.notifyRepoLocked(r)
 					}
 				} else if !adhocActive && r.Lock == LockIdle && r.Queue == QueuePaused && r.Reason == ReasonAdhocASE && !st.IsClean {
-					// Ad-hoc ASE finished (ASEState == IDLE) while worktree still has uncommitted changes:
+					// Ad-hoc ASE finished (ASEState == IDLE or FAILED_DIRTY) while worktree still has uncommitted changes:
 					// transition pause reason from ReasonAdhocASE to ReasonDirty so UI never remains stuck on "Adhoc ASE Active".
+					r.Reason = ReasonDirty
+					e.notifyRepoLocked(r)
+				} else if !adhocActive && r.Lock == LockIdle && r.Queue == QueueOpen && !st.IsClean &&
+					strings.EqualFold(strings.TrimSpace(st.ASEState), "FAILED_DIRTY") && isStoryID(st.ActiveStoryID) {
+					// Stranded in-flight story branch with no live agent process: pause queue with ReasonDirty (HALTED_DIRTY)
+					// rather than leaving queue OPEN or fabricating ReasonAdhocASE.
+					r.Queue = QueuePaused
 					r.Reason = ReasonDirty
 					e.notifyRepoLocked(r)
 				} else if r.Queue == QueueHealing && !st.IsClean {
