@@ -6,8 +6,11 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -106,6 +109,55 @@ func TestRunServerGracefulShutdown(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for server shutdown")
+	}
+}
+
+func TestRunServerShipsLogsToCentralTelemetryGateway(t *testing.T) {
+	var gatewayRequests atomic.Int32
+	var lastPayload atomic.Value
+
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/telemetry/logs" {
+			gatewayRequests.Add(1)
+			b, _ := io.ReadAll(r.Body)
+			lastPayload.Store(string(b))
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"status":"accepted","index":"iazio-logs"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer gw.Close()
+
+	addr := getFreeAddr(t)
+	t.Setenv("IAZIO_HARNESS_API_ADDR", addr)
+	t.Setenv("IAZIO_AUTH_TOKEN", "test-gateway-token")
+	t.Setenv("CENTRAL_TELEMETRY_GATEWAY_URL", gw.URL)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- run(ctx, []string{"iazio-harness-api"})
+	}()
+
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("run returned error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for server shutdown")
+	}
+
+	if gatewayRequests.Load() == 0 {
+		t.Fatalf("expected logs shipped to central-telemetry-gateway on shutdown flush, got 0 requests")
+	}
+	payload, _ := lastPayload.Load().(string)
+	if !strings.Contains(payload, "iazio-harness-api") {
+		t.Fatalf("expected shipped log payload to contain service.name iazio-harness-api, got: %s", payload)
 	}
 }
 

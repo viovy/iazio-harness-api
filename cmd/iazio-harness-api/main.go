@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -42,6 +43,29 @@ func run(ctx context.Context, args []string) error {
 	if len(args) > 1 && args[1] == "version" {
 		fmt.Println("iazio-harness-api " + version.Informational())
 		return nil
+	}
+	if destURL, isGateway := telemetry.ResolveTelemetryDestination("", os.Getenv); destURL != "" {
+		host, _ := os.Hostname()
+		authTok := strings.TrimSpace(os.Getenv("IAZIO_AUTH_TOKEN"))
+		if authTok == "" {
+			authTok = strings.TrimSpace(os.Getenv("IAZIO_HARNESS_API_TOKEN"))
+		}
+		sink := telemetry.NewElasticSink(telemetry.ElasticConfig{
+			URL:         destURL,
+			IsGateway:   isGateway,
+			AuthToken:   authTok,
+			ServiceName: "iazio-harness-api",
+			Version:     version.Version,
+			HostName:    host,
+		})
+		telemetry.SetGlobalSink(sink)
+		defer func() {
+			telemetry.SetGlobalSink(nil)
+			_ = sink.Close()
+		}()
+		origLogger := slog.Default()
+		defer slog.SetDefault(origLogger)
+		slog.SetDefault(slog.New(telemetry.NewSlogHandler(sink, slog.NewJSONHandler(os.Stderr, nil))))
 	}
 	addr := ":8080"
 	if v := os.Getenv("IAZIO_HARNESS_API_ADDR"); v != "" {
