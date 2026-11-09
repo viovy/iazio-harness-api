@@ -3763,7 +3763,8 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 				st.ExecutionProvenance = "NONE"
 			}
 			st.LastCheckedAt = now // Always stamp server receive time to prevent client clock skew issues (G1)
-			if prev, exists := h.RepoStatuses[cleanPath]; exists && st.ASEState == "" && st.ExecutionProvenance == "" && st.ToolLiveness == "" && !st.IsClean {
+			if prev, exists := h.RepoStatuses[cleanPath]; exists && st.ASEState == "" && st.ExecutionProvenance == "" && st.ToolLiveness == "" &&
+				(!st.IsClean || IsAdhocASEActive(prev.ExecutionProvenance, prev.ToolLiveness, prev.ASEState, false)) {
 				if !prev.LastCheckedAt.IsZero() && now.Sub(prev.LastCheckedAt) <= 90*time.Second {
 					st.ASEState = prev.ASEState
 					st.ActiveStoryID = prev.ActiveStoryID
