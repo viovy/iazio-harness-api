@@ -758,7 +758,30 @@ func (h *JobLifecycleHandler) GetJob(w http.ResponseWriter, r *http.Request) {
 			jobID = altID
 		}
 	}
+	if found && job != nil {
+		isUnpopulated := strings.TrimSpace(job.Type) == "" && strings.TrimSpace(job.NormalizedPrompt) == "" && len(job.Payload) == 0 && strings.TrimSpace(job.StoryID) == ""
+		if dispatch.IsPhantomEmptyQueueJob(job) {
+			h.purgePhantomQueueJob(r.Context(), job.ID)
+			job = nil
+			found = false
+		} else if isUnpopulated && h.engine != nil {
+			if _, ok := h.engine.GetJob(jobID); ok {
+				h.purgePhantomQueueJob(r.Context(), job.ID)
+				job = nil
+				found = false
+			}
+		}
+	}
 	if !found || job == nil {
+		if h.engine != nil {
+			if ej, ok := h.engine.GetJob(jobID); ok {
+				resp := formatEngineJobDetailToResponse(ej)
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(resp)
+				return
+			}
+		}
 		if h.historyFinder != nil {
 			if row, host, path, hFound := h.historyFinder.FindHistoryRow(jobID); hFound {
 				resp := formatHistoryRowToJobDetail(row, host, path)
@@ -834,6 +857,17 @@ func (h *JobLifecycleHandler) ForceDispatchJob(w http.ResponseWriter, r *http.Re
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+func (h *JobLifecycleHandler) purgePhantomQueueJob(ctx context.Context, jobID string) {
+	if h == nil || h.queue == nil || strings.TrimSpace(jobID) == "" {
+		return
+	}
+	if purger, ok := h.queue.(interface {
+		PurgeJob(ctx context.Context, jobID string) bool
+	}); ok {
+		purger.PurgeJob(ctx, jobID)
+	}
+}
+
 func (h *JobLifecycleHandler) reconcileQueueWithEngine(ctx context.Context) {
 	if h.queue == nil || h.engine == nil {
 		return
@@ -845,6 +879,21 @@ func (h *JobLifecycleHandler) reconcileQueueWithEngine(ctx context.Context) {
 	for _, qj := range jobs {
 		if qj == nil {
 			continue
+		}
+		isUnpopulated := strings.TrimSpace(qj.Type) == "" && strings.TrimSpace(qj.NormalizedPrompt) == "" && len(qj.Payload) == 0 && strings.TrimSpace(qj.StoryID) == ""
+		if dispatch.IsPhantomEmptyQueueJob(qj) {
+			h.purgePhantomQueueJob(ctx, qj.ID)
+			continue
+		}
+		if isUnpopulated && strings.HasPrefix(strings.TrimSpace(qj.ID), "job-") {
+			if jd, ok := h.engine.GetJob(qj.ID); ok {
+				h.purgePhantomQueueJob(ctx, qj.ID)
+				jdStatus := strings.ToUpper(strings.TrimSpace(jd.Status))
+				if jdStatus != "RUNNING" && jdStatus != "LEASED" && jdStatus != "CANCEL_REQUESTED" {
+					h.engine.ReleaseDispatchJobRepo(qj.ID)
+				}
+				continue
+			}
 		}
 		st := strings.ToLower(strings.TrimSpace(qj.Status))
 		if st != dispatch.JobStatusPending && st != dispatch.JobStatusClaimed && st != dispatch.JobStatusLeased && st != dispatch.JobStatusRunning {
@@ -1369,6 +1418,77 @@ func (h *JobLifecycleHandler) BindStory(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(formatJobDetail(job))
+}
+
+func formatEngineJobDetailToResponse(ej control.JobDetail) JobDetailResponse {
+	activeCID := strings.TrimSpace(ej.ActiveConversationID)
+	if activeCID == "" {
+		activeCID = strings.TrimSpace(ej.ResumeConversationID)
+	}
+	if activeCID == "" {
+		activeCID = strings.TrimSpace(ej.InitialConversationID)
+	}
+	convIDs := ej.ConversationIDs
+	if activeCID == "" && len(convIDs) > 0 {
+		activeCID = strings.TrimSpace(convIDs[0])
+	}
+	if len(convIDs) == 0 && activeCID != "" {
+		convIDs = []string{activeCID}
+	}
+	host := strings.TrimSpace(ej.HostID)
+	if host == "" {
+		host = strings.TrimSpace(ej.TargetHost)
+	}
+	errMsg := strings.TrimSpace(ej.TerminationReasonMessage)
+	if errMsg == "" {
+		errMsg = strings.TrimSpace(ej.TerminationReasonCode)
+	}
+	if errMsg == "" {
+		errMsg = strings.TrimSpace(ej.Reason)
+	}
+	normPrompt := strings.TrimSpace(ej.NormalizedPrompt)
+	if normPrompt == "" {
+		normPrompt = strings.TrimSpace(ej.Prompt)
+	}
+	jobType := strings.TrimSpace(ej.Kind)
+	if jobType == "" {
+		jobType = "story_execution"
+	}
+	return JobDetailResponse{
+		ID:                      ej.ID,
+		ScheduleID:              ej.ScheduleID,
+		Type:                    jobType,
+		Repo:                    ej.WorktreePath,
+		WorktreePath:            ej.WorktreePath,
+		TargetHost:              host,
+		ClaimedHost:             host,
+		HostID:                  host,
+		TargetAgent:             ej.Engine,
+		StoryID:                 ej.StoryID,
+		StoryTitle:              ej.StoryTitle,
+		StoryPath:               ej.StoryPath,
+		StoryAllocationStatus:   ej.StoryAllocationStatus,
+		AllocationSource:        ej.AllocationSource,
+		PriorityRankSelected:    ej.PriorityRankSelected,
+		NormalizedPrompt:        normPrompt,
+		EffectiveAction:         ej.EffectiveAction,
+		SourceConversationTitle: ej.SourceConversationTitle,
+		ConversationID:          activeCID,
+		ActiveConversationID:    activeCID,
+		ConversationIDs:         convIDs,
+		ConversationURL:         dispatch.BuildConversationURL("", activeCID),
+		HarnessPID:              ej.HarnessPID,
+		ToolPID:                 ej.ToolPID,
+		ElapsedSeconds:          ej.ElapsedSeconds,
+		LiveURL:                 dispatch.BuildLiveURL("", ej.ID),
+		Status:                  ej.Status,
+		Error:                   errMsg,
+		FailureCategory:         ej.FailureCategory,
+		ParentID:                ej.ParentJobID,
+		TraceID:                 ej.TraceID,
+		CreatedAt:               ej.StartedAt,
+		PromotedMemories:        []string{},
+	}
 }
 
 func formatHistoryRowToJobDetail(row control.HistoryRow, host, path string) JobDetailResponse {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -1040,5 +1041,156 @@ func TestE2E_StoryGOV5196_PC1MultiWorktreeAllocation_ToolsUpdateExecution_And_Ac
 		t.Fatalf("expected clean main worktrees C:\\work\\meta-repo and C:\\work\\meta-repo-02 to be allocated ahead of feature-branch C:\\work\\meta-repo-03, got %v", allocatedWorktrees)
 	}
 }
+
+func TestE2E_StoryGov5206_ForensicRemediation_Sch1569_Job1408_Job1424(t *testing.T) {
+	now := time.Date(2026, 11, 9, 3, 29, 12, 0, time.UTC)
+	eng := control.NewEngine(func() time.Time { return now })
+
+	queue := dispatch.NewInMemoryQueue()
+	queue.SetNowFunc(func() time.Time { return now })
+	eng.BindDispatchQueue(queue)
+	srv := &httpserver.Server{
+		Engine: eng,
+		Queue:  queue,
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	client := ts.Client()
+
+	_ = eng.RegisterHost("pc1", "permanent")
+	_ = eng.UpsertRepo(control.Repo{
+		HostID:                       "pc1",
+		WorktreePath:                 `C:\work\meta-repo`,
+		CloneURL:                     "https://github.com/viovy/meta-repo.git",
+		Queue:                        control.QueueOpen,
+		Lock:                         control.LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+	_ = eng.UpsertRepo(control.Repo{
+		HostID:                       "pc1",
+		WorktreePath:                 `C:\work\meta-repo-03`,
+		CloneURL:                     "https://github.com/viovy/meta-repo.git",
+		Queue:                        control.QueueOpen,
+		Lock:                         control.LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+	_ = eng.Heartbeat("pc1", []control.Tool{{Name: "agy", Installed: true, Path: `C:\Users\romeo\.local\bin\agy.exe`, Status: "ok"}}, false)
+
+	// 1. Seed historical Engine jobs job-1408 and job-1424 and phantom dispatch.Job shadows with phantom_or_superseded_remediation_STORY_IAZIO_0192.
+	eng.SetHistory(`pc1:C:\work\meta-repo`, []control.HistoryRow{
+		{
+			JobID:                 "job-1408",
+			ScheduleID:            "sch-1407",
+			Status:                "LEASE_EXPIRED",
+			Engine:                "agy",
+			PromptTitle:           "tools on pc1",
+			ActiveConversationID:  "287e8a2b-1e95-4aa1-b2f9-9b151134c574",
+			ConversationIDs:       []string{"287e8a2b-1e95-4aa1-b2f9-9b151134c574"},
+			TerminationReasonCode: "LEASE_EXPIRED",
+			CreatedAt:             now.Add(-14 * 24 * time.Hour),
+		},
+	})
+	eng.SetHistory(`pc1:C:\work\meta-repo-03`, []control.HistoryRow{
+		{
+			JobID:                 "job-1424",
+			ScheduleID:            "sch-1423",
+			Status:                "FAILED",
+			Engine:                "agy",
+			StoryID:               "STORY-ROOT-79861",
+			PromptTitle:           "cleanup prompt folder in meta-repo",
+			ActiveConversationID:  "247f0f29-853c-48db-905c-88740c8c1fa5",
+			ConversationIDs:       []string{"247f0f29-853c-48db-905c-88740c8c1fa5"},
+			TerminationReasonCode: "NON_ZERO_EXIT",
+			CreatedAt:             now.Add(-14 * 24 * time.Hour),
+		},
+	})
+
+	for _, pid := range []string{"job-1408", "job-1424"} {
+		_, err := queue.Enqueue(context.Background(), &dispatch.Job{
+			ID:        pid,
+			Type:      "",
+			Status:    dispatch.JobStatusCanceled,
+			Error:     "phantom_or_superseded_remediation_STORY_IAZIO_0192",
+			CreatedAt: now.Add(-72 * time.Hour),
+		})
+		if err != nil {
+			t.Fatalf("Enqueue phantom %s failed: %v", pid, err)
+		}
+	}
+
+	// Verify both /v1/jobs/{id} and /api/v1/jobs/{id} return authoritative Engine job details and purge the phantom rows.
+	for _, tc := range []struct {
+		id     string
+		status string
+		prompt string
+		convID string
+	}{
+		{"job-1408", "LEASE_EXPIRED", "tools on pc1", "287e8a2b-1e95-4aa1-b2f9-9b151134c574"},
+		{"job-1424", "FAILED", "cleanup prompt folder in meta-repo", "247f0f29-853c-48db-905c-88740c8c1fa5"},
+	} {
+		for _, prefix := range []string{"/v1/jobs/", "/api/v1/jobs/"} {
+			resp, err := client.Get(ts.URL + prefix + tc.id)
+			if err != nil {
+				t.Fatalf("GET %s%s failed: %v", prefix, tc.id, err)
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("expected 200 OK for %s%s, got %d", prefix, tc.id, resp.StatusCode)
+			}
+			var body map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+				t.Fatalf("decode %s%s failed: %v", prefix, tc.id, err)
+			}
+			_ = resp.Body.Close()
+			if gotErr, _ := body["error"].(string); strings.Contains(gotErr, "phantom_or_superseded_remediation") {
+				t.Fatalf("%s%s returned shadowed phantom error %q instead of authoritative engine job", prefix, tc.id, gotErr)
+			}
+			if gotStatus, _ := body["status"].(string); !strings.EqualFold(gotStatus, tc.status) {
+				t.Fatalf("expected %s%s status=%s, got %v", prefix, tc.id, tc.status, body["status"])
+			}
+			if gotConv, _ := body["active_conversation_id"].(string); gotConv != tc.convID {
+				t.Fatalf("expected %s%s active_conversation_id=%s, got %v", prefix, tc.id, tc.convID, body["active_conversation_id"])
+			}
+		}
+		if _, exists := queue.Get(tc.id); exists {
+			t.Fatalf("expected phantom queue row %s to be purged from queue", tc.id)
+		}
+	}
+
+	// 2. Lease a schedule job (simulating sch-1569 -> job-1570) on pc1 C:\work\meta-repo and send host heartbeats across >10 minutes.
+	sched, err := eng.EnqueueGlobalStorySchedule("STORY-ROOT-45276", "meta-repo", "agy", "deep review and fix in canonical AI")
+	if err != nil {
+		t.Fatalf("EnqueueGlobalStorySchedule failed: %v", err)
+	}
+	leasedJob, _, _, ok := eng.PollHostWithWorktrees("pc1", []string{`C:\work\meta-repo`})
+	if !ok || leasedJob.ID == "" {
+		t.Fatalf("PollHostWithWorktrees failed: ok=%v", ok)
+	}
+
+	// Seed a >10m old phantom queue entry for leasedJob.ID to verify heartbeat purges it WITHOUT canceling or releasing the Engine repo lock.
+	_, _ = queue.Enqueue(context.Background(), &dispatch.Job{
+		ID:        leasedJob.ID,
+		Type:      "",
+		Status:    dispatch.JobStatusRunning,
+		CreatedAt: now.Add(-11 * time.Minute),
+	})
+
+	hbPayload := fmt.Sprintf(`{"presence":"ONLINE","active_jobs":[{"job_id":%q,"worktree_path":"C:\\work\\meta-repo","pid":21860}]}`, leasedJob.ID)
+	hbResp, err := client.Post(ts.URL+"/v1/hosts/pc1/heartbeat", "application/json", strings.NewReader(hbPayload))
+	if err != nil {
+		t.Fatalf("POST /v1/hosts/pc1/heartbeat failed: %v", err)
+	}
+	_ = hbResp.Body.Close()
+
+	// Verify phantom entry was purged and NOT re-fabricated by ExtendLeasesForHost.
+	if qj, exists := queue.Get(leasedJob.ID); exists && qj != nil {
+		t.Fatalf("expected heartbeat not to fabricate/retain phantom queue entry for %s, got %+v", leasedJob.ID, qj)
+	}
+	// Verify Engine repo lock is STILL held by leasedJob.ID!
+	repoAfter, rok := eng.GetRepo("pc1", `C:\work\meta-repo`)
+	if !rok || repoAfter.Lock != control.LockRunning || repoAfter.RunningJobID != leasedJob.ID {
+		t.Fatalf("expected C:\\work\\meta-repo lock to remain RUNNING for %s across >10m heartbeat, got lock=%s runningJobID=%s (schedule=%s)", leasedJob.ID, repoAfter.Lock, repoAfter.RunningJobID, sched.ID)
+	}
+}
+
 
 

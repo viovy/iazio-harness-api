@@ -246,6 +246,47 @@ func IsHostLevelNonWorktreeJob(jobType, repo string) bool {
 	return cleanRepo == "fleet" || cleanRepo == "tools"
 }
 
+// IsControlPlaneScheduleJobID returns true when id matches the control-plane engine
+// schedule job identifier format ("job-<digits>", e.g. "job-1408", "job-1424", "job-1570"),
+// as distinct from dispatch queue job IDs ("job_<16hex>").
+func IsControlPlaneScheduleJobID(id string) bool {
+	clean := strings.TrimSpace(id)
+	if !strings.HasPrefix(clean, "job-") || len(clean) <= 4 {
+		return false
+	}
+	for i := 4; i < len(clean); i++ {
+		if clean[i] < '0' || clean[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// IsPhantomEmptyQueueJob returns true when a queue entry is an unpopulated phantom
+// artifact (empty Type, empty NormalizedPrompt, empty Payload, and no StoryID) that
+// was canceled/reconciled as phantom or synthetic (`phantom_empty_job`,
+// `phantom_or_superseded_remediation_*`, `terminal_engine_job`, `synthetic_test_job`).
+func IsPhantomEmptyQueueJob(j *Job) bool {
+	if j == nil {
+		return false
+	}
+	if strings.TrimSpace(j.Type) != "" || strings.TrimSpace(j.NormalizedPrompt) != "" || len(j.Payload) > 0 || strings.TrimSpace(j.StoryID) != "" {
+		return false
+	}
+	id := strings.TrimSpace(j.ID)
+	if id == "job-cp-fallback" || strings.HasPrefix(id, "job-reap-") || strings.HasPrefix(id, "job-missing-") {
+		return true
+	}
+	errLower := strings.ToLower(strings.TrimSpace(j.Error))
+	if errLower == "phantom_empty_job" ||
+		strings.Contains(errLower, "phantom_or_superseded_remediation") ||
+		errLower == "terminal_engine_job" ||
+		errLower == "synthetic_test_job" {
+		return true
+	}
+	return false
+}
+
 // NormalizeToSuperprojectSlotFamily normalizes submodule names (e.g. iazio-mcp, iazio-agent)
 // and meta-repo worktree paths (e.g. /home/romeo/work/meta-repo-02) to their superproject worktree slot family ("meta-repo").
 func NormalizeToSuperprojectSlotFamily(repo string) string {
@@ -1066,6 +1107,16 @@ func (q *InMemoryQueue) SetStore(s QueueStore) error {
 		defer q.mu.Unlock()
 		now := q.now()
 		for _, j := range persisted {
+			if j == nil || IsPhantomEmptyQueueJob(j) {
+				if j != nil {
+					if deleter, ok := s.(interface {
+						DeleteQueueJob(ctx context.Context, jobID string) error
+					}); ok {
+						_ = deleter.DeleteQueueJob(context.Background(), j.ID)
+					}
+				}
+				continue
+			}
 			normalizeJobDependencies(j)
 			PopulateJobConversationFields(j)
 			if j.FencingToken > q.fencingSeq {
@@ -2519,6 +2570,31 @@ func (q *InMemoryQueue) Get(jobID string) (*Job, bool) {
 	return nil, false
 }
 
+// PurgeJob deletes a job (such as a phantom empty row) from the in-memory queue
+// and, if the backing store supports deletion, from durable storage.
+func (q *InMemoryQueue) PurgeJob(ctx context.Context, jobID string) bool {
+	cleanID := strings.TrimSpace(jobID)
+	if cleanID == "" {
+		return false
+	}
+	q.mu.Lock()
+	_, existed := q.jobs[cleanID]
+	delete(q.jobs, cleanID)
+	q.activeJobs.Delete(cleanID)
+	store := q.store
+	q.mu.Unlock()
+	if store != nil {
+		if deleter, ok := store.(interface {
+			DeleteQueueJob(ctx context.Context, jobID string) error
+		}); ok {
+			sctx, cancel := storeContext(ctx)
+			_ = deleter.DeleteQueueJob(sctx, cleanID)
+			cancel()
+		}
+	}
+	return existed
+}
+
 func matchesJobStatusFilter(jobStatus, filterStatus string) bool {
 	f := strings.ToLower(strings.TrimSpace(filterStatus))
 	if f == "" || f == "all" {
@@ -2549,6 +2625,9 @@ func (q *InMemoryQueue) Count(ctx context.Context, filter JobFilter) (int, error
 
 	count := 0
 	for _, j := range q.jobs {
+		if IsPhantomEmptyQueueJob(j) {
+			continue
+		}
 		if filter.Repo != "" && j.Repo != filter.Repo {
 			continue
 		}
@@ -2580,6 +2659,9 @@ func (q *InMemoryQueue) List(ctx context.Context, filter JobFilter) ([]*Job, err
 
 	var matched []*Job
 	for _, j := range q.jobs {
+		if IsPhantomEmptyQueueJob(j) {
+			continue
+		}
 		if filter.Repo != "" && j.Repo != filter.Repo {
 			continue
 		}

@@ -3864,8 +3864,9 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 						r.DiscardPending = false
 						changed = true
 					}
-					if isDefaultBranchForRepo(r) && len(st.DirtySubmodules) == 0 &&
+					if len(st.DirtySubmodules) == 0 && st.DirtyFilesCount == 0 &&
 						(strings.EqualFold(strings.TrimSpace(r.ASEState), "ORPHANED") ||
+							strings.EqualFold(strings.TrimSpace(r.ASEState), "FAILED_DIRTY") ||
 							strings.EqualFold(strings.TrimSpace(r.ExecutionProvenance), "COORDINATED_HARNESS_FAILED") ||
 							strings.EqualFold(strings.TrimSpace(r.ToolLiveness), "KILLED")) {
 						r.ASEState = "IDLE"

@@ -1446,6 +1446,15 @@ WHERE id = $1 AND status != 'completed';
 	return nil
 }
 
+// DeleteQueueJob deletes a phantom or invalidated queue job row by ID.
+func (s *Store) DeleteQueueJob(ctx context.Context, jobID string) error {
+	if s == nil || s.db == nil || strings.TrimSpace(jobID) == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM harness_dispatch_jobs WHERE id = $1`, strings.TrimSpace(jobID))
+	return err
+}
+
 // LoadQueueJobs loads active, pending, and recent jobs from harness_dispatch_jobs.
 func (s *Store) LoadQueueJobs(ctx context.Context) ([]*dispatch.Job, error) {
 	if s == nil || s.db == nil {
