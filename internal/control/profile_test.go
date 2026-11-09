@@ -464,4 +464,36 @@ func TestSanitizeProfileTools_AndAdhocASEQueuePause(t *testing.T) {
 	if IsAdhocASEActive("INDEPENDENT_USER_SESSION", "LIVE", "IDLE", false) {
 		t.Fatalf("expected IsAdhocASEActive=false when ASEState=IDLE even if ToolLiveness=LIVE")
 	}
+
+	// 5. Terminated tool or FAILED_DIRTY stranded story must NOT trigger Adhoc ASE Active, and must pause queue with HALTED_DIRTY
+	if IsAdhocASEActive("INDEPENDENT_USER_SESSION", "TERMINATED", "RUNNING", false) {
+		t.Fatalf("expected IsAdhocASEActive=false when ToolLiveness=TERMINATED")
+	}
+	if IsAdhocASEActive("NONE", "TERMINATED", "FAILED_DIRTY", false) {
+		t.Fatalf("expected IsAdhocASEActive=false when ASEState=FAILED_DIRTY")
+	}
+	e.UpdateRepoRuntimeStatus("mac-mini", []RepoRuntimeStatus{
+		{
+			RepoPath:            "/Users/romeo/work/meta-repo",
+			IsClean:             false,
+			SubmodulesClean:     false,
+			Branch:              "main",
+			ASEState:            "FAILED_DIRTY",
+			ActiveStoryID:       "STORY-VIGO-0289",
+			ToolLiveness:        "TERMINATED",
+			ExecutionProvenance: "NONE",
+			DirtySubmodules:     []string{"vigo", "vigo-api"},
+		},
+	})
+	_, adhocExecs4, _ := e.GetHostExecutionCounts("mac-mini")
+	if adhocExecs4 != 0 {
+		t.Fatalf("expected adhocExecs=0 for stranded FAILED_DIRTY story, got %d", adhocExecs4)
+	}
+	strandedRepo, _ := e.GetRepo("mac-mini", "/Users/romeo/work/meta-repo")
+	if strandedRepo.Queue != QueuePaused || strandedRepo.Reason != ReasonDirty {
+		t.Fatalf("expected stranded FAILED_DIRTY story to pause queue with ReasonDirty (%q), got queue=%q reason=%q", ReasonDirty, strandedRepo.Queue, strandedRepo.Reason)
+	}
+	if strandedRepo.DirtyStoryID != "STORY-VIGO-0289" {
+		t.Fatalf("expected DirtyStoryID=STORY-VIGO-0289, got %q", strandedRepo.DirtyStoryID)
+	}
 }

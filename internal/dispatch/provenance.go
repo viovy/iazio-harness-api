@@ -7,11 +7,16 @@ import (
 	"strings"
 )
 
-var provenanceStoryIDRegex = regexp.MustCompile(`(?i)\b(STORY-[A-Z]+(?:-[A-Z]+)*-[0-9]+)\b`)
+var (
+	provenanceStoryIDRegex    = regexp.MustCompile(`(?i)\b(STORY-[A-Z]+-[0-9]{3,6})\b`)
+	provenanceReviewPathRegex = regexp.MustCompile(`(?i)(?:^|[\s"'` + "`" + `(])(?:\S*/)?docs/reviews/\S+`)
+)
 
-// ExtractStoryIDFromPrompt extracts a canonical STORY-<DOMAIN>-<NNNN> identifier from text if present.
+// ExtractStoryIDFromPrompt extracts a canonical STORY-<DOMAIN>-<NNNN> identifier from text if present,
+// ignoring STORY-* substrings that only appear inside docs/reviews/... artifact paths.
 func ExtractStoryIDFromPrompt(text string) string {
-	if m := provenanceStoryIDRegex.FindStringSubmatch(text); len(m) > 1 {
+	sanitized := provenanceReviewPathRegex.ReplaceAllString(text, " ")
+	if m := provenanceStoryIDRegex.FindStringSubmatch(sanitized); len(m) > 1 {
 		return strings.ToUpper(strings.TrimSpace(m[1]))
 	}
 	return ""

@@ -173,3 +173,15 @@ func TestQueueProvenance_RootAndChildReviewSession(t *testing.T) {
 		t.Errorf("child inherited WorktreePath = %q, want /home/romeo/work/workspace", childProv.WorktreePath)
 	}
 }
+
+func TestStoryGov5223_ExtractStoryIDFromPromptIgnoresReviewArtifactPaths(t *testing.T) {
+	prompt := `/autonomous-story-execution Please read docs/reviews/2026-11-08-STORY-VIGO-SECURITY-TRANSPORT-HYGIENE-iter-1-opencode.md and fix all issues.`
+	if got := ExtractStoryIDFromPrompt(prompt); got != "" {
+		t.Fatalf("expected empty story ID when prompt only contains non-canonical review artifact filename, got %q", got)
+	}
+	promptWithCanonical := `/autonomous-story-execution STORY-VIGO-0289 Please read docs/reviews/2026-11-08-STORY-VIGO-SECURITY-TRANSPORT-HYGIENE-iter-1-opencode.md`
+	if got := ExtractStoryIDFromPrompt(promptWithCanonical); got != "STORY-VIGO-0289" {
+		t.Fatalf("expected STORY-VIGO-0289, got %q", got)
+	}
+}
+
