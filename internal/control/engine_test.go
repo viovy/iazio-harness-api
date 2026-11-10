@@ -2080,6 +2080,9 @@ func TestExtractStoryIDFromBranchAndPorcelain(t *testing.T) {
 		{"bug/vigo-0042", "STORY-VIGO-0042"},
 		{"chore/app-0098-feature", "STORY-APP-0098"},
 		{"clean-branch-name-no-id", ""},
+		{"chore/governance-pointers-20261109-171414", ""},
+		{"docs/stories/2026-11-09-governance-pointers-20261109-171414.story.md", ""},
+		{"docs/reviews/2026-10-15-review-v0-V2-52a3f2-gov-3404-vigo-k8s-fleet-enterprise-architecture-alignment.md", "STORY-GOV-3404"},
 	}
 	for _, tc := range tests {
 		got := extractStoryIDFromString(tc.input)
@@ -2095,6 +2098,65 @@ func TestExtractStoryIDFromBranchAndPorcelain(t *testing.T) {
 	}
 	if rfile != "docs/reviews/2026-10-09-review-v0-26991d-STORY-APP-0098.md" {
 		t.Errorf("expected review file docs/reviews/..., got %q", rfile)
+	}
+
+	// Regression test for STORY-IAZIO-0201 (D3): stranded governance-pointers rebase or broken alternates
+	// with modified historical review file must NOT fabricate STORY-GOV-3404 as in-flight story.
+	strandedMaintenancePorcelain := strings.Join([]string{
+		" M .gitmodules",
+		" M AGENTS.md",
+		" M Makefile",
+		" M docs/reviews/2026-10-15-review-v0-V2-52a3f2-gov-3404-vigo-k8s-fleet-enterprise-architecture-alignment.md",
+		" M docs/stories/2026-11-09-governance-pointers-20261109-171414.story.md",
+		" M docs/stories/index.yml",
+	}, "\n")
+	if gotSID, _ := extractStoryIDFromPorcelain(strandedMaintenancePorcelain); gotSID != "" {
+		t.Errorf("expected empty storyID for stranded maintenance porcelain, got %q", gotSID)
+	}
+
+	// Priority test: docs/stories/*.story.md takes precedence over docs/reviews/*.md, and porcelain v2 is supported.
+	v2PorcelainWithStoryAndReview := strings.Join([]string{
+		"1 .M N... 100644 100644 100644 aaaaaa bbbbbb docs/reviews/2026-10-15-review-v0-V2-52a3f2-gov-3404-vigo.md",
+		"? docs/stories/2026-11-09-iazio-0201-windows-wsl-alternates-rebase-and-adhoc-ase-detection.story.md",
+	}, "\n")
+	gotV2SID, _ := extractStoryIDFromPorcelain(v2PorcelainWithStoryAndReview)
+	if gotV2SID != "STORY-IAZIO-0201" {
+		t.Errorf("expected STORY-IAZIO-0201 from porcelain v2 with story+review, got %q", gotV2SID)
+	}
+
+	// Completed story guard in ApplyPreflight: if a story is already DONE, porcelain fallback must not set DirtyStoryID.
+	e := NewEngine(nil)
+	e.RegisterHost("pc1", "permanent")
+	if err := e.UpsertRepo(Repo{
+		HostID:       "pc1",
+		WorktreePath: `C:\work\meta-repo-04`,
+		CloneURL:     "https://github.com/viovy/meta-repo.git",
+		Queue:        QueueOpen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = e.SaveStory(Story{
+		ID:     "STORY-GOV-3404",
+		Title:  "Completed story",
+		Status: "DONE",
+	})
+	_ = e.ApplyPreflight("pc1", `C:\work\meta-repo-04`, Preflight{
+		Kind:          "ordinary",
+		FreeBytes:     20 << 30,
+		GitWorkTree:   true,
+		HeadAttached:  false,
+		Branch:        "chore/governance-pointers-20261109-171414",
+		DefaultBranch: "main",
+		GitAuthOK:     true,
+		DocsHubOK:     true,
+		WorkPorcelain: " M docs/reviews/2026-10-15-review-v0-V2-52a3f2-gov-3404-vigo.md",
+	})
+	detail, ok := e.GetRepoDetail("pc1", `C:\work\meta-repo-04`)
+	if !ok {
+		t.Fatal("expected repo detail for pc1")
+	}
+	if detail.Repo.DirtyStoryID != "" {
+		t.Errorf("expected empty DirtyStoryID for completed story STORY-GOV-3404, got %q", detail.Repo.DirtyStoryID)
 	}
 }
 
