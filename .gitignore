@@ -19,3 +19,7 @@ tmp/
 .scannerwork/
 .autopilot/
 .session_story_id
+TestResults/
+scratch/
+Makefile
+metadata.yml
