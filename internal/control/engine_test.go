@@ -6224,7 +6224,3 @@ func TestStoryGov5254_CrossWorktreeAdhocStatusSanitizationAndAutoRecovery(t *tes
 	e.mu.Unlock()
 }
 
-
-
-
-
