@@ -6159,6 +6159,72 @@ func TestUpdateRepoRuntimeStatus_StoryGov5197_AdhocASECarryForwardExpiryAndIdleN
 	e.mu.Unlock()
 }
 
+func TestStoryGov5254_CrossWorktreeAdhocStatusSanitizationAndAutoRecovery(t *testing.T) {
+	now := time.Date(2026, 11, 11, 19, 30, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return now })
+	_ = e.RegisterHost("mac-mini", "permanent", "generic")
+	wt03 := "/Users/romeo/work/meta-repo-03"
+	wt04 := "/Users/romeo/work/meta-repo-04"
+	_ = e.UpsertRepo(Repo{
+		HostID:        "mac-mini",
+		WorktreePath:  wt03,
+		DefaultBranch: "main",
+		Queue:         QueueOpen,
+		Lock:          LockRunning,
+		RunningJobID:  "prompt_ase_1794416923",
+	})
+	_ = e.UpsertRepo(Repo{
+		HostID:        "mac-mini",
+		WorktreePath:  wt04,
+		DefaultBranch: "main",
+		Queue:         QueuePaused,
+		Reason:        ReasonAdhocASE,
+		DirtyStoryID:  "STORY-GOV-5249",
+		Lock:          LockIdle,
+	})
+
+	// Report wt03 running STORY-GOV-5249 and wt04 (clean main) falsely reporting STORY-GOV-5249 from cross-worktree contamination
+	e.UpdateRepoRuntimeStatus("mac-mini", []RepoRuntimeStatus{
+		{
+			RepoPath:             wt03,
+			Branch:               "feat/gov-5249-oss-hygiene",
+			IsClean:              false,
+			SubmodulesClean:      false,
+			ASEState:             "RUNNING",
+			ActiveStoryID:        "STORY-GOV-5249",
+			ActiveConversationID: "34e278f2-fe4a-4991-aee4-d52c0b954556",
+			ActiveTool:           "agy",
+			ToolLiveness:         "LIVE",
+			ExecutionProvenance:  "COORDINATED_HARNESS",
+		},
+		{
+			RepoPath:             wt04,
+			Branch:               "main",
+			IsClean:              true,
+			SubmodulesClean:      true,
+			ASEState:             "RUNNING",
+			ActiveStoryID:        "STORY-GOV-5249",
+			ActiveConversationID: "34e278f2-fe4a-4991-aee4-d52c0b954556",
+			ActiveTool:           "agy",
+			ToolLiveness:         "LIVE",
+			ExecutionProvenance:  "INDEPENDENT_USER_SESSION",
+		},
+	})
+
+	e.mu.Lock()
+	r04 := e.repos[repoKey("mac-mini", wt04)]
+	if r04 == nil {
+		e.mu.Unlock()
+		t.Fatal("expected repo wt04 to exist")
+	}
+	if r04.Queue != QueueOpen || r04.Reason != "" || r04.DirtyStoryID != "" || r04.ASEState != "IDLE" || r04.ExecutionProvenance != "NONE" {
+		e.mu.Unlock()
+		t.Fatalf("expected clean main wt04 with cross-worktree story to sanitize to QueueOpen/IDLE/empty DirtyStoryID, got %+v", r04)
+	}
+	e.mu.Unlock()
+}
+
+
 
 
 
