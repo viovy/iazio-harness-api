@@ -2905,4 +2905,89 @@ func TestStoryGOV5196_HostLevelToolsUpdateBypassesWorktreeSlotAllocation(t *test
 	}
 }
 
+func TestStoryGOV5248_CompleteWithFencingAfterFailedDoesNotPanicAndClearsStaleErrors(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 11, 8, 55, 0, 0, time.UTC)
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+
+	// 1. Verify ClassifyDispatchFailureWithDirection strips [agy step #N] transcript lines
+	// so "authorized_slugs" inside a 157KB transcript does not falsely match "auth" -> TOOL_QUOTA_OR_AUTH,
+	// and classifies policy hook blocks as POLICY_HOOK_BLOCKED.
+	transcriptErr := "iazio-harness prompt run failed: exit status 1 (stderr: ALLOCATED_STORY_ID: STORY-VIGO-0310\n" +
+		"[agy step #1] TOOL read_file -> authorized_slugs: [vigo, vigo-cli, vigo-api]\n" +
+		"[agy step #44] TOOL run_command -> HARD BLOCK: AUTONOMOUS SELF-CONFIRMATION DETECTED (echo y | / yes |)\n" +
+		"Error: agent stopped before emitting ## CRAFT Closeout)"
+	cat, stage, dir, svc, summary, retriable := ClassifyDispatchFailureWithDirection(transcriptErr)
+	if cat != FailureCategoryPolicyHookBlocked {
+		t.Fatalf("expected FailureCategoryPolicyHookBlocked, got cat=%q stage=%q dir=%q svc=%q summary=%q retriable=%v", cat, stage, dir, svc, summary, retriable)
+	}
+	if svc != "iazio-pre-tool-hook" {
+		t.Fatalf("expected targetService='iazio-pre-tool-hook', got %q", svc)
+	}
+
+	// 2. Verify NormalizeErrorSignature extracts the terminal error line rather than truncating at line 1 ("ALLOCATED_STORY_ID").
+	sig := NormalizeErrorSignature(transcriptErr)
+	if strings.Contains(strings.ToLower(sig), "allocated_story_id") {
+		t.Fatalf("expected NormalizeErrorSignature to skip ALLOCATED_STORY_ID preamble, got %q", sig)
+	}
+	if !strings.Contains(strings.ToLower(sig), "craft closeout") {
+		t.Fatalf("expected NormalizeErrorSignature to preserve terminal error line, got %q", sig)
+	}
+
+	// 3. Verify CompleteWithFencing on a job that previously transitioned to JobStatusFailed (closing doneCh)
+	// does NOT panic on double-close of job.doneCh and cleanly transitions to JobStatusCompleted + CLEAN_RUN.
+	jobID := "job_7a422318d6294d43"
+	_, err := q.Enqueue(ctx, &Job{
+		ID:          jobID,
+		Type:        JobTypePromptExecute,
+		Repo:        "meta-repo",
+		TargetAgent: "antigravity",
+		Payload:     json.RawMessage(`{"prompt":"/autonomous-story-execution STORY-VIGO-0310","story_id":"STORY-VIGO-0310"}`),
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	claimed, err := q.Claim(ctx, "mac-studio", []string{JobTypePromptExecute})
+	if err != nil || claimed == nil {
+		t.Fatalf("claim: job=%+v err=%v", claimed, err)
+	}
+
+	// Fail the job via CompleteWithFencing with errStr != "" (transitions to JobStatusFailed, closing job.doneCh).
+	failedPayload := json.RawMessage(`{"status":"failed","story_id":"STORY-VIGO-0310","output":"` + strings.ReplaceAll(transcriptErr, "\n", `\n`) + `"}`)
+	if err := q.CompleteWithFencing(ctx, jobID, claimed.FencingToken, failedPayload, transcriptErr); err != nil {
+		t.Fatalf("CompleteWithFencing(failed): %v", err)
+	}
+	failedSnap, ok := q.Get(jobID)
+	if !ok || failedSnap.Status != JobStatusFailed {
+		t.Fatalf("expected job in JobStatusFailed, got %+v", failedSnap)
+	}
+
+	// Complete the job with the same fencingToken (late completion reconciliation); must not panic on close(done).
+	closeoutPayload := json.RawMessage(`{"status":"completed","story_id":"STORY-VIGO-0310","output":"## CRAFT Closeout\nAll PRs merged and verified."}`)
+	if err := q.CompleteWithFencing(ctx, jobID, claimed.FencingToken, closeoutPayload, ""); err != nil {
+		t.Fatalf("CompleteWithFencing after JobStatusFailed returned error: %v", err)
+	}
+
+	completedSnap, ok := q.Get(jobID)
+	if !ok {
+		t.Fatalf("expected job %s to exist", jobID)
+	}
+	if completedSnap.Status != JobStatusCompleted {
+		t.Fatalf("expected JobStatusCompleted, got %q", completedSnap.Status)
+	}
+	if completedSnap.Error != "" || completedSnap.FailureCategory != "" {
+		t.Fatalf("expected cleared Error and FailureCategory, got error=%q cat=%q", completedSnap.Error, completedSnap.FailureCategory)
+	}
+	snap := ExtractJobSnapshot(completedSnap, []string{"[agy step #44] HARD BLOCK: ERROR"})
+	if len(snap.ErrorClusters) != 0 || snap.TestFailureCount != 0 {
+		t.Fatalf("expected ExtractJobSnapshot on completed job to have zero ErrorClusters, got %+v", snap)
+	}
+	rc := NewRunComparisonService().CompareRuns(snap, snap)
+	if rc == nil || rc.Verdict != VerdictCleanRun {
+		t.Fatalf("expected CompareRuns Verdict == CLEAN_RUN, got %+v", rc)
+	}
+}
+
+
 

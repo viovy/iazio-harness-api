@@ -200,6 +200,16 @@ func NormalizeErrorSignature(raw string) string {
 	if s == "" {
 		return ""
 	}
+	if strings.Contains(s, "\n") && strings.Contains(s, "ALLOCATED_STORY_ID:") {
+		lines := strings.Split(s, "\n")
+		for i := len(lines) - 1; i >= 0; i-- {
+			cand := strings.TrimSpace(lines[i])
+			if cand != "" && !strings.Contains(cand, "ALLOCATED_STORY_ID:") {
+				s = cand
+				break
+			}
+		}
+	}
 	if idx := strings.IndexByte(s, '\n'); idx > 0 {
 		s = strings.TrimSpace(s[:idx])
 	}
@@ -886,6 +896,12 @@ func ExtractJobSnapshot(job *Job, logLines []string) RunTelemetrySnapshot {
 	}
 
 	applyJobResultTelemetry(&snap, job.Result)
+	if strings.EqualFold(strings.TrimSpace(job.Status), JobStatusCompleted) && snap.RawError == "" {
+		snap.ErrorClusters = nil
+		snap.FailedTests = nil
+		snap.TestFailureCount = 0
+		return snap
+	}
 	if snap.RawError != "" {
 		snap.FailedTests = extractFailedTestsFromText(snap.FailedTests, snap.RawError)
 		if len(snap.ErrorClusters) == 0 {

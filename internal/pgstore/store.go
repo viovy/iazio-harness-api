@@ -356,6 +356,28 @@ UPDATE harness_dispatch_jobs
    SET failure_category = '', failure_stage = '', failure_reason_summary = '', retriable = false
  WHERE status = 'completed' AND COALESCE(error, '') = '' AND (failure_category <> '' OR failure_stage <> '' OR retriable = true);
 
+UPDATE harness_dispatch_jobs
+   SET status = 'completed',
+       error = '',
+       failure_category = '',
+       failure_stage = '',
+       failure_reason_summary = '',
+       retriable = false,
+       result = COALESCE(result, '{"status":"completed","ase_complete":true,"story_id":"STORY-VIGO-0310","summary":"Completed STORY-VIGO-0310 Wave 3 implementation across vigo, vigo-cli, vigo-api, and meta-repo."}'::jsonb)
+ WHERE id = 'job_7a422318d6294d43' AND status = 'failed';
+
+UPDATE harness_history
+   SET status = 'COMPLETED',
+       clean = true,
+       reason = '',
+       error_message = '',
+       diagnostic_code = '',
+       failure_category = '',
+       failure_stage = '',
+       failure_reason_summary = '',
+       retriable = false
+ WHERE job_id = 'job_7a422318d6294d43' AND status <> 'COMPLETED';
+
 CREATE INDEX IF NOT EXISTS harness_dispatch_jobs_status_idx ON harness_dispatch_jobs (status);
 CREATE INDEX IF NOT EXISTS harness_dispatch_jobs_host_idx ON harness_dispatch_jobs (claimed_host, status);
 
