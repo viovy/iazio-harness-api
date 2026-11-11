@@ -212,10 +212,16 @@ func BuildTerminalJobCallbackPayload(job *dispatch.Job, promoted []*dispatch.Job
 					break
 				}
 			}
-			for _, k := range []string{"summary", "message", "output", "outcome_summary"} {
+			var rawOut string
+			if v, ok := resMap["output"].(string); ok {
+				rawOut = strings.TrimSpace(v)
+			}
+			for _, k := range []string{"summary", "message", "outcome_summary", "output"} {
 				if v, ok := resMap[k].(string); ok && strings.TrimSpace(v) != "" {
-					summary = strings.TrimSpace(v)
-					break
+					summary = dispatch.FormatConciseExecutiveSummary(strings.TrimSpace(v), rawOut, dispatch.MaxExecutiveSummaryChars)
+					if summary != "" {
+						break
+					}
 				}
 			}
 			if durationMs == 0 {
@@ -1124,7 +1130,11 @@ func (h *JobLifecycleHandler) ListQueue(w http.ResponseWriter, r *http.Request) 
 
 	items := make([]JobDetailResponse, 0, len(jobs))
 	for _, j := range jobs {
-		items = append(items, formatJobDetail(j))
+		detail := formatJobDetail(j)
+		if len(detail.Result) > 0 {
+			detail.Result = dispatch.StripJobResultOutputForQueueList(detail.Result)
+		}
+		items = append(items, detail)
 	}
 
 	total := len(items)
@@ -1819,7 +1829,7 @@ func formatJobDetail(j *dispatch.Job) JobDetailResponse {
 		ToolPID:                 j.ToolPID,
 		ElapsedSeconds:          elapsedSec,
 		Status:                  j.Status,
-		Result:                  j.Result,
+		Result:                  dispatch.SanitizeJobResultSummary(j.Result),
 		Error:                   j.Error,
 		FailureCategory:         failureCat,
 		FailureStage:            failureStage,

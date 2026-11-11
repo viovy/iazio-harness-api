@@ -27,6 +27,143 @@ import (
 
 var executeStoryPrefixRegex = regexp.MustCompile(`(?i)^execute\s+story\s+(?:STORY-[A-Za-z0-9_-]+|[A-Z]{2,16}-[0-9]+)(?:\s*[:\-]\s*|\s+|$)`)
 
+// MaxExecutiveSummaryChars is the maximum length of result.summary on completed/failed jobs (AC2).
+const MaxExecutiveSummaryChars = 1000
+
+var agyStepOutputLineRegex = regexp.MustCompile(`^(?:\[[^\]]+\]\s*)?\[agy step #\d+\]\s*output:\s*(.+)$`)
+
+// FormatConciseExecutiveSummary strips [agy step #...] trace lines and [ASE-SUPERVISOR] log lines
+// and bounds the resulting executive summary to <= maxChars (default 1,000 chars).
+func FormatConciseExecutiveSummary(summary, output string, maxChars int) string {
+	if maxChars <= 0 {
+		maxChars = MaxExecutiveSummaryChars
+	}
+	filterClean := func(s string) string {
+		if strings.TrimSpace(s) == "" {
+			return ""
+		}
+		var kept []string
+		for _, line := range strings.Split(s, "\n") {
+			trimmed := strings.TrimRight(line, "\r")
+			if strings.TrimSpace(trimmed) == "" {
+				continue
+			}
+			if strings.Contains(trimmed, "[agy step #") || strings.Contains(trimmed, "[ASE-SUPERVISOR]") {
+				continue
+			}
+			kept = append(kept, trimmed)
+		}
+		return strings.TrimSpace(strings.Join(kept, "\n"))
+	}
+
+	var lastStepOutput string
+	for _, src := range []string{output, summary} {
+		for _, line := range strings.Split(src, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if m := agyStepOutputLineRegex.FindStringSubmatch(trimmed); len(m) > 1 {
+				cand := strings.TrimSpace(m[1])
+				if cand != "" && !strings.Contains(cand, "[agy step #") && !strings.Contains(cand, "[ASE-SUPERVISOR]") {
+					lastStepOutput = cand
+				}
+			}
+		}
+	}
+
+	cleaned := filterClean(summary)
+	if lastStepOutput != "" && !strings.Contains(cleaned, lastStepOutput) {
+		if cleaned == "" {
+			cleaned = lastStepOutput
+		} else {
+			cleaned = cleaned + "\n" + lastStepOutput
+		}
+	}
+	if cleaned == "" && output != "" {
+		cleaned = filterClean(output)
+	}
+	cleaned = strings.TrimSpace(cleaned)
+	if len(cleaned) > maxChars {
+		if lastStepOutput != "" && len(lastStepOutput) < maxChars-10 && !strings.Contains(cleaned[:maxChars-3], lastStepOutput) {
+			headBudget := maxChars - len(lastStepOutput) - 5
+			if headBudget > 0 {
+				cleaned = strings.TrimSpace(cleaned[:headBudget]) + "\n...\n" + lastStepOutput
+			} else {
+				cleaned = lastStepOutput
+			}
+		}
+		if len(cleaned) > maxChars {
+			cleaned = strings.TrimSpace(cleaned[:maxChars-3]) + "..."
+		}
+	}
+	return cleaned
+}
+
+// SanitizeJobResultSummary ensures result.summary contains only a concise executive summary
+// (<=1,000 chars, stripped of [agy step #...] and [ASE-SUPERVISOR] log lines) while preserving
+// full execution output in result.output.
+func SanitizeJobResultSummary(raw json.RawMessage) json.RawMessage {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return raw
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil || m == nil {
+		return raw
+	}
+	rawSummary, hasSummary := m["summary"].(string)
+	rawOutput, _ := m["output"].(string)
+	modified := false
+
+	if strings.TrimSpace(rawOutput) == "" && strings.TrimSpace(rawSummary) != "" &&
+		(strings.Contains(rawSummary, "[agy step #") || strings.Contains(rawSummary, "[ASE-SUPERVISOR]") || len(rawSummary) > MaxExecutiveSummaryChars) {
+		m["output"] = rawSummary
+		rawOutput = rawSummary
+		modified = true
+	}
+	if hasSummary || strings.TrimSpace(rawOutput) != "" {
+		cleanSummary := FormatConciseExecutiveSummary(rawSummary, rawOutput, MaxExecutiveSummaryChars)
+		if cleanSummary != rawSummary || !hasSummary {
+			m["summary"] = cleanSummary
+			modified = true
+		}
+	}
+	if rawFail, ok := m["failure_reason_summary"].(string); ok && strings.TrimSpace(rawFail) != "" {
+		cleanFail := FormatConciseExecutiveSummary(rawFail, "", MaxExecutiveSummaryChars)
+		if cleanFail != rawFail {
+			m["failure_reason_summary"] = cleanFail
+			modified = true
+		}
+	}
+	if !modified {
+		return raw
+	}
+	encoded, err := json.Marshal(m)
+	if err != nil {
+		return raw
+	}
+	return encoded
+}
+
+// StripJobResultOutputForQueueList sanitizes result.summary and strips the heavy result.output
+// field for compact queue listing endpoints.
+func StripJobResultOutputForQueueList(raw json.RawMessage) json.RawMessage {
+	sanitized := SanitizeJobResultSummary(raw)
+	if len(bytes.TrimSpace(sanitized)) == 0 {
+		return sanitized
+	}
+	var m map[string]any
+	if err := json.Unmarshal(sanitized, &m); err != nil || m == nil {
+		return sanitized
+	}
+	if _, hasOutput := m["output"]; !hasOutput {
+		return sanitized
+	}
+	delete(m, "output")
+	encoded, err := json.Marshal(m)
+	if err != nil {
+		return sanitized
+	}
+	return encoded
+}
+
 // isSyntheticTestConversationID returns true for legacy unit-test fixture UUIDs
 // ("11111111-2222-3333-4444-555555555555" and "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 // as a defense-in-depth filter when a real conversation UUID is also present on a job.
@@ -1119,6 +1256,13 @@ func (q *InMemoryQueue) SetStore(s QueueStore) error {
 				continue
 			}
 			normalizeJobDependencies(j)
+			if len(j.Result) > 0 {
+				sanitized := SanitizeJobResultSummary(j.Result)
+				if !bytes.Equal(sanitized, j.Result) {
+					j.Result = sanitized
+					_ = s.SaveQueueJob(context.Background(), j)
+				}
+			}
 			PopulateJobConversationFields(j)
 			if j.FencingToken > q.fencingSeq {
 				q.fencingSeq = j.FencingToken
@@ -2328,6 +2472,9 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 
 	now := q.now()
 	job.CompletedAt = &now
+	if len(result) > 0 {
+		result = SanitizeJobResultSummary(result)
+	}
 
 	var resMap map[string]any
 	if len(result) > 0 {
@@ -2397,7 +2544,7 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 			job.FailureStage = strings.TrimSpace(resFailStage)
 		}
 		if resFailSummary, ok := resMap["failure_reason_summary"].(string); ok && strings.TrimSpace(resFailSummary) != "" {
-			job.FailureReasonSummary = strings.TrimSpace(resFailSummary)
+			job.FailureReasonSummary = FormatConciseExecutiveSummary(strings.TrimSpace(resFailSummary), "", MaxExecutiveSummaryChars)
 		}
 		if errStr == "" {
 			resStatus, _ := resMap["status"].(string)

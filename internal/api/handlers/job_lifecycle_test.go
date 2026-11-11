@@ -1193,4 +1193,105 @@ func TestStory0194_CanonicalJobsLiveURLAndRepoNormalization(t *testing.T) {
 	}
 }
 
+func TestStoryGov5253_ConciseResultSummaryAndQueueListStripping(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	h := NewJobLifecycleHandler(q)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/jobs/{id}", h.GetJob)
+	mux.HandleFunc("GET /api/v1/queue", h.ListQueue)
+
+	var traceBuilder strings.Builder
+	for i := 1; i <= 1132; i++ {
+		traceBuilder.WriteString(fmt.Sprintf("[2026-11-11T18:00:00Z] [agy step #%d] thinking: Step %d trace payload %s\n", i, i, strings.Repeat("a", 120)))
+	}
+	finalLine := "Autonomous story execution is complete for STORY-GOV-5253 — all acceptance criteria verified."
+	traceBuilder.WriteString("[2026-11-11T18:15:00Z] [ASE-SUPERVISOR] Execution active (elapsed=300s)\n")
+	traceBuilder.WriteString(fmt.Sprintf("[2026-11-11T18:20:00Z] [agy step #1133] output: %s\n", finalLine))
+	fullTranscript := traceBuilder.String()
+
+	job, err := q.Enqueue(context.Background(), &dispatch.Job{
+		ID:      "job_gov_5253_explosion",
+		Type:    dispatch.JobTypePromptExecute,
+		Repo:    "iazio-mcp",
+		StoryID: "STORY-GOV-5253",
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+	claimed, err := q.Claim(context.Background(), "debian", nil)
+	if err != nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+
+	rawResult, _ := json.Marshal(map[string]any{
+		"status":          "completed",
+		"exit_code":       0,
+		"conversation_id": "208632c0-2776-40a2-80e5-c905cecb280c",
+		"summary":         fullTranscript,
+		"output":          fullTranscript,
+		"duration_ms":     42000,
+	})
+	if err := q.CompleteWithFencing(context.Background(), job.ID, claimed.FencingToken, rawResult, ""); err != nil {
+		t.Fatalf("complete failed: %v", err)
+	}
+
+	// 1. Verify GetJob preserves result.output while sanitizing result.summary to <=1,000 chars without [agy step #...] or [ASE-SUPERVISOR]
+	getReq := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/"+job.ID, nil)
+	getRr := httptest.NewRecorder()
+	mux.ServeHTTP(getRr, getReq)
+	if getRr.Code != http.StatusOK {
+		t.Fatalf("GetJob failed: %d", getRr.Code)
+	}
+	var detail JobDetailResponse
+	if err := json.Unmarshal(getRr.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("unmarshal detail: %v", err)
+	}
+	var resMap map[string]any
+	if err := json.Unmarshal(detail.Result, &resMap); err != nil {
+		t.Fatalf("unmarshal detail.Result: %v", err)
+	}
+	gotSummary, _ := resMap["summary"].(string)
+	gotOutput, _ := resMap["output"].(string)
+	if len(gotSummary) > dispatch.MaxExecutiveSummaryChars {
+		t.Fatalf("expected result.summary <= %d chars, got %d", dispatch.MaxExecutiveSummaryChars, len(gotSummary))
+	}
+	if strings.Contains(gotSummary, "[agy step #") || strings.Contains(gotSummary, "[ASE-SUPERVISOR]") {
+		t.Fatalf("expected result.summary to strip [agy step #...] and [ASE-SUPERVISOR], got: %s", gotSummary)
+	}
+	if !strings.Contains(gotSummary, finalLine) {
+		t.Fatalf("expected result.summary to preserve final outcome %q, got: %s", finalLine, gotSummary)
+	}
+	if gotOutput == "" || !strings.Contains(gotOutput, "[agy step #1]") {
+		t.Fatalf("expected result.output on GetJob to preserve full transcript")
+	}
+
+	// 2. Verify ListQueue strips result.output so list responses stay compact
+	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/queue?limit=10", nil)
+	listRr := httptest.NewRecorder()
+	mux.ServeHTTP(listRr, listReq)
+	if listRr.Code != http.StatusOK {
+		t.Fatalf("ListQueue failed: %d", listRr.Code)
+	}
+	var listResp ListQueueResponse
+	if err := json.Unmarshal(listRr.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("unmarshal listResp: %v", err)
+	}
+	if len(listResp.Items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(listResp.Items))
+	}
+	var listItemRes map[string]any
+	_ = json.Unmarshal(listResp.Items[0].Result, &listItemRes)
+	if _, hasOut := listItemRes["output"]; hasOut {
+		t.Fatalf("expected ListQueue item result to strip heavy output field")
+	}
+
+	// 3. Verify BuildTerminalJobCallbackPayload also uses concise summary
+	storedJob, _ := q.Get(job.ID)
+	cbPayload := BuildTerminalJobCallbackPayload(storedJob, nil)
+	if len(cbPayload.Summary) > dispatch.MaxExecutiveSummaryChars || strings.Contains(cbPayload.Summary, "[agy step #") || strings.Contains(cbPayload.Summary, "[ASE-SUPERVISOR]") {
+		t.Fatalf("expected callback payload summary to be concise and stripped, got: %s", cbPayload.Summary)
+	}
+}
+
+
 
