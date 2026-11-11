@@ -2270,16 +2270,19 @@ func TestQueue_DependsOnJobID_ChainingPromotionAndFailureCascade(t *testing.T) {
 		t.Fatalf("expected to claim promoted wave2, got %+v (err=%v)", claimed2, err)
 	}
 
-	// 7. Fail wave2 -> wave3 must automatically cascade to failed with DEPENDENCY_FAILED
+	// 7. Fail wave2 -> wave3 must remain in the active queue as blocked_by_dependency (NOT terminal failed history) with DEPENDENCY_FAILED diagnostics
 	if err := q.CompleteWithFencing(ctx, wave2.ID, claimed2.FencingToken, nil, "unit tests failed in wave2"); err != nil {
 		t.Fatalf("fail wave2 failed: %v", err)
 	}
-	w3Failed, _ := q.Get(wave3.ID)
-	if w3Failed.Status != JobStatusFailed {
-		t.Fatalf("expected wave3 to transition to %s when wave2 failed, got %s", JobStatusFailed, w3Failed.Status)
+	w3Blocked, _ := q.Get(wave3.ID)
+	if w3Blocked.Status != JobStatusBlockedByDependency {
+		t.Fatalf("expected wave3 to remain %s in active queue when wave2 failed, got %s", JobStatusBlockedByDependency, w3Blocked.Status)
 	}
-	if w3Failed.FailureCategory != FailureCategoryDependencyFailed || !strings.Contains(w3Failed.Error, "DEPENDENCY_FAILED") {
-		t.Fatalf("expected DEPENDENCY_FAILED category/error on wave3, got category=%q error=%q", w3Failed.FailureCategory, w3Failed.Error)
+	if w3Blocked.CompletedAt != nil {
+		t.Fatalf("expected wave3 CompletedAt to remain nil so it is not moved to history, got %v", w3Blocked.CompletedAt)
+	}
+	if w3Blocked.FailureCategory != FailureCategoryDependencyFailed || !strings.Contains(w3Blocked.Error, "DEPENDENCY_FAILED") {
+		t.Fatalf("expected DEPENDENCY_FAILED category/error on wave3, got category=%q error=%q", w3Blocked.FailureCategory, w3Blocked.Error)
 	}
 }
 
@@ -2989,5 +2992,119 @@ func TestStoryGOV5248_CompleteWithFencingAfterFailedDoesNotPanicAndClearsStaleEr
 	}
 }
 
+func TestStoryGov5256_DependentJobsStayInActiveQueueAndRestoreOnSetStoreAndRetryRebinds(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 11, 21, 0, 0, 0, time.UTC)
 
+	// 1. Verify ClassifyDispatchFailureWithDirection classifies unmerged_feature_branch with 'jenkins' in branch name as ASE_GATE_INCOMPLETE (Retriable=true)
+	errStr := "ASE_GATE_INCOMPLETE: unmerged_feature_branch (worktree remains on branch feat/gov-5251-k8s-clusters-jenkins-unification; git-flow land not completed)"
+	cat, stage, dir, _, _, retriable := ClassifyDispatchFailureWithDirection(errStr)
+	if cat != FailureCategoryASEGateIncomplete || stage != FailureStageCompletionGate || dir != FailureDirectionLocalExecution || !retriable {
+		t.Fatalf("expected ASE_GATE_INCOMPLETE/COMPLETION_GATE/LOCAL_EXECUTION/retriable=true, got cat=%q stage=%q dir=%q retriable=%v", cat, stage, dir, retriable)
+	}
+
+	// 2. Verify SetStore restores persisted DEPENDENCY_FAILED jobs from terminal 'failed' back to 'blocked_by_dependency'
+	compAt := now.Add(-10 * time.Minute)
+	store := &fakePersistenceStore{
+		loadedJobs: []*Job{
+			{
+				ID:              "job_7d5cad6fd223f5a0",
+				Type:            JobTypePromptExecute,
+				Repo:            "k8s",
+				StoryID:         "STORY-GOV-5251",
+				Status:          JobStatusFailed,
+				FencingToken:    1,
+				FailureCategory: FailureCategoryASEGateIncomplete,
+				Error:           errStr,
+				CreatedAt:       now.Add(-2 * time.Hour),
+				CompletedAt:     &compAt,
+			},
+			{
+				ID:              "job_afddead322e5bee9",
+				Type:            JobTypePromptExecute,
+				Repo:            "k8s",
+				StoryID:         "STORY-GOV-5250",
+				DependsOnJobID:  "job_7d5cad6fd223f5a0",
+				Status:          JobStatusFailed,
+				FailureCategory: FailureCategoryDependencyFailed,
+				Error:           "DEPENDENCY_FAILED: upstream job job_7d5cad6fd223f5a0 failed",
+				CreatedAt:       now.Add(-2 * time.Hour),
+				CompletedAt:     &compAt,
+			},
+			{
+				ID:              "job_bf10a230d00d38df",
+				Type:            JobTypePromptExecute,
+				Repo:            "k8s",
+				StoryID:         "STORY-GOV-5252",
+				DependsOnJobID:  "job_afddead322e5bee9",
+				Status:          JobStatusFailed,
+				FailureCategory: FailureCategoryDependencyFailed,
+				Error:           "DEPENDENCY_FAILED: upstream job job_afddead322e5bee9 failed",
+				CreatedAt:       now.Add(-2 * time.Hour),
+				CompletedAt:     &compAt,
+			},
+			{
+				ID:              "job_495d06c8ca67a76b",
+				Type:            JobTypePromptExecute,
+				Repo:            "vigo",
+				StoryID:         "STORY-VIGO-0311",
+				DependsOnJobID:  "job_bf10a230d00d38df",
+				Status:          JobStatusFailed,
+				FailureCategory: FailureCategoryDependencyFailed,
+				Error:           "DEPENDENCY_FAILED: upstream job job_bf10a230d00d38df failed",
+				CreatedAt:       now.Add(-2 * time.Hour),
+				CompletedAt:     &compAt,
+			},
+		},
+	}
+
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+	if err := q.SetStore(store); err != nil {
+		t.Fatalf("SetStore failed: %v", err)
+	}
+
+	for _, depID := range []string{"job_afddead322e5bee9", "job_bf10a230d00d38df", "job_495d06c8ca67a76b"} {
+		j, ok := q.Get(depID)
+		if !ok {
+			t.Fatalf("expected job %s to exist", depID)
+		}
+		if j.Status != JobStatusBlockedByDependency || j.CompletedAt != nil {
+			t.Fatalf("expected SetStore to restore %s to %s with nil CompletedAt, got status=%s completedAt=%v", depID, JobStatusBlockedByDependency, j.Status, j.CompletedAt)
+		}
+	}
+
+	// 3. Reconciling Wave 1 (job_7d5cad6fd223f5a0) to completed via CompleteWithFencing promotes Wave 2 (job_afddead322e5bee9) to pending
+	reconcileRes := json.RawMessage(`{"status":"completed","exit_code":0,"ase_complete":true,"story_id":"STORY-GOV-5251"}`)
+	if err := q.CompleteWithFencing(ctx, "job_7d5cad6fd223f5a0", 1, reconcileRes, ""); err != nil {
+		t.Fatalf("expected CompleteWithFencing reconciliation on ASE_GATE_INCOMPLETE job to succeed, got %v", err)
+	}
+	w1, _ := q.Get("job_7d5cad6fd223f5a0")
+	if w1.Status != JobStatusCompleted {
+		t.Fatalf("expected job_7d5cad6fd223f5a0 status=completed, got %s", w1.Status)
+	}
+	w2, _ := q.Get("job_afddead322e5bee9")
+	if w2.Status != JobStatusPending || w2.Error != "" || w2.FailureCategory != "" {
+		t.Fatalf("expected Wave 2 (job_afddead322e5bee9) promoted to pending with cleared error, got status=%s cat=%q err=%q", w2.Status, w2.FailureCategory, w2.Error)
+	}
+	w3, _ := q.Get("job_bf10a230d00d38df")
+	if w3.Status != JobStatusBlockedByDependency {
+		t.Fatalf("expected Wave 3 (job_bf10a230d00d38df) to remain blocked_by_dependency waiting on Wave 2, got %s", w3.Status)
+	}
+
+	// 4. Verify Retry on a failed upstream job re-binds downstream dependent jobs to the new retry job ID
+	claimed2, err := q.Claim(ctx, "pc1", nil)
+	if err != nil || claimed2 == nil || claimed2.ID != "job_afddead322e5bee9" {
+		t.Fatalf("expected to claim Wave 2, got %+v (err=%v)", claimed2, err)
+	}
+	_ = q.CompleteWithFencing(ctx, claimed2.ID, claimed2.FencingToken, nil, errStr)
+	retried2, err := q.Retry(ctx, "job_afddead322e5bee9")
+	if err != nil || retried2 == nil {
+		t.Fatalf("Retry Wave 2 failed: %v", err)
+	}
+	w3AfterRetry, _ := q.Get("job_bf10a230d00d38df")
+	if w3AfterRetry.DependsOnJobID != retried2.ID || len(w3AfterRetry.DependsOnJobIDs) != 1 || w3AfterRetry.DependsOnJobIDs[0] != retried2.ID {
+		t.Fatalf("expected Wave 3 dependency re-bound to retried Wave 2 job %s, got DependsOnJobID=%q DependsOnJobIDs=%v", retried2.ID, w3AfterRetry.DependsOnJobID, w3AfterRetry.DependsOnJobIDs)
+	}
+}
 
