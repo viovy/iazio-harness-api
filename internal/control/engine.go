@@ -3880,7 +3880,72 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 
 	now := e.now().UTC()
 
+	authoritativeStoryOwner := make(map[string]string)
+	authoritativeConvOwner := make(map[string]string)
+	recordAuthoritativeOwner := func(repoPath, storyID, convID string) {
+		normWT := normalizeWorktreePathForSlotMatch(repoPath)
+		if normWT == "" {
+			return
+		}
+		if sid := strings.ToUpper(strings.TrimSpace(storyID)); isStoryID(sid) {
+			authoritativeStoryOwner[sid] = normWT
+		}
+		if cid := strings.TrimSpace(convID); cid != "" {
+			authoritativeConvOwner[cid] = normWT
+		}
+	}
+	for _, r := range e.repos {
+		if r == nil || r.HostID != hostID {
+			continue
+		}
+		nonMain := r.CurrentBranch != "" && r.CurrentBranch != "main" && r.CurrentBranch != "master"
+		if r.Lock == LockRunning || strings.TrimSpace(r.RunningJobID) != "" ||
+			strings.EqualFold(strings.TrimSpace(r.ExecutionProvenance), "COORDINATED_HARNESS") ||
+			nonMain || len(r.DirtySubmodules) > 0 || len(r.NonMainSubmodules) > 0 {
+			recordAuthoritativeOwner(r.WorktreePath, r.DirtyStoryID, r.DetectedConversationID)
+		}
+	}
+
 	h, hasHost := e.hosts[hostID]
+	if hasHost && h != nil && h.RepoStatuses != nil {
+		for _, prevSt := range h.RepoStatuses {
+			nonMain := prevSt.Branch != "" && prevSt.Branch != "main" && prevSt.Branch != "master"
+			if strings.EqualFold(strings.TrimSpace(prevSt.ExecutionProvenance), "COORDINATED_HARNESS") ||
+				!prevSt.IsClean || !prevSt.SubmodulesClean || len(prevSt.NonMainSubmodules) > 0 || nonMain {
+				recordAuthoritativeOwner(prevSt.RepoPath, prevSt.ActiveStoryID, prevSt.ActiveConversationID)
+			}
+		}
+	}
+	for _, st := range statuses {
+		nonMain := st.Branch != "" && st.Branch != "main" && st.Branch != "master"
+		if strings.EqualFold(strings.TrimSpace(st.ExecutionProvenance), "COORDINATED_HARNESS") ||
+			!st.IsClean || !st.SubmodulesClean || len(st.NonMainSubmodules) > 0 || nonMain {
+			recordAuthoritativeOwner(st.RepoPath, st.ActiveStoryID, st.ActiveConversationID)
+		}
+	}
+
+	for i := range statuses {
+		st := statuses[i]
+		isMain := st.Branch == "" || st.Branch == "main" || st.Branch == "master"
+		if st.IsClean && st.SubmodulesClean && len(st.NonMainSubmodules) == 0 && isMain &&
+			!strings.EqualFold(strings.TrimSpace(st.ExecutionProvenance), "COORDINATED_HARNESS") {
+			normWT := normalizeWorktreePathForSlotMatch(st.RepoPath)
+			sid := strings.ToUpper(strings.TrimSpace(st.ActiveStoryID))
+			cid := strings.TrimSpace(st.ActiveConversationID)
+			crossStory := sid != "" && authoritativeStoryOwner[sid] != "" && authoritativeStoryOwner[sid] != normWT
+			crossConv := cid != "" && authoritativeConvOwner[cid] != "" && authoritativeConvOwner[cid] != normWT
+			if crossStory || crossConv {
+				st.ActiveStoryID = ""
+				st.ActiveConversationID = ""
+				st.ASEState = "IDLE"
+				st.ExecutionProvenance = "NONE"
+				st.ToolLiveness = "NONE"
+				st.ActiveTool = "NONE"
+				statuses[i] = st
+			}
+		}
+	}
+
 	if hasHost && h != nil {
 		if h.RepoStatuses == nil {
 			h.RepoStatuses = make(map[string]RepoRuntimeStatus)
@@ -3958,7 +4023,7 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 				r.Porcelain = st.Porcelain
 				if isStoryID(st.ActiveStoryID) {
 					r.DirtyStoryID = st.ActiveStoryID
-				} else if st.ASEState != "" && !strings.EqualFold(strings.TrimSpace(st.ASEState), "RUNNING") && !strings.EqualFold(strings.TrimSpace(st.ASEState), "IN_PROGRESS") {
+				} else if st.ActiveStoryID == "" && (st.IsClean || (st.ASEState != "" && !strings.EqualFold(strings.TrimSpace(st.ASEState), "RUNNING") && !strings.EqualFold(strings.TrimSpace(st.ASEState), "IN_PROGRESS"))) {
 					r.DirtyStoryID = ""
 				}
 				if st.ActiveConversationID != "" {
