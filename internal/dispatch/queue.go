@@ -81,6 +81,7 @@ const (
 	FailureCategoryCircuitBreakerTripped  = "CIRCUIT_BREAKER_TRIPPED"
 	FailureCategoryStoryNotFound          = "STORY_NOT_FOUND"
 	FailureCategoryDependencyFailed       = "DEPENDENCY_FAILED"
+	FailureCategoryPolicyHookBlocked      = "POLICY_HOOK_BLOCKED"
 
 	FailureStageIngress         = "INGRESS"
 	FailureStageQueueDispatch   = "QUEUE_DISPATCH"
@@ -2173,13 +2174,82 @@ func (q *InMemoryQueue) Complete(ctx context.Context, jobID string, result json.
 	return q.CompleteWithFencing(ctx, jobID, fencingToken, result, errStr)
 }
 
+// extractDispatchFailureTail strips intermediate multi-turn `[agy step #N]` transcript lines
+// from an error string so historical step logs (e.g. story YAML `authorized_slugs:`) do not
+// poison terminal failure classification.
+func extractDispatchFailureTail(errStr string) string {
+	trimmed := strings.TrimSpace(errStr)
+	if !strings.Contains(trimmed, "[agy step #") || !strings.Contains(trimmed, "\n") {
+		return trimmed
+	}
+	lines := strings.Split(trimmed, "\n")
+	var nonStepLines []string
+	var lastStepLines []string
+	for _, line := range lines {
+		l := strings.TrimSpace(line)
+		if l == "" {
+			continue
+		}
+		if strings.Contains(l, "[agy step #") {
+			lastStepLines = append(lastStepLines, l)
+			if len(lastStepLines) > 3 {
+				lastStepLines = lastStepLines[len(lastStepLines)-3:]
+			}
+			continue
+		}
+		if strings.HasPrefix(l, "iazio-harness prompt run failed:") && strings.Contains(l, "ALLOCATED_STORY_ID:") {
+			continue
+		}
+		nonStepLines = append(nonStepLines, l)
+	}
+	tail := append(lastStepLines, nonStepLines...)
+	if len(tail) == 0 {
+		return lines[len(lines)-1]
+	}
+	return strings.Join(tail, "\n")
+}
+
+func hasQuotaOrAuthFailureToken(lower string) bool {
+	for _, tok := range []string{
+		"429",
+		"resource_exhausted",
+		"resourceexhausted",
+		"quota",
+		"rate limit",
+		"token limit",
+		"unauthorized",
+		"unauthenticated",
+		"auth_error",
+		"authentication failed",
+		"auth expired",
+		"auth expiration",
+		"invalid_api_key",
+		"permission_denied",
+		"tool_quota_or_auth",
+		"preflight_or_early_tool_exit",
+	} {
+		if strings.Contains(lower, tok) {
+			return true
+		}
+	}
+	if strings.Contains(lower, "auth") {
+		cleaned := strings.ReplaceAll(lower, "authorized_slugs", "")
+		cleaned = strings.ReplaceAll(cleaned, "authorized", "")
+		cleaned = strings.ReplaceAll(cleaned, "author", "")
+		return strings.Contains(cleaned, "auth")
+	}
+	return false
+}
+
 // ClassifyDispatchFailureWithDirection maps an error string to canonical failure taxonomy including upstream/downstream service direction.
 func ClassifyDispatchFailureWithDirection(errStr string) (category, stage, direction, service, summary string, retriable bool) {
-	lower := strings.ToLower(strings.TrimSpace(errStr))
+	lower := strings.ToLower(extractDispatchFailureTail(errStr))
 	switch {
+	case strings.Contains(lower, "hard block:") || strings.Contains(lower, "autonomous self-confirmation detected") || strings.Contains(lower, "iazio-pre-tool-hook") || strings.Contains(lower, "policy_hook_blocked"):
+		return FailureCategoryPolicyHookBlocked, FailureStageToolExecution, FailureDirectionLocalExecution, "iazio-pre-tool-hook", "Pre-tool safety hook blocked forbidden autonomous tool call", true
 	case strings.Contains(lower, "claim") || strings.Contains(lower, "startup_heartbeat") || strings.Contains(lower, "unacknowledged lease"):
 		return FailureCategoryDispatchClaimTimeout, FailureStageQueueDispatch, FailureDirectionDownstream, "iazio-agent", "Agent lease claim timed out or lost before initial acknowledgement", true
-	case strings.Contains(lower, "429") || strings.Contains(lower, "resource_exhausted") || strings.Contains(lower, "resourceexhausted") || strings.Contains(lower, "quota") || strings.Contains(lower, "auth") || strings.Contains(lower, "token limit") || strings.Contains(lower, "unauthorized") || strings.Contains(lower, "preflight_or_early_tool_exit"):
+	case hasQuotaOrAuthFailureToken(lower):
 		return FailureCategoryToolQuotaOrAuth, FailureStageToolExecution, FailureDirectionUpstream, "antigravity-llm-provider", "Tool startup failed due to quota exhaustion, rate limit, or auth expiration", true
 	case strings.Contains(lower, "api.github.com") || (strings.Contains(lower, "github.com") && (strings.Contains(lower, "502") || strings.Contains(lower, "503") || strings.Contains(lower, "504") || strings.Contains(lower, "connection refused"))):
 		return "UPSTREAM_SCM_UNAVAILABLE", FailureStageCompletionGate, FailureDirectionUpstream, "github-api", "Upstream GitHub SCM API unavailable during delivery", true
@@ -2434,10 +2504,15 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 	q.rebuildActiveJobsLocked()
 	jobSnapshot := cloneJobSnapshot(job)
 	done := job.doneCh
+	job.doneCh = nil
 	q.mu.Unlock()
 
 	if done != nil {
-		close(done)
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
 	}
 	for _, ch := range depDoneChs {
 		select {
