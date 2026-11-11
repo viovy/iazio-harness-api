@@ -6224,3 +6224,60 @@ func TestStoryGov5254_CrossWorktreeAdhocStatusSanitizationAndAutoRecovery(t *tes
 	e.mu.Unlock()
 }
 
+func TestStoryGov5256_IncompleteASEBlocksHostAndRepoAllocationUntilCompleted(t *testing.T) {
+	now := time.Date(2026, 11, 11, 21, 30, 0, 0, time.UTC)
+	e := NewEngine(func() time.Time { return now })
+	_ = e.RegisterHost("pc1", "permanent", "generic")
+	_ = e.Heartbeat("pc1", []Tool{{Name: "agy", Installed: true, Path: `C:\bin\agy.exe`, Status: "ok"}}, false)
+
+	wt01 := `C:\work\meta-repo-01`
+	wt02 := `C:\work\meta-repo-02`
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "pc1",
+		WorktreePath:                 wt01,
+		DefaultBranch:                "main",
+		CurrentBranch:                "main",
+		Queue:                        QueueOpen,
+		Lock:                         LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+	_ = e.UpsertRepo(Repo{
+		HostID:                       "pc1",
+		WorktreePath:                 wt02,
+		DefaultBranch:                "main",
+		CurrentBranch:                "feat/gov-5251-k8s-clusters-jenkins-unification",
+		Queue:                        QueueOpen,
+		Lock:                         LockRunning,
+		RunningJobID:                 "job_7d5cad6fd223f5a0",
+		LockHolder:                   "job_7d5cad6fd223f5a0",
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	// Mark job_7d5cad6fd223f5a0 as incomplete ASE on pc1 / C:\work\meta-repo-02
+	e.MarkDispatchJobASEIncomplete("job_7d5cad6fd223f5a0", "STORY-GOV-5251", "pc1", wt02)
+
+	// 1. Verify repo wt02 is quarantined (FAILED_DIRTY, QueuePaused, DirtyStoryID=STORY-GOV-5251)
+	r02, ok := e.GetRepo("pc1", wt02)
+	if !ok || r02.ASEState != "FAILED_DIRTY" || r02.DirtyStoryID != "STORY-GOV-5251" || r02.Queue != QueuePaused {
+		t.Fatalf("expected wt02 quarantined with FAILED_DIRTY and STORY-GOV-5251, got %+v", r02)
+	}
+
+	// 2. Verify host pc1 and all repo slots on pc1 are blocked from claiming/allocating other prompts while STORY-GOV-5251 is incomplete
+	if eligible, reason := e.IsHostEligibleForClaim("pc1"); eligible || !strings.Contains(reason, "STORY-GOV-5251") {
+		t.Fatalf("expected IsHostEligibleForClaim(pc1)=false mentioning STORY-GOV-5251, got eligible=%v reason=%q", eligible, reason)
+	}
+	if allocWT, allocOK := e.AllocateDispatchJobSlot("pc1", "job_other_prompt", "meta-repo", "k8s", "agy", []string{wt01, wt02}); allocOK || allocWT != "" {
+		t.Fatalf("expected AllocateDispatchJobSlot on pc1 to be blocked while STORY-GOV-5251 is incomplete, got ok=%v wt=%q", allocOK, allocWT)
+	}
+
+	// 3. Once STORY-GOV-5251 is completed, ClearDispatchJobASEIncomplete unblocks both wt02 and host pc1
+	e.ClearDispatchJobASEIncomplete("job_7d5cad6fd223f5a0", "STORY-GOV-5251", "pc1", wt02)
+	if eligible, reason := e.IsHostEligibleForClaim("pc1"); !eligible {
+		t.Fatalf("expected IsHostEligibleForClaim(pc1)=true after STORY-GOV-5251 completed, got false (%s)", reason)
+	}
+	if allocWT, allocOK := e.AllocateDispatchJobSlot("pc1", "job_next_wave", "meta-repo", "k8s", "agy", []string{wt01, wt02}); !allocOK || allocWT == "" {
+		t.Fatalf("expected AllocateDispatchJobSlot on pc1 to succeed after STORY-GOV-5251 completed, got ok=%v wt=%q", allocOK, allocWT)
+	}
+}
+
+

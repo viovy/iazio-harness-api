@@ -1293,5 +1293,88 @@ func TestStoryGov5253_ConciseResultSummaryAndQueueListStripping(t *testing.T) {
 	}
 }
 
+func TestStoryGov5256_CompleteHandlerQuarantinesHostAndRepoOnASEGateIncompleteAndUnblocksOnCompletion(t *testing.T) {
+	q := dispatch.NewInMemoryQueue()
+	engine := control.NewEngine(nil)
+	_ = engine.RegisterHost("pc1", "permanent", "generic")
+	wt02 := `C:\work\meta-repo-02`
+	_ = engine.UpsertRepo(control.Repo{
+		HostID:                       "pc1",
+		WorktreePath:                 wt02,
+		DefaultBranch:                "main",
+		CurrentBranch:                "main",
+		Queue:                        control.QueueOpen,
+		Lock:                         control.LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+	engine.BindDispatchQueue(q)
 
+	ah := NewAgentJobsHandler(q)
+	ah.SetEngine(engine)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/agent/jobs/{id}/complete", ah.CompleteHandler)
+
+	// Enqueue Wave 1 and dependent Wave 2
+	w1, _ := q.Enqueue(context.Background(), &dispatch.Job{
+		ID:      "job_7d5cad6fd223f5a0",
+		Type:    dispatch.JobTypePromptExecute,
+		Repo:    "k8s",
+		StoryID: "STORY-GOV-5251",
+	})
+	w2, _ := q.Enqueue(context.Background(), &dispatch.Job{
+		ID:             "job_afddead322e5bee9",
+		Type:           dispatch.JobTypePromptExecute,
+		Repo:           "k8s",
+		StoryID:        "STORY-GOV-5250",
+		DependsOnJobID: w1.ID,
+	})
+
+	claimed1, err := q.ClaimWithWorktrees(context.Background(), "pc1", nil, []string{wt02})
+	if err != nil || claimed1 == nil || claimed1.ID != w1.ID {
+		t.Fatalf("expected pc1 to claim w1, got %+v (err=%v)", claimed1, err)
+	}
+
+	// 1. Report ASE_GATE_INCOMPLETE via CompleteHandler
+	failReq, _ := json.Marshal(CompleteJobRequest{
+		FencingToken: claimed1.FencingToken,
+		Result:       json.RawMessage(`{"status":"failed","failure_category":"ASE_GATE_INCOMPLETE","story_id":"STORY-GOV-5251","worktree_path":"C:/work/meta-repo-02"}`),
+		Error:        "ASE_GATE_INCOMPLETE: unmerged_feature_branch (worktree remains on branch feat/gov-5251-k8s-clusters-jenkins-unification; git-flow land not completed)",
+	})
+	rrFail := httptest.NewRecorder()
+	mux.ServeHTTP(rrFail, httptest.NewRequest(http.MethodPost, "/api/v1/agent/jobs/"+w1.ID+"/complete", bytes.NewReader(failReq)))
+	if rrFail.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from CompleteHandler on fail, got %d: %s", rrFail.Code, rrFail.Body.String())
+	}
+
+	// Wave 2 must remain in blocked_by_dependency (not failed!)
+	w2AfterFail, _ := q.Get(w2.ID)
+	if w2AfterFail.Status != dispatch.JobStatusBlockedByDependency || w2AfterFail.CompletedAt != nil {
+		t.Fatalf("expected Wave 2 to stay in blocked_by_dependency with nil CompletedAt, got status=%s completedAt=%v", w2AfterFail.Status, w2AfterFail.CompletedAt)
+	}
+	// Host pc1 and repo wt02 must be quarantined against new unrelated claims
+	if eligible, _ := engine.IsHostEligibleForClaim("pc1"); eligible {
+		t.Fatalf("expected pc1 to be blocked from claiming other prompts while STORY-GOV-5251 is FAILED_DIRTY")
+	}
+
+	// 2. Reconcile Wave 1 to completed via CompleteHandler once branch lands
+	compReq, _ := json.Marshal(CompleteJobRequest{
+		FencingToken: claimed1.FencingToken,
+		Result:       json.RawMessage(`{"status":"completed","exit_code":0,"ase_complete":true,"story_id":"STORY-GOV-5251","worktree_path":"C:/work/meta-repo-02"}`),
+		Error:        "",
+	})
+	rrComp := httptest.NewRecorder()
+	mux.ServeHTTP(rrComp, httptest.NewRequest(http.MethodPost, "/api/v1/agent/jobs/"+w1.ID+"/complete", bytes.NewReader(compReq)))
+	if rrComp.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from CompleteHandler reconciliation, got %d: %s", rrComp.Code, rrComp.Body.String())
+	}
+
+	// Wave 2 must now be promoted to pending and host pc1 unblocked!
+	w2AfterComp, _ := q.Get(w2.ID)
+	if w2AfterComp.Status != dispatch.JobStatusPending {
+		t.Fatalf("expected Wave 2 promoted to pending after Wave 1 completion, got %s", w2AfterComp.Status)
+	}
+	if eligible, reason := engine.IsHostEligibleForClaim("pc1"); !eligible {
+		t.Fatalf("expected pc1 unblocked after Wave 1 completion, got false (%s)", reason)
+	}
+}
 

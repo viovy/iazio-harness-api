@@ -1170,36 +1170,42 @@ func (q *InMemoryQueue) resolveDependentJobsLocked(ctx context.Context, now time
 			}
 			satisfied, failedDep := q.areDependenciesSatisfiedLocked(child)
 			if failedDep != nil {
-				child.Status = JobStatusFailed
 				reason := strings.TrimSpace(failedDep.Error)
+				var depErr string
 				if reason != "" {
-					child.Error = fmt.Sprintf("DEPENDENCY_FAILED: upstream job %s %s (%s)", failedDep.ID, failedDep.Status, reason)
+					depErr = fmt.Sprintf("DEPENDENCY_FAILED: upstream job %s %s (%s)", failedDep.ID, failedDep.Status, reason)
 				} else {
-					child.Error = fmt.Sprintf("DEPENDENCY_FAILED: upstream job %s %s", failedDep.ID, failedDep.Status)
+					depErr = fmt.Sprintf("DEPENDENCY_FAILED: upstream job %s %s", failedDep.ID, failedDep.Status)
 				}
-				child.FailureCategory = FailureCategoryDependencyFailed
-				child.FailureStage = FailureStageQueueDispatch
-				child.FailureDirection = FailureDirectionUpstream
-				child.FailureService = "iazio-harness-api"
-				child.FailureReasonSummary = child.Error
-				child.Retriable = false
-				compAt := now
-				child.CompletedAt = &compAt
-				if child.DispatchDiagnostics != nil {
-					child.DispatchDiagnostics.QueueState = "failed"
-				} else {
-					child.DispatchDiagnostics = &DispatchDiagnostics{QueueState: "failed"}
+				if child.Status != JobStatusBlockedByDependency || child.FailureCategory != FailureCategoryDependencyFailed || child.Error != depErr || child.CompletedAt != nil {
+					child.Status = JobStatusBlockedByDependency
+					child.Error = depErr
+					child.FailureCategory = FailureCategoryDependencyFailed
+					child.FailureStage = FailureStageQueueDispatch
+					child.FailureDirection = FailureDirectionUpstream
+					child.FailureService = "iazio-harness-api"
+					child.FailureReasonSummary = child.Error
+					child.Retriable = true
+					child.CompletedAt = nil
+					if child.DispatchDiagnostics != nil {
+						child.DispatchDiagnostics.QueueState = JobStatusBlockedByDependency
+					} else {
+						child.DispatchDiagnostics = &DispatchDiagnostics{QueueState: JobStatusBlockedByDependency}
+					}
+					if q.store != nil {
+						_ = q.store.SaveQueueJob(ctx, child)
+					}
+					changed = true
 				}
-				if child.doneCh != nil {
-					doneChs = append(doneChs, child.doneCh)
-				}
-				if q.store != nil {
-					_ = q.store.SaveQueueJob(ctx, child)
-				}
-				cascadedFailed = append(cascadedFailed, cloneJobSnapshot(child))
-				changed = true
 			} else if satisfied && child.Status == JobStatusBlockedByDependency {
 				child.Status = JobStatusPending
+				child.Error = ""
+				child.FailureCategory = ""
+				child.FailureStage = ""
+				child.FailureDirection = ""
+				child.FailureService = ""
+				child.FailureReasonSummary = ""
+				child.CompletedAt = nil
 				if child.DispatchDiagnostics != nil {
 					child.DispatchDiagnostics.QueueState = "queued"
 				} else {
@@ -1280,6 +1286,17 @@ func (q *InMemoryQueue) SetStore(s QueueStore) error {
 				if j.DispatchDiagnostics != nil {
 					j.DispatchDiagnostics.QueueState = "completed"
 				}
+			} else if j.Status == JobStatusFailed && j.FailureCategory == FailureCategoryDependencyFailed && len(j.DependsOnJobIDs) > 0 {
+				// STORY-GOV-5256: Restore any cascade-failed dependent jobs from terminal failed history back into active blocked_by_dependency queue state.
+				j.Status = JobStatusBlockedByDependency
+				j.CompletedAt = nil
+				j.Retriable = true
+				if j.DispatchDiagnostics != nil {
+					j.DispatchDiagnostics.QueueState = JobStatusBlockedByDependency
+				} else {
+					j.DispatchDiagnostics = &DispatchDiagnostics{QueueState: JobStatusBlockedByDependency}
+				}
+				_ = s.SaveQueueJob(context.Background(), j)
 			}
 			if q.startupGrace > 0 && (j.Status == JobStatusRunning || j.Status == JobStatusClaimed || j.Status == JobStatusLeased) {
 				minExpiry := now.Add(q.startupGrace)
@@ -2395,6 +2412,8 @@ func ClassifyDispatchFailureWithDirection(errStr string) (category, stage, direc
 		return FailureCategoryDispatchClaimTimeout, FailureStageQueueDispatch, FailureDirectionDownstream, "iazio-agent", "Agent lease claim timed out or lost before initial acknowledgement", true
 	case hasQuotaOrAuthFailureToken(lower):
 		return FailureCategoryToolQuotaOrAuth, FailureStageToolExecution, FailureDirectionUpstream, "antigravity-llm-provider", "Tool startup failed due to quota exhaustion, rate limit, or auth expiration", true
+	case strings.Contains(lower, "dirty_worktree_post_exit") || strings.Contains(lower, "post_exit") || strings.Contains(lower, "unmerged_feature_branch") || strings.Contains(lower, "unmerged feature branch") || strings.Contains(lower, "incomplete_ase_flow") || strings.Contains(lower, "unpushed_commits") || strings.Contains(lower, "ase_completion_gate_violation") || strings.Contains(lower, "ase_gate_incomplete"):
+		return FailureCategoryASEGateIncomplete, FailureStageCompletionGate, FailureDirectionLocalExecution, "autopilot", "Post-execution gate: child engine exited before completing git-flow landing or left uncommitted worktree changes", true
 	case strings.Contains(lower, "api.github.com") || (strings.Contains(lower, "github.com") && (strings.Contains(lower, "502") || strings.Contains(lower, "503") || strings.Contains(lower, "504") || strings.Contains(lower, "connection refused"))):
 		return "UPSTREAM_SCM_UNAVAILABLE", FailureStageCompletionGate, FailureDirectionUpstream, "github-api", "Upstream GitHub SCM API unavailable during delivery", true
 	case strings.Contains(lower, "jenkins") || strings.Contains(lower, "sonarqube"):
@@ -2405,8 +2424,6 @@ func ClassifyDispatchFailureWithDirection(errStr string) (category, stage, direc
 		return "DOWNSTREAM_INGEST_UNAVAILABLE", FailureStageCompletionGate, FailureDirectionDownstream, "iazio-api", "Downstream ingestion API or harvester unavailable", true
 	case strings.Contains(lower, "crash") || strings.Contains(lower, "exit status") || strings.Contains(lower, "sigsegv") || strings.Contains(lower, "binary"):
 		return FailureCategoryToolCrash, FailureStageToolExecution, FailureDirectionLocalExecution, "iazio-harness", "AI agent tool process crashed or exited non-zero during early execution", true
-	case strings.Contains(lower, "dirty_worktree_post_exit") || strings.Contains(lower, "post_exit"):
-		return FailureCategoryASEGateIncomplete, FailureStageCompletionGate, FailureDirectionLocalExecution, "autopilot", "Post-execution gate: child engine exited but left uncommitted worktree changes", true
 	case strings.Contains(lower, "worktree") || strings.Contains(lower, "workspace_prep") || strings.Contains(lower, "lock") || strings.Contains(lower, "porcelain") || strings.Contains(lower, "submodule") || strings.Contains(lower, "dirty"):
 		return FailureCategoryWorkspacePrepError, FailureStageWorkspacePrep, FailureDirectionLocalExecution, "iazio-agent", "Workspace preparation conflict: dirty worktree or stale git locks", true
 	case strings.Contains(lower, "1h0m0s") || strings.Contains(lower, "background task") || strings.Contains(lower, "drain") || strings.Contains(lower, "lease_expired") || strings.Contains(lower, "heartbeat_timeout") || strings.Contains(lower, "execution_timeout") || strings.Contains(lower, "lease expired"):
@@ -2428,7 +2445,7 @@ func ClassifyDispatchFailure(errStr string) (category, stage, summary string, re
 	return cat, stg, sum, ret
 }
 
-// isReconcilableFailure checks whether a failure reason was caused by lease/heartbeat/reaper timeout.
+// isReconcilableFailure checks whether a failure reason was caused by lease/heartbeat/reaper timeout or an incomplete ASE landing gate.
 func isReconcilableFailure(errStr string) bool {
 	lower := strings.ToLower(errStr)
 	return strings.Contains(lower, "lease_expired") ||
@@ -2437,7 +2454,14 @@ func isReconcilableFailure(errStr string) bool {
 		strings.Contains(lower, "background_drain_timeout") ||
 		strings.Contains(lower, "stalled") ||
 		strings.Contains(lower, "process_died") ||
-		strings.Contains(lower, "lease expired")
+		strings.Contains(lower, "lease expired") ||
+		strings.Contains(lower, "ase_gate_incomplete") ||
+		strings.Contains(lower, "unmerged_feature_branch") ||
+		strings.Contains(lower, "unmerged feature branch") ||
+		strings.Contains(lower, "dirty_worktree_post_exit") ||
+		strings.Contains(lower, "incomplete_ase_flow") ||
+		strings.Contains(lower, "unpushed_commits") ||
+		strings.Contains(lower, "ase_completion_gate_violation")
 }
 
 // CompleteWithFencing validates the fencing token and updates the job with final result or error.
@@ -3006,6 +3030,29 @@ func (q *InMemoryQueue) Retry(ctx context.Context, jobID string) (*Job, error) {
 	}
 	q.jobs[newJob.ID] = newJob
 	q.syncJobActiveStateLocked(newJob)
+	// STORY-GOV-5256: Re-bind any downstream dependent jobs waiting on orig.ID to newJob.ID
+	// so retrying an upstream wave job automatically unblocks/continues downstream waves.
+	for _, child := range q.jobs {
+		if child == nil || child.ID == orig.ID || child.ID == newJob.ID {
+			continue
+		}
+		updatedDep := false
+		if child.DependsOnJobID == orig.ID {
+			child.DependsOnJobID = newJob.ID
+			updatedDep = true
+		}
+		for i, depID := range child.DependsOnJobIDs {
+			if depID == orig.ID {
+				child.DependsOnJobIDs[i] = newJob.ID
+				updatedDep = true
+			}
+		}
+		if updatedDep && q.store != nil {
+			_ = q.store.SaveQueueJob(ctx, child)
+		}
+	}
+	_, _, _ = q.resolveDependentJobsLocked(ctx, q.now())
+	q.rebuildActiveJobsLocked()
 	if q.store != nil {
 		_ = q.store.SaveQueueJob(ctx, orig)
 		_ = q.store.SaveQueueJob(ctx, newJob)

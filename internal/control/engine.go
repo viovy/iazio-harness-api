@@ -1448,7 +1448,31 @@ func isRepoSlotIdleForDispatch(r *Repo) bool {
 	if r.DirtyStoryID != "" || strings.TrimSpace(r.Porcelain) != "" || len(r.DirtySubmodules) > 0 {
 		return false
 	}
+	aseUpper := strings.ToUpper(strings.TrimSpace(r.ASEState))
+	if aseUpper == "RUNNING" || aseUpper == "IN_PROGRESS" || aseUpper == "FAILED_DIRTY" {
+		return false
+	}
 	return true
+}
+
+func (e *Engine) isHostBlockedByIncompleteASELocked(hostID string) (bool, string) {
+	cleanID := strings.TrimSpace(hostID)
+	if cleanID == "" {
+		return false, ""
+	}
+	for _, r := range e.repos {
+		if r == nil || r.HostID != cleanID {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(r.ASEState), "FAILED_DIRTY") {
+			sid := strings.TrimSpace(r.DirtyStoryID)
+			if sid == "" {
+				sid = "uncompleted-ase"
+			}
+			return true, fmt.Sprintf("host %s is blocked until incomplete ASE story %s on %s is completed", cleanID, sid, r.WorktreePath)
+		}
+	}
+	return false, ""
 }
 
 func (e *Engine) isHostBlockedByEagerUpdateLocked(h *Host) (bool, string) {
@@ -1486,6 +1510,9 @@ func (e *Engine) IsHostEligibleForClaim(hostID string) (bool, string) {
 		return false, "host is OFFLINE"
 	}
 	if blocked, reason := e.isHostBlockedByEagerUpdateLocked(h); blocked {
+		return false, reason
+	}
+	if blocked, reason := e.isHostBlockedByIncompleteASELocked(cleanID); blocked {
 		return false, reason
 	}
 	return true, ""
@@ -1706,6 +1733,10 @@ func (e *Engine) AllocateDispatchJobSlot(hostID, jobID, targetRepo, targetSubmod
 
 	if dispatch.IsHostLevelNonWorktreeJob("", targetRepo) {
 		return "", true
+	}
+
+	if blocked, _ := e.isHostBlockedByIncompleteASELocked(cleanHostID); blocked {
+		return "", false
 	}
 
 	// Enforce concurrent submodule mutation guard against active schedules on the engine
@@ -2120,6 +2151,67 @@ func (e *Engine) ReleaseDispatchJobRepo(jobID string) {
 			}
 			h.ActiveJobs = kept
 			h.HarnessActive = stillActive || len(h.ActiveJobs) > 0
+		}
+	}
+}
+
+// MarkDispatchJobASEIncomplete quarantines the repository worktree and blocks host/repo allocation
+// when an Autonomous Story Execution job exits without completing its landing gate.
+func (e *Engine) MarkDispatchJobASEIncomplete(jobID, storyID, hostID, worktreePath string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	cleanJobID := strings.TrimSpace(jobID)
+	cleanStoryID := strings.TrimSpace(storyID)
+	if cleanStoryID == "" {
+		cleanStoryID = cleanJobID
+	}
+	cleanHostID := strings.TrimSpace(hostID)
+	normWT := normalizeWorktreePathForSlotMatch(worktreePath)
+
+	for _, r := range e.repos {
+		if r == nil {
+			continue
+		}
+		matched := (cleanJobID != "" && (r.RunningJobID == cleanJobID || r.LockHolder == cleanJobID)) ||
+			(cleanHostID != "" && r.HostID == cleanHostID && normWT != "" && normalizeWorktreePathForSlotMatch(r.WorktreePath) == normWT)
+		if matched {
+			r.Lock = LockIdle
+			r.RunningJobID = ""
+			r.LockHolder = ""
+			r.DirtyStoryID = cleanStoryID
+			r.ASEState = "FAILED_DIRTY"
+			r.Queue = QueuePaused
+			r.Reason = ReasonDirty
+			e.notifyRepoLocked(r)
+		}
+	}
+}
+
+// ClearDispatchJobASEIncomplete clears the FAILED_DIRTY quarantine on a repository worktree
+// once its Autonomous Story Execution job has been completed and landed.
+func (e *Engine) ClearDispatchJobASEIncomplete(jobID, storyID, hostID, worktreePath string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	cleanStoryID := strings.TrimSpace(storyID)
+	cleanHostID := strings.TrimSpace(hostID)
+	normWT := normalizeWorktreePathForSlotMatch(worktreePath)
+
+	for _, r := range e.repos {
+		if r == nil {
+			continue
+		}
+		matchedWT := cleanHostID != "" && r.HostID == cleanHostID && normWT != "" && normalizeWorktreePathForSlotMatch(r.WorktreePath) == normWT
+		matchedStory := cleanStoryID != "" && strings.EqualFold(strings.TrimSpace(r.DirtyStoryID), cleanStoryID)
+		if (matchedWT || matchedStory) && strings.EqualFold(strings.TrimSpace(r.ASEState), "FAILED_DIRTY") {
+			r.DirtyStoryID = ""
+			r.ASEState = "IDLE"
+			if r.Queue == QueuePaused && r.Reason == ReasonDirty {
+				r.Queue = QueueOpen
+				r.Reason = ""
+			}
+			e.notifyRepoLocked(r)
 		}
 	}
 }

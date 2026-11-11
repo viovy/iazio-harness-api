@@ -227,6 +227,29 @@ func (h *AgentJobsHandler) CompleteHandler(w http.ResponseWriter, r *http.Reques
 	}
 
 	job, _ := h.queue.Get(jobID)
+	if job != nil && h.engine != nil {
+		targetHost := strings.TrimSpace(job.ClaimedHost)
+		if targetHost == "" {
+			targetHost = strings.TrimSpace(job.HostID)
+		}
+		if targetHost == "" {
+			targetHost = strings.TrimSpace(job.TargetHost)
+		}
+		errLower := strings.ToLower(req.Error + " " + job.Error + " " + job.FailureCategory)
+		if job.Status == dispatch.JobStatusFailed &&
+			(job.FailureCategory == dispatch.FailureCategoryASEGateIncomplete ||
+				strings.Contains(errLower, "ase_gate_incomplete") ||
+				strings.Contains(errLower, "ase_completion_gate_violation") ||
+				strings.Contains(errLower, "unmerged_feature_branch") ||
+				strings.Contains(errLower, "unmerged feature branch") ||
+				strings.Contains(errLower, "dirty_worktree_post_exit") ||
+				strings.Contains(errLower, "incomplete_ase_flow") ||
+				strings.Contains(errLower, "unpushed_commits")) {
+			h.engine.MarkDispatchJobASEIncomplete(jobID, job.StoryID, targetHost, job.WorktreePath)
+		} else if job.Status == dispatch.JobStatusCompleted {
+			h.engine.ClearDispatchJobASEIncomplete(jobID, job.StoryID, targetHost, job.WorktreePath)
+		}
+	}
 	if job != nil && h.engine != nil && (strings.EqualFold(strings.TrimSpace(job.Type), "agent.tools.update") || strings.EqualFold(strings.TrimSpace(job.Repo), "fleet")) {
 		targetHost := strings.TrimSpace(job.ClaimedHost)
 		if targetHost == "" {
