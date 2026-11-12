@@ -1165,7 +1165,7 @@ func (q *InMemoryQueue) resolveDependentJobsLocked(ctx context.Context, now time
 			if len(child.DependsOnJobIDs) == 0 {
 				continue
 			}
-			if child.Status != JobStatusBlockedByDependency && child.Status != JobStatusPending && !(child.Status == JobStatusFailed && child.FailureCategory == FailureCategoryDependencyFailed) {
+			if child.Status != JobStatusBlockedByDependency && child.Status != JobStatusPending && child.Status != JobStatusRequeued && !(child.Status == JobStatusFailed && child.FailureCategory == FailureCategoryDependencyFailed) {
 				continue
 			}
 			satisfied, failedDep := q.areDependenciesSatisfiedLocked(child)
@@ -1198,7 +1198,7 @@ func (q *InMemoryQueue) resolveDependentJobsLocked(ctx context.Context, now time
 					}
 					changed = true
 				}
-			} else if satisfied && (child.Status == JobStatusBlockedByDependency || (child.Status == JobStatusFailed && child.FailureCategory == FailureCategoryDependencyFailed)) {
+			} else if satisfied && (child.Status == JobStatusBlockedByDependency || child.Status == JobStatusRequeued || (child.Status == JobStatusFailed && child.FailureCategory == FailureCategoryDependencyFailed)) {
 				child.Status = JobStatusPending
 				child.Error = ""
 				child.FailureCategory = ""
@@ -1218,7 +1218,7 @@ func (q *InMemoryQueue) resolveDependentJobsLocked(ctx context.Context, now time
 				}
 				promoted = append(promoted, cloneJobSnapshot(child))
 				changed = true
-			} else if !satisfied && (child.Status == JobStatusPending || (child.Status == JobStatusFailed && child.FailureCategory == FailureCategoryDependencyFailed) || (child.Status == JobStatusBlockedByDependency && child.FailureCategory == FailureCategoryDependencyFailed)) {
+			} else if !satisfied && (child.Status == JobStatusPending || child.Status == JobStatusRequeued || (child.Status == JobStatusFailed && child.FailureCategory == FailureCategoryDependencyFailed) || (child.Status == JobStatusBlockedByDependency && child.FailureCategory == FailureCategoryDependencyFailed)) {
 				child.Status = JobStatusBlockedByDependency
 				child.Error = ""
 				child.FailureCategory = ""

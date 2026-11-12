@@ -3232,4 +3232,64 @@ func TestExtendLeasesForHost_EmptyActiveSetAfterRebootDoesNotExtendIndefinitely(
 	}
 }
 
+func TestStoryGov5262_RequeuedDependentJobPromotesWhenUpstreamCompletes(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC)
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+
+	// 1. Enqueue upstream job
+	w1, err := q.Enqueue(ctx, &Job{
+		ID:   "job_up_5262",
+		Type: JobTypePromptExecute,
+		Repo: "meta-repo",
+	})
+	if err != nil {
+		t.Fatalf("enqueue upstream: %v", err)
+	}
+
+	// 2. Enqueue downstream job depending on upstream
+	w2, err := q.Enqueue(ctx, &Job{
+		ID:             "job_down_5262",
+		Type:           JobTypePromptExecute,
+		Repo:           "iazio-agent",
+		DependsOnJobID: w1.ID,
+	})
+	if err != nil {
+		t.Fatalf("enqueue downstream: %v", err)
+	}
+	if w2.Status != JobStatusBlockedByDependency {
+		t.Fatalf("expected downstream to be %s, got %s", JobStatusBlockedByDependency, w2.Status)
+	}
+
+	// 3. Simulate downstream having been put in requeued with a stale DEPENDENCY_FAILED error
+	q.mu.Lock()
+	downJob := q.jobs[w2.ID]
+	downJob.Status = JobStatusRequeued
+	downJob.Error = "DEPENDENCY_FAILED: upstream job failed"
+	downJob.FailureCategory = FailureCategoryDependencyFailed
+	q.mu.Unlock()
+
+	// 4. Complete upstream job successfully
+	if err := q.Complete(ctx, w1.ID, json.RawMessage(`{"status":"completed","exit_code":0,"ase_complete":true}`), ""); err != nil {
+		t.Fatalf("complete upstream failed: %v", err)
+	}
+
+	// 5. Verify downstream job was promoted to pending with clean error/category
+	after, ok := q.Get(w2.ID)
+	if !ok {
+		t.Fatalf("downstream job %s missing", w2.ID)
+	}
+	if after.Status != JobStatusPending {
+		t.Fatalf("expected downstream job in %s, got %s", JobStatusPending, after.Status)
+	}
+	if after.Error != "" {
+		t.Fatalf("expected error cleared, got %q", after.Error)
+	}
+	if after.FailureCategory != "" {
+		t.Fatalf("expected FailureCategory cleared, got %q", after.FailureCategory)
+	}
+}
+
+
 
