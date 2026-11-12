@@ -1964,7 +1964,7 @@ func (q *InMemoryQueue) reconcileQueueIntegrityLocked(now time.Time) []string {
 				mutated = true
 			}
 		} else if j.Status == JobStatusFailed && !hasReplacementChild[j.ID] && j.InfraRequeueCount == 0 &&
-			(strings.TrimSpace(j.ActiveConversationID) != "" || strings.TrimSpace(j.ResumeConversationID) != "" || strings.TrimSpace(j.ConversationID) != "" || strings.TrimSpace(j.WorktreePath) != "") &&
+			(strings.TrimSpace(j.ActiveConversationID) != "" || strings.TrimSpace(j.ResumeConversationID) != "" || strings.TrimSpace(j.ConversationID) != "") &&
 			(j.FailureCategory == FailureCategoryASEGateIncomplete || strings.HasPrefix(strings.TrimSpace(j.Error), "LEASE_EXPIRED")) {
 			applyASECloseoutRemediationLocked(j, j.Error)
 			mutated = true
@@ -3084,8 +3084,7 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 		cat, stage, dir, svc, summary, retriable := ClassifyDispatchFailureWithDirection(errStr)
 		hasResumableASEState := strings.TrimSpace(job.ActiveConversationID) != "" ||
 			strings.TrimSpace(job.ResumeConversationID) != "" ||
-			strings.TrimSpace(job.ConversationID) != "" ||
-			strings.TrimSpace(job.WorktreePath) != ""
+			strings.TrimSpace(job.ConversationID) != ""
 		if (cat == FailureCategoryASEGateIncomplete || job.FailureCategory == FailureCategoryASEGateIncomplete) &&
 			job.InfraRequeueCount == 0 && hasResumableASEState {
 			job.Result = result
