@@ -3291,5 +3291,161 @@ func TestStoryGov5262_RequeuedDependentJobPromotesWhenUpstreamCompletes(t *testi
 	}
 }
 
+func TestStoryGov5264_GlobalQueueLifecycleRemediation(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+
+	// 1. Upstream job_7d5cad6fd223f5a0 (STORY-GOV-5251) hits ASE_GATE_INCOMPLETE with resumable ASE state -> automated single-attempt closeout remediation
+	up, err := q.Enqueue(ctx, &Job{
+		ID:                   "job_7d5cad6fd223f5a0",
+		Type:                 JobTypePromptExecute,
+		Repo:                 "k8s",
+		StoryID:              "STORY-GOV-5251",
+		WorktreePath:         "/Users/romeo/work/meta-repo-02/k8s",
+		ResumeConversationID: "conv-5251-closeout",
+		NormalizedPrompt:     "/autonomous-story-execution STORY-GOV-5251",
+	})
+	if err != nil {
+		t.Fatalf("enqueue upstream: %v", err)
+	}
+	dep1, _ := q.Enqueue(ctx, &Job{
+		ID:             "job_495d06c8ca67a76b",
+		Type:           JobTypePromptExecute,
+		Repo:           "k8s",
+		DependsOnJobID: up.ID,
+	})
+	dep2, _ := q.Enqueue(ctx, &Job{
+		ID:             "job_bf10a230d00d38df",
+		Type:           JobTypePromptExecute,
+		Repo:           "vigo",
+		DependsOnJobID: dep1.ID,
+	})
+	dep3, _ := q.Enqueue(ctx, &Job{
+		ID:             "job_5caae91005a69cef",
+		Type:           JobTypePromptExecute,
+		Repo:           "k8s",
+		DependsOnJobID: up.ID,
+	})
+
+	claimedUp, err := q.Claim(ctx, "mac-mini", nil)
+	if err != nil || claimedUp == nil {
+		t.Fatalf("claim upstream: %v", err)
+	}
+	// Trigger ASE_GATE_INCOMPLETE -> must auto-remediate to pending (InfraRequeueCount=1) rather than cascading DEPENDENCY_FAILED
+	if err := q.CompleteWithFencing(ctx, up.ID, claimedUp.FencingToken, nil, "ASE_GATE_INCOMPLETE: unmerged_feature_branch"); err != nil {
+		t.Fatalf("complete with ASE_GATE_INCOMPLETE: %v", err)
+	}
+	upAfterGate, _ := q.Get(up.ID)
+	if upAfterGate.Status != JobStatusPending || upAfterGate.InfraRequeueCount != 1 {
+		t.Fatalf("expected upstream auto-remediated to pending with InfraRequeueCount=1, got status=%s count=%d", upAfterGate.Status, upAfterGate.InfraRequeueCount)
+	}
+	dep1AfterGate, _ := q.Get(dep1.ID)
+	if dep1AfterGate.Status != JobStatusBlockedByDependency {
+		t.Fatalf("expected dep1 to remain %s during upstream closeout remediation, got %s", JobStatusBlockedByDependency, dep1AfterGate.Status)
+	}
+
+	// 2. Simulate legacy state where dep1 and dep2 were orphaned in requeued with DEPENDENCY_FAILED while upstream completed
+	q.mu.Lock()
+	q.jobs[up.ID].Status = JobStatusCompleted
+	q.jobs[up.ID].Result = json.RawMessage(`{"status":"completed","exit_code":0,"ase_complete":true}`)
+	q.jobs[dep1.ID].Status = JobStatusRequeued
+	q.jobs[dep1.ID].Error = "DEPENDENCY_FAILED: upstream job_7d5cad6fd223f5a0 failed"
+	q.jobs[dep1.ID].FailureCategory = FailureCategoryDependencyFailed
+	q.jobs[dep2.ID].Status = JobStatusRequeued
+	q.jobs[dep2.ID].Error = "DEPENDENCY_FAILED: upstream job_495d06c8ca67a76b failed"
+	q.jobs[dep2.ID].FailureCategory = FailureCategoryDependencyFailed
+	q.jobs[dep3.ID].Status = JobStatusBlockedByDependency
+	q.jobs[dep3.ID].Error = "DEPENDENCY_FAILED: upstream job_7d5cad6fd223f5a0 failed"
+	q.jobs[dep3.ID].FailureCategory = FailureCategoryDependencyFailed
+
+	// Also add stale agent.tools.update job_e28047b251eff446 stuck in requeued with completed_via_eager_readiness
+	q.jobs["job_e28047b251eff446"] = &Job{
+		ID:        "job_e28047b251eff446",
+		Type:      "agent.tools.update",
+		Status:    JobStatusRequeued,
+		Result:    json.RawMessage(`{"status":"completed_via_eager_readiness"}`),
+		CreatedAt: now.Add(-7 * time.Hour),
+		doneCh:    make(chan struct{}),
+	}
+	q.reconcileQueueIntegrityLocked(now)
+	q.mu.Unlock()
+
+	dep1Reconciled, _ := q.Get(dep1.ID)
+	if dep1Reconciled.Status != JobStatusPending || dep1Reconciled.Error != "" || dep1Reconciled.FailureCategory != "" {
+		t.Fatalf("expected dep1 promoted to pending with cleared error, got status=%s err=%q cat=%q", dep1Reconciled.Status, dep1Reconciled.Error, dep1Reconciled.FailureCategory)
+	}
+	dep3Reconciled, _ := q.Get(dep3.ID)
+	if dep3Reconciled.Status != JobStatusPending || dep3Reconciled.Error != "" {
+		t.Fatalf("expected dep3 promoted to pending with cleared error, got status=%s err=%q", dep3Reconciled.Status, dep3Reconciled.Error)
+	}
+	// dep2 depends on dep1 (which is pending, not completed yet) -> must be in blocked_by_dependency, NOT spinning in requeued!
+	dep2Reconciled, _ := q.Get(dep2.ID)
+	if dep2Reconciled.Status != JobStatusBlockedByDependency {
+		t.Fatalf("expected dep2 moved from requeued to blocked_by_dependency while dep1 is pending, got %s", dep2Reconciled.Status)
+	}
+
+	// Verify job_e28047b251eff446 atomically transitioned to completed
+	eagerJob, _ := q.Get("job_e28047b251eff446")
+	if eagerJob.Status != JobStatusCompleted || eagerJob.CompletedAt == nil {
+		t.Fatalf("expected job_e28047b251eff446 transitioned to completed, got status=%s completedAt=%v", eagerJob.Status, eagerJob.CompletedAt)
+	}
+}
+
+type transientDeadlineLeaseStore struct {
+	fakeQueueStore
+	leaseErr error
+}
+
+func (s *transientDeadlineLeaseStore) UpdateQueueJobLease(_ context.Context, _ string, _ string, _ int64, _, _ time.Time) error {
+	return s.leaseErr
+}
+
+func TestStoryGov5264_LeaseHeartbeatTransientTimeoutResilience(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 12, 13, 0, 0, 0, time.UTC)
+	store := &transientDeadlineLeaseStore{
+		leaseErr: context.DeadlineExceeded,
+	}
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+	if err := q.SetStore(store); err != nil {
+		t.Fatalf("SetStore: %v", err)
+	}
+
+	job, err := q.Enqueue(ctx, &Job{
+		ID:          "job_bda5a4c780604853",
+		Type:        JobTypePromptExecute,
+		Repo:        "iazio-agent",
+		StoryID:     "STORY-IAZIO-0196",
+		TargetAgent: "agy",
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	claimed, err := q.Claim(ctx, "pc1", nil)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// Advance time and trigger HeartbeatWithStory and ExtendLeasesForHost while DB store times out with context.DeadlineExceeded
+	now = now.Add(2 * time.Minute)
+	hbJob, err := q.HeartbeatWithStory(ctx, job.ID, claimed.FencingToken, "STORY-IAZIO-0196")
+	if err != nil {
+		t.Fatalf("expected HeartbeatWithStory to tolerate transient context deadline exceeded, got err=%v", err)
+	}
+	if hbJob.LeaseExpiresAt == nil || !hbJob.LeaseExpiresAt.After(now) {
+		t.Fatalf("expected in-memory LeaseExpiresAt extended despite transient DB timeout, got %v", hbJob.LeaseExpiresAt)
+	}
+
+	now = now.Add(2 * time.Minute)
+	extended, err := q.ExtendLeasesForHost(ctx, "pc1", []string{job.ID})
+	if err != nil || len(extended) != 1 {
+		t.Fatalf("expected ExtendLeasesForHost to succeed in-memory on transient DB timeout, got extended=%v err=%v", extended, err)
+	}
+}
+
+
 
 

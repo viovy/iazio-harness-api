@@ -3197,6 +3197,19 @@ func (s *Server) updateEagerReadiness(w http.ResponseWriter, r *http.Request) {
 	if s.Engine != nil {
 		s.Engine.UpdateEagerReadiness(hostID, report)
 	}
+	if s.Queue != nil && (strings.EqualFold(string(report.EagerUpdateState), "COMPLETED") || strings.EqualFold(string(report.EagerUpdateState), "IDLE")) {
+		eagerResult := json.RawMessage(`{"status":"completed_via_eager_readiness"}`)
+		if jobs, err := s.Queue.List(r.Context(), dispatch.JobFilter{}); err == nil {
+			for _, j := range jobs {
+				if j == nil || j.Type != "agent.tools.update" {
+					continue
+				}
+				if (j.TargetHost == hostID || j.ClaimedHost == hostID || j.HostID == hostID) && j.Status != dispatch.JobStatusCompleted {
+					_ = s.Queue.CompleteWithFencing(r.Context(), j.ID, j.FencingToken, eagerResult, "")
+				}
+			}
+		}
+	}
 	s.reconcileQueueWithEngine(r.Context())
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

@@ -1093,6 +1093,100 @@ func normalizeJobDependencies(job *Job) {
 	}
 }
 
+func (q *InMemoryQueue) hasActiveReplacementChildLocked(parentID string) bool {
+	return q.latestReplacementChildLocked(parentID) != nil
+}
+
+func (q *InMemoryQueue) latestReplacementChildLocked(parentID string) *Job {
+	cleanID := strings.TrimSpace(parentID)
+	if cleanID == "" || q.jobs[cleanID] == nil {
+		return nil
+	}
+	visited := map[string]bool{cleanID: true}
+	currID := cleanID
+	var latest *Job
+	for {
+		var next *Job
+		for _, cand := range q.jobs {
+			if cand == nil || cand.ID == currID || cand.Status == JobStatusCanceled {
+				continue
+			}
+			if strings.TrimSpace(cand.ParentID) == currID {
+				if next == nil || cand.CreatedAt.After(next.CreatedAt) {
+					next = cand
+				}
+			}
+		}
+		if next == nil || visited[next.ID] {
+			break
+		}
+		visited[next.ID] = true
+		latest = next
+		currID = next.ID
+	}
+	return latest
+}
+
+func isJobTerminalCompleted(dep *Job) (satisfied bool, failedJob *Job) {
+	if dep == nil || dep.Status != JobStatusCompleted {
+		return false, nil
+	}
+	if len(dep.Result) > 0 {
+		var rm map[string]any
+		if json.Unmarshal(dep.Result, &rm) == nil && rm != nil {
+			if rawEC, hasEC := rm["exit_code"]; hasEC {
+				switch ec := rawEC.(type) {
+				case float64:
+					if int(ec) != 0 {
+						return false, &Job{ID: dep.ID, Status: JobStatusFailed, Error: fmt.Sprintf("exit_code=%d", int(ec))}
+					}
+				case int:
+					if ec != 0 {
+						return false, &Job{ID: dep.ID, Status: JobStatusFailed, Error: fmt.Sprintf("exit_code=%d", ec)}
+					}
+				}
+			}
+			if rawASE, hasASE := rm["ase_complete"]; hasASE {
+				if aseBool, ok := rawASE.(bool); ok && !aseBool {
+					return false, nil
+				}
+			}
+		}
+	}
+	return true, nil
+}
+
+func (q *InMemoryQueue) resolveEffectiveDependencyJobLocked(depID string) (*Job, bool) {
+	dep, exists := q.jobs[depID]
+	if !exists || dep == nil {
+		return nil, false
+	}
+	if dep.Status == JobStatusCompleted {
+		return dep, true
+	}
+	if rep := q.latestReplacementChildLocked(dep.ID); rep != nil {
+		return rep, true
+	}
+	storyID := strings.TrimSpace(dep.StoryID)
+	if storyID != "" && !strings.EqualFold(storyID, "pending-allocation") && !strings.EqualFold(storyID, "pending_harness_creation") {
+		var bestCompleted *Job
+		for _, cand := range q.jobs {
+			if cand == nil || cand.ID == dep.ID || !strings.EqualFold(strings.TrimSpace(cand.StoryID), storyID) {
+				continue
+			}
+			if ok, _ := isJobTerminalCompleted(cand); ok {
+				if bestCompleted == nil || cand.CreatedAt.After(bestCompleted.CreatedAt) {
+					bestCompleted = cand
+				}
+			}
+		}
+		if bestCompleted != nil {
+			return bestCompleted, true
+		}
+	}
+	return dep, true
+}
+
 func (q *InMemoryQueue) areDependenciesSatisfiedLocked(job *Job) (satisfied bool, failedDep *Job) {
 	if job == nil {
 		return true, nil
@@ -1101,8 +1195,8 @@ func (q *InMemoryQueue) areDependenciesSatisfiedLocked(job *Job) (satisfied bool
 	if len(job.DependsOnJobIDs) == 0 {
 		return true, nil
 	}
-	for _, depID := range job.DependsOnJobIDs {
-		dep, exists := q.jobs[depID]
+	for i, depID := range job.DependsOnJobIDs {
+		dep, exists := q.resolveEffectiveDependencyJobLocked(depID)
 		if !exists || dep == nil {
 			if q.externalDepChecker != nil {
 				extExists, extSatisfied, extFailed, extReason := q.externalDepChecker(depID)
@@ -1118,34 +1212,20 @@ func (q *InMemoryQueue) areDependenciesSatisfiedLocked(job *Job) (satisfied bool
 			}
 			return false, nil
 		}
+		if dep.ID != depID {
+			job.DependsOnJobIDs[i] = dep.ID
+			if job.DependsOnJobID == depID {
+				job.DependsOnJobID = dep.ID
+			}
+		}
 		if dep.Status == JobStatusFailed || dep.Status == JobStatusCanceled {
 			return false, dep
 		}
 		if dep.Status != JobStatusCompleted {
 			return false, nil
 		}
-		// Enforce terminal COMPLETED criteria (exit_code == 0 and ase_complete == true when present in Result)
-		if len(dep.Result) > 0 {
-			var rm map[string]any
-			if json.Unmarshal(dep.Result, &rm) == nil && rm != nil {
-				if rawEC, hasEC := rm["exit_code"]; hasEC {
-					switch ec := rawEC.(type) {
-					case float64:
-						if int(ec) != 0 {
-							return false, &Job{ID: dep.ID, Status: JobStatusFailed, Error: fmt.Sprintf("exit_code=%d", int(ec))}
-						}
-					case int:
-						if ec != 0 {
-							return false, &Job{ID: dep.ID, Status: JobStatusFailed, Error: fmt.Sprintf("exit_code=%d", ec)}
-						}
-					}
-				}
-				if rawASE, hasASE := rm["ase_complete"]; hasASE {
-					if aseBool, ok := rawASE.(bool); ok && !aseBool {
-						return false, nil
-					}
-				}
-			}
+		if ok, failed := isJobTerminalCompleted(dep); !ok {
+			return false, failed
 		}
 	}
 	return true, nil
@@ -1165,7 +1245,44 @@ func (q *InMemoryQueue) resolveDependentJobsLocked(ctx context.Context, now time
 			if len(child.DependsOnJobIDs) == 0 {
 				continue
 			}
-			if child.Status != JobStatusBlockedByDependency && child.Status != JobStatusPending && child.Status != JobStatusRequeued && !(child.Status == JobStatusFailed && child.FailureCategory == FailureCategoryDependencyFailed) {
+			if child.Status == JobStatusRequeued && q.hasActiveReplacementChildLocked(child.ID) {
+				if rep := q.latestReplacementChildLocked(child.ID); rep != nil {
+					for _, grandChild := range q.jobs {
+						if grandChild == nil || grandChild.ID == child.ID || grandChild.ID == rep.ID {
+							continue
+						}
+						reb := false
+						if grandChild.DependsOnJobID == child.ID {
+							grandChild.DependsOnJobID = rep.ID
+							reb = true
+						}
+						for idx, dID := range grandChild.DependsOnJobIDs {
+							if dID == child.ID {
+								grandChild.DependsOnJobIDs[idx] = rep.ID
+								reb = true
+							}
+						}
+						if reb && q.store != nil {
+							_ = q.store.SaveQueueJob(ctx, grandChild)
+						}
+					}
+				}
+				if child.FailureCategory == FailureCategoryDependencyFailed || strings.HasPrefix(strings.TrimSpace(child.Error), "DEPENDENCY_FAILED") {
+					child.Error = ""
+					child.FailureCategory = ""
+					child.FailureStage = ""
+					child.FailureDirection = ""
+					child.FailureService = ""
+					child.FailureReasonSummary = ""
+					child.Retriable = false
+					if q.store != nil {
+						_ = q.store.SaveQueueJob(ctx, child)
+					}
+				}
+				continue
+			}
+			isDepFailedState := child.FailureCategory == FailureCategoryDependencyFailed || strings.HasPrefix(strings.TrimSpace(child.Error), "DEPENDENCY_FAILED")
+			if child.Status != JobStatusBlockedByDependency && child.Status != JobStatusPending && child.Status != JobStatusRequeued && !(child.Status == JobStatusFailed && isDepFailedState) {
 				continue
 			}
 			satisfied, failedDep := q.areDependenciesSatisfiedLocked(child)
@@ -1198,7 +1315,7 @@ func (q *InMemoryQueue) resolveDependentJobsLocked(ctx context.Context, now time
 					}
 					changed = true
 				}
-			} else if satisfied && (child.Status == JobStatusBlockedByDependency || child.Status == JobStatusRequeued || (child.Status == JobStatusFailed && child.FailureCategory == FailureCategoryDependencyFailed)) {
+			} else if satisfied && (child.Status == JobStatusBlockedByDependency || child.Status == JobStatusRequeued || (child.Status == JobStatusFailed && isDepFailedState) || (child.Status == JobStatusPending && (child.Error != "" || child.FailureCategory != ""))) {
 				child.Status = JobStatusPending
 				child.Error = ""
 				child.FailureCategory = ""
@@ -1206,7 +1323,16 @@ func (q *InMemoryQueue) resolveDependentJobsLocked(ctx context.Context, now time
 				child.FailureDirection = ""
 				child.FailureService = ""
 				child.FailureReasonSummary = ""
+				child.Retriable = false
 				child.CompletedAt = nil
+				child.ClaimedHost = ""
+				child.HostID = ""
+				child.LeaseOwner = ""
+				child.LeaseToken = ""
+				child.ClaimedAt = nil
+				child.HeartbeatAt = nil
+				child.LeaseExpiresAt = nil
+				child.LeaseAckDeadlineAt = nil
 				child.doneCh = make(chan struct{})
 				if child.DispatchDiagnostics != nil {
 					child.DispatchDiagnostics.QueueState = "queued"
@@ -1218,7 +1344,7 @@ func (q *InMemoryQueue) resolveDependentJobsLocked(ctx context.Context, now time
 				}
 				promoted = append(promoted, cloneJobSnapshot(child))
 				changed = true
-			} else if !satisfied && (child.Status == JobStatusPending || child.Status == JobStatusRequeued || (child.Status == JobStatusFailed && child.FailureCategory == FailureCategoryDependencyFailed) || (child.Status == JobStatusBlockedByDependency && child.FailureCategory == FailureCategoryDependencyFailed)) {
+			} else if !satisfied && (child.Status == JobStatusPending || child.Status == JobStatusRequeued || (child.Status == JobStatusFailed && isDepFailedState) || (child.Status == JobStatusBlockedByDependency && (child.FailureCategory == FailureCategoryDependencyFailed || child.Error != ""))) {
 				child.Status = JobStatusBlockedByDependency
 				child.Error = ""
 				child.FailureCategory = ""
@@ -1565,13 +1691,15 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 		}
 	}
 
-	if len(expiredIDs) > 0 {
-		_, _, depDoneChs := q.resolveDependentJobsLocked(context.Background(), now)
-		doneChannels = append(doneChannels, depDoneChs...)
+	promoted, _, depDoneChs := q.resolveDependentJobsLocked(context.Background(), now)
+	doneChannels = append(doneChannels, depDoneChs...)
+	if len(expiredIDs) > 0 || len(promoted) > 0 {
 		q.rebuildActiveJobsLocked()
 	}
 	if reconciledIDs := q.reconcileQueueIntegrityLocked(now); len(reconciledIDs) > 0 {
 		expiredIDs = append(expiredIDs, reconciledIDs...)
+		_, _, postDoneChs := q.resolveDependentJobsLocked(context.Background(), now)
+		doneChannels = append(doneChannels, postDoneChs...)
 		q.rebuildActiveJobsLocked()
 	}
 
@@ -1596,6 +1724,78 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 	return expiredIDs
 }
 
+func applyASECloseoutRemediationLocked(job *Job, reason string) {
+	if job == nil {
+		return
+	}
+	job.InfraRequeueCount++
+	if job.ResumeConversationID == "" {
+		if job.ActiveConversationID != "" {
+			job.ResumeConversationID = job.ActiveConversationID
+		} else if job.ConversationID != "" {
+			job.ResumeConversationID = job.ConversationID
+		}
+	}
+	if strings.TrimSpace(job.TargetHost) == "" && strings.TrimSpace(job.HostID) != "" {
+		job.TargetHost = job.HostID
+	} else if strings.TrimSpace(job.TargetHost) == "" && strings.TrimSpace(job.ClaimedHost) != "" {
+		job.TargetHost = job.ClaimedHost
+	}
+	closeoutDirective := fmt.Sprintf(
+		"Resume and complete /autonomous-story-execution closeout (%s): run git-flow land / autopilot-git-flow land --story %s --status-done --record-reviews, ensure feature branch is merged and worktree is clean on main.",
+		strings.TrimSpace(reason), strings.TrimSpace(job.StoryID),
+	)
+	if !strings.Contains(job.NormalizedPrompt, "autopilot-git-flow land") {
+		if strings.TrimSpace(job.NormalizedPrompt) == "" {
+			job.NormalizedPrompt = closeoutDirective
+		} else {
+			job.NormalizedPrompt = job.NormalizedPrompt + "\n\n" + closeoutDirective
+		}
+	}
+	if len(job.Payload) > 0 {
+		var pm map[string]any
+		if json.Unmarshal(job.Payload, &pm) == nil && pm != nil {
+			if job.ResumeConversationID != "" {
+				pm["resume_conversation_id"] = job.ResumeConversationID
+				pm["conversation_id"] = job.ResumeConversationID
+			}
+			if job.TargetHost != "" {
+				pm["target_host"] = job.TargetHost
+			}
+			if job.WorktreePath != "" {
+				pm["worktree_path"] = job.WorktreePath
+			}
+			pm["ase_closeout_remediation"] = true
+			if updated, err := json.Marshal(pm); err == nil {
+				job.Payload = updated
+			}
+		}
+	}
+	job.Status = JobStatusPending
+	job.Error = ""
+	job.FailureCategory = ""
+	job.FailureStage = ""
+	job.FailureDirection = ""
+	job.FailureService = ""
+	job.FailureReasonSummary = ""
+	job.Retriable = true
+	job.CompletedAt = nil
+	job.ClaimedHost = ""
+	job.HostID = ""
+	job.LeaseOwner = ""
+	job.LeaseToken = ""
+	job.ClaimedAt = nil
+	job.HeartbeatAt = nil
+	job.LeaseExpiresAt = nil
+	job.LeaseAckDeadlineAt = nil
+	job.doneCh = make(chan struct{})
+	if job.DispatchDiagnostics != nil {
+		job.DispatchDiagnostics.QueueState = "queued"
+	} else {
+		job.DispatchDiagnostics = &DispatchDiagnostics{QueueState: "queued"}
+	}
+}
+
 func (q *InMemoryQueue) reconcileQueueIntegrityLocked(now time.Time) []string {
 	if now.IsZero() {
 		now = q.now()
@@ -1605,7 +1805,8 @@ func (q *InMemoryQueue) reconcileQueueIntegrityLocked(now time.Time) []string {
 		if j == nil {
 			continue
 		}
-		if parentID := strings.TrimSpace(j.ParentID); parentID != "" && j.Status != JobStatusCanceled {
+		parentID := strings.TrimSpace(j.ParentID)
+		if parentID != "" && parentID != j.ID && q.jobs[parentID] != nil && j.Status != JobStatusCanceled {
 			hasReplacementChild[parentID] = true
 		}
 	}
@@ -1616,15 +1817,23 @@ func (q *InMemoryQueue) reconcileQueueIntegrityLocked(now time.Time) []string {
 			continue
 		}
 		mutated := false
-		if j.Status == JobStatusRequeued && !hasReplacementChild[j.ID] && strings.TrimSpace(j.Error) == "" &&
-			strings.Contains(string(j.Result), "completed_via_eager_readiness") {
+		if j.Status != JobStatusCompleted && strings.Contains(string(j.Result), "completed_via_eager_readiness") {
 			j.Status = JobStatusCompleted
+			j.Error = ""
+			j.FailureCategory = ""
+			j.FailureStage = ""
+			j.FailureDirection = ""
+			j.FailureService = ""
+			j.FailureReasonSummary = ""
+			j.Retriable = false
 			if j.CompletedAt == nil {
 				completedAt := now
 				j.CompletedAt = &completedAt
 			}
 			if j.DispatchDiagnostics != nil {
 				j.DispatchDiagnostics.QueueState = "completed"
+			} else {
+				j.DispatchDiagnostics = &DispatchDiagnostics{QueueState: "completed"}
 			}
 			if j.doneCh != nil {
 				select {
@@ -1632,6 +1841,11 @@ func (q *InMemoryQueue) reconcileQueueIntegrityLocked(now time.Time) []string {
 				default:
 					close(j.doneCh)
 				}
+			}
+			if q.store != nil && j.CompletedAt != nil {
+				sctx, cancel := storeContext(context.Background())
+				_ = q.store.CompleteQueueJob(sctx, j.ID, JobStatusCompleted, j.Result, "", *j.CompletedAt)
+				cancel()
 			}
 			mutated = true
 		} else if j.Status == JobStatusPending && hasReplacementChild[j.ID] {
@@ -1645,6 +1859,57 @@ func (q *InMemoryQueue) reconcileQueueIntegrityLocked(now time.Time) []string {
 			j.HeartbeatAt = nil
 			j.LeaseExpiresAt = nil
 			j.LeaseAckDeadlineAt = nil
+			mutated = true
+		} else if j.Status == JobStatusRequeued && !hasReplacementChild[j.ID] && len(j.DependsOnJobIDs) > 0 {
+			satisfied, failedDep := q.areDependenciesSatisfiedLocked(j)
+			if satisfied {
+				j.Status = JobStatusPending
+				j.Error = ""
+				j.FailureCategory = ""
+				j.FailureStage = ""
+				j.FailureDirection = ""
+				j.FailureService = ""
+				j.FailureReasonSummary = ""
+				j.Retriable = false
+				j.CompletedAt = nil
+				j.HostID = ""
+				j.ClaimedHost = ""
+				j.LeaseOwner = ""
+				j.LeaseToken = ""
+				j.ClaimedAt = nil
+				j.HeartbeatAt = nil
+				j.LeaseExpiresAt = nil
+				j.LeaseAckDeadlineAt = nil
+				j.doneCh = make(chan struct{})
+				if j.DispatchDiagnostics != nil {
+					j.DispatchDiagnostics.QueueState = "queued"
+				} else {
+					j.DispatchDiagnostics = &DispatchDiagnostics{QueueState: "queued"}
+				}
+				mutated = true
+			} else {
+				j.Status = JobStatusBlockedByDependency
+				j.CompletedAt = nil
+				if failedDep == nil {
+					j.Error = ""
+					j.FailureCategory = ""
+					j.FailureStage = ""
+					j.FailureDirection = ""
+					j.FailureService = ""
+					j.FailureReasonSummary = ""
+				}
+				j.doneCh = make(chan struct{})
+				if j.DispatchDiagnostics != nil {
+					j.DispatchDiagnostics.QueueState = JobStatusBlockedByDependency
+				} else {
+					j.DispatchDiagnostics = &DispatchDiagnostics{QueueState: JobStatusBlockedByDependency}
+				}
+				mutated = true
+			}
+		} else if j.Status == JobStatusFailed && !hasReplacementChild[j.ID] && j.InfraRequeueCount == 0 &&
+			(strings.TrimSpace(j.ActiveConversationID) != "" || strings.TrimSpace(j.ResumeConversationID) != "" || strings.TrimSpace(j.ConversationID) != "" || strings.TrimSpace(j.WorktreePath) != "") &&
+			(j.FailureCategory == FailureCategoryASEGateIncomplete || strings.HasPrefix(strings.TrimSpace(j.Error), "LEASE_EXPIRED")) {
+			applyASECloseoutRemediationLocked(j, j.Error)
 			mutated = true
 		} else if j.Status == JobStatusPending {
 			if j.HostID != "" || j.ClaimedHost != "" || j.LeaseOwner != "" || j.LeaseToken != "" {
@@ -2227,8 +2492,12 @@ func (q *InMemoryQueue) HeartbeatWithStory(ctx context.Context, jobID string, fe
 		sctx, cancel := storeContext(ctx)
 		defer cancel()
 		if err := q.store.UpdateQueueJobLease(sctx, job.ID, job.LeaseOwner, job.FencingToken, now, expires); err != nil {
-			log.Printf("[dispatch-queue] ERROR: failed to persist heartbeat lease for %s: %v", jobID, err)
-			return nil, fmt.Errorf("persist heartbeat lease: %w", err)
+			if isTransientPersistenceTimeout(err) {
+				log.Printf("[dispatch-queue] WARN: transient DB timeout persisting heartbeat lease for %s (retaining in-memory lease extension): %v", jobID, err)
+			} else {
+				log.Printf("[dispatch-queue] ERROR: failed to persist heartbeat lease for %s: %v", jobID, err)
+				return nil, fmt.Errorf("persist heartbeat lease: %w", err)
+			}
 		}
 		if statusTransitioned || storyUpdated {
 			_ = q.store.SaveQueueJob(sctx, job)
@@ -2241,7 +2510,20 @@ func storeContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	return context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+}
+
+func isTransientPersistenceTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "context deadline exceeded") ||
+		strings.Contains(lower, "timeout") ||
+		strings.Contains(lower, "deadlock detected")
 }
 
 // NormalizeStoryTitle strips any duplicate or chained "Execute story <ID>:" prefix from title
@@ -2350,10 +2632,15 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 			sctx, cancel := storeContext(ctx)
 			if err := q.store.UpdateQueueJobLease(sctx, j.ID, hostID, j.FencingToken, now, expires); err != nil {
 				cancel()
-				log.Printf("[dispatch-queue] ERROR: failed to persist lease update for %s: %v", j.ID, err)
-				continue
+				if isTransientPersistenceTimeout(err) {
+					log.Printf("[dispatch-queue] WARN: transient DB timeout persisting lease update for %s (retaining in-memory lease extension): %v", j.ID, err)
+				} else {
+					log.Printf("[dispatch-queue] ERROR: failed to persist lease update for %s: %v", j.ID, err)
+					continue
+				}
+			} else {
+				cancel()
 			}
-			cancel()
 		}
 
 		j.HeartbeatAt = &now
@@ -2445,10 +2732,14 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 				sctx, cancel := storeContext(ctx)
 				_ = q.store.SaveQueueJob(sctx, q.jobs[jobID])
 				if err := q.store.UpdateQueueJobLease(sctx, jobID, hostID, q.jobs[jobID].FencingToken, now, expires); err != nil {
-					log.Printf("[dispatch-queue] ERROR: failed to persist rehydrated lease for %s: %v", jobID, err)
-					cancel()
-					delete(q.jobs, jobID)
-					continue
+					if isTransientPersistenceTimeout(err) {
+						log.Printf("[dispatch-queue] WARN: transient DB timeout persisting rehydrated lease for %s (retaining in-memory lease extension): %v", jobID, err)
+					} else {
+						log.Printf("[dispatch-queue] ERROR: failed to persist rehydrated lease for %s: %v", jobID, err)
+						cancel()
+						delete(q.jobs, jobID)
+						continue
+					}
 				}
 				cancel()
 			}
@@ -2728,11 +3019,57 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 		}
 	}
 
+	if strings.Contains(string(result), "completed_via_eager_readiness") {
+		errStr = ""
+	}
+
 	if errStr != "" {
+		cat, stage, dir, svc, summary, retriable := ClassifyDispatchFailureWithDirection(errStr)
+		hasResumableASEState := strings.TrimSpace(job.ActiveConversationID) != "" ||
+			strings.TrimSpace(job.ResumeConversationID) != "" ||
+			strings.TrimSpace(job.ConversationID) != "" ||
+			strings.TrimSpace(job.WorktreePath) != ""
+		if (cat == FailureCategoryASEGateIncomplete || job.FailureCategory == FailureCategoryASEGateIncomplete) &&
+			job.InfraRequeueCount == 0 && hasResumableASEState {
+			job.Result = result
+			attemptNum := job.Attempts
+			if attemptNum <= 0 {
+				attemptNum = len(job.AttemptHistory) + 1
+			}
+			job.AttemptHistory = append(job.AttemptHistory, AttemptFailure{
+				AttemptNumber:    attemptNum,
+				Host:             job.HostID,
+				Workspace:        job.Repo,
+				Tool:             job.TargetAgent,
+				FailureCategory:  FailureCategoryASEGateIncomplete,
+				FailureStage:     FailureStageCompletionGate,
+				FailureDirection: FailureDirectionLocalExecution,
+				FailureService:   "autopilot",
+				Reason:           "ASE_GATE_INCOMPLETE_AUTO_CLOSEOUT",
+				ExitCode:         1,
+				StderrTail:       errStr,
+				Timestamp:        now.UTC().Format(time.RFC3339),
+				TriggerReason:    "ase_gate_incomplete_auto_closeout",
+				OutcomeSummary:   summary,
+			})
+			applyASECloseoutRemediationLocked(job, errStr)
+			q.syncJobActiveStateLocked(job)
+			if q.store != nil {
+				sctx, cancel := storeContext(ctx)
+				_ = q.store.SaveQueueJob(sctx, job)
+				cancel()
+			}
+			slotRel := q.slotReleaser
+			q.mu.Unlock()
+			if slotRel != nil {
+				slotRel(jobID)
+			}
+			return nil
+		}
+
 		job.Status = JobStatusFailed
 		job.Result = result
 		job.Error = errStr
-		cat, stage, dir, svc, summary, retriable := ClassifyDispatchFailureWithDirection(errStr)
 		if job.FailureCategory == "" || job.FailureCategory == FailureCategoryNone {
 			job.FailureCategory = cat
 		}
@@ -2775,6 +3112,9 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 			log.Printf("[dispatch-queue] ERROR: failed to persist job completion for %s: %v", job.ID, err)
 			q.mu.Unlock()
 			return fmt.Errorf("persist job completion: %w", err)
+		}
+		if strings.Contains(string(job.Result), "completed_via_eager_readiness") {
+			_ = q.store.SaveQueueJob(sctx, job)
 		}
 		cancel()
 	}
@@ -3129,6 +3469,67 @@ func (q *InMemoryQueue) Retry(ctx context.Context, jobID string) (*Job, error) {
 		return nil, ErrJobNotFound
 	}
 
+	normalizeJobDependencies(orig)
+	isDepBlockedOrFailed := len(orig.DependsOnJobIDs) > 0 &&
+		(orig.Status == JobStatusBlockedByDependency ||
+			(orig.Status == JobStatusRequeued && !q.hasActiveReplacementChildLocked(orig.ID)) ||
+			orig.FailureCategory == FailureCategoryDependencyFailed ||
+			strings.HasPrefix(strings.TrimSpace(orig.Error), "DEPENDENCY_FAILED"))
+	if isDepBlockedOrFailed {
+		satisfied, failedDep := q.areDependenciesSatisfiedLocked(orig)
+		if satisfied {
+			orig.Status = JobStatusPending
+			orig.Error = ""
+			orig.FailureCategory = ""
+			orig.FailureStage = ""
+			orig.FailureDirection = ""
+			orig.FailureService = ""
+			orig.FailureReasonSummary = ""
+			orig.Retriable = false
+			orig.CompletedAt = nil
+			orig.ClaimedHost = ""
+			orig.HostID = ""
+			orig.LeaseOwner = ""
+			orig.LeaseToken = ""
+			orig.ClaimedAt = nil
+			orig.HeartbeatAt = nil
+			orig.LeaseExpiresAt = nil
+			orig.LeaseAckDeadlineAt = nil
+			orig.doneCh = make(chan struct{})
+			if orig.DispatchDiagnostics != nil {
+				orig.DispatchDiagnostics.QueueState = "queued"
+			} else {
+				orig.DispatchDiagnostics = &DispatchDiagnostics{QueueState: "queued"}
+			}
+		} else {
+			orig.Status = JobStatusBlockedByDependency
+			orig.CompletedAt = nil
+			if failedDep == nil {
+				orig.Error = ""
+				orig.FailureCategory = ""
+				orig.FailureStage = ""
+				orig.FailureDirection = ""
+				orig.FailureService = ""
+				orig.FailureReasonSummary = ""
+			}
+			orig.doneCh = make(chan struct{})
+			if orig.DispatchDiagnostics != nil {
+				orig.DispatchDiagnostics.QueueState = JobStatusBlockedByDependency
+			} else {
+				orig.DispatchDiagnostics = &DispatchDiagnostics{QueueState: JobStatusBlockedByDependency}
+			}
+		}
+		q.syncJobActiveStateLocked(orig)
+		_, _, _ = q.resolveDependentJobsLocked(ctx, q.now())
+		q.rebuildActiveJobsLocked()
+		if q.store != nil {
+			_ = q.store.SaveQueueJob(ctx, orig)
+		}
+		origSnapshot := cloneJobSnapshot(orig)
+		q.mu.Unlock()
+		return origSnapshot, nil
+	}
+
 	orig.Status = JobStatusRequeued
 	q.syncJobActiveStateLocked(orig)
 	retryTargetHost := orig.TargetHost
@@ -3270,8 +3671,12 @@ func (q *InMemoryQueue) AckLease(ctx context.Context, jobID, leaseToken string, 
 		sctx, cancel := storeContext(ctx)
 		defer cancel()
 		if err := q.store.UpdateQueueJobLease(sctx, job.ID, job.LeaseOwner, job.FencingToken, now, expires); err != nil {
-			log.Printf("[dispatch-queue] ERROR: failed to persist heartbeat lease for %s: %v", jobID, err)
-			return nil, fmt.Errorf("persist heartbeat lease: %w", err)
+			if isTransientPersistenceTimeout(err) {
+				log.Printf("[dispatch-queue] WARN: transient DB timeout persisting ack-lease heartbeat for %s (retaining in-memory lease extension): %v", jobID, err)
+			} else {
+				log.Printf("[dispatch-queue] ERROR: failed to persist heartbeat lease for %s: %v", jobID, err)
+				return nil, fmt.Errorf("persist heartbeat lease: %w", err)
+			}
 		}
 		_ = q.store.SaveQueueJob(sctx, job)
 	}
@@ -3557,9 +3962,60 @@ func (q *InMemoryQueue) RetryRetriable(ctx context.Context) ([]*Job, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
+	q.resolveDependentJobsLocked(ctx, q.now())
+
 	var retried []*Job
 	for _, job := range q.jobs {
+		if job.Status == JobStatusBlockedByDependency {
+			if satisfied, _ := q.areDependenciesSatisfiedLocked(job); satisfied {
+				job.Status = JobStatusPending
+				job.Error = ""
+				job.FailureCategory = ""
+				job.FailureStage = ""
+				job.FailureDirection = ""
+				job.FailureService = ""
+				job.FailureReasonSummary = ""
+				job.CompletedAt = nil
+				q.syncJobActiveStateLocked(job)
+				if q.store != nil {
+					_ = q.store.SaveQueueJob(ctx, job)
+				}
+				retried = append(retried, cloneJobSnapshot(job))
+			}
+			continue
+		}
 		if (job.Status == JobStatusFailed || job.Status == JobStatusCanceled) && job.Retriable {
+			if strings.EqualFold(strings.TrimSpace(job.FailureCategory), string(FailureCategoryDependencyFailed)) ||
+				strings.Contains(strings.ToUpper(job.Error), "DEPENDENCY_FAILED") {
+				if satisfied, _ := q.areDependenciesSatisfiedLocked(job); satisfied {
+					job.Status = JobStatusPending
+					job.Error = ""
+					job.FailureCategory = ""
+					job.FailureStage = ""
+					job.FailureDirection = ""
+					job.FailureService = ""
+					job.FailureReasonSummary = ""
+					job.CompletedAt = nil
+					job.ClaimedHost = ""
+					job.HostID = ""
+					job.ClaimedAt = nil
+					job.HeartbeatAt = nil
+					job.LeaseExpiresAt = nil
+					job.LeaseOwner = ""
+					job.LeaseToken = ""
+					job.LeaseAckDeadlineAt = nil
+				} else {
+					job.Status = JobStatusBlockedByDependency
+					job.CompletedAt = nil
+				}
+				q.syncJobActiveStateLocked(job)
+				if q.store != nil {
+					_ = q.store.SaveQueueJob(ctx, job)
+				}
+				retried = append(retried, cloneJobSnapshot(job))
+				continue
+			}
+
 			job.Status = JobStatusRequeued
 			q.syncJobActiveStateLocked(job)
 			retryTargetHost := job.TargetHost
@@ -3611,9 +4067,38 @@ func (q *InMemoryQueue) RetryRetriable(ctx context.Context) ([]*Job, error) {
 				_ = q.store.SaveQueueJob(ctx, job)
 				_ = q.store.SaveQueueJob(ctx, newJob)
 			}
+			for _, depJob := range q.jobs {
+				if depJob == nil || depJob.ID == job.ID || depJob.ID == newJob.ID {
+					continue
+				}
+				depChanged := false
+				if strings.TrimSpace(depJob.DependsOnJobID) == job.ID {
+					depJob.DependsOnJobID = newJob.ID
+					depChanged = true
+				}
+				for idx, depID := range depJob.DependsOnJobIDs {
+					if strings.TrimSpace(depID) == job.ID {
+						depJob.DependsOnJobIDs[idx] = newJob.ID
+						depChanged = true
+					}
+				}
+				if depChanged {
+					normalizeJobDependencies(depJob)
+					if depJob.Status == JobStatusRequeued || depJob.Status == JobStatusFailed {
+						depJob.Status = JobStatusBlockedByDependency
+						depJob.CompletedAt = nil
+					}
+					q.syncJobActiveStateLocked(depJob)
+					if q.store != nil {
+						_ = q.store.SaveQueueJob(ctx, depJob)
+					}
+				}
+			}
 			retried = append(retried, cloneJobSnapshot(newJob))
 		}
 	}
+	q.resolveDependentJobsLocked(ctx, q.now())
+	q.rebuildActiveJobsLocked()
 	return retried, nil
 }
 
