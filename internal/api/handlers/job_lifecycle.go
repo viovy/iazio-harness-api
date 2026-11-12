@@ -1495,7 +1495,6 @@ func (h *JobLifecycleHandler) ExecuteStory(w http.ResponseWriter, r *http.Reques
 		NormalizedPrompt:        normalizedPrompt,
 		EffectiveAction:         action,
 		TraceID:                 traceID,
-		ParentID:                span.ID,
 		SearchID:                strings.TrimSpace(req.SearchID),
 		DependsOnJobID:          strings.TrimSpace(req.DependsOnJobID),
 		DependsOnJobIDs:         req.DependsOnJobIDs,

@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -1365,6 +1366,50 @@ ON CONFLICT (id) DO UPDATE SET
   updated_at = now();
 `
 
+func isTransientDBError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "context deadline exceeded") ||
+		strings.Contains(lower, "timeout") ||
+		strings.Contains(lower, "deadlock detected") ||
+		strings.Contains(lower, "could not serialize access") ||
+		strings.Contains(lower, "connection reset") ||
+		strings.Contains(lower, "bad connection")
+}
+
+func (s *Store) execWithTransientRetry(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		attemptCtx := ctx
+		var cancel context.CancelFunc
+		if attempt > 1 || ctx.Err() != nil {
+			attemptCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+		}
+		res, err := s.db.ExecContext(attemptCtx, query, args...)
+		if cancel != nil {
+			cancel()
+		}
+		if err == nil {
+			return res, nil
+		}
+		lastErr = err
+		if !isTransientDBError(err) || attempt == maxAttempts {
+			return nil, lastErr
+		}
+		time.Sleep(time.Duration(attempt*50) * time.Millisecond)
+	}
+	return nil, lastErr
+}
+
 // SaveQueueJob persists or upserts a dispatch queue job into harness_dispatch_jobs.
 func (s *Store) SaveQueueJob(ctx context.Context, job *dispatch.Job) error {
 	if s == nil || s.db == nil || job == nil {
@@ -1397,7 +1442,7 @@ func (s *Store) SaveQueueJob(ctx context.Context, job *dispatch.Job) error {
 			affinityJSON = string(b)
 		}
 	}
-	_, err = s.db.ExecContext(ctx, SaveQueueJobUpsertSQL,
+	_, err = s.execWithTransientRetry(ctx, SaveQueueJobUpsertSQL,
 		job.ID, job.Type, job.Repo, job.TargetHost, job.ClaimedHost, job.HostID, job.TargetAgent, job.StoryID,
 		job.NormalizedPrompt, payloadBytes, job.Status, resultBytes, job.Error, job.TraceID, job.FencingToken, job.LeaseVersion,
 		job.LeaseOwner, job.LeaseToken, job.Attempts, job.CreatedAt, job.ClaimedAt, job.HeartbeatAt, job.LeaseExpiresAt, job.CompletedAt,
@@ -1417,7 +1462,7 @@ func (s *Store) UpdateQueueJobLease(ctx context.Context, jobID string, leaseOwne
 	if s == nil || s.db == nil {
 		return nil
 	}
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.execWithTransientRetry(ctx, `
 UPDATE harness_dispatch_jobs
 SET lease_owner = $2,
     lease_version = $3,
@@ -1448,7 +1493,7 @@ func (s *Store) CompleteQueueJob(ctx context.Context, jobID string, status strin
 	if len(resBytes) == 0 {
 		resBytes = nil
 	}
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.execWithTransientRetry(ctx, `
 UPDATE harness_dispatch_jobs
 SET status = $2,
     result = $3,
