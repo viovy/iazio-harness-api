@@ -1288,8 +1288,8 @@ func TestStoryGov5253_ConciseResultSummaryAndQueueListStripping(t *testing.T) {
 	// 3. Verify BuildTerminalJobCallbackPayload also uses concise summary
 	storedJob, _ := q.Get(job.ID)
 	cbPayload := BuildTerminalJobCallbackPayload(storedJob, nil)
-	if len(cbPayload.Summary) > dispatch.MaxExecutiveSummaryChars || strings.Contains(cbPayload.Summary, "[agy step #") || strings.Contains(cbPayload.Summary, "[ASE-SUPERVISOR]") {
-		t.Fatalf("expected callback payload summary to be concise and stripped, got: %s", cbPayload.Summary)
+	if len(cbPayload.Summary) > 500 || len(cbPayload.Summary) > dispatch.MaxExecutiveSummaryChars || strings.Contains(cbPayload.Summary, "[agy step #") || strings.Contains(cbPayload.Summary, "[ASE-SUPERVISOR]") {
+		t.Fatalf("expected callback payload summary to be concise (<=500 chars) and stripped, got (len=%d): %s", len(cbPayload.Summary), cbPayload.Summary)
 	}
 }
 
