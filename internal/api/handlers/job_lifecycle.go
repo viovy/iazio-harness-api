@@ -1130,6 +1130,15 @@ func (h *JobLifecycleHandler) ListQueue(w http.ResponseWriter, r *http.Request) 
 
 	items := make([]JobDetailResponse, 0, len(jobs))
 	for _, j := range jobs {
+		if j != nil && j.Status == dispatch.JobStatusPending && j.DispatchDiagnostics == nil && h.engine != nil {
+			diag := h.engine.EvaluateDispatchDiagnostics(j.TargetHost, j.TargetAgent)
+			if diag != nil {
+				if diag.QueueState == "" {
+					diag.QueueState = "queued"
+				}
+				j.DispatchDiagnostics = diag
+			}
+		}
 		detail := formatJobDetail(j)
 		if len(detail.Result) > 0 {
 			detail.Result = dispatch.StripJobResultOutputForQueueList(detail.Result)
