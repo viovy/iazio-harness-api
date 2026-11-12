@@ -1325,6 +1325,7 @@ func (q *InMemoryQueue) SetStore(s QueueStore) error {
 			}
 		}
 		_, _, depDoneChs := q.resolveDependentJobsLocked(context.Background(), now)
+		q.reconcileQueueIntegrityLocked(now)
 		q.rebuildActiveJobsLocked()
 		for _, ch := range depDoneChs {
 			select {
@@ -1523,7 +1524,8 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 					if j.ResumeConversationID == "" && j.ActiveConversationID != "" {
 						j.ResumeConversationID = j.ActiveConversationID
 					}
-					if strings.TrimSpace(j.StoryID) != "" && strings.TrimSpace(j.HostID) != "" {
+					if strings.TrimSpace(j.StoryID) != "" && strings.TrimSpace(j.HostID) != "" &&
+						(strings.TrimSpace(j.ResumeConversationID) != "" || strings.TrimSpace(j.ActiveConversationID) != "") {
 						j.TargetHost = j.HostID
 					}
 					j.Status = JobStatusPending
@@ -1568,6 +1570,10 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 		doneChannels = append(doneChannels, depDoneChs...)
 		q.rebuildActiveJobsLocked()
 	}
+	if reconciledIDs := q.reconcileQueueIntegrityLocked(now); len(reconciledIDs) > 0 {
+		expiredIDs = append(expiredIDs, reconciledIDs...)
+		q.rebuildActiveJobsLocked()
+	}
 
 	for _, ch := range doneChannels {
 		select {
@@ -1588,6 +1594,97 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 	}
 
 	return expiredIDs
+}
+
+func (q *InMemoryQueue) reconcileQueueIntegrityLocked(now time.Time) []string {
+	if now.IsZero() {
+		now = q.now()
+	}
+	hasReplacementChild := make(map[string]bool)
+	for _, j := range q.jobs {
+		if j == nil {
+			continue
+		}
+		if parentID := strings.TrimSpace(j.ParentID); parentID != "" && j.Status != JobStatusCanceled {
+			hasReplacementChild[parentID] = true
+		}
+	}
+
+	var reconciled []string
+	for _, j := range q.jobs {
+		if j == nil {
+			continue
+		}
+		mutated := false
+		if j.Status == JobStatusRequeued && !hasReplacementChild[j.ID] && strings.TrimSpace(j.Error) == "" &&
+			strings.Contains(string(j.Result), "completed_via_eager_readiness") {
+			j.Status = JobStatusCompleted
+			if j.CompletedAt == nil {
+				completedAt := now
+				j.CompletedAt = &completedAt
+			}
+			if j.DispatchDiagnostics != nil {
+				j.DispatchDiagnostics.QueueState = "completed"
+			}
+			if j.doneCh != nil {
+				select {
+				case <-j.doneCh:
+				default:
+					close(j.doneCh)
+				}
+			}
+			mutated = true
+		} else if j.Status == JobStatusPending && hasReplacementChild[j.ID] {
+			j.Status = JobStatusRequeued
+			j.HostID = ""
+			j.ClaimedHost = ""
+			j.WorktreePath = ""
+			j.LeaseOwner = ""
+			j.LeaseToken = ""
+			j.ClaimedAt = nil
+			j.HeartbeatAt = nil
+			j.LeaseExpiresAt = nil
+			j.LeaseAckDeadlineAt = nil
+			mutated = true
+		} else if j.Status == JobStatusPending {
+			if j.HostID != "" || j.ClaimedHost != "" || j.LeaseOwner != "" || j.LeaseToken != "" {
+				j.HostID = ""
+				j.ClaimedHost = ""
+				j.LeaseOwner = ""
+				j.LeaseToken = ""
+				mutated = true
+			}
+			if strings.EqualFold(strings.TrimSpace(j.AllocationSource), "global_queue_tool_priority") &&
+				(strings.TrimSpace(j.ParentID) != "" || j.Attempts > 0 || j.InfraRequeueCount > 0) &&
+				strings.TrimSpace(j.ResumeConversationID) == "" &&
+				strings.TrimSpace(j.ActiveConversationID) == "" &&
+				strings.TrimSpace(j.TargetHost) != "" {
+				j.TargetHost = ""
+				if len(j.Payload) > 0 {
+					var pm map[string]any
+					if json.Unmarshal(j.Payload, &pm) == nil && pm != nil {
+						if _, hasTH := pm["target_host"]; hasTH {
+							pm["target_host"] = ""
+							if updated, err := json.Marshal(pm); err == nil {
+								j.Payload = updated
+							}
+						}
+					}
+				}
+				mutated = true
+			}
+		}
+		if mutated {
+			q.syncJobActiveStateLocked(j)
+			reconciled = append(reconciled, j.ID)
+			if q.store != nil {
+				sctx, cancel := storeContext(context.Background())
+				_ = q.store.SaveQueueJob(sctx, j)
+				cancel()
+			}
+		}
+	}
+	return reconciled
 }
 
 // ReapExpired runs an expiration sweep across all pending and claimed jobs.
@@ -3034,11 +3131,17 @@ func (q *InMemoryQueue) Retry(ctx context.Context, jobID string) (*Job, error) {
 
 	orig.Status = JobStatusRequeued
 	q.syncJobActiveStateLocked(orig)
+	retryTargetHost := orig.TargetHost
+	if strings.EqualFold(strings.TrimSpace(orig.AllocationSource), "global_queue_tool_priority") &&
+		strings.TrimSpace(orig.ResumeConversationID) == "" &&
+		strings.TrimSpace(orig.ActiveConversationID) == "" {
+		retryTargetHost = ""
+	}
 	newJob := &Job{
 		ID:                      generateJobID(),
 		Type:                    orig.Type,
 		Repo:                    orig.Repo,
-		TargetHost:              orig.TargetHost,
+		TargetHost:              retryTargetHost,
 		TargetAgent:             orig.TargetAgent,
 		StoryID:                 orig.StoryID,
 		StoryTitle:              orig.StoryTitle,
@@ -3459,11 +3562,17 @@ func (q *InMemoryQueue) RetryRetriable(ctx context.Context) ([]*Job, error) {
 		if (job.Status == JobStatusFailed || job.Status == JobStatusCanceled) && job.Retriable {
 			job.Status = JobStatusRequeued
 			q.syncJobActiveStateLocked(job)
+			retryTargetHost := job.TargetHost
+			if strings.EqualFold(strings.TrimSpace(job.AllocationSource), "global_queue_tool_priority") &&
+				strings.TrimSpace(job.ResumeConversationID) == "" &&
+				strings.TrimSpace(job.ActiveConversationID) == "" {
+				retryTargetHost = ""
+			}
 			newJob := &Job{
 				ID:                      generateJobID(),
 				Type:                    job.Type,
 				Repo:                    job.Repo,
-				TargetHost:              job.TargetHost,
+				TargetHost:              retryTargetHost,
 				TargetAgent:             job.TargetAgent,
 				StoryID:                 job.StoryID,
 				StoryTitle:              job.StoryTitle,
@@ -3657,6 +3766,11 @@ func (q *InMemoryQueue) ForceDispatch(ctx context.Context, jobID string) (*Job, 
 	job.Status = JobStatusPending
 	job.ClaimedHost = ""
 	job.HostID = ""
+	if strings.EqualFold(strings.TrimSpace(job.AllocationSource), "global_queue_tool_priority") &&
+		strings.TrimSpace(job.ResumeConversationID) == "" &&
+		strings.TrimSpace(job.ActiveConversationID) == "" {
+		job.TargetHost = ""
+	}
 	job.ClaimedAt = nil
 	job.HeartbeatAt = nil
 	job.LeaseExpiresAt = nil
