@@ -27,13 +27,56 @@ import (
 
 var executeStoryPrefixRegex = regexp.MustCompile(`(?i)^execute\s+story\s+(?:STORY-[A-Za-z0-9_-]+|[A-Z]{2,16}-[0-9]+)(?:\s*[:\-]\s*|\s+|$)`)
 
-// MaxExecutiveSummaryChars is the maximum length of result.summary on completed/failed jobs (AC2).
-const MaxExecutiveSummaryChars = 1000
+// MaxExecutiveSummaryChars is the maximum length of result.summary on completed/failed jobs (AC3: <= 500 chars).
+const MaxExecutiveSummaryChars = 500
 
 var agyStepOutputLineRegex = regexp.MustCompile(`^(?:\[[^\]]+\]\s*)?\[agy step #\d+\]\s*output:\s*(.+)$`)
 
+func extractCraftOrTerminalHeadline(sources ...string) string {
+	var headline string
+	for _, src := range sources {
+		lines := strings.Split(src, "\n")
+		for i, rawLine := range lines {
+			trimmed := strings.TrimSpace(rawLine)
+			if m := agyStepOutputLineRegex.FindStringSubmatch(trimmed); len(m) > 1 {
+				trimmed = strings.TrimSpace(m[1])
+			}
+			if trimmed == "" || strings.Contains(trimmed, "[agy step #") || strings.Contains(trimmed, "[ASE-SUPERVISOR]") {
+				continue
+			}
+			lower := strings.ToLower(trimmed)
+			if strings.HasPrefix(lower, "## craft closeout") || strings.HasPrefix(lower, "# craft closeout") {
+				detail := ""
+				for j := i + 1; j < len(lines) && j <= i+12; j++ {
+					cand := strings.TrimSpace(lines[j])
+					if m := agyStepOutputLineRegex.FindStringSubmatch(cand); len(m) > 1 {
+						cand = strings.TrimSpace(m[1])
+					}
+					if cand == "" || strings.HasPrefix(cand, "#") || strings.Contains(cand, "[agy step #") || strings.Contains(cand, "[ASE-SUPERVISOR]") {
+						continue
+					}
+					detail = cand
+					break
+				}
+				if detail != "" {
+					headline = trimmed + " — " + detail
+				} else {
+					headline = trimmed
+				}
+			} else if strings.Contains(lower, "autonomous story execution is complete") || strings.Contains(lower, "craft closeout") {
+				headline = trimmed
+			}
+		}
+	}
+	if len(headline) > 280 {
+		headline = strings.TrimSpace(headline[:277]) + "..."
+	}
+	return headline
+}
+
 // FormatConciseExecutiveSummary strips [agy step #...] trace lines and [ASE-SUPERVISOR] log lines
-// and bounds the resulting executive summary to <= maxChars (default 1,000 chars).
+// and bounds the resulting executive summary to <= maxChars (default 500 chars), prioritizing
+// CRAFT closeout headlines or terminal status lines rather than duplicating output.
 func FormatConciseExecutiveSummary(summary, output string, maxChars int) string {
 	if maxChars <= 0 {
 		maxChars = MaxExecutiveSummaryChars
@@ -68,17 +111,31 @@ func FormatConciseExecutiveSummary(summary, output string, maxChars int) string 
 			}
 		}
 	}
+	craftHeadline := extractCraftOrTerminalHeadline(output, summary)
+	if craftHeadline != "" && lastStepOutput == "" {
+		lastStepOutput = craftHeadline
+	}
+	if len(lastStepOutput) > 320 {
+		lastStepOutput = strings.TrimSpace(lastStepOutput[:317]) + "..."
+	}
 
 	cleaned := filterClean(summary)
+	if cleaned == "" && output != "" {
+		cleaned = filterClean(output)
+	}
+	if craftHeadline != "" && !strings.Contains(cleaned, craftHeadline) {
+		if cleaned == "" {
+			cleaned = craftHeadline
+		} else {
+			cleaned = craftHeadline + "\n" + cleaned
+		}
+	}
 	if lastStepOutput != "" && !strings.Contains(cleaned, lastStepOutput) {
 		if cleaned == "" {
 			cleaned = lastStepOutput
 		} else {
 			cleaned = cleaned + "\n" + lastStepOutput
 		}
-	}
-	if cleaned == "" && output != "" {
-		cleaned = filterClean(output)
 	}
 	cleaned = strings.TrimSpace(cleaned)
 	if len(cleaned) > maxChars {
