@@ -3108,3 +3108,72 @@ func TestStoryGov5256_DependentJobsStayInActiveQueueAndRestoreOnSetStoreAndRetry
 	}
 }
 
+func TestStoryGov5257_EnqueueDependencyBlockingAndFailedJobCompletionReconciliation(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 12, 6, 0, 0, 0, time.UTC)
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+
+	// 1. Enqueue Wave 1 and fail it with UPSTREAM_MODEL_UNAVAILABLE
+	w1, err := q.Enqueue(ctx, &Job{
+		ID:      "job_wave1_gov5257",
+		Type:    JobTypePromptExecute,
+		Repo:    "k8s",
+		StoryID: "STORY-GOV-5251",
+	})
+	if err != nil {
+		t.Fatalf("enqueue wave 1: %v", err)
+	}
+	claimed1, err := q.Claim(ctx, "pc1", nil)
+	if err != nil || claimed1 == nil {
+		t.Fatalf("claim wave 1: %v", err)
+	}
+	if err := q.CompleteWithFencing(ctx, w1.ID, claimed1.FencingToken, nil, "UPSTREAM_MODEL_UNAVAILABLE: 503 service unavailable"); err != nil {
+		t.Fatalf("fail wave 1: %v", err)
+	}
+
+	// 2. Enqueue Wave 2 and Wave 3 while Wave 1 is currently failed -> must enter blocked_by_dependency (NOT terminal failed)
+	w2, err := q.Enqueue(ctx, &Job{
+		ID:             "job_wave2_gov5257",
+		Type:           JobTypePromptExecute,
+		Repo:           "k8s",
+		DependsOnJobID: w1.ID,
+	})
+	if err != nil {
+		t.Fatalf("enqueue wave 2: %v", err)
+	}
+	if w2.Status != JobStatusBlockedByDependency || w2.CompletedAt != nil {
+		t.Fatalf("expected Wave 2 enqueued against failed upstream to be %s with nil CompletedAt, got status=%s completedAt=%v",
+			JobStatusBlockedByDependency, w2.Status, w2.CompletedAt)
+	}
+
+	w3, err := q.Enqueue(ctx, &Job{
+		ID:             "job_wave3_gov5257",
+		Type:           JobTypePromptExecute,
+		Repo:           "vigo",
+		DependsOnJobID: w2.ID,
+	})
+	if err != nil {
+		t.Fatalf("enqueue wave 3: %v", err)
+	}
+	if w3.Status != JobStatusBlockedByDependency {
+		t.Fatalf("expected Wave 3 to be %s, got %s", JobStatusBlockedByDependency, w3.Status)
+	}
+
+	// 3. Reconcile Wave 1 to completed via Complete -> Wave 2 promotes to pending, Wave 3 stays blocked_by_dependency with clean error
+	if err := q.Complete(ctx, w1.ID, json.RawMessage(`{"status":"completed","exit_code":0,"ase_complete":true}`), ""); err != nil {
+		t.Fatalf("reconcile wave 1 via Complete failed: %v", err)
+	}
+	w2After, _ := q.Get(w2.ID)
+	if w2After.Status != JobStatusPending || w2After.Error != "" || w2After.FailureCategory != "" {
+		t.Fatalf("expected Wave 2 promoted to pending with empty error/category, got status=%s cat=%q err=%q",
+			w2After.Status, w2After.FailureCategory, w2After.Error)
+	}
+	w3After, _ := q.Get(w3.ID)
+	if w3After.Status != JobStatusBlockedByDependency || w3After.Error != "" {
+		t.Fatalf("expected Wave 3 in blocked_by_dependency with cleared error, got status=%s err=%q",
+			w3After.Status, w3After.Error)
+	}
+}
+
+
