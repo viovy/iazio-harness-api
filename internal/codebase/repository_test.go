@@ -55,7 +55,7 @@ func TestListRepositories(t *testing.T) {
 	ctx := context.Background()
 
 	repos := []codebase.Repository{
-		{Name: "iazio-api", Path: "iazio-api", Description: "API Gateway", UpdatedAt: time.Now()},
+		{Name: "iazio-harvester-api", Path: "iazio-harvester-api", Description: "API Gateway", UpdatedAt: time.Now()},
 		{Name: "iazio-agent", Path: "iazio-agent", Description: "Host Agent", UpdatedAt: time.Now()},
 		{Name: "iazio-web", Path: "iazio-web", Description: "Web UI", UpdatedAt: time.Now()},
 		{Name: "iazio-mcp", Path: "iazio-mcp", Description: "MCP Gateway", UpdatedAt: time.Now()},
@@ -91,10 +91,10 @@ func TestListRepositories(t *testing.T) {
 	}
 
 	// Delete and verify
-	_ = store.DeleteRepository(ctx, "iazio-api")
-	_, ok, _ := store.GetRepository(ctx, "iazio-api")
+	_ = store.DeleteRepository(ctx, "iazio-harvester-api")
+	_, ok, _ := store.GetRepository(ctx, "iazio-harvester-api")
 	if ok {
-		t.Error("expected iazio-api to be deleted")
+		t.Error("expected iazio-harvester-api to be deleted")
 	}
 }
 

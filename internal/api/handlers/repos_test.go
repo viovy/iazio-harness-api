@@ -21,7 +21,7 @@ func TestReposHandler_ListAndFiltering(t *testing.T) {
 		Path:          "iazio-mcp",
 		DefaultBranch: "main",
 		GitTreeSHA:    "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
-		Description:   "MCP server bridging iazio-api and iazio-harness-api",
+		Description:   "MCP server bridging iazio-harvester-api and iazio-harness-api",
 		UpdatedAt:     now,
 	})
 	_ = store.UpsertRepository(ctx, codebase.Repository{

@@ -2095,7 +2095,7 @@ func TestClassifyDispatchFailureWithDirection_AllBranchesAndUpdateRuntimeMetadat
 		{"https://api.github.com 503", "UPSTREAM_SCM_UNAVAILABLE", FailureDirectionUpstream, "github-api", true},
 		{"jenkins pipeline failed", "UPSTREAM_CI_UNAVAILABLE", FailureDirectionUpstream, "jenkins-ci", true},
 		{"postgres connection sqlstate", "DOWNSTREAM_DATABASE_UNAVAILABLE", FailureDirectionDownstream, "postgresql", true},
-		{"iazio-harvester /v1/ingest failed", "DOWNSTREAM_INGEST_UNAVAILABLE", FailureDirectionDownstream, "iazio-api", true},
+		{"iazio-harvester /v1/ingest failed", "DOWNSTREAM_INGEST_UNAVAILABLE", FailureDirectionDownstream, "iazio-harvester-api", true},
 		{"exit status 139 sigsegv", FailureCategoryToolCrash, FailureDirectionLocalExecution, "iazio-harness", true},
 		{"dirty_worktree_post_exit", FailureCategoryASEGateIncomplete, FailureDirectionLocalExecution, "autopilot", true},
 		{"dirty worktree lock", FailureCategoryWorkspacePrepError, FailureDirectionLocalExecution, "iazio-agent", true},

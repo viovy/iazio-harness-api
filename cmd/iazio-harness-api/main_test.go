@@ -201,7 +201,7 @@ func TestRunServerWithDatabase(t *testing.T) {
 	addr := getFreeAddr(t)
 	t.Setenv("IAZIO_HARNESS_API_ADDR", addr)
 	t.Setenv("DATABASE_URL", dsn)
-	t.Setenv("IAZIO_EXTRACT_WORKER", "/nonexistent/worker.py")
+	t.Setenv("IAZIO_EXTRACT_WORKER", "native")
 
 	ctx, cancel := context.WithCancel(context.Background())
 

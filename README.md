@@ -13,4 +13,4 @@ go build -o iazio-harness-api ./cmd/iazio-harness-api
 
 `POST /v1/ideas/import-gemini` accepts `{ "share_url": "https://gemini.google.com/share/<id>" }` only. One page render runs at a time. A second request receives HTTP 429.
 
-Public modules in this family: `iazio`, `iazio-api`, `iazio-web`, `iazio-harvester`, `iazio-mcp`, `iazio-agent`, `iazio-harness`.
+Public modules in this family: `iazio-core`, `iazio`, `iazio-harvester-api`, `iazio-web`, `iazio-harvester`, `iazio-mcp`, `iazio-agent`, `iazio-harness`, `iazio-harness-api`, `iazio-rag-api`.
