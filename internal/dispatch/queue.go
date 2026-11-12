@@ -1165,7 +1165,7 @@ func (q *InMemoryQueue) resolveDependentJobsLocked(ctx context.Context, now time
 			if len(child.DependsOnJobIDs) == 0 {
 				continue
 			}
-			if child.Status != JobStatusBlockedByDependency && child.Status != JobStatusPending {
+			if child.Status != JobStatusBlockedByDependency && child.Status != JobStatusPending && !(child.Status == JobStatusFailed && child.FailureCategory == FailureCategoryDependencyFailed) {
 				continue
 			}
 			satisfied, failedDep := q.areDependenciesSatisfiedLocked(child)
@@ -1187,6 +1187,7 @@ func (q *InMemoryQueue) resolveDependentJobsLocked(ctx context.Context, now time
 					child.FailureReasonSummary = child.Error
 					child.Retriable = true
 					child.CompletedAt = nil
+					child.doneCh = make(chan struct{})
 					if child.DispatchDiagnostics != nil {
 						child.DispatchDiagnostics.QueueState = JobStatusBlockedByDependency
 					} else {
@@ -1197,7 +1198,7 @@ func (q *InMemoryQueue) resolveDependentJobsLocked(ctx context.Context, now time
 					}
 					changed = true
 				}
-			} else if satisfied && child.Status == JobStatusBlockedByDependency {
+			} else if satisfied && (child.Status == JobStatusBlockedByDependency || (child.Status == JobStatusFailed && child.FailureCategory == FailureCategoryDependencyFailed)) {
 				child.Status = JobStatusPending
 				child.Error = ""
 				child.FailureCategory = ""
@@ -1206,6 +1207,7 @@ func (q *InMemoryQueue) resolveDependentJobsLocked(ctx context.Context, now time
 				child.FailureService = ""
 				child.FailureReasonSummary = ""
 				child.CompletedAt = nil
+				child.doneCh = make(chan struct{})
 				if child.DispatchDiagnostics != nil {
 					child.DispatchDiagnostics.QueueState = "queued"
 				} else {
@@ -1216,8 +1218,16 @@ func (q *InMemoryQueue) resolveDependentJobsLocked(ctx context.Context, now time
 				}
 				promoted = append(promoted, cloneJobSnapshot(child))
 				changed = true
-			} else if !satisfied && child.Status == JobStatusPending {
+			} else if !satisfied && (child.Status == JobStatusPending || (child.Status == JobStatusFailed && child.FailureCategory == FailureCategoryDependencyFailed) || (child.Status == JobStatusBlockedByDependency && child.FailureCategory == FailureCategoryDependencyFailed)) {
 				child.Status = JobStatusBlockedByDependency
+				child.Error = ""
+				child.FailureCategory = ""
+				child.FailureStage = ""
+				child.FailureDirection = ""
+				child.FailureService = ""
+				child.FailureReasonSummary = ""
+				child.CompletedAt = nil
+				child.doneCh = make(chan struct{})
 				if child.DispatchDiagnostics != nil {
 					child.DispatchDiagnostics.QueueState = JobStatusBlockedByDependency
 				} else {
@@ -1634,8 +1644,7 @@ func (q *InMemoryQueue) Enqueue(ctx context.Context, job *Job) (*Job, error) {
 	if len(job.DependsOnJobIDs) > 0 {
 		satisfied, failedDep := q.areDependenciesSatisfiedLocked(job)
 		if failedDep != nil {
-			now := q.now()
-			job.Status = JobStatusFailed
+			job.Status = JobStatusBlockedByDependency
 			reason := strings.TrimSpace(failedDep.Error)
 			if reason != "" {
 				job.Error = fmt.Sprintf("DEPENDENCY_FAILED: upstream job %s %s (%s)", failedDep.ID, failedDep.Status, reason)
@@ -1647,11 +1656,9 @@ func (q *InMemoryQueue) Enqueue(ctx context.Context, job *Job) (*Job, error) {
 			job.FailureDirection = FailureDirectionUpstream
 			job.FailureService = "iazio-harness-api"
 			job.FailureReasonSummary = job.Error
-			job.Retriable = false
-			job.CompletedAt = &now
-			job.DispatchDiagnostics = &DispatchDiagnostics{QueueState: "failed"}
-			close(job.doneCh)
-			failedOnEnqueue = cloneJobSnapshot(job)
+			job.Retriable = true
+			job.CompletedAt = nil
+			job.DispatchDiagnostics = &DispatchDiagnostics{QueueState: JobStatusBlockedByDependency}
 		} else if !satisfied {
 			job.Status = JobStatusBlockedByDependency
 			job.DispatchDiagnostics = &DispatchDiagnostics{QueueState: JobStatusBlockedByDependency}
@@ -2107,7 +2114,7 @@ func storeContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	return context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 }
 
 // NormalizeStoryTitle strips any duplicate or chained "Execute story <ID>:" prefix from title
@@ -2476,7 +2483,7 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 		q.mu.Unlock()
 		return ErrJobAlreadyCompleted
 	}
-	reconcilableFailed := job.Status == JobStatusFailed && isReconcilableFailure(job.Error+" "+job.FailureCategory+" "+job.FailureReasonSummary)
+	reconcilableFailed := job.Status == JobStatusFailed && (errStr == "" || isReconcilableFailure(job.Error+" "+job.FailureCategory+" "+job.FailureReasonSummary))
 	if (job.Status == JobStatusPending || reconcilableFailed) && fencingToken > 0 {
 		// Active worker finished while job was requeued to pending or reconcilable failed (before any other worker claimed it).
 		// Re-adopt fencingToken so Attempt 1 completes cleanly without requiring a redundant Attempt 2 retrigger.

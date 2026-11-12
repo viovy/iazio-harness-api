@@ -6670,7 +6670,7 @@ func (e *Engine) ResumeRepoInPlace(host, path string, opts ...ResumeOptions) (Sc
 
 func canonicalizeEngine(engine, convID string) string {
 	raw := strings.ToLower(strings.TrimSpace(engine))
-	if strings.Contains(raw, "harness") {
+	if strings.Contains(raw, "harness") || raw == "autopilot" || raw == "autopilot-ase" || raw == "default" || raw == "" {
 		if strings.HasPrefix(strings.ToLower(convID), "cursor-") {
 			return "agent"
 		}
@@ -6705,8 +6705,9 @@ func resolveResumeIdentity(parentEngine, requestedEngine, convID string, isQuota
 	// Canonicalize parent engine
 	canonicalParent := canonicalizeEngine(parentEngine, convID)
 
-	// Remap alias/harness
-	if strings.Contains(strings.ToLower(engineName), "harness") {
+	// Remap alias/harness/autopilot/default
+	lowerEngine := strings.ToLower(strings.TrimSpace(engineName))
+	if strings.Contains(lowerEngine, "harness") || lowerEngine == "autopilot" || lowerEngine == "autopilot-ase" || lowerEngine == "default" {
 		if strings.HasPrefix(strings.ToLower(convID), "cursor-") {
 			engineName = "agent"
 		} else {

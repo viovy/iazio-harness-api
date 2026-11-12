@@ -190,6 +190,11 @@ func (h *AgentJobsHandler) CompleteHandler(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
+	if req.FencingToken == 0 && strings.TrimSpace(req.Error) == "" {
+		if existingJob, ok := h.queue.Get(jobID); ok && existingJob != nil && existingJob.Status == dispatch.JobStatusFailed {
+			req.FencingToken = existingJob.FencingToken
+		}
+	}
 	err := h.queue.CompleteWithFencing(r.Context(), jobID, req.FencingToken, req.Result, req.Error)
 	if err == dispatch.ErrJobNotFound && !isEngineJob && req.FencingToken > 0 && len(req.Result) > 0 {
 		if rehydrated, enqErr := h.queue.Enqueue(r.Context(), &dispatch.Job{

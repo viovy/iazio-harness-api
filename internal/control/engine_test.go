@@ -6280,4 +6280,26 @@ func TestStoryGov5256_IncompleteASEBlocksHostAndRepoAllocationUntilCompleted(t *
 	}
 }
 
+func TestStoryGov5257_CanonicalizeEngineAutopilotPreservesSameConversationResume(t *testing.T) {
+	convID := "643debb4-49b8-4382-8467-2c2bd93d1bd1"
+	for _, parentEng := range []string{"autopilot", "autopilot-ase", "default", "iazio-harness", ""} {
+		finalEng, resumeMode, fallbackReason, resumeConv := resolveResumeIdentity(parentEng, "agy", convID, false, "", "")
+		if finalEng != "agy" {
+			t.Fatalf("parentEngine=%q: expected finalEng='agy', got %q", parentEng, finalEng)
+		}
+		if resumeMode == "fallback_new_conversation" || resumeConv != convID {
+			t.Fatalf("parentEngine=%q: expected same-conversation resume preserving %q, got mode=%q conv=%q reason=%q",
+				parentEng, convID, resumeMode, resumeConv, fallbackReason)
+		}
+	}
+
+	cursorConv := "cursor-session-9988"
+	finalCursor, modeCursor, reasonCursor, resCursor := resolveResumeIdentity("autopilot", "autopilot", cursorConv, false, "", "")
+	if finalCursor != "agent" || modeCursor == "fallback_new_conversation" || resCursor != cursorConv {
+		t.Fatalf("expected autopilot with cursor- session to canonicalize to agent and preserve convID, got eng=%q mode=%q conv=%q reason=%q",
+			finalCursor, modeCursor, resCursor, reasonCursor)
+	}
+}
+
+
 
