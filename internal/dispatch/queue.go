@@ -2460,8 +2460,8 @@ func ClassifyDispatchFailureWithDirection(errStr string) (category, stage, direc
 		return "UPSTREAM_CI_UNAVAILABLE", FailureStageCompletionGate, FailureDirectionUpstream, "jenkins-ci", "Upstream CI/SonarQube pipeline unavailable during verification", true
 	case strings.Contains(lower, "postgres") || strings.Contains(lower, "pgvector") || strings.Contains(lower, "sqlstate"):
 		return "DOWNSTREAM_DATABASE_UNAVAILABLE", FailureStageQueueDispatch, FailureDirectionDownstream, "postgresql", "Downstream PostgreSQL database unavailable", true
-	case strings.Contains(lower, "iazio-api") || strings.Contains(lower, "iazio-harvester") || strings.Contains(lower, "/v1/ingest"):
-		return "DOWNSTREAM_INGEST_UNAVAILABLE", FailureStageCompletionGate, FailureDirectionDownstream, "iazio-api", "Downstream ingestion API or harvester unavailable", true
+	case strings.Contains(lower, "iazio-harvester-api") || strings.Contains(lower, "iazio-api") || strings.Contains(lower, "iazio-harvester") || strings.Contains(lower, "/v1/ingest"):
+		return "DOWNSTREAM_INGEST_UNAVAILABLE", FailureStageCompletionGate, FailureDirectionDownstream, "iazio-harvester-api", "Downstream ingestion API or harvester unavailable", true
 	case strings.Contains(lower, "crash") || strings.Contains(lower, "exit status") || strings.Contains(lower, "sigsegv") || strings.Contains(lower, "binary"):
 		return FailureCategoryToolCrash, FailureStageToolExecution, FailureDirectionLocalExecution, "iazio-harness", "AI agent tool process crashed or exited non-zero during early execution", true
 	case strings.Contains(lower, "worktree") || strings.Contains(lower, "workspace_prep") || strings.Contains(lower, "lock") || strings.Contains(lower, "porcelain") || strings.Contains(lower, "submodule") || strings.Contains(lower, "dirty"):

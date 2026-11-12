@@ -320,7 +320,7 @@ func TestAgentCodebaseSync_ValidationsAndErrors(t *testing.T) {
 		Store:    store,
 		Ingestor: &mockErrIngestor{err: errors.New("unexpected storage error")},
 	}
-	reqValid := codebase.IngestRequest{RepoName: "iazio-api"}
+	reqValid := codebase.IngestRequest{RepoName: "iazio-harvester-api"}
 	bValid, _ := json.Marshal(reqValid)
 	r = httptest.NewRequest(http.MethodPost, "/api/v1/agent/codebase/sync", bytes.NewReader(bValid))
 	w = httptest.NewRecorder()

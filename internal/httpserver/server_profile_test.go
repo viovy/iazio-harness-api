@@ -29,7 +29,7 @@ fleet_distribution:
       primary: "%USERPROFILE%/bin"
   endpoints:
     harness_api: "https://example.com/iazio-harness-api"
-    iazio_api: "https://example.com/iazio-api"
+    harvester_api: "https://example.com/iazio-harvester-api"
   repositories:
     autopilot-core:
       repo: viovy/autopilot
