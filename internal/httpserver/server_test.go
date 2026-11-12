@@ -3643,3 +3643,80 @@ func TestConcurrentEngineHostDetailAndQueueClaim_NoDeadlock_StoryGOV5192(t *test
 	}
 }
 
+func TestAbandonJob_ProcessDisappearedOnHost_RequeuesAndResumesFailedDirtyStory(t *testing.T) {
+	now := time.Now().UTC()
+	eng := control.NewEngine(func() time.Time { return now })
+	_ = eng.RegisterHost("mac-mini", "permanent")
+	_ = eng.Heartbeat("mac-mini", nil, false)
+	_ = eng.UpsertRepo(control.Repo{
+		HostID:                       "mac-mini",
+		WorktreePath:                 "/Users/romeo/work/meta-repo-03",
+		Queue:                        control.QueueOpen,
+		Lock:                         control.LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	queue := dispatch.NewInMemoryQueue()
+	eng.BindDispatchQueue(queue)
+	srv := &Server{
+		Engine: eng,
+		Queue:  queue,
+	}
+	handler := srv.Handler()
+
+	job, err := queue.Enqueue(context.Background(), &dispatch.Job{
+		ID:          "job_de8c502853f28781",
+		Type:        dispatch.JobTypePromptExecute,
+		Repo:        "meta-repo",
+		TargetAgent: "agy",
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	claimed, err := queue.ClaimWithWorktrees(context.Background(), "mac-mini", nil, []string{"/Users/romeo/work/meta-repo-03"})
+	if err != nil || claimed == nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+	_, _ = queue.AckLease(context.Background(), claimed.ID, claimed.LeaseToken, 32137, "34e278f2-fe4a-4991-aee4-d52c0b954556")
+	_, _ = queue.HeartbeatWithStory(context.Background(), claimed.ID, claimed.FencingToken, "STORY-GOV-5249")
+
+	// Simulate post-reboot process_disappeared_on_host abandon + FAILED_DIRTY repo state
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID+"/abandon", strings.NewReader(`{"reason":"process_disappeared_on_host"}`))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /v1/jobs/%s/abandon, got %d: %s", job.ID, rr.Code, rr.Body.String())
+	}
+
+	afterAbandon, ok := queue.Get(job.ID)
+	if !ok || afterAbandon.Status != dispatch.JobStatusPending {
+		t.Fatalf("expected job to be declined back to pending (not canceled) on process_disappeared_on_host, got %+v", afterAbandon)
+	}
+	if afterAbandon.ResumeConversationID != "34e278f2-fe4a-4991-aee4-d52c0b954556" {
+		t.Fatalf("expected ResumeConversationID preserved on process_disappeared_on_host, got %q", afterAbandon.ResumeConversationID)
+	}
+
+	// Mark repo FAILED_DIRTY for STORY-GOV-5249 (simulating post-reboot telemetry probe)
+	eng.MarkDispatchJobASEIncomplete(job.ID, "STORY-GOV-5249", "mac-mini", "/Users/romeo/work/meta-repo-03")
+
+	// Verify unrelated pending job cannot be claimed on mac-mini while STORY-GOV-5249 is FAILED_DIRTY
+	_, _ = queue.Enqueue(context.Background(), &dispatch.Job{
+		ID:          "job_unrelated_999",
+		Type:        dispatch.JobTypePromptExecute,
+		Repo:        "meta-repo",
+		TargetAgent: "agy",
+		CreatedAt:   time.Now().Add(-10 * time.Minute),
+	})
+
+	// Re-claim on mac-mini must skip job_unrelated_999 and claim job_de8c502853f28781 in /Users/romeo/work/meta-repo-03!
+	reclaimed, err := queue.ClaimWithWorktrees(context.Background(), "mac-mini", nil, []string{"/Users/romeo/work/meta-repo-03"})
+	if err != nil || reclaimed == nil || reclaimed.ID != job.ID {
+		t.Fatalf("expected mac-mini to reclaim interrupted story job %s on FAILED_DIRTY worktree, got %+v (err=%v)", job.ID, reclaimed, err)
+	}
+	if reclaimed.WorktreePath != "/Users/romeo/work/meta-repo-03" {
+		t.Fatalf("expected reclaimed worktree=/Users/romeo/work/meta-repo-03, got %q", reclaimed.WorktreePath)
+	}
+}
+
+

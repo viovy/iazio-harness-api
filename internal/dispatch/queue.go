@@ -1468,9 +1468,11 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 
 		// 2. Claim lease & heartbeat timeout:
 		if j.Status == JobStatusClaimed || j.Status == JobStatusRunning {
+			hadProgressAfterClaim := (j.HeartbeatAt != nil && j.ClaimedAt != nil && j.HeartbeatAt.After(*j.ClaimedAt)) ||
+				j.ToolPID > 0 || j.ActiveConversationID != "" || j.StoryID != ""
 			hasActiveHeartbeatOrTool := (j.LeaseExpiresAt != nil && !j.LeaseExpiresAt.IsZero() && !now.After(*j.LeaseExpiresAt)) &&
-				((j.HeartbeatAt != nil && j.ClaimedAt != nil && j.HeartbeatAt.After(*j.ClaimedAt)) || j.ToolPID > 0 || j.ActiveConversationID != "")
-			if q.claimTimeout > 0 && j.ClaimedAt != nil && !j.ClaimedAt.IsZero() && now.Sub(*j.ClaimedAt) > q.claimTimeout && !hasActiveHeartbeatOrTool {
+				hadProgressAfterClaim
+			if q.claimTimeout > 0 && j.ClaimedAt != nil && !j.ClaimedAt.IsZero() && now.Sub(*j.ClaimedAt) > q.claimTimeout && !hasActiveHeartbeatOrTool && !hadProgressAfterClaim {
 				j.Status = JobStatusFailed
 				j.Error = "LEASE_EXPIRED: execution lease expired without completion"
 				j.FailureCategory = FailureCategoryBackgroundDrainTimeout
@@ -1516,7 +1518,14 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 				}
 
 				if j.Attempts < DefaultMaxAttempts && !consecutiveLeaseExpired {
-					// Safe runner recovery: revert to pending for retry without duplicate execution
+					// Safe runner recovery: revert to pending for retry without duplicate execution,
+					// preserving ResumeConversationID and host affinity when an in-flight story was already allocated.
+					if j.ResumeConversationID == "" && j.ActiveConversationID != "" {
+						j.ResumeConversationID = j.ActiveConversationID
+					}
+					if strings.TrimSpace(j.StoryID) != "" && strings.TrimSpace(j.HostID) != "" {
+						j.TargetHost = j.HostID
+					}
 					j.Status = JobStatusPending
 					j.ClaimedHost = ""
 					j.HostID = ""
@@ -1744,6 +1753,7 @@ func isHostLevelToolsUpdateJob(j *Job) bool {
 // concurrent submodule mutation guard, and atomic worktree slot reservation.
 func (q *InMemoryQueue) ClaimWithWorktrees(ctx context.Context, hostID string, jobTypes []string, idleWorktrees []string) (*Job, error) {
 	hostEligibleForRepoJobs := true
+	incompleteASEBlockedReason := ""
 	if hostID != "" {
 		q.mu.Lock()
 		checker := q.hostEligibilityChecker
@@ -1753,6 +1763,9 @@ func (q *InMemoryQueue) ClaimWithWorktrees(ctx context.Context, hostID string, j
 				upperReason := strings.ToUpper(strings.TrimSpace(reason))
 				if strings.Contains(upperReason, "DRIFT_DETECTED") {
 					hostEligibleForRepoJobs = false
+				} else if strings.Contains(upperReason, "INCOMPLETE ASE STORY") {
+					hostEligibleForRepoJobs = false
+					incompleteASEBlockedReason = upperReason
 				} else {
 					return nil, nil
 				}
@@ -1813,7 +1826,10 @@ func (q *InMemoryQueue) ClaimWithWorktrees(ctx context.Context, hostID string, j
 	var boundWorktree string
 	for _, j := range candidates {
 		isToolsUpdate := isHostLevelToolsUpdateJob(j)
-		if !hostEligibleForRepoJobs && !isToolsUpdate {
+		isIncompleteStoryOwner := incompleteASEBlockedReason != "" &&
+			strings.TrimSpace(j.StoryID) != "" &&
+			strings.Contains(incompleteASEBlockedReason, strings.ToUpper(strings.TrimSpace(j.StoryID)))
+		if !hostEligibleForRepoJobs && !isToolsUpdate && !isIncompleteStoryOwner {
 			continue
 		}
 		if j.DependsOnJobID != "" || len(j.DependsOnJobIDs) > 0 {
@@ -1842,9 +1858,13 @@ func (q *InMemoryQueue) ClaimWithWorktrees(ctx context.Context, hostID string, j
 				continue
 			}
 
+			slotSubmod := submod
+			if isIncompleteStoryOwner && slotSubmod == "" {
+				slotSubmod = "story:" + strings.TrimSpace(j.StoryID)
+			}
 			slotFamily := NormalizeToSuperprojectSlotFamily(j.Repo)
 			if q.slotAllocator != nil && hostID != "" {
-				wt, ok := q.slotAllocator(hostID, j.ID, slotFamily, submod, j.TargetAgent, idleWorktrees)
+				wt, ok := q.slotAllocator(hostID, j.ID, slotFamily, slotSubmod, j.TargetAgent, idleWorktrees)
 				if !ok {
 					continue
 				}
@@ -1970,16 +1990,26 @@ func (q *InMemoryQueue) Decline(ctx context.Context, jobID string, reason string
 		return snap, nil
 	}
 
-	if job.Attempts > 0 && (job.Status == JobStatusLeased || strings.EqualFold(strings.TrimSpace(reason), "REPO_BUSY") || strings.Contains(strings.ToUpper(reason), "DECLINE")) {
+	if job.Attempts > 0 && (job.Status == JobStatusLeased || strings.EqualFold(strings.TrimSpace(reason), "REPO_BUSY") || strings.EqualFold(strings.TrimSpace(reason), "process_disappeared_on_host") || strings.Contains(strings.ToUpper(reason), "DECLINE")) {
 		job.Attempts--
 	}
+	if job.ResumeConversationID == "" && job.ActiveConversationID != "" {
+		job.ResumeConversationID = job.ActiveConversationID
+	}
+	preserveHostForStory := strings.EqualFold(strings.TrimSpace(reason), "process_disappeared_on_host") &&
+		strings.TrimSpace(job.StoryID) != "" && strings.TrimSpace(job.HostID) != ""
+	prevHost := job.HostID
 	job.Status = JobStatusPending
 	job.HostID = ""
 	job.ClaimedHost = ""
 	job.WorktreePath = ""
-	job.TargetHost = ""
-	if job.AgentAffinity != nil {
-		job.AgentAffinity.HostID = ""
+	if preserveHostForStory {
+		job.TargetHost = prevHost
+	} else {
+		job.TargetHost = ""
+		if job.AgentAffinity != nil {
+			job.AgentAffinity.HostID = ""
+		}
 	}
 	job.LeaseOwner = ""
 	job.LeaseToken = ""
@@ -2209,10 +2239,13 @@ func (q *InMemoryQueue) ExtendLeasesForHost(ctx context.Context, hostID string, 
 			continue
 		}
 
-		// If specific active jobs were reported, require membership in the active set.
-		// If no active jobs were reported, keep all active jobs on this host alive as long as host heartbeats.
-		if len(activeSet) > 0 && !activeSet[j.ID] {
-			continue
+		// Require membership in the reported activeSet once the job is past a brief 30s initial claim grace window.
+		// If a host reboots or loses its runner process and sends heartbeats with active_jobs: [] (len(activeSet) == 0),
+		// do NOT extend the lease of dead RUNNING jobs forever.
+		if !activeSet[j.ID] {
+			if len(activeSet) > 0 || j.ClaimedAt == nil || now.Sub(*j.ClaimedAt) >= 30*time.Second {
+				continue
+			}
 		}
 
 		expires := now.Add(DefaultHeartbeatTimeout)
