@@ -3176,4 +3176,60 @@ func TestStoryGov5257_EnqueueDependencyBlockingAndFailedJobCompletionReconciliat
 	}
 }
 
+func TestExtendLeasesForHost_EmptyActiveSetAfterRebootDoesNotExtendIndefinitely(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 11, 17, 8, 45, 0, time.UTC)
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+
+	job, err := q.Enqueue(ctx, &Job{
+		ID:          "job_de8c502853f28781",
+		Type:        JobTypePromptExecute,
+		Repo:        "/Users/romeo/work/meta-repo-03",
+		TargetAgent: "agy",
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	claimed, err := q.Claim(ctx, "mac-mini", []string{JobTypePromptExecute})
+	if err != nil || claimed == nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+	if _, err := q.AckLease(ctx, claimed.ID, claimed.LeaseToken, 32137, "34e278f2-fe4a-4991-aee4-d52c0b954556"); err != nil {
+		t.Fatalf("ack lease failed: %v", err)
+	}
+	if _, err := q.HeartbeatWithStory(ctx, claimed.ID, claimed.FencingToken, "STORY-GOV-5249"); err != nil {
+		t.Fatalf("heartbeat with story failed: %v", err)
+	}
+
+	// Host reboots 1 hour into execution and sends heartbeats with active_jobs: [] (empty slice).
+	now = now.Add(1 * time.Hour)
+	extended, err := q.ExtendLeasesForHost(ctx, "mac-mini", nil)
+	if err != nil {
+		t.Fatalf("ExtendLeasesForHost failed: %v", err)
+	}
+	if len(extended) != 0 {
+		t.Fatalf("expected empty active_jobs after 1h not to extend dead job lease, got extended=%v", extended)
+	}
+
+	// Reaper runs and must reap the expired lease back to PENDING with ResumeConversationID and TargetHost preserved!
+	now = now.Add(DefaultHeartbeatTimeout + 1*time.Second)
+	reaped := q.ReapExpired(now)
+	if len(reaped) != 1 || reaped[0] != job.ID {
+		t.Fatalf("expected job %s to be reaped after host reboot, got %v", job.ID, reaped)
+	}
+
+	afterReap, ok := q.Get(job.ID)
+	if !ok || afterReap.Status != JobStatusPending {
+		t.Fatalf("expected job to be requeued to pending, got %+v", afterReap)
+	}
+	if afterReap.ResumeConversationID != "34e278f2-fe4a-4991-aee4-d52c0b954556" {
+		t.Fatalf("expected ResumeConversationID preserved on reap, got %q", afterReap.ResumeConversationID)
+	}
+	if afterReap.TargetHost != "mac-mini" {
+		t.Fatalf("expected TargetHost='mac-mini' preserved for in-flight story STORY-GOV-5249, got %q", afterReap.TargetHost)
+	}
+}
+
 

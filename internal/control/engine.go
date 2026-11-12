@@ -1735,12 +1735,18 @@ func (e *Engine) AllocateDispatchJobSlot(hostID, jobID, targetRepo, targetSubmod
 		return "", true
 	}
 
-	if blocked, _ := e.isHostBlockedByIncompleteASELocked(cleanHostID); blocked {
+	cleanSubmod := strings.ToLower(strings.TrimSpace(targetSubmodule))
+	var resumeStoryID string
+	if strings.HasPrefix(cleanSubmod, "story:") {
+		resumeStoryID = strings.ToUpper(strings.TrimSpace(targetSubmodule[len("story:"):]))
+		cleanSubmod = ""
+	}
+
+	if blocked, _ := e.isHostBlockedByIncompleteASELocked(cleanHostID); blocked && resumeStoryID == "" {
 		return "", false
 	}
 
 	// Enforce concurrent submodule mutation guard against active schedules on the engine
-	cleanSubmod := strings.ToLower(strings.TrimSpace(targetSubmodule))
 	if cleanSubmod != "" {
 		for _, sch := range e.schedules {
 			if sch == nil || (sch.Status != "RUNNING" && sch.Status != "LEASED" && sch.Status != "CLAIMED") {
@@ -1792,6 +1798,32 @@ func (e *Engine) AllocateDispatchJobSlot(hostID, jobID, targetRepo, targetSubmod
 				h.HarnessActive = true
 			}
 			return r.WorktreePath, true
+		}
+	}
+
+	// If resuming an interrupted story that left a worktree on this host in FAILED_DIRTY,
+	// allocate that exact worktree so the resumed job completes the in-flight story branch in place.
+	if resumeStoryID != "" {
+		for _, r := range hostRepos {
+			if strings.EqualFold(strings.TrimSpace(r.DirtyStoryID), resumeStoryID) &&
+				(r.RunningJobID == "" || r.RunningJobID == cleanJobID) &&
+				repoMatchesTargetOrSlotFamily(r, targetRepo) {
+				r.DirtyStoryID = ""
+				r.ASEState = "IDLE"
+				if r.Queue == QueuePaused && r.Reason == ReasonDirty {
+					r.Queue = QueueOpen
+					r.Reason = ""
+				}
+				r.Lock = LockRunning
+				r.RunningJobID = cleanJobID
+				r.LockHolder = cleanJobID
+				r.LastRuntimeCheck = e.now()
+				if h, ok := e.hosts[r.HostID]; ok && h != nil {
+					h.HarnessActive = true
+				}
+				e.notifyRepoLocked(r)
+				return r.WorktreePath, true
+			}
 		}
 	}
 

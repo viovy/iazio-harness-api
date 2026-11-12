@@ -809,7 +809,11 @@ func (s *Server) abandonJob(w http.ResponseWriter, r *http.Request) {
 	var errQueue error
 	var handledByQueue bool
 	if s.Queue != nil {
-		if strings.EqualFold(strings.TrimSpace(raw.Reason), "REPO_BUSY") {
+		trimmedReason := strings.TrimSpace(raw.Reason)
+		qj, existsInQueue := s.Queue.Get(jobID)
+		isStrandedDisappearance := strings.EqualFold(trimmedReason, "process_disappeared_on_host") &&
+			existsInQueue && qj != nil && qj.Attempts < dispatch.DefaultMaxAttempts
+		if strings.EqualFold(trimmedReason, "REPO_BUSY") || isStrandedDisappearance {
 			if _, qErr := s.Queue.Decline(r.Context(), jobID, raw.Reason); qErr == nil {
 				handledByQueue = true
 				if s.Engine != nil {
@@ -818,7 +822,7 @@ func (s *Server) abandonJob(w http.ResponseWriter, r *http.Request) {
 			} else {
 				errQueue = qErr
 			}
-		} else if _, ok := s.Queue.Get(jobID); ok {
+		} else if existsInQueue {
 			if _, qErr := s.Queue.Cancel(r.Context(), jobID, raw.Reason); qErr == nil {
 				handledByQueue = true
 				if s.Engine != nil {
