@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -3288,6 +3289,43 @@ func TestStoryGov5262_RequeuedDependentJobPromotesWhenUpstreamCompletes(t *testi
 	}
 	if after.FailureCategory != "" {
 		t.Fatalf("expected FailureCategory cleared, got %q", after.FailureCategory)
+	}
+}
+
+func TestStoryGov5265_SanitizeJobResultSummary500CharCeilingAndCraftCloseout(t *testing.T) {
+	if MaxExecutiveSummaryChars != 500 {
+		t.Fatalf("expected MaxExecutiveSummaryChars == 500, got %d", MaxExecutiveSummaryChars)
+	}
+	var transcript strings.Builder
+	for i := 1; i <= 500; i++ {
+		transcript.WriteString(fmt.Sprintf("[agy step #%d] thinking: Step %d trace payload %s\n", i, i, strings.Repeat("z", 120)))
+	}
+	transcript.WriteString("[agy step #501] output: ## CRAFT Closeout\n")
+	transcript.WriteString("[agy step #502] output: Completed STORY-GOV-5265 across all submodules.\n")
+
+	rawPayload, _ := json.Marshal(map[string]any{
+		"status":         "completed",
+		"story_id":       "STORY-GOV-5265",
+		"ase_complete":   true,
+		"git_head_sha":   "abcdef1234567890",
+		"output":         transcript.String(),
+		"summary":        transcript.String() + "\n" + strings.Repeat("extra verbose build line\n", 30),
+	})
+
+	sanitized := SanitizeJobResultSummary(rawPayload)
+	var m map[string]any
+	if err := json.Unmarshal(sanitized, &m); err != nil {
+		t.Fatalf("unmarshal sanitized result: %v", err)
+	}
+	summary, _ := m["summary"].(string)
+	if len(summary) > 500 {
+		t.Fatalf("expected summary <= 500 chars, got %d:\n%s", len(summary), summary)
+	}
+	if strings.Contains(summary, "[agy step #") {
+		t.Fatalf("expected zero [agy step # lines in summary, got:\n%s", summary)
+	}
+	if !strings.Contains(summary, "Completed STORY-GOV-5265") {
+		t.Fatalf("expected terminal outcome preserved in summary, got:\n%s", summary)
 	}
 }
 
