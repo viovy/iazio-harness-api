@@ -6301,5 +6301,49 @@ func TestStoryGov5257_CanonicalizeEngineAutopilotPreservesSameConversationResume
 	}
 }
 
+func TestStoryGov5273_ControlPlaneNormalizesMaintenanceBranchesAndPromptRun(t *testing.T) {
+	e := NewEngine(nil)
+	e.RegisterHost("mac-mini", "permanent")
+	wt04 := "/Users/romeo/work/meta-repo-04"
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: wt04,
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	})
+
+	// Report a non-coordinated status on chore/governance-pointers-* with STORY-GOV-POINTERS-* or ActiveTool="iazio-harness"
+	e.UpdateRepoRuntimeStatus("mac-mini", []RepoRuntimeStatus{
+		{
+			RepoPath:            wt04,
+			Branch:              "chore/governance-pointers-20261113-033931",
+			IsClean:             true,
+			SubmodulesClean:     true,
+			ASEState:            "RUNNING",
+			ExecutionProvenance: "INDEPENDENT_USER_SESSION",
+			ToolLiveness:        "LIVE",
+			ActiveTool:          "iazio-harness",
+			ActiveStoryID:       "STORY-GOV-POINTERS-20261113-033931",
+		},
+	})
+
+	det, ok := e.GetHostDetail("mac-mini")
+	if !ok {
+		t.Fatal("expected GetHostDetail(mac-mini) to succeed")
+	}
+	for _, r := range det.Repos {
+		if r.WorktreePath == wt04 {
+			if r.Queue == QueuePaused && r.Reason == "adhoc_ase_active" {
+				t.Fatalf("expected wt04 NOT to be paused with adhoc_ase_active on maintenance branch, got %+v", r)
+			}
+			if r.ASEState != "IDLE" || r.ExecutionProvenance != "NONE" || r.DirtyStoryID != "" {
+				t.Fatalf("expected wt04 normalized to IDLE/NONE with empty DirtyStoryID, got ASEState=%q Prov=%q Story=%q",
+					r.ASEState, r.ExecutionProvenance, r.DirtyStoryID)
+			}
+		}
+	}
+}
+
+
 
 
