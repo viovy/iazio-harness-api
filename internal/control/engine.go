@@ -4050,6 +4050,26 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 
 	for i := range statuses {
 		st := statuses[i]
+		if !strings.EqualFold(strings.TrimSpace(st.ExecutionProvenance), "COORDINATED_HARNESS") {
+			brLower := strings.ToLower(strings.TrimSpace(st.Branch))
+			sidUpper := strings.ToUpper(strings.TrimSpace(st.ActiveStoryID))
+			toolLower := strings.ToLower(strings.TrimSpace(st.ActiveTool))
+			isMaintBranch := strings.HasPrefix(brLower, "chore/governance-pointers-") ||
+				strings.HasPrefix(brLower, "chore/submodule-pointers-") ||
+				strings.HasPrefix(brLower, "chore/auto-sync-")
+			isMaintStory := strings.HasPrefix(sidUpper, "STORY-GOV-POINTERS-") || sidUpper == "STORY-GOV-POINTERS"
+			isPromptRunWrapper := toolLower == "iazio-harness" && sidUpper == ""
+			if isMaintBranch || isMaintStory || isPromptRunWrapper {
+				st.ActiveStoryID = ""
+				st.ASEState = "IDLE"
+				st.ExecutionProvenance = "NONE"
+				st.ToolLiveness = "NONE"
+				if isPromptRunWrapper {
+					st.ActiveTool = "NONE"
+				}
+				statuses[i] = st
+			}
+		}
 		isMain := st.Branch == "" || st.Branch == "main" || st.Branch == "master"
 		if st.IsClean && st.SubmodulesClean && len(st.NonMainSubmodules) == 0 && isMain &&
 			!strings.EqualFold(strings.TrimSpace(st.ExecutionProvenance), "COORDINATED_HARNESS") {
