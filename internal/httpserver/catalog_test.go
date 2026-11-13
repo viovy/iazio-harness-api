@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/viovy/iazio-harness-api/internal/control"
+	"github.com/viovy/iazio-harness-api/internal/dispatch"
 )
 
 func TestWebCatalogRoundTrip(t *testing.T) {
@@ -568,5 +569,105 @@ func TestSchedulesAndHistoryEndpoints(t *testing.T) {
 	schedulesTrailingSlash := get(t, h, "/v1/schedules?repo_path=/repos/app/", http.StatusOK)
 	if !strings.Contains(schedulesTrailingSlash, schID) {
 		t.Fatalf("expected trailing slash repo_path to match in /v1/schedules: %s", schedulesTrailingSlash)
+	}
+}
+
+func TestDebianMultiSlotDuplicateRunningJobAttributionFixed(t *testing.T) {
+	e := control.NewEngine(nil)
+	q := dispatch.NewInMemoryQueue()
+	s := &Server{Engine: e, Queue: q}
+	e.IsDispatchJobActive = s.isDispatchJobActive
+	h := s.Handler()
+
+	post(t, h, "/v1/hosts/register", `{"id":"debian","kind":"permanent"}`, http.StatusOK)
+	_ = e.UpsertRepo(control.Repo{
+		HostID:                       "debian",
+		WorktreePath:                 "/home/romeo/work/meta-repo",
+		CloneURL:                     "https://github.com/viovy/meta-repo.git",
+		Queue:                        control.QueueOpen,
+		Lock:                         control.LockRunning,
+		RunningJobID:                 "job_5caae91005a69cef",
+		LockHolder:                   "job_5caae91005a69cef",
+		GlobalQueueAllocationEnabled: true,
+	})
+	_ = e.UpsertRepo(control.Repo{
+		HostID:                       "debian",
+		WorktreePath:                 "/home/romeo/work/meta-repo-02",
+		CloneURL:                     "https://github.com/viovy/meta-repo.git",
+		Queue:                        control.QueuePaused,
+		Reason:                       control.ReasonDirty,
+		Lock:                         control.LockIdle,
+		Porcelain:                    "M k8s-clusters/Jenkinsfile.pr-gate",
+		DirtyStoryID:                 "STORY-GOV-5272",
+		DetectedConversationID:       "e7caeb85-ec91-4395-a084-494fecccad04",
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	_, err := q.Enqueue(t.Context(), &dispatch.Job{
+		ID:                   "job_5caae91005a69cef",
+		Type:                 dispatch.JobTypePromptExecute,
+		Status:               dispatch.JobStatusRunning,
+		Repo:                 "meta-repo",
+		WorktreePath:         "/home/romeo/work/meta-repo",
+		TargetHost:           "debian",
+		ClaimedHost:          "debian",
+		HostID:               "debian",
+		TargetAgent:          "agy",
+		StoryID:              "STORY-GOV-5272",
+		ActiveConversationID: "e7caeb85-ec91-4395-a084-494fecccad04",
+	})
+	if err != nil {
+		t.Fatalf("failed to enqueue job: %v", err)
+	}
+
+	// Simulate BindDispatchJobRepo when agent executes in /home/romeo/work/meta-repo-02
+	boundWT := e.BindDispatchJobRepo("debian", "/home/romeo/work/meta-repo-02", "job_5caae91005a69cef")
+	if boundWT != "/home/romeo/work/meta-repo-02" {
+		t.Fatalf("expected BindDispatchJobRepo to bind /home/romeo/work/meta-repo-02, got %q", boundWT)
+	}
+
+	// Simulate host heartbeat reporting active_jobs on /home/romeo/work/meta-repo-02
+	post(t, h, "/v1/hosts/debian/heartbeat", `{
+		"presence":"ONLINE",
+		"tools":[{"name":"agy","installed":true,"status":"UP_TO_DATE"}],
+		"active_jobs":[{"job_id":"job_5caae91005a69cef","worktree_path":"/home/romeo/work/meta-repo-02","pid":45456}]
+	}`, http.StatusOK)
+
+	qJob, ok := q.Get("job_5caae91005a69cef")
+	if !ok || qJob == nil {
+		t.Fatalf("expected job in queue")
+	}
+	if qJob.WorktreePath != "/home/romeo/work/meta-repo-02" || qJob.Repo != "/home/romeo/work/meta-repo-02" {
+		t.Fatalf("expected queue job WorktreePath and Repo updated to /home/romeo/work/meta-repo-02, got wt=%q repo=%q", qJob.WorktreePath, qJob.Repo)
+	}
+
+	// Verify /home/romeo/work/meta-repo is IDLE with no running job
+	slot1DetailBody := get(t, h, "/v1/hosts/debian/repos?path=/home/romeo/work/meta-repo", http.StatusOK)
+	var slot1Detail map[string]any
+	if err := json.Unmarshal([]byte(slot1DetailBody), &slot1Detail); err != nil {
+		t.Fatal(err)
+	}
+	if slot1Detail["lock"] != control.LockIdle {
+		t.Fatalf("expected /home/romeo/work/meta-repo lock IDLE, got %v (body: %s)", slot1Detail["lock"], slot1DetailBody)
+	}
+	if slot1Detail["running_job"] != nil {
+		t.Fatalf("expected /home/romeo/work/meta-repo running_job nil, got %v", slot1Detail["running_job"])
+	}
+
+	// Verify /home/romeo/work/meta-repo-02 is RUNNING_HARNESS and Queue OPEN
+	slot2DetailBody := get(t, h, "/v1/hosts/debian/repos?path=/home/romeo/work/meta-repo-02", http.StatusOK)
+	var slot2Detail map[string]any
+	if err := json.Unmarshal([]byte(slot2DetailBody), &slot2Detail); err != nil {
+		t.Fatal(err)
+	}
+	if slot2Detail["lock"] != control.LockRunning {
+		t.Fatalf("expected /home/romeo/work/meta-repo-02 lock RUNNING_HARNESS, got %v", slot2Detail["lock"])
+	}
+	if slot2Detail["queue"] != control.QueueOpen {
+		t.Fatalf("expected /home/romeo/work/meta-repo-02 queue OPEN while running coordinated harness job, got %v", slot2Detail["queue"])
+	}
+	runningJob, _ := slot2Detail["running_job"].(map[string]any)
+	if runningJob == nil || runningJob["id"] != "job_5caae91005a69cef" {
+		t.Fatalf("expected /home/romeo/work/meta-repo-02 running_job job_5caae91005a69cef, got %v", slot2Detail["running_job"])
 	}
 }

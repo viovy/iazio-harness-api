@@ -1020,6 +1020,22 @@ func (e *Engine) isExternalDispatchJobActiveLocked(repo *Repo, jobID string) boo
 	if cleanID == "" {
 		return false
 	}
+	if repo != nil {
+		if h, ok := e.hosts[repo.HostID]; ok && h != nil {
+			for _, aj := range h.ActiveJobs {
+				if strings.TrimSpace(aj.JobID) == cleanID {
+					wt := strings.TrimSpace(aj.WorktreePath)
+					if wt != "" && wt != "." && wt != "root" && !repoExactPathOrAliasMatch(repo, wt) {
+						for _, other := range e.repos {
+							if other != nil && other != repo && other.HostID == repo.HostID && repoExactPathOrAliasMatch(other, wt) {
+								return false
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 	if j, ok := e.jobs[cleanID]; ok && j != nil {
 		if j.ExitPosted || (j.Status != "RUNNING" && j.Status != "LEASED" && j.Status != "CANCEL_REQUESTED") {
 			return false
@@ -1032,7 +1048,10 @@ func (e *Engine) isExternalDispatchJobActiveLocked(repo *Repo, jobID string) boo
 		if h, ok := e.hosts[repo.HostID]; ok && h != nil {
 			for _, aj := range h.ActiveJobs {
 				if strings.TrimSpace(aj.JobID) == cleanID {
-					return true
+					wt := strings.TrimSpace(aj.WorktreePath)
+					if wt == "" || wt == "." || wt == "root" || repoExactPathOrAliasMatch(repo, wt) {
+						return true
+					}
 				}
 			}
 		}
@@ -1685,6 +1704,67 @@ func sortHostReposForDispatch(hostRepos []*Repo) {
 	})
 }
 
+func repoExactPathOrAliasMatch(r *Repo, target string) bool {
+	if r == nil {
+		return false
+	}
+	cleanTarget := strings.TrimRight(strings.TrimSpace(target), "/")
+	if cleanTarget == "" || cleanTarget == "." || strings.EqualFold(cleanTarget, "root") {
+		return false
+	}
+	cleanWT := strings.TrimRight(strings.TrimSpace(r.WorktreePath), "/")
+	if cleanWT != "" {
+		if cleanWT == cleanTarget || filepath.Clean(cleanWT) == filepath.Clean(cleanTarget) {
+			return true
+		}
+		normWT := normalizeWorktreePathForSlotMatch(cleanWT)
+		normTarget := normalizeWorktreePathForSlotMatch(cleanTarget)
+		if normWT != "" && normWT == normTarget {
+			return true
+		}
+		if !strings.Contains(cleanTarget, "/") && strings.HasSuffix(cleanWT, "/"+cleanTarget) {
+			return true
+		}
+	}
+	alias := strings.TrimSpace(r.EffectiveAlias())
+	if alias != "" {
+		if alias == cleanTarget {
+			return true
+		}
+		if !strings.HasPrefix(cleanTarget, "/") && !strings.Contains(cleanTarget, ":\\") && strings.HasSuffix(cleanTarget, "/"+alias) {
+			return true
+		}
+	}
+	return false
+}
+
+func findExplicitHostRepoSlot(hostRepos []*Repo, target string) *Repo {
+	cleanTarget := strings.TrimRight(strings.TrimSpace(target), "/")
+	if cleanTarget == "" || cleanTarget == "." || strings.EqualFold(cleanTarget, "root") {
+		return nil
+	}
+	for _, r := range hostRepos {
+		if r == nil {
+			continue
+		}
+		cleanWT := strings.TrimRight(strings.TrimSpace(r.WorktreePath), "/")
+		if cleanWT != "" && (cleanWT == cleanTarget || filepath.Clean(cleanWT) == filepath.Clean(cleanTarget) ||
+			(normalizeWorktreePathForSlotMatch(cleanWT) != "" && normalizeWorktreePathForSlotMatch(cleanWT) == normalizeWorktreePathForSlotMatch(cleanTarget))) {
+			return r
+		}
+	}
+	family := dispatch.NormalizeToSuperprojectSlotFamily(cleanTarget)
+	isNumberedSlotAlias := !strings.Contains(cleanTarget, "/") && family != "" && !strings.EqualFold(cleanTarget, family)
+	if isNumberedSlotAlias {
+		for _, r := range hostRepos {
+			if r != nil && repoExactPathOrAliasMatch(r, cleanTarget) {
+				return r
+			}
+		}
+	}
+	return nil
+}
+
 func repoMatchesTargetOrSlotFamily(r *Repo, reqRepo string) bool {
 	if r == nil {
 		return false
@@ -1693,7 +1773,7 @@ func repoMatchesTargetOrSlotFamily(r *Repo, reqRepo string) bool {
 	if cleanReq == "" || cleanReq == "." || strings.EqualFold(cleanReq, "root") || dispatch.IsHostLevelNonWorktreeJob("", cleanReq) {
 		return true
 	}
-	if r.WorktreePath == cleanReq || r.EffectiveAlias() == cleanReq || strings.Contains(r.WorktreePath, cleanReq) {
+	if repoExactPathOrAliasMatch(r, cleanReq) {
 		return true
 	}
 	reqFamily := dispatch.NormalizeToSuperprojectSlotFamily(cleanReq)
@@ -1789,15 +1869,19 @@ func (e *Engine) AllocateDispatchJobSlot(hostID, jobID, targetRepo, targetSubmod
 
 	idleFilter := buildIdleWorktreeFilter(idleWorktrees)
 
-	// If jobID is already bound to a repo on this host, return it.
+	explicitSlot := findExplicitHostRepoSlot(hostRepos, targetRepo)
+
+	// If jobID is already bound to a repo on this host, return it unless targetRepo explicitly designates a different slot.
 	for _, r := range hostRepos {
 		if r.RunningJobID == cleanJobID {
-			r.Lock = LockRunning
-			r.LockHolder = cleanJobID
-			if h, ok := e.hosts[r.HostID]; ok && h != nil {
-				h.HarnessActive = true
+			if explicitSlot == nil || explicitSlot == r {
+				r.Lock = LockRunning
+				r.LockHolder = cleanJobID
+				if h, ok := e.hosts[r.HostID]; ok && h != nil {
+					h.HarnessActive = true
+				}
+				return r.WorktreePath, true
 			}
-			return r.WorktreePath, true
 		}
 	}
 
@@ -1808,9 +1892,17 @@ func (e *Engine) AllocateDispatchJobSlot(hostID, jobID, targetRepo, targetSubmod
 			if strings.EqualFold(strings.TrimSpace(r.DirtyStoryID), resumeStoryID) &&
 				(r.RunningJobID == "" || r.RunningJobID == cleanJobID) &&
 				repoMatchesTargetOrSlotFamily(r, targetRepo) {
+				for _, other := range e.repos {
+					if other != nil && other != r && (other.RunningJobID == cleanJobID || other.LockHolder == cleanJobID) {
+						other.Lock = LockIdle
+						other.RunningJobID = ""
+						other.LockHolder = ""
+						e.notifyRepoLocked(other)
+					}
+				}
 				r.DirtyStoryID = ""
 				r.ASEState = "IDLE"
-				if r.Queue == QueuePaused && r.Reason == ReasonDirty {
+				if r.Queue == QueuePaused && (r.Reason == ReasonDirty || r.Reason == ReasonAdhocASE || r.Reason == ReasonDetached) {
 					r.Queue = QueueOpen
 					r.Reason = ""
 				}
@@ -1836,6 +1928,7 @@ func (e *Engine) AllocateDispatchJobSlot(hostID, jobID, targetRepo, targetSubmod
 	}
 
 	var matched *Repo
+	// First pass: prefer exact path/alias slot match if eligible and idle
 	for _, r := range hostRepos {
 		if anyGlobalEnabled && !r.GlobalQueueAllocationEnabled {
 			continue
@@ -1849,14 +1942,44 @@ func (e *Engine) AllocateDispatchJobSlot(hostID, jobID, targetRepo, targetSubmod
 		if !isRepoSlotIdleForDispatch(r) {
 			continue
 		}
-		if repoMatchesTargetOrSlotFamily(r, targetRepo) {
+		if repoExactPathOrAliasMatch(r, targetRepo) {
 			matched = r
 			break
+		}
+	}
+	// Second pass: match by superproject slot family on idle repos
+	if matched == nil {
+		for _, r := range hostRepos {
+			if anyGlobalEnabled && !r.GlobalQueueAllocationEnabled {
+				continue
+			}
+			if !repoMatchesIdleWorktreeFilter(r, idleFilter) {
+				continue
+			}
+			if r.Queue == QueuePaused || r.Queue == QueueBlocked {
+				continue
+			}
+			if !isRepoSlotIdleForDispatch(r) {
+				continue
+			}
+			if repoMatchesTargetOrSlotFamily(r, targetRepo) {
+				matched = r
+				break
+			}
 		}
 	}
 
 	if matched == nil {
 		return "", false
+	}
+
+	for _, other := range e.repos {
+		if other != nil && other != matched && (other.RunningJobID == cleanJobID || other.LockHolder == cleanJobID) {
+			other.Lock = LockIdle
+			other.RunningJobID = ""
+			other.LockHolder = ""
+			e.notifyRepoLocked(other)
+		}
 	}
 
 	matched.Lock = LockRunning
@@ -2066,12 +2189,47 @@ func (e *Engine) BindDispatchJobRepo(hostID, worktreePath, jobID string) string 
 	}
 	sortHostReposForDispatch(hostRepos)
 
-	// 1. If already bound to this jobID on a specific repo and cleanWT is empty/generic or matches, return it.
+	explicitSlot := findExplicitHostRepoSlot(hostRepos, cleanWT)
+
+	// 1. If cleanWT explicitly names a specific slot on this host, bind directly to that slot
+	// (even if it was previously QueuePaused) as long as it is not running a different job.
+	if explicitSlot != nil {
+		if explicitSlot.RunningJobID == "" || explicitSlot.RunningJobID == cleanJobID || explicitSlot.Lock != LockRunning {
+			for _, r := range e.repos {
+				if r != nil && r != explicitSlot && (r.RunningJobID == cleanJobID || r.LockHolder == cleanJobID) {
+					r.Lock = LockIdle
+					r.RunningJobID = ""
+					r.LockHolder = ""
+					e.notifyRepoLocked(r)
+				}
+			}
+			explicitSlot.Lock = LockRunning
+			explicitSlot.RunningJobID = cleanJobID
+			explicitSlot.LockHolder = cleanJobID
+			if explicitSlot.Queue == QueuePaused && (explicitSlot.Reason == ReasonDirty || explicitSlot.Reason == ReasonAdhocASE || explicitSlot.Reason == ReasonDetached) {
+				explicitSlot.Queue = QueueOpen
+				explicitSlot.Reason = ""
+			}
+			explicitSlot.LastRuntimeCheck = e.now()
+			if h, ok := e.hosts[explicitSlot.HostID]; ok && h != nil {
+				h.HarnessActive = true
+			}
+			e.notifyRepoLocked(explicitSlot)
+			return explicitSlot.WorktreePath
+		}
+		return explicitSlot.WorktreePath
+	}
+
+	// 2. If already bound to this jobID on a specific repo and cleanWT is empty/generic or matches, return it.
 	for _, r := range hostRepos {
 		if r.RunningJobID == cleanJobID {
 			if cleanWT == "" || cleanWT == "." || cleanWT == "root" || repoMatchesTargetOrSlotFamily(r, cleanWT) {
 				r.Lock = LockRunning
 				r.LockHolder = cleanJobID
+				if r.Queue == QueuePaused && (r.Reason == ReasonDirty || r.Reason == ReasonAdhocASE || r.Reason == ReasonDetached) {
+					r.Queue = QueueOpen
+					r.Reason = ""
+				}
 				if h, ok := e.hosts[r.HostID]; ok && h != nil {
 					h.HarnessActive = true
 				}
@@ -2081,19 +2239,11 @@ func (e *Engine) BindDispatchJobRepo(hostID, worktreePath, jobID string) string 
 	}
 
 	var matched *Repo
-	// 2. Exact worktree path or alias match (must be idle or already bound to cleanJobID)
+	// 3. Exact worktree path or alias match (must be idle or already bound to cleanJobID)
 	if cleanWT != "" && cleanWT != "." && cleanWT != "root" {
 		for _, r := range hostRepos {
-			if r.WorktreePath == cleanWT || r.EffectiveAlias() == cleanWT {
-				if isRepoSlotIdleForDispatch(r) || r.RunningJobID == cleanJobID {
-					matched = r
-					break
-				}
-			}
-		}
-		if matched == nil {
-			for _, r := range hostRepos {
-				if strings.HasSuffix(r.WorktreePath, "/"+cleanWT) && (isRepoSlotIdleForDispatch(r) || r.RunningJobID == cleanJobID) {
+			if repoExactPathOrAliasMatch(r, cleanWT) {
+				if isRepoSlotIdleForDispatch(r) || r.RunningJobID == cleanJobID || r.RunningJobID == "" {
 					matched = r
 					break
 				}
@@ -2101,7 +2251,7 @@ func (e *Engine) BindDispatchJobRepo(hostID, worktreePath, jobID string) string 
 		}
 	}
 
-	// 3. Match by superproject slot family on IDLE repos (e.g. iazio-mcp -> /home/romeo/work/meta-repo-02)
+	// 4. Match by superproject slot family on IDLE repos (e.g. iazio-mcp -> /home/romeo/work/meta-repo-02)
 	if matched == nil {
 		for _, r := range hostRepos {
 			if r.GlobalQueueAllocationEnabled && isRepoSlotIdleForDispatch(r) && repoMatchesTargetOrSlotFamily(r, cleanWT) {
@@ -2111,7 +2261,7 @@ func (e *Engine) BindDispatchJobRepo(hostID, worktreePath, jobID string) string 
 		}
 	}
 
-	// 4. Fallback to first IDLE repo on hostID when worktreePath is "." / "root" / submodule name
+	// 5. Fallback to first IDLE repo on hostID when worktreePath is "." / "root" / submodule name
 	if matched == nil {
 		for _, r := range hostRepos {
 			if r.GlobalQueueAllocationEnabled && isRepoSlotIdleForDispatch(r) {
@@ -2131,12 +2281,17 @@ func (e *Engine) BindDispatchJobRepo(hostID, worktreePath, jobID string) string 
 			r.Lock = LockIdle
 			r.RunningJobID = ""
 			r.LockHolder = ""
+			e.notifyRepoLocked(r)
 		}
 	}
 
 	matched.Lock = LockRunning
 	matched.RunningJobID = cleanJobID
 	matched.LockHolder = cleanJobID
+	if matched.Queue == QueuePaused && (matched.Reason == ReasonDirty || matched.Reason == ReasonAdhocASE || matched.Reason == ReasonDetached) {
+		matched.Queue = QueueOpen
+		matched.Reason = ""
+	}
 	matched.LastRuntimeCheck = e.now()
 	if h, ok := e.hosts[matched.HostID]; ok && h != nil {
 		h.HarnessActive = true
@@ -4196,7 +4351,13 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 				isCoordinated := r.Lock == LockRunning || strings.TrimSpace(r.RunningJobID) != ""
 				adhocActive := IsAdhocASEActive(r.ExecutionProvenance, r.ToolLiveness, r.ASEState, isCoordinated)
 
-				if adhocActive && r.Lock == LockIdle {
+				if isCoordinated {
+					if r.Queue == QueuePaused && (r.Reason == ReasonDirty || r.Reason == ReasonAdhocASE || r.Reason == ReasonDetached) {
+						r.Queue = QueueOpen
+						r.Reason = ""
+						e.notifyRepoLocked(r)
+					}
+				} else if adhocActive && r.Lock == LockIdle {
 					if r.Queue != QueuePaused || r.Reason != ReasonAdhocASE {
 						r.Queue = QueuePaused
 						r.Reason = ReasonAdhocASE

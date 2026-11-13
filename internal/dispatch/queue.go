@@ -3783,9 +3783,10 @@ func (q *InMemoryQueue) UpdateRuntimeMetadata(jobID, worktreePath, activeConvID 
 	}
 	changed := false
 	wt := strings.TrimSpace(worktreePath)
-	if wt != "" && wt != "." && wt != "root" && job.Repo != wt {
+	if wt != "" && wt != "." && wt != "root" && (job.Repo != wt || job.WorktreePath != wt) {
 		origSubmodule := job.Repo
 		job.Repo = wt
+		job.WorktreePath = wt
 		changed = true
 		if len(job.Payload) > 0 {
 			var payloadMap map[string]any
