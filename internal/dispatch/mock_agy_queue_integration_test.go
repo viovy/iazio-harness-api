@@ -303,6 +303,52 @@ func TestMockAgy_NeverAbandonSameJobIDAutoremediate(t *testing.T) {
 	}
 }
 
+func TestRetryRetriable_DoesNotReviveCanceledOrParentWithReplacementChild(t *testing.T) {
+	ctx := context.Background()
+	q := NewInMemoryQueue()
+	canceled := &Job{
+		ID:       "job_canceled_5275",
+		Type:     "agent.prompt",
+		Status:   JobStatusCanceled,
+		Retriable: true,
+		doneCh:   make(chan struct{}),
+	}
+	parent := &Job{
+		ID:     "job_parent_5275",
+		Type:   "agent.prompt",
+		Status: JobStatusRequeued,
+		doneCh: make(chan struct{}),
+	}
+	child := &Job{
+		ID:       "job_child_5275",
+		Type:     "agent.prompt",
+		Status:   JobStatusPending,
+		ParentID: parent.ID,
+		doneCh:   make(chan struct{}),
+	}
+	q.jobs[canceled.ID] = canceled
+	q.jobs[parent.ID] = parent
+	q.jobs[child.ID] = child
+
+	retried, err := q.RetryRetriable(ctx)
+	if err != nil {
+		t.Fatalf("RetryRetriable: %v", err)
+	}
+	for _, j := range retried {
+		if j.ID == canceled.ID || j.ID == parent.ID {
+			t.Fatalf("must not revive canceled or parent-with-child, got %s", j.ID)
+		}
+	}
+	gotCanceled, _ := q.Get(canceled.ID)
+	gotParent, _ := q.Get(parent.ID)
+	if gotCanceled.Status != JobStatusCanceled {
+		t.Fatalf("canceled must stay canceled, got %s", gotCanceled.Status)
+	}
+	if gotParent.Status != JobStatusRequeued {
+		t.Fatalf("parent with replacement child must stay requeued, got %s", gotParent.Status)
+	}
+}
+
 func TestClassifyDispatchFailure_TerminalStopOnlyCreditsAndInfra(t *testing.T) {
 	cat, _, _, _, _, ret := ClassifyDispatchFailureWithDirection("DoD incomplete review scheme gate")
 	if cat != FailureCategoryASEGateIncomplete || !ret {

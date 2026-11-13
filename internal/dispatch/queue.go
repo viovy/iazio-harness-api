@@ -4026,40 +4026,45 @@ func (q *InMemoryQueue) RetryRetriable(ctx context.Context) ([]*Job, error) {
 			}
 			continue
 		}
-		if (job.Status == JobStatusFailed || job.Status == JobStatusCanceled || job.Status == JobStatusRequeued) &&
-			(job.Retriable || !IsTerminalStopFailure(job.FailureCategory, job.Error+" "+job.FailureReasonSummary)) {
-			if IsTerminalStopFailure(job.FailureCategory, job.Error+" "+job.FailureReasonSummary) {
-				continue
-			}
-			if strings.EqualFold(strings.TrimSpace(job.FailureCategory), string(FailureCategoryDependencyFailed)) ||
-				strings.Contains(strings.ToUpper(job.Error), "DEPENDENCY_FAILED") {
-				if satisfied, _ := q.areDependenciesSatisfiedLocked(job); satisfied {
-					resetJobPendingInPlaceLocked(job, "")
-				} else {
-					job.Status = JobStatusBlockedByDependency
-					job.CompletedAt = nil
-				}
-				q.syncJobActiveStateLocked(job)
-				if q.store != nil {
-					_ = q.store.SaveQueueJob(ctx, job)
-				}
-				retried = append(retried, cloneJobSnapshot(job))
-				continue
-			}
-
-			// STORY-GOV-5275: remediable retry keeps the SAME job ID claimable (no orphan requeued parent).
-			resetJobPendingInPlaceLocked(job, "")
-			if len(job.DependsOnJobIDs) > 0 {
-				if satisfied, _ := q.areDependenciesSatisfiedLocked(job); !satisfied {
-					job.Status = JobStatusBlockedByDependency
-				}
+		// Never revive canceled jobs. Only remediable failed jobs, or orphan requeued
+		// jobs that have no active replacement child (STORY-GOV-5275 P0).
+		orphanRequeued := job.Status == JobStatusRequeued && !q.hasActiveReplacementChildLocked(job.ID)
+		remediableFailed := job.Status == JobStatusFailed &&
+			(job.Retriable || !IsTerminalStopFailure(job.FailureCategory, job.Error+" "+job.FailureReasonSummary))
+		if !remediableFailed && !orphanRequeued {
+			continue
+		}
+		if IsTerminalStopFailure(job.FailureCategory, job.Error+" "+job.FailureReasonSummary) {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(job.FailureCategory), string(FailureCategoryDependencyFailed)) ||
+			strings.Contains(strings.ToUpper(job.Error), "DEPENDENCY_FAILED") {
+			if satisfied, _ := q.areDependenciesSatisfiedLocked(job); satisfied {
+				resetJobPendingInPlaceLocked(job, "")
+			} else {
+				job.Status = JobStatusBlockedByDependency
+				job.CompletedAt = nil
 			}
 			q.syncJobActiveStateLocked(job)
 			if q.store != nil {
 				_ = q.store.SaveQueueJob(ctx, job)
 			}
 			retried = append(retried, cloneJobSnapshot(job))
+			continue
 		}
+
+		// Remediable retry keeps the SAME job ID claimable (no orphan requeued parent).
+		resetJobPendingInPlaceLocked(job, "")
+		if len(job.DependsOnJobIDs) > 0 {
+			if satisfied, _ := q.areDependenciesSatisfiedLocked(job); !satisfied {
+				job.Status = JobStatusBlockedByDependency
+			}
+		}
+		q.syncJobActiveStateLocked(job)
+		if q.store != nil {
+			_ = q.store.SaveQueueJob(ctx, job)
+		}
+		retried = append(retried, cloneJobSnapshot(job))
 	}
 	q.resolveDependentJobsLocked(ctx, q.now())
 	q.rebuildActiveJobsLocked()
