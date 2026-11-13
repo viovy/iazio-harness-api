@@ -240,13 +240,14 @@ func TestE2E_GlobalQueue_RetryRetriable(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	// Seed retriable and non-retriable jobs
+	// Seed remediable vs terminal-stop jobs (STORY-GOV-5275).
 	_, _ = queue.Enqueue(context.Background(), &dispatch.Job{
 		ID:              "job-retriable-1",
 		Repo:            "/work/sample-repo",
 		Type:            "ase",
 		Status:          dispatch.JobStatusFailed,
-		FailureCategory: control.FailureCategoryToolQuotaOrAuth,
+		FailureCategory: control.FailureCategoryToolCrash,
+		Error:           "tool crashed during execution",
 		Retriable:       true,
 	})
 	_, _ = queue.Enqueue(context.Background(), &dispatch.Job{
@@ -254,7 +255,8 @@ func TestE2E_GlobalQueue_RetryRetriable(t *testing.T) {
 		Repo:            "/work/sample-repo",
 		Type:            "ase",
 		Status:          dispatch.JobStatusFailed,
-		FailureCategory: control.FailureCategoryASEGateIncomplete,
+		FailureCategory: control.FailureCategoryToolQuotaOrAuth,
+		Error:           "quota exhausted: no AI credits",
 		Retriable:       false,
 	})
 
@@ -272,12 +274,13 @@ func TestE2E_GlobalQueue_RetryRetriable(t *testing.T) {
 	}
 
 	j1, _ := queue.Get("job-retriable-1")
-	if j1.Status != dispatch.JobStatusRequeued {
-		t.Fatalf("expected job-retriable-1 to be marked requeued, got %s", j1.Status)
+	// STORY-GOV-5275: RetryRetriable resets remediable failures in-place to pending (same ID).
+	if j1.Status != dispatch.JobStatusPending {
+		t.Fatalf("expected job-retriable-1 to be pending after in-place retry, got %s", j1.Status)
 	}
 	j2, _ := queue.Get("job-non-retriable-2")
 	if j2.Status != dispatch.JobStatusFailed {
-		t.Fatalf("expected job-non-retriable-2 to remain failed, got %s", j2.Status)
+		t.Fatalf("expected job-non-retriable-2 (terminal credits) to remain failed, got %s", j2.Status)
 	}
 }
 

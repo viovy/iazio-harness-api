@@ -276,6 +276,12 @@ const (
 	FailureCategoryStoryNotFound          = "STORY_NOT_FOUND"
 	FailureCategoryDependencyFailed       = "DEPENDENCY_FAILED"
 	FailureCategoryPolicyHookBlocked      = "POLICY_HOOK_BLOCKED"
+	// Infra / operator-stop categories (STORY-GOV-5275): jobs may stop ONLY for these.
+	FailureCategoryInfraDown              = "INFRA_DOWN"
+	FailureCategoryUpstreamSCMUnavailable = "UPSTREAM_SCM_UNAVAILABLE"
+	FailureCategoryUpstreamCIUnavailable  = "UPSTREAM_CI_UNAVAILABLE"
+	FailureCategoryDownstreamDBUnavailable = "DOWNSTREAM_DATABASE_UNAVAILABLE"
+	FailureCategoryDownstreamIngestUnavailable = "DOWNSTREAM_INGEST_UNAVAILABLE"
 
 	FailureStageIngress         = "INGRESS"
 	FailureStageQueueDispatch   = "QUEUE_DISPATCH"
@@ -1701,38 +1707,25 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 					}
 				}
 
-				if j.Attempts < DefaultMaxAttempts && !consecutiveLeaseExpired {
-					// Safe runner recovery: revert to pending for retry without duplicate execution,
-					// preserving ResumeConversationID and host affinity when an in-flight story was already allocated.
-					if j.ResumeConversationID == "" && j.ActiveConversationID != "" {
-						j.ResumeConversationID = j.ActiveConversationID
-					}
-					if strings.TrimSpace(j.StoryID) != "" && strings.TrimSpace(j.HostID) != "" &&
-						(strings.TrimSpace(j.ResumeConversationID) != "" || strings.TrimSpace(j.ActiveConversationID) != "") {
-						j.TargetHost = j.HostID
-					}
-					j.Status = JobStatusPending
-					j.ClaimedHost = ""
-					j.HostID = ""
-					j.WorktreePath = ""
-					j.LeaseOwner = ""
-					j.LeaseToken = ""
-					j.ClaimedAt = nil
-					j.HeartbeatAt = nil
-					j.LeaseExpiresAt = nil
-					j.LeaseAckDeadlineAt = nil
-					if q.slotReleaser != nil {
-						q.pendingSlotReleases = append(q.pendingSlotReleases, j.ID)
-					}
-					expiredIDs = append(expiredIDs, j.ID)
-				} else {
+				// STORY-GOV-5275: lease/heartbeat expiry is remediable — never permanently abandon
+				// unless a true terminal-stop category applies. Keep the SAME job ID pending.
+				if j.ResumeConversationID == "" && j.ActiveConversationID != "" {
+					j.ResumeConversationID = j.ActiveConversationID
+				}
+				if strings.TrimSpace(j.StoryID) != "" && strings.TrimSpace(j.HostID) != "" &&
+					(strings.TrimSpace(j.ResumeConversationID) != "" || strings.TrimSpace(j.ActiveConversationID) != "") {
+					j.TargetHost = j.HostID
+				}
+				leaseErr := "LEASE_EXPIRED: execution lease expired without completion"
+				if consecutiveLeaseExpired {
+					leaseErr = "LEASE_EXPIRED: consecutive attempts expired lease without progress"
+				} else if j.Attempts >= DefaultMaxAttempts {
+					leaseErr = "HEARTBEAT_TIMEOUT: runner heartbeat stopped, retrying with same job id"
+				}
+				if IsTerminalStopFailure(j.FailureCategory, leaseErr) {
 					j.Status = JobStatusFailed
 					j.Retriable = false
-					if consecutiveLeaseExpired {
-						j.Error = "LEASE_EXPIRED: consecutive attempts expired lease without progress"
-					} else {
-						j.Error = "HEARTBEAT_TIMEOUT: runner heartbeat stopped, max retry attempts exceeded"
-					}
+					j.Error = leaseErr
 					j.FailureCategory = FailureCategoryBackgroundDrainTimeout
 					j.FailureStage = FailureStageBackgroundDrain
 					j.FailureReasonSummary = j.Error
@@ -1742,6 +1735,12 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 					if j.doneCh != nil {
 						doneChannels = append(doneChannels, j.doneCh)
 					}
+				} else {
+					resetJobPendingInPlaceLocked(j, leaseErr)
+					if q.slotReleaser != nil {
+						q.pendingSlotReleases = append(q.pendingSlotReleases, j.ID)
+					}
+					expiredIDs = append(expiredIDs, j.ID)
 				}
 				continue
 			}
@@ -1781,7 +1780,9 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 	return expiredIDs
 }
 
-func applyASECloseoutRemediationLocked(job *Job, reason string) {
+// resetJobPendingInPlaceLocked returns a job to claimable pending state without changing its ID
+// (STORY-GOV-5275). Prevents abandoned original job URLs when remediating failures.
+func resetJobPendingInPlaceLocked(job *Job, lastError string) {
 	if job == nil {
 		return
 	}
@@ -1792,6 +1793,46 @@ func applyASECloseoutRemediationLocked(job *Job, reason string) {
 		} else if job.ConversationID != "" {
 			job.ResumeConversationID = job.ConversationID
 		}
+	}
+	if strings.EqualFold(strings.TrimSpace(job.AllocationSource), "global_queue_tool_priority") &&
+		strings.TrimSpace(job.ResumeConversationID) == "" &&
+		strings.TrimSpace(job.ActiveConversationID) == "" {
+		job.TargetHost = ""
+	}
+	job.Status = JobStatusPending
+	if strings.TrimSpace(lastError) != "" {
+		job.Error = lastError
+	} else {
+		job.Error = ""
+	}
+	job.FailureCategory = ""
+	job.FailureStage = ""
+	job.FailureDirection = ""
+	job.FailureService = ""
+	job.FailureReasonSummary = ""
+	job.Retriable = true
+	job.CompletedAt = nil
+	job.ClaimedHost = ""
+	job.HostID = ""
+	job.LeaseOwner = ""
+	job.LeaseToken = ""
+	job.ClaimedAt = nil
+	job.HeartbeatAt = nil
+	job.LeaseExpiresAt = nil
+	job.LeaseAckDeadlineAt = nil
+	job.FencingToken = 0
+	job.LeaseVersion = 0
+	job.doneCh = make(chan struct{})
+	if job.DispatchDiagnostics != nil {
+		job.DispatchDiagnostics.QueueState = "queued"
+	} else {
+		job.DispatchDiagnostics = &DispatchDiagnostics{QueueState: "queued"}
+	}
+}
+
+func applyASECloseoutRemediationLocked(job *Job, reason string) {
+	if job == nil {
+		return
 	}
 	if strings.TrimSpace(job.TargetHost) == "" && strings.TrimSpace(job.HostID) != "" {
 		job.TargetHost = job.HostID
@@ -1828,29 +1869,7 @@ func applyASECloseoutRemediationLocked(job *Job, reason string) {
 			}
 		}
 	}
-	job.Status = JobStatusPending
-	job.Error = ""
-	job.FailureCategory = ""
-	job.FailureStage = ""
-	job.FailureDirection = ""
-	job.FailureService = ""
-	job.FailureReasonSummary = ""
-	job.Retriable = true
-	job.CompletedAt = nil
-	job.ClaimedHost = ""
-	job.HostID = ""
-	job.LeaseOwner = ""
-	job.LeaseToken = ""
-	job.ClaimedAt = nil
-	job.HeartbeatAt = nil
-	job.LeaseExpiresAt = nil
-	job.LeaseAckDeadlineAt = nil
-	job.doneCh = make(chan struct{})
-	if job.DispatchDiagnostics != nil {
-		job.DispatchDiagnostics.QueueState = "queued"
-	} else {
-		job.DispatchDiagnostics = &DispatchDiagnostics{QueueState: "queued"}
-	}
+	resetJobPendingInPlaceLocked(job, "")
 }
 
 func (q *InMemoryQueue) reconcileQueueIntegrityLocked(now time.Time) []string {
@@ -1917,52 +1936,40 @@ func (q *InMemoryQueue) reconcileQueueIntegrityLocked(now time.Time) []string {
 			j.LeaseExpiresAt = nil
 			j.LeaseAckDeadlineAt = nil
 			mutated = true
-		} else if j.Status == JobStatusRequeued && !hasReplacementChild[j.ID] && len(j.DependsOnJobIDs) > 0 {
-			satisfied, failedDep := q.areDependenciesSatisfiedLocked(j)
-			if satisfied {
-				j.Status = JobStatusPending
-				j.Error = ""
-				j.FailureCategory = ""
-				j.FailureStage = ""
-				j.FailureDirection = ""
-				j.FailureService = ""
-				j.FailureReasonSummary = ""
-				j.Retriable = false
-				j.CompletedAt = nil
-				j.HostID = ""
-				j.ClaimedHost = ""
-				j.LeaseOwner = ""
-				j.LeaseToken = ""
-				j.ClaimedAt = nil
-				j.HeartbeatAt = nil
-				j.LeaseExpiresAt = nil
-				j.LeaseAckDeadlineAt = nil
-				j.doneCh = make(chan struct{})
-				if j.DispatchDiagnostics != nil {
-					j.DispatchDiagnostics.QueueState = "queued"
+		} else if j.Status == JobStatusRequeued && !hasReplacementChild[j.ID] {
+			// STORY-GOV-5275: orphan requeued jobs (no replacement child) must become claimable again.
+			if len(j.DependsOnJobIDs) > 0 {
+				satisfied, failedDep := q.areDependenciesSatisfiedLocked(j)
+				if satisfied {
+					resetJobPendingInPlaceLocked(j, "")
+					mutated = true
 				} else {
-					j.DispatchDiagnostics = &DispatchDiagnostics{QueueState: "queued"}
+					j.Status = JobStatusBlockedByDependency
+					j.CompletedAt = nil
+					if failedDep == nil {
+						j.Error = ""
+						j.FailureCategory = ""
+						j.FailureStage = ""
+						j.FailureDirection = ""
+						j.FailureService = ""
+						j.FailureReasonSummary = ""
+					}
+					j.doneCh = make(chan struct{})
+					if j.DispatchDiagnostics != nil {
+						j.DispatchDiagnostics.QueueState = JobStatusBlockedByDependency
+					} else {
+						j.DispatchDiagnostics = &DispatchDiagnostics{QueueState: JobStatusBlockedByDependency}
+					}
+					mutated = true
 				}
-				mutated = true
 			} else {
-				j.Status = JobStatusBlockedByDependency
-				j.CompletedAt = nil
-				if failedDep == nil {
-					j.Error = ""
-					j.FailureCategory = ""
-					j.FailureStage = ""
-					j.FailureDirection = ""
-					j.FailureService = ""
-					j.FailureReasonSummary = ""
-				}
-				j.doneCh = make(chan struct{})
-				if j.DispatchDiagnostics != nil {
-					j.DispatchDiagnostics.QueueState = JobStatusBlockedByDependency
-				} else {
-					j.DispatchDiagnostics = &DispatchDiagnostics{QueueState: JobStatusBlockedByDependency}
-				}
+				resetJobPendingInPlaceLocked(j, "")
 				mutated = true
 			}
+		} else if j.Status == JobStatusFailed && !hasReplacementChild[j.ID] && !IsTerminalStopFailure(j.FailureCategory, j.Error+" "+j.FailureReasonSummary) {
+			// Remediable failed jobs without a replacement child: promote in-place to pending.
+			resetJobPendingInPlaceLocked(j, j.Error)
+			mutated = true
 		} else if j.Status == JobStatusFailed && !hasReplacementChild[j.ID] && j.InfraRequeueCount == 0 &&
 			(strings.TrimSpace(j.ActiveConversationID) != "" || strings.TrimSpace(j.ResumeConversationID) != "" || strings.TrimSpace(j.ConversationID) != "") &&
 			(j.FailureCategory == FailureCategoryASEGateIncomplete || strings.HasPrefix(strings.TrimSpace(j.Error), "LEASE_EXPIRED")) {
@@ -2887,6 +2894,30 @@ func hasQuotaOrAuthFailureToken(lower string) bool {
 	return false
 }
 
+// IsTerminalStopFailure reports whether a failure category/error must STOP auto-remediation
+// (STORY-GOV-5275). Only no-AI-credits / quota-or-auth exhaustion and infrastructure-down
+// categories are terminal. Broken/deceptive local implementations must keep remediating.
+func IsTerminalStopFailure(category, errStr string) bool {
+	cat := strings.ToUpper(strings.TrimSpace(category))
+	lower := strings.ToLower(errStr)
+	switch cat {
+	case FailureCategoryToolQuotaOrAuth:
+		return true
+	case FailureCategoryInfraDown, FailureCategoryUpstreamSCMUnavailable, FailureCategoryUpstreamCIUnavailable,
+		FailureCategoryDownstreamDBUnavailable, FailureCategoryDownstreamIngestUnavailable:
+		return true
+	}
+	if hasQuotaOrAuthFailureToken(strings.ToLower(extractDispatchFailureTail(errStr))) {
+		return true
+	}
+	if strings.Contains(lower, "infrastructure down") || strings.Contains(lower, "infra_down") ||
+		strings.Contains(lower, "no ai credit") || strings.Contains(lower, "out of credits") ||
+		strings.Contains(lower, "quota exhausted") {
+		return true
+	}
+	return false
+}
+
 // ClassifyDispatchFailureWithDirection maps an error string to canonical failure taxonomy including upstream/downstream service direction.
 func ClassifyDispatchFailureWithDirection(errStr string) (category, stage, direction, service, summary string, retriable bool) {
 	lower := strings.ToLower(extractDispatchFailureTail(errStr))
@@ -2896,17 +2927,20 @@ func ClassifyDispatchFailureWithDirection(errStr string) (category, stage, direc
 	case strings.Contains(lower, "claim") || strings.Contains(lower, "startup_heartbeat") || strings.Contains(lower, "unacknowledged lease"):
 		return FailureCategoryDispatchClaimTimeout, FailureStageQueueDispatch, FailureDirectionDownstream, "iazio-agent", "Agent lease claim timed out or lost before initial acknowledgement", true
 	case hasQuotaOrAuthFailureToken(lower):
-		return FailureCategoryToolQuotaOrAuth, FailureStageToolExecution, FailureDirectionUpstream, "antigravity-llm-provider", "Tool startup failed due to quota exhaustion, rate limit, or auth expiration", true
+		// Terminal stop: no AI credits / quota / auth exhaustion (STORY-GOV-5275).
+		return FailureCategoryToolQuotaOrAuth, FailureStageToolExecution, FailureDirectionUpstream, "antigravity-llm-provider", "Tool startup failed due to quota exhaustion, rate limit, or auth expiration", false
 	case strings.Contains(lower, "dirty_worktree_post_exit") || strings.Contains(lower, "post_exit") || strings.Contains(lower, "unmerged_feature_branch") || strings.Contains(lower, "unmerged feature branch") || strings.Contains(lower, "incomplete_ase_flow") || strings.Contains(lower, "unpushed_commits") || strings.Contains(lower, "ase_completion_gate_violation") || strings.Contains(lower, "ase_gate_incomplete"):
 		return FailureCategoryASEGateIncomplete, FailureStageCompletionGate, FailureDirectionLocalExecution, "autopilot", "Post-execution gate: child engine exited before completing git-flow landing or left uncommitted worktree changes", true
 	case strings.Contains(lower, "api.github.com") || (strings.Contains(lower, "github.com") && (strings.Contains(lower, "502") || strings.Contains(lower, "503") || strings.Contains(lower, "504") || strings.Contains(lower, "connection refused"))):
-		return "UPSTREAM_SCM_UNAVAILABLE", FailureStageCompletionGate, FailureDirectionUpstream, "github-api", "Upstream GitHub SCM API unavailable during delivery", true
+		return FailureCategoryUpstreamSCMUnavailable, FailureStageCompletionGate, FailureDirectionUpstream, "github-api", "Upstream GitHub SCM API unavailable during delivery", false
+	case strings.Contains(lower, "infrastructure down") || strings.Contains(lower, "infra_down") || strings.Contains(lower, "host unreachable") || strings.Contains(lower, "no route to host"):
+		return FailureCategoryInfraDown, FailureStageQueueDispatch, FailureDirectionDownstream, "iazio-infra", "Infrastructure down: host or dependent service unreachable", false
 	case strings.Contains(lower, "jenkins") || strings.Contains(lower, "sonarqube"):
-		return "UPSTREAM_CI_UNAVAILABLE", FailureStageCompletionGate, FailureDirectionUpstream, "jenkins-ci", "Upstream CI/SonarQube pipeline unavailable during verification", true
+		return FailureCategoryUpstreamCIUnavailable, FailureStageCompletionGate, FailureDirectionUpstream, "jenkins-ci", "Upstream CI/SonarQube pipeline unavailable during verification", false
 	case strings.Contains(lower, "postgres") || strings.Contains(lower, "pgvector") || strings.Contains(lower, "sqlstate"):
-		return "DOWNSTREAM_DATABASE_UNAVAILABLE", FailureStageQueueDispatch, FailureDirectionDownstream, "postgresql", "Downstream PostgreSQL database unavailable", true
+		return FailureCategoryDownstreamDBUnavailable, FailureStageQueueDispatch, FailureDirectionDownstream, "postgresql", "Downstream PostgreSQL database unavailable", false
 	case strings.Contains(lower, "iazio-harvester-api") || strings.Contains(lower, "iazio-api") || strings.Contains(lower, "iazio-harvester") || strings.Contains(lower, "/v1/ingest"):
-		return "DOWNSTREAM_INGEST_UNAVAILABLE", FailureStageCompletionGate, FailureDirectionDownstream, "iazio-harvester-api", "Downstream ingestion API or harvester unavailable", true
+		return FailureCategoryDownstreamIngestUnavailable, FailureStageCompletionGate, FailureDirectionDownstream, "iazio-harvester-api", "Downstream ingestion API or harvester unavailable", false
 	case strings.Contains(lower, "crash") || strings.Contains(lower, "exit status") || strings.Contains(lower, "sigsegv") || strings.Contains(lower, "binary"):
 		return FailureCategoryToolCrash, FailureStageToolExecution, FailureDirectionLocalExecution, "iazio-harness", "AI agent tool process crashed or exited non-zero during early execution", true
 	case strings.Contains(lower, "worktree") || strings.Contains(lower, "workspace_prep") || strings.Contains(lower, "lock") || strings.Contains(lower, "porcelain") || strings.Contains(lower, "submodule") || strings.Contains(lower, "dirty"):
@@ -2914,11 +2948,14 @@ func ClassifyDispatchFailureWithDirection(errStr string) (category, stage, direc
 	case strings.Contains(lower, "1h0m0s") || strings.Contains(lower, "background task") || strings.Contains(lower, "drain") || strings.Contains(lower, "lease_expired") || strings.Contains(lower, "heartbeat_timeout") || strings.Contains(lower, "execution_timeout") || strings.Contains(lower, "lease expired"):
 		return FailureCategoryBackgroundDrainTimeout, FailureStageBackgroundDrain, FailureDirectionLocalExecution, "agy-cli", errStr, true
 	case strings.Contains(lower, "circuit") || strings.Contains(lower, "breaker") || strings.Contains(lower, "retry_capped"):
-		return FailureCategoryCircuitBreakerTripped, FailureStageQueueDispatch, FailureDirectionDownstream, "iazio-harness-api", errStr, false
+		// Remediable: circuit breaker is a control-plane soft gate, not infra-down / credits.
+		return FailureCategoryCircuitBreakerTripped, FailureStageQueueDispatch, FailureDirectionDownstream, "iazio-harness-api", errStr, true
 	case strings.Contains(lower, "story_not_found") || strings.Contains(lower, "not found in backlog") || strings.Contains(lower, "cannot execute nonexistent story"):
-		return FailureCategoryStoryNotFound, FailureStageStoryValidation, FailureDirectionLocalExecution, "backlog", "Story not found in backlog or control plane: cannot execute nonexistent story", false
+		// Remediable: backlog sync / story allocation may heal this; do not abandon.
+		return FailureCategoryStoryNotFound, FailureStageStoryValidation, FailureDirectionLocalExecution, "backlog", "Story not found in backlog or control plane: cannot execute nonexistent story", true
 	case strings.Contains(lower, "gate") || strings.Contains(lower, "dod") || strings.Contains(lower, "incomplete") || strings.Contains(lower, "ase_gate"):
-		return FailureCategoryASEGateIncomplete, FailureStageCompletionGate, FailureDirectionLocalExecution, "autopilot", "Autonomous Story Execution DoD or review scheme validation incomplete", false
+		// Remediable ASE/DoD incompleteness — never terminal (STORY-GOV-5275).
+		return FailureCategoryASEGateIncomplete, FailureStageCompletionGate, FailureDirectionLocalExecution, "autopilot", "Autonomous Story Execution DoD or review scheme validation incomplete", true
 	default:
 		return FailureCategoryToolCrash, FailureStageToolExecution, FailureDirectionLocalExecution, "iazio-harness", "Execution error: " + errStr, true
 	}
@@ -3085,8 +3122,13 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 		hasResumableASEState := strings.TrimSpace(job.ActiveConversationID) != "" ||
 			strings.TrimSpace(job.ResumeConversationID) != "" ||
 			strings.TrimSpace(job.ConversationID) != ""
-		if (cat == FailureCategoryASEGateIncomplete || job.FailureCategory == FailureCategoryASEGateIncomplete) &&
-			job.InfraRequeueCount == 0 && hasResumableASEState {
+		effectiveCat := cat
+		if job.FailureCategory != "" && job.FailureCategory != FailureCategoryNone {
+			effectiveCat = job.FailureCategory
+		}
+		terminalStop := IsTerminalStopFailure(effectiveCat, errStr) || (!retriable && IsTerminalStopFailure(cat, errStr))
+		if !terminalStop {
+			// Never abandon remediable failures: record attempt and requeue SAME job ID to pending.
 			job.Result = result
 			attemptNum := job.Attempts
 			if attemptNum <= 0 {
@@ -3097,18 +3139,23 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 				Host:             job.HostID,
 				Workspace:        job.Repo,
 				Tool:             job.TargetAgent,
-				FailureCategory:  FailureCategoryASEGateIncomplete,
-				FailureStage:     FailureStageCompletionGate,
-				FailureDirection: FailureDirectionLocalExecution,
-				FailureService:   "autopilot",
-				Reason:           "ASE_GATE_INCOMPLETE_AUTO_CLOSEOUT",
+				FailureCategory:  cat,
+				FailureStage:     stage,
+				FailureDirection: dir,
+				FailureService:   svc,
+				Reason:           cat,
 				ExitCode:         1,
 				StderrTail:       errStr,
 				Timestamp:        now.UTC().Format(time.RFC3339),
-				TriggerReason:    "ase_gate_incomplete_auto_closeout",
+				TriggerReason:    "auto_remediate_inplace",
 				OutcomeSummary:   summary,
 			})
-			applyASECloseoutRemediationLocked(job, errStr)
+			if (cat == FailureCategoryASEGateIncomplete || job.FailureCategory == FailureCategoryASEGateIncomplete) &&
+				job.InfraRequeueCount == 0 && hasResumableASEState {
+				applyASECloseoutRemediationLocked(job, errStr)
+			} else {
+				resetJobPendingInPlaceLocked(job, errStr)
+			}
 			q.syncJobActiveStateLocked(job)
 			if q.store != nil {
 				sctx, cancel := storeContext(ctx)
@@ -3141,7 +3188,7 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 		if job.FailureReasonSummary == "" {
 			job.FailureReasonSummary = summary
 		}
-		job.Retriable = retriable
+		job.Retriable = false
 		if job.DispatchDiagnostics != nil {
 			job.DispatchDiagnostics.QueueState = "failed"
 		}
@@ -3586,81 +3633,19 @@ func (q *InMemoryQueue) Retry(ctx context.Context, jobID string) (*Job, error) {
 		return origSnapshot, nil
 	}
 
-	orig.Status = JobStatusRequeued
+	// STORY-GOV-5275: explicit Retry keeps the SAME job ID pending (never orphan as requeued).
+	if IsTerminalStopFailure(orig.FailureCategory, orig.Error+" "+orig.FailureReasonSummary) {
+		q.mu.Unlock()
+		return nil, fmt.Errorf("job %s is terminal-stop (%s): not retriable", orig.ID, orig.FailureCategory)
+	}
+	resetJobPendingInPlaceLocked(orig, "")
 	q.syncJobActiveStateLocked(orig)
-	retryTargetHost := orig.TargetHost
-	if strings.EqualFold(strings.TrimSpace(orig.AllocationSource), "global_queue_tool_priority") &&
-		strings.TrimSpace(orig.ResumeConversationID) == "" &&
-		strings.TrimSpace(orig.ActiveConversationID) == "" {
-		retryTargetHost = ""
-	}
-	newJob := &Job{
-		ID:                      generateJobID(),
-		Type:                    orig.Type,
-		Repo:                    orig.Repo,
-		TargetHost:              retryTargetHost,
-		TargetAgent:             orig.TargetAgent,
-		StoryID:                 orig.StoryID,
-		StoryTitle:              orig.StoryTitle,
-		StoryPath:               orig.StoryPath,
-		StoryAllocationStatus:   orig.StoryAllocationStatus,
-		AllocationSource:        orig.AllocationSource,
-		PriorityRankSelected:    orig.PriorityRankSelected,
-		SourceConversationTitle: orig.SourceConversationTitle,
-		NormalizedPrompt:        orig.NormalizedPrompt,
-		EffectiveAction:         orig.EffectiveAction,
-		AgentAffinity:           orig.AgentAffinity,
-		Payload:                 orig.Payload,
-		TraceID:                 orig.TraceID,
-		SearchID:                orig.SearchID,
-		ParentID:                orig.ID,
-		DependsOnJobID:          orig.DependsOnJobID,
-		DependsOnJobIDs:         append([]string(nil), orig.DependsOnJobIDs...),
-		CallbackURL:             orig.CallbackURL,
-		Retriable:               orig.Retriable,
-		Status:                  JobStatusPending,
-		CreatedAt:               q.now(),
-		doneCh:                  make(chan struct{}),
-	}
-	normalizeJobDependencies(newJob)
-	if len(newJob.DependsOnJobIDs) > 0 {
-		if satisfied, _ := q.areDependenciesSatisfiedLocked(newJob); !satisfied {
-			newJob.Status = JobStatusBlockedByDependency
-		}
-	}
-	q.jobs[newJob.ID] = newJob
-	q.syncJobActiveStateLocked(newJob)
-	// STORY-GOV-5256: Re-bind any downstream dependent jobs waiting on orig.ID to newJob.ID
-	// so retrying an upstream wave job automatically unblocks/continues downstream waves.
-	for _, child := range q.jobs {
-		if child == nil || child.ID == orig.ID || child.ID == newJob.ID {
-			continue
-		}
-		updatedDep := false
-		if child.DependsOnJobID == orig.ID {
-			child.DependsOnJobID = newJob.ID
-			updatedDep = true
-		}
-		for i, depID := range child.DependsOnJobIDs {
-			if depID == orig.ID {
-				child.DependsOnJobIDs[i] = newJob.ID
-				updatedDep = true
-			}
-		}
-		if updatedDep && q.store != nil {
-			_ = q.store.SaveQueueJob(ctx, child)
-		}
-	}
-	_, _, _ = q.resolveDependentJobsLocked(ctx, q.now())
-	q.rebuildActiveJobsLocked()
 	if q.store != nil {
 		_ = q.store.SaveQueueJob(ctx, orig)
-		_ = q.store.SaveQueueJob(ctx, newJob)
 	}
-	newJobSnapshot := cloneJobSnapshot(newJob)
+	origSnapshot := cloneJobSnapshot(orig)
 	q.mu.Unlock()
-
-	return newJobSnapshot, nil
+	return origSnapshot, nil
 }
 
 // AckLease completes Phase 2 of the two-phase lease handshake, transitioning the job to running.
@@ -4041,118 +4026,45 @@ func (q *InMemoryQueue) RetryRetriable(ctx context.Context) ([]*Job, error) {
 			}
 			continue
 		}
-		if (job.Status == JobStatusFailed || job.Status == JobStatusCanceled) && job.Retriable {
-			if strings.EqualFold(strings.TrimSpace(job.FailureCategory), string(FailureCategoryDependencyFailed)) ||
-				strings.Contains(strings.ToUpper(job.Error), "DEPENDENCY_FAILED") {
-				if satisfied, _ := q.areDependenciesSatisfiedLocked(job); satisfied {
-					job.Status = JobStatusPending
-					job.Error = ""
-					job.FailureCategory = ""
-					job.FailureStage = ""
-					job.FailureDirection = ""
-					job.FailureService = ""
-					job.FailureReasonSummary = ""
-					job.CompletedAt = nil
-					job.ClaimedHost = ""
-					job.HostID = ""
-					job.ClaimedAt = nil
-					job.HeartbeatAt = nil
-					job.LeaseExpiresAt = nil
-					job.LeaseOwner = ""
-					job.LeaseToken = ""
-					job.LeaseAckDeadlineAt = nil
-				} else {
-					job.Status = JobStatusBlockedByDependency
-					job.CompletedAt = nil
-				}
-				q.syncJobActiveStateLocked(job)
-				if q.store != nil {
-					_ = q.store.SaveQueueJob(ctx, job)
-				}
-				retried = append(retried, cloneJobSnapshot(job))
-				continue
+		// Never revive canceled jobs. Only remediable failed jobs, or orphan requeued
+		// jobs that have no active replacement child (STORY-GOV-5275 P0).
+		orphanRequeued := job.Status == JobStatusRequeued && !q.hasActiveReplacementChildLocked(job.ID)
+		remediableFailed := job.Status == JobStatusFailed &&
+			(job.Retriable || !IsTerminalStopFailure(job.FailureCategory, job.Error+" "+job.FailureReasonSummary))
+		if !remediableFailed && !orphanRequeued {
+			continue
+		}
+		if IsTerminalStopFailure(job.FailureCategory, job.Error+" "+job.FailureReasonSummary) {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(job.FailureCategory), string(FailureCategoryDependencyFailed)) ||
+			strings.Contains(strings.ToUpper(job.Error), "DEPENDENCY_FAILED") {
+			if satisfied, _ := q.areDependenciesSatisfiedLocked(job); satisfied {
+				resetJobPendingInPlaceLocked(job, "")
+			} else {
+				job.Status = JobStatusBlockedByDependency
+				job.CompletedAt = nil
 			}
-
-			job.Status = JobStatusRequeued
 			q.syncJobActiveStateLocked(job)
-			retryTargetHost := job.TargetHost
-			if strings.EqualFold(strings.TrimSpace(job.AllocationSource), "global_queue_tool_priority") &&
-				strings.TrimSpace(job.ResumeConversationID) == "" &&
-				strings.TrimSpace(job.ActiveConversationID) == "" {
-				retryTargetHost = ""
-			}
-			newJob := &Job{
-				ID:                      generateJobID(),
-				Type:                    job.Type,
-				Repo:                    job.Repo,
-				TargetHost:              retryTargetHost,
-				TargetAgent:             job.TargetAgent,
-				StoryID:                 job.StoryID,
-				StoryTitle:              job.StoryTitle,
-				StoryPath:               job.StoryPath,
-				StoryAllocationStatus:   job.StoryAllocationStatus,
-				AllocationSource:        job.AllocationSource,
-				PriorityRankSelected:    job.PriorityRankSelected,
-				SourceConversationTitle: job.SourceConversationTitle,
-				NormalizedPrompt:        job.NormalizedPrompt,
-				EffectiveAction:         job.EffectiveAction,
-				AgentAffinity:           job.AgentAffinity,
-				Payload:                 append(json.RawMessage(nil), job.Payload...),
-				Status:                  JobStatusPending,
-				CreatedAt:               q.now(),
-				TraceID:                 job.TraceID,
-				Traceparent:             job.Traceparent,
-				ZipkinTraceID:           job.ZipkinTraceID,
-				ZipkinTraceURL:          job.ZipkinTraceURL,
-				SearchID:                job.SearchID,
-				ParentID:                job.ID,
-				DependsOnJobID:          job.DependsOnJobID,
-				DependsOnJobIDs:         append([]string(nil), job.DependsOnJobIDs...),
-				CallbackURL:             job.CallbackURL,
-				Retriable:               true,
-				doneCh:                  make(chan struct{}),
-			}
-			normalizeJobDependencies(newJob)
-			if len(newJob.DependsOnJobIDs) > 0 {
-				if satisfied, _ := q.areDependenciesSatisfiedLocked(newJob); !satisfied {
-					newJob.Status = JobStatusBlockedByDependency
-				}
-			}
-			q.jobs[newJob.ID] = newJob
-			q.syncJobActiveStateLocked(newJob)
 			if q.store != nil {
 				_ = q.store.SaveQueueJob(ctx, job)
-				_ = q.store.SaveQueueJob(ctx, newJob)
 			}
-			for _, depJob := range q.jobs {
-				if depJob == nil || depJob.ID == job.ID || depJob.ID == newJob.ID {
-					continue
-				}
-				depChanged := false
-				if strings.TrimSpace(depJob.DependsOnJobID) == job.ID {
-					depJob.DependsOnJobID = newJob.ID
-					depChanged = true
-				}
-				for idx, depID := range depJob.DependsOnJobIDs {
-					if strings.TrimSpace(depID) == job.ID {
-						depJob.DependsOnJobIDs[idx] = newJob.ID
-						depChanged = true
-					}
-				}
-				if depChanged {
-					normalizeJobDependencies(depJob)
-					if depJob.Status == JobStatusRequeued || depJob.Status == JobStatusFailed {
-						depJob.Status = JobStatusBlockedByDependency
-						depJob.CompletedAt = nil
-					}
-					q.syncJobActiveStateLocked(depJob)
-					if q.store != nil {
-						_ = q.store.SaveQueueJob(ctx, depJob)
-					}
-				}
-			}
-			retried = append(retried, cloneJobSnapshot(newJob))
+			retried = append(retried, cloneJobSnapshot(job))
+			continue
 		}
+
+		// Remediable retry keeps the SAME job ID claimable (no orphan requeued parent).
+		resetJobPendingInPlaceLocked(job, "")
+		if len(job.DependsOnJobIDs) > 0 {
+			if satisfied, _ := q.areDependenciesSatisfiedLocked(job); !satisfied {
+				job.Status = JobStatusBlockedByDependency
+			}
+		}
+		q.syncJobActiveStateLocked(job)
+		if q.store != nil {
+			_ = q.store.SaveQueueJob(ctx, job)
+		}
+		retried = append(retried, cloneJobSnapshot(job))
 	}
 	q.resolveDependentJobsLocked(ctx, q.now())
 	q.rebuildActiveJobsLocked()

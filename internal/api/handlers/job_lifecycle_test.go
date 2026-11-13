@@ -161,7 +161,8 @@ func TestJobLifecycleHandler_RetryJob(t *testing.T) {
 
 	var retried JobDetailResponse
 	_ = json.Unmarshal(rr.Body.Bytes(), &retried)
-	if retried.ID == job.ID || retried.Status != dispatch.JobStatusPending || retried.Repo != "repo-retry" {
+	// STORY-GOV-5275: Retry keeps the SAME job ID pending (never orphan as requeued child).
+	if retried.ID != job.ID || retried.Status != dispatch.JobStatusPending || retried.Repo != "repo-retry" {
 		t.Fatalf("unexpected retried job: %+v", retried)
 	}
 }
@@ -561,8 +562,10 @@ func TestJobLifecycleHandler_GetJob_ClaimedHostAndFailureDetails(t *testing.T) {
 	if err != nil || claimed == nil {
 		t.Fatalf("failed to claim: %v", err)
 	}
-	failMeta := json.RawMessage(`{"failure_category":"git_conflict","failure_stage":"git_push","failure_reason_summary":"non-fast-forward"}`)
-	if err := q.Complete(context.Background(), claimed.ID, failMeta, "git push error"); err != nil {
+	// Terminal stop (quota/credits) keeps failed status + ClaimedHost; remediable failures
+	// reset in-place to pending and clear claim fields (STORY-GOV-5275).
+	failMeta := json.RawMessage(`{"failure_category":"TOOL_QUOTA_OR_AUTH","failure_stage":"TOOL_EXECUTION","failure_reason_summary":"quota exhausted"}`)
+	if err := q.Complete(context.Background(), claimed.ID, failMeta, "quota exhausted: no AI credits"); err != nil {
 		t.Fatalf("Complete failed: %v", err)
 	}
 
@@ -587,8 +590,11 @@ func TestJobLifecycleHandler_GetJob_ClaimedHostAndFailureDetails(t *testing.T) {
 	if detail.LiveURL != "https://tian.go.ro/iazio-web/jobs/"+job.ID {
 		t.Fatalf("expected LiveURL to use canonical https://tian.go.ro/iazio-web/jobs/<job_id>, got %q", detail.LiveURL)
 	}
-	if detail.FailureCategory != "git_conflict" || detail.FailureStage != "git_push" || !detail.Retriable {
-		t.Fatalf("expected failure classification fields in JobDetailResponse, got %+v", detail)
+	if detail.Status != dispatch.JobStatusFailed {
+		t.Fatalf("expected terminal-stop job to remain failed, got %s", detail.Status)
+	}
+	if detail.FailureCategory != dispatch.FailureCategoryToolQuotaOrAuth || detail.Retriable {
+		t.Fatalf("expected terminal TOOL_QUOTA_OR_AUTH non-retriable fields in JobDetailResponse, got %+v", detail)
 	}
 }
 
@@ -1316,10 +1322,11 @@ func TestStoryGov5256_CompleteHandlerQuarantinesHostAndRepoOnASEGateIncompleteAn
 
 	// Enqueue Wave 1 and dependent Wave 2
 	w1, _ := q.Enqueue(context.Background(), &dispatch.Job{
-		ID:      "job_7d5cad6fd223f5a0",
-		Type:    dispatch.JobTypePromptExecute,
-		Repo:    "k8s",
-		StoryID: "STORY-GOV-5251",
+		ID:           "job_7d5cad6fd223f5a0",
+		Type:         dispatch.JobTypePromptExecute,
+		Repo:         "k8s",
+		StoryID:      "STORY-GOV-5251",
+		WorktreePath: wt02,
 	})
 	w2, _ := q.Enqueue(context.Background(), &dispatch.Job{
 		ID:             "job_afddead322e5bee9",
@@ -1346,6 +1353,12 @@ func TestStoryGov5256_CompleteHandlerQuarantinesHostAndRepoOnASEGateIncompleteAn
 		t.Fatalf("expected 200 OK from CompleteHandler on fail, got %d: %s", rrFail.Code, rrFail.Body.String())
 	}
 
+	// STORY-GOV-5275: ASE_GATE remediates same job ID to pending (never abandon), while
+	// CompleteHandler still quarantines the dirty worktree so unrelated claims stay blocked.
+	w1AfterFail, _ := q.Get(w1.ID)
+	if w1AfterFail.Status != dispatch.JobStatusPending {
+		t.Fatalf("expected Wave 1 remediable ASE_GATE to reset in-place to pending, got %s", w1AfterFail.Status)
+	}
 	// Wave 2 must remain in blocked_by_dependency (not failed!)
 	w2AfterFail, _ := q.Get(w2.ID)
 	if w2AfterFail.Status != dispatch.JobStatusBlockedByDependency || w2AfterFail.CompletedAt != nil {

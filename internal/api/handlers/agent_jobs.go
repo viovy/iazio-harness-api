@@ -190,6 +190,23 @@ func (h *AgentJobsHandler) CompleteHandler(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
+	// Snapshot host/worktree before Complete: remediable ASE_GATE failures reset the job
+	// in-place to pending and clear ClaimedHost (STORY-GOV-5275), but dirty-worktree
+	// quarantine still needs the pre-complete host binding.
+	preCompleteHost := ""
+	preCompleteWorktree := ""
+	preCompleteStoryID := ""
+	if existingJob, ok := h.queue.Get(jobID); ok && existingJob != nil {
+		preCompleteHost = strings.TrimSpace(existingJob.ClaimedHost)
+		if preCompleteHost == "" {
+			preCompleteHost = strings.TrimSpace(existingJob.HostID)
+		}
+		if preCompleteHost == "" {
+			preCompleteHost = strings.TrimSpace(existingJob.TargetHost)
+		}
+		preCompleteWorktree = strings.TrimSpace(existingJob.WorktreePath)
+		preCompleteStoryID = strings.TrimSpace(existingJob.StoryID)
+	}
 	if req.FencingToken == 0 && strings.TrimSpace(req.Error) == "" {
 		if existingJob, ok := h.queue.Get(jobID); ok && existingJob != nil && existingJob.Status == dispatch.JobStatusFailed {
 			req.FencingToken = existingJob.FencingToken
@@ -240,19 +257,33 @@ func (h *AgentJobsHandler) CompleteHandler(w http.ResponseWriter, r *http.Reques
 		if targetHost == "" {
 			targetHost = strings.TrimSpace(job.TargetHost)
 		}
+		if targetHost == "" {
+			targetHost = preCompleteHost
+		}
+		worktreePath := strings.TrimSpace(job.WorktreePath)
+		if worktreePath == "" {
+			worktreePath = preCompleteWorktree
+		}
+		storyID := strings.TrimSpace(job.StoryID)
+		if storyID == "" {
+			storyID = preCompleteStoryID
+		}
 		errLower := strings.ToLower(req.Error + " " + job.Error + " " + job.FailureCategory)
-		if job.Status == dispatch.JobStatusFailed &&
-			(job.FailureCategory == dispatch.FailureCategoryASEGateIncomplete ||
-				strings.Contains(errLower, "ase_gate_incomplete") ||
-				strings.Contains(errLower, "ase_completion_gate_violation") ||
-				strings.Contains(errLower, "unmerged_feature_branch") ||
-				strings.Contains(errLower, "unmerged feature branch") ||
-				strings.Contains(errLower, "dirty_worktree_post_exit") ||
-				strings.Contains(errLower, "incomplete_ase_flow") ||
-				strings.Contains(errLower, "unpushed_commits")) {
-			h.engine.MarkDispatchJobASEIncomplete(jobID, job.StoryID, targetHost, job.WorktreePath)
+		aseGateIncomplete := job.FailureCategory == dispatch.FailureCategoryASEGateIncomplete ||
+			strings.Contains(errLower, "ase_gate_incomplete") ||
+			strings.Contains(errLower, "ase_completion_gate_violation") ||
+			strings.Contains(errLower, "unmerged_feature_branch") ||
+			strings.Contains(errLower, "unmerged feature branch") ||
+			strings.Contains(errLower, "dirty_worktree_post_exit") ||
+			strings.Contains(errLower, "incomplete_ase_flow") ||
+			strings.Contains(errLower, "unpushed_commits")
+		// Quarantine dirty ASE worktrees for both terminal-failed and remediable-pending
+		// (in-place never-abandon) outcomes so other prompts cannot claim the dirty tree.
+		if aseGateIncomplete &&
+			(job.Status == dispatch.JobStatusFailed || job.Status == dispatch.JobStatusPending) {
+			h.engine.MarkDispatchJobASEIncomplete(jobID, storyID, targetHost, worktreePath)
 		} else if job.Status == dispatch.JobStatusCompleted {
-			h.engine.ClearDispatchJobASEIncomplete(jobID, job.StoryID, targetHost, job.WorktreePath)
+			h.engine.ClearDispatchJobASEIncomplete(jobID, storyID, targetHost, worktreePath)
 		}
 	}
 	if job != nil && h.engine != nil && (strings.EqualFold(strings.TrimSpace(job.Type), "agent.tools.update") || strings.EqualFold(strings.TrimSpace(job.Repo), "fleet")) {
