@@ -191,3 +191,133 @@ func TestMockAgy_GlobalQueueIntegrityAndUnpinRemediation(t *testing.T) {
 			done1.ID, done1.Status, done2.ID, done2.Status)
 	}
 }
+
+// TestMockAgy_NeverAbandonSameJobIDAutoremediate (STORY-GOV-5275) verifies:
+// 1. Remediable ASE-gate failure requeues the SAME job ID to pending (claimable).
+// 2. Orphan requeued jobs without replacement children are promoted to pending and claimable.
+// 3. TOOL_QUOTA_OR_AUTH / infra-down are terminal stops (Retriable=false); mock-agy never resumes them.
+// 4. After remediable failure, mac-mini claims the original job ID and mock-agy completes it.
+func TestMockAgy_NeverAbandonSameJobIDAutoremediate(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	mockAgyBin := buildMockAgyBinary(t, tmpDir)
+	now := time.Date(2026, 11, 13, 20, 0, 0, 0, time.UTC)
+	q := NewInMemoryQueue()
+	q.nowFunc = func() time.Time { return now }
+
+	origID := "job_3ffa5d0be1649f0e"
+	job := &Job{
+		ID:               origID,
+		Type:             "agent.prompt",
+		Repo:             "meta-repo",
+		StoryID:          "STORY-GOV-5275",
+		AllocationSource: "global_queue_tool_priority",
+		Status:           JobStatusPending,
+		TargetAgent:      "agy",
+		CreatedAt:        now.Add(-time.Hour),
+		Payload:          json.RawMessage(`{"prompt":"fix never abandon"}`),
+		doneCh:           make(chan struct{}),
+	}
+	q.jobs[job.ID] = job
+
+	claimed, err := q.Claim(ctx, "mac-mini", []string{"agent.prompt"})
+	if err != nil || claimed == nil || claimed.ID != origID {
+		t.Fatalf("initial claim of %s failed: job=%v err=%v", origID, claimed, err)
+	}
+	if _, err := q.AckLease(ctx, claimed.ID, claimed.LeaseToken, 4242, "conv-5275"); err != nil {
+		t.Fatalf("AckLease: %v", err)
+	}
+
+	// Remediable ASE-gate incomplete must keep SAME id pending (never abandon).
+	if err := q.Complete(ctx, claimed.ID, json.RawMessage(`{"status":"failed"}`), "ASE_GATE_INCOMPLETE: unmerged_feature_branch"); err != nil {
+		t.Fatalf("Complete remediable: %v", err)
+	}
+	after, ok := q.Get(origID)
+	if !ok || after.Status != JobStatusPending {
+		t.Fatalf("expected %s pending in-place after remediable ASE gate, got ok=%v status=%v", origID, ok, after)
+	}
+	if IsTerminalStopFailure(FailureCategoryASEGateIncomplete, "ASE_GATE_INCOMPLETE") {
+		t.Fatal("ASE_GATE_INCOMPLETE must not be terminal stop")
+	}
+
+	// Orphan requeued without replacement child → pending via reconcile.
+	orphanID := "job_985bc2111a0944cd"
+	orphan := &Job{
+		ID:               orphanID,
+		Type:             "agent.prompt",
+		Repo:             "meta-repo",
+		StoryID:          "STORY-GOV-5275-orphan",
+		AllocationSource: "global_queue_tool_priority",
+		Status:           JobStatusRequeued,
+		CreatedAt:        now.Add(-2 * time.Hour),
+		doneCh:           make(chan struct{}),
+	}
+	q.jobs[orphan.ID] = orphan
+	_ = q.reconcileQueueIntegrityLocked(now)
+	gotOrphan, _ := q.Get(orphanID)
+	if gotOrphan.Status != JobStatusPending {
+		t.Fatalf("expected orphan requeued %s promoted to pending, got %s", orphanID, gotOrphan.Status)
+	}
+
+	// Terminal stop: credits
+	if !IsTerminalStopFailure(FailureCategoryToolQuotaOrAuth, "quota exhausted") {
+		t.Fatal("TOOL_QUOTA_OR_AUTH must be terminal stop")
+	}
+	creditsID := "job_97d33fd156a88144"
+	creditsJob := &Job{
+		ID:     creditsID,
+		Type:   "agent.prompt",
+		Repo:   "meta-repo",
+		Status: JobStatusPending,
+		doneCh: make(chan struct{}),
+	}
+	q.jobs[creditsJob.ID] = creditsJob
+	cClaim, err := q.Claim(ctx, "pc1", []string{"agent.prompt"})
+	if err != nil || cClaim == nil {
+		t.Fatalf("claim credits job: %v %v", cClaim, err)
+	}
+	if _, err := q.AckLease(ctx, cClaim.ID, cClaim.LeaseToken, 1, "conv-credits"); err != nil {
+		t.Fatalf("ack credits: %v", err)
+	}
+	if err := q.Complete(ctx, cClaim.ID, nil, "quota exhausted: no AI credits remaining"); err != nil {
+		t.Fatalf("complete credits: %v", err)
+	}
+	gotCredits, _ := q.Get(cClaim.ID)
+	if gotCredits.Status != JobStatusFailed || gotCredits.Retriable {
+		t.Fatalf("expected terminal credits stop failed+non-retriable, got status=%s retriable=%v cat=%s",
+			gotCredits.Status, gotCredits.Retriable, gotCredits.FailureCategory)
+	}
+
+	// Original remediable job is claimable again and completes via mock agy.
+	reclaimed, err := q.Claim(ctx, "mac-mini", []string{"agent.prompt"})
+	if err != nil || reclaimed == nil {
+		t.Fatalf("reclaim after remediate: %v %v", reclaimed, err)
+	}
+	if reclaimed.ID != origID && reclaimed.ID != orphanID {
+		t.Fatalf("expected reclaim of remediable/orphan job, got %s", reclaimed.ID)
+	}
+	runMockAgyForClaimedJob(t, ctx, mockAgyBin, q, reclaimed, "mac-mini")
+	done, _ := q.Get(reclaimed.ID)
+	if done.Status != JobStatusCompleted {
+		t.Fatalf("expected mock-agy completion for %s, got %s", reclaimed.ID, done.Status)
+	}
+}
+
+func TestClassifyDispatchFailure_TerminalStopOnlyCreditsAndInfra(t *testing.T) {
+	cat, _, _, _, _, ret := ClassifyDispatchFailureWithDirection("DoD incomplete review scheme gate")
+	if cat != FailureCategoryASEGateIncomplete || !ret {
+		t.Fatalf("ASE/DoD incomplete must be remediable, got cat=%s retriable=%v", cat, ret)
+	}
+	cat, _, _, _, _, ret = ClassifyDispatchFailureWithDirection("quota exhausted rate limit")
+	if cat != FailureCategoryToolQuotaOrAuth || ret {
+		t.Fatalf("quota must be terminal, got cat=%s retriable=%v", cat, ret)
+	}
+	cat, _, _, _, _, ret = ClassifyDispatchFailureWithDirection("infrastructure down: host unreachable")
+	if cat != FailureCategoryInfraDown || ret {
+		t.Fatalf("infra down must be terminal, got cat=%s retriable=%v", cat, ret)
+	}
+	cat, _, _, _, _, ret = ClassifyDispatchFailureWithDirection("circuit breaker tripped")
+	if cat != FailureCategoryCircuitBreakerTripped || !ret {
+		t.Fatalf("circuit breaker must be remediable, got cat=%s retriable=%v", cat, ret)
+	}
+}
