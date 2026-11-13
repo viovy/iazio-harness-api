@@ -352,18 +352,35 @@ func (e *Engine) HeartbeatWithCapabilities(id, presence string, tools []Tool, fe
 
 	activeMap := make(map[string]bool)
 	for _, aj := range activeJobs {
-		if aj.JobID != "" {
-			activeMap[aj.JobID] = true
+		cleanJobID := strings.TrimSpace(aj.JobID)
+		if cleanJobID != "" {
+			activeMap[cleanJobID] = true
 			wt := strings.TrimSpace(aj.WorktreePath)
 			if wt != "" && wt != "." && wt != "root" {
+				var matchedRepo *Repo
 				for _, r := range e.repos {
-					if r != nil && r.HostID == id && (r.WorktreePath == wt || r.EffectiveAlias() == wt) {
-						if r.RunningJobID == "" || r.RunningJobID == aj.JobID {
-							r.Lock = LockRunning
-							r.RunningJobID = aj.JobID
-							r.LockHolder = aj.JobID
+					if r != nil && r.HostID == id && repoExactPathOrAliasMatch(r, wt) {
+						matchedRepo = r
+						break
+					}
+				}
+				if matchedRepo != nil && (matchedRepo.RunningJobID == "" || matchedRepo.RunningJobID == cleanJobID) {
+					for _, other := range e.repos {
+						if other != nil && other != matchedRepo && (other.RunningJobID == cleanJobID || other.LockHolder == cleanJobID) {
+							other.Lock = LockIdle
+							other.RunningJobID = ""
+							other.LockHolder = ""
+							e.notifyRepoLocked(other)
 						}
 					}
+					matchedRepo.Lock = LockRunning
+					matchedRepo.RunningJobID = cleanJobID
+					matchedRepo.LockHolder = cleanJobID
+					if matchedRepo.Queue == QueuePaused && (matchedRepo.Reason == ReasonDirty || matchedRepo.Reason == ReasonAdhocASE || matchedRepo.Reason == ReasonDetached) {
+						matchedRepo.Queue = QueueOpen
+						matchedRepo.Reason = ""
+					}
+					e.notifyRepoLocked(matchedRepo)
 				}
 			}
 		}
@@ -371,10 +388,19 @@ func (e *Engine) HeartbeatWithCapabilities(id, presence string, tools []Tool, fe
 	for _, r := range e.repos {
 		if r != nil && r.HostID == id && r.Lock == LockRunning && r.RunningJobID != "" {
 			if !activeMap[r.RunningJobID] {
-				if j, ok := e.jobs[r.RunningJobID]; ok && j != nil && j.Status != "RUNNING" && j.Status != "LEASED" && j.Status != "QUEUED" && j.Status != "PENDING" {
+				if j, ok := e.jobs[r.RunningJobID]; ok && j != nil {
+					if j.Status != "RUNNING" && j.Status != "LEASED" && j.Status != "QUEUED" && j.Status != "PENDING" {
+						r.Lock = LockIdle
+						r.RunningJobID = ""
+						r.LockHolder = ""
+						e.notifyRepoLocked(r)
+						continue
+					}
+				} else if len(activeJobs) > 0 && strings.HasPrefix(r.RunningJobID, "job_") && !e.isExternalDispatchJobActiveLocked(r, r.RunningJobID) {
 					r.Lock = LockIdle
 					r.RunningJobID = ""
 					r.LockHolder = ""
+					e.notifyRepoLocked(r)
 					continue
 				}
 			}

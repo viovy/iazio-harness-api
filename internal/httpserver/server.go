@@ -3610,6 +3610,65 @@ func (s *Server) isDispatchJobActive(jobID string) bool {
 	return st == dispatch.JobStatusRunning || st == dispatch.JobStatusClaimed || st == dispatch.JobStatusLeased
 }
 
+func (s *Server) isDispatchJobBoundToOtherHostRepo(repo control.Repo, qJob *dispatch.Job) bool {
+	if qJob == nil || s.Engine == nil || repo.HostID == "" {
+		return false
+	}
+	detail, ok := s.Engine.GetHostDetail(repo.HostID)
+	if !ok {
+		return false
+	}
+	repoPath := strings.TrimRight(strings.TrimSpace(repo.WorktreePath), "/")
+	repoAlias := strings.TrimSpace(repo.EffectiveAlias())
+	matchesRepoSlot := func(r control.Repo, target string) bool {
+		clean := strings.TrimRight(strings.TrimSpace(target), "/")
+		if clean == "" || clean == "." || strings.EqualFold(clean, "root") {
+			return false
+		}
+		rPath := strings.TrimRight(strings.TrimSpace(r.WorktreePath), "/")
+		rAlias := strings.TrimSpace(r.EffectiveAlias())
+		if rPath != "" && rPath == clean {
+			return true
+		}
+		family := dispatch.NormalizeToSuperprojectSlotFamily(clean)
+		isNumberedSlot := !strings.Contains(clean, "/") && family != "" && !strings.EqualFold(clean, family)
+		if isNumberedSlot && ((rAlias != "" && rAlias == clean) || (rPath != "" && strings.HasSuffix(rPath, "/"+clean))) {
+			return true
+		}
+		return false
+	}
+	for _, aj := range detail.Host.ActiveJobs {
+		if strings.TrimSpace(aj.JobID) == qJob.ID {
+			if matchesRepoSlot(repo, aj.WorktreePath) {
+				return false
+			}
+			for _, other := range detail.Repos {
+				if other.WorktreePath != repoPath && matchesRepoSlot(other, aj.WorktreePath) {
+					return true
+				}
+			}
+		}
+	}
+	for _, candidateWT := range []string{qJob.WorktreePath, qJob.Repo} {
+		if matchesRepoSlot(repo, candidateWT) {
+			return false
+		}
+		for _, other := range detail.Repos {
+			if other.WorktreePath != repoPath && matchesRepoSlot(other, candidateWT) {
+				return true
+			}
+		}
+	}
+	for _, other := range detail.Repos {
+		if other.WorktreePath != repoPath && (other.RunningJobID == qJob.ID || other.LockHolder == qJob.ID) {
+			if repo.RunningJobID != qJob.ID && repo.LockHolder != qJob.ID && repoAlias != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (s *Server) findActiveDispatchJobForRepo(repo control.Repo) *dispatch.Job {
 	if s.Queue == nil {
 		return nil
@@ -3622,6 +3681,9 @@ func (s *Server) findActiveDispatchJobForRepo(repo control.Repo) *dispatch.Job {
 		if qJob, ok := s.Queue.Get(cid); ok && qJob != nil {
 			st := strings.ToLower(strings.TrimSpace(qJob.Status))
 			if st == dispatch.JobStatusRunning || st == dispatch.JobStatusClaimed || st == dispatch.JobStatusLeased {
+				if s.isDispatchJobBoundToOtherHostRepo(repo, qJob) {
+					continue
+				}
 				return qJob
 			}
 		}
@@ -3650,8 +3712,20 @@ func (s *Server) findActiveDispatchJobForRepo(repo control.Repo) *dispatch.Job {
 		if repo.HostID != "" && jobHost != "" && !strings.EqualFold(repo.HostID, jobHost) {
 			continue
 		}
+		if s.isDispatchJobBoundToOtherHostRepo(repo, qJob) {
+			continue
+		}
+		qWT := strings.TrimRight(strings.TrimSpace(qJob.WorktreePath), "/")
+		if qWT != "" && qWT != "." && !strings.EqualFold(qWT, "root") {
+			if qWT == repoPath || (repoAlias != "" && qWT == repoAlias) {
+				return qJob
+			}
+			if strings.HasPrefix(qWT, "/") || strings.Contains(qWT, ":\\") {
+				continue
+			}
+		}
 		qRepo := strings.TrimRight(strings.TrimSpace(qJob.Repo), "/")
-		if qRepo != "" && (qRepo == repoPath || (repoAlias != "" && (qRepo == repoAlias || strings.HasSuffix(qRepo, "/"+repoAlias)))) {
+		if qRepo != "" && (qRepo == repoPath || (repoAlias != "" && (qRepo == repoAlias || (!strings.HasPrefix(qRepo, "/") && strings.HasSuffix(qRepo, "/"+repoAlias))))) {
 			return qJob
 		}
 	}
@@ -3664,12 +3738,21 @@ func (s *Server) enrichRepoWithDispatch(repo *control.Repo) *dispatch.Job {
 	}
 	qJob := s.findActiveDispatchJobForRepo(*repo)
 	if qJob == nil {
+		if strings.HasPrefix(strings.TrimSpace(repo.RunningJobID), "job_") {
+			repo.Lock = control.LockIdle
+			repo.RunningJobID = ""
+			repo.LockHolder = ""
+		}
 		return nil
 	}
 	repo.Lock = control.LockRunning
 	repo.RunningJobID = qJob.ID
 	if repo.LockHolder == "" {
 		repo.LockHolder = qJob.ID
+	}
+	if repo.Queue == control.QueuePaused && (repo.Reason == control.ReasonDirty || repo.Reason == control.ReasonAdhocASE || repo.Reason == control.ReasonDetached) {
+		repo.Queue = control.QueueOpen
+		repo.Reason = ""
 	}
 	if repo.ActiveTool == "" && qJob.TargetAgent != "" {
 		repo.ActiveTool = qJob.TargetAgent

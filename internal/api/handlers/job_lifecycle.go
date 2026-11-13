@@ -1978,6 +1978,9 @@ func (h *JobLifecycleHandler) AckLease(w http.ResponseWriter, r *http.Request) {
 	}
 	if qJob != nil {
 		if effectiveWT == "" {
+			effectiveWT = strings.TrimSpace(qJob.WorktreePath)
+		}
+		if effectiveWT == "" {
 			effectiveWT = strings.TrimSpace(qJob.Repo)
 		}
 		if h.engine != nil {
@@ -2057,6 +2060,9 @@ func (h *JobLifecycleHandler) Heartbeat(w http.ResponseWriter, r *http.Request) 
 		effectiveWT := strings.TrimSpace(req.WorktreePath)
 		if effectiveWT == "" {
 			effectiveWT = strings.TrimSpace(req.Repo)
+		}
+		if effectiveWT == "" {
+			effectiveWT = strings.TrimSpace(qJob.WorktreePath)
 		}
 		if effectiveWT == "" {
 			effectiveWT = strings.TrimSpace(qJob.Repo)
