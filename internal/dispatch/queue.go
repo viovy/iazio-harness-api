@@ -1160,18 +1160,38 @@ func (q *InMemoryQueue) hasActiveReplacementChildLocked(parentID string) bool {
 	return q.latestReplacementChildLocked(parentID) != nil
 }
 
-// isActiveReplacementStatus reports whether a child job still supersedes its parent for
-// claim/reconcile purposes (STORY-IAZIO-0202). Completed/canceled/terminal-failed children
-// must NOT block parent promotion or superseded-parent completion — otherwise parents stay
-// eternal requeued after historical child-spawn retries finish (job_3ffa5d0be1649f0e et al.).
+// isActiveReplacementStatus reports whether a child status still parks its parent.
+// Completed/canceled never park (STORY-IAZIO-0202 RC-6). Failed children are handled by
+// isActiveReplacementChild (remediable failed parks; terminal-stop failed does not un-park
+// the parent into pending — see reconcile / RetryRetriable).
 func isActiveReplacementStatus(status string) bool {
 	switch strings.TrimSpace(status) {
 	case JobStatusPending, JobStatusLeased, JobStatusClaimed, JobStatusRunning,
-		JobStatusBlockedByDependency, JobStatusRequeued:
+		JobStatusBlockedByDependency, JobStatusRequeued, JobStatusFailed:
 		return true
 	default:
-		// completed / canceled / failed are terminal-or-own-remediation states and must not
-		// eternally park the parent as unclaimable requeued (STORY-IAZIO-0202).
+		// completed / canceled must not eternally park the parent (STORY-IAZIO-0202).
+		return false
+	}
+}
+
+// isActiveReplacementChild reports whether child still supersedes parent for claim/reconcile.
+// Remediable failed children park the parent (avoid duplicate dispatch). Terminal-stop failed
+// children also keep the parent parked (do not bypass credits/infra stop one generation up).
+// Only completed/canceled children release the parent for superseded-completion or orphan promote.
+func isActiveReplacementChild(child *Job) bool {
+	if child == nil {
+		return false
+	}
+	st := strings.TrimSpace(child.Status)
+	switch st {
+	case JobStatusPending, JobStatusLeased, JobStatusClaimed, JobStatusRunning,
+		JobStatusBlockedByDependency, JobStatusRequeued:
+		return true
+	case JobStatusFailed:
+		// Both remediable and terminal-stop failed children park the parent.
+		return true
+	default:
 		return false
 	}
 }
@@ -1215,6 +1235,45 @@ func completeSupersededParentLocked(job *Job, child *Job, now time.Time) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
+	// Snapshot failure telemetry BEFORE clearing fields (review F2 / STORY-IAZIO-0202).
+	priorResult := strings.TrimSpace(string(job.Result))
+	priorError := strings.TrimSpace(job.Error)
+	priorFailCat := strings.TrimSpace(job.FailureCategory)
+	priorFailStage := strings.TrimSpace(job.FailureStage)
+	priorFailSummary := strings.TrimSpace(job.FailureReasonSummary)
+	priorHost := strings.TrimSpace(job.HostID)
+	if priorHost == "" {
+		priorHost = strings.TrimSpace(job.ClaimedHost)
+	}
+	priorTool := strings.TrimSpace(job.TargetAgent)
+	priorWorkspace := strings.TrimSpace(job.Repo)
+	priorLooksFailed := (priorResult != "" &&
+		(strings.Contains(priorResult, "test_failure_count") ||
+			strings.Contains(priorResult, "failed_tests") ||
+			strings.Contains(priorResult, `"has_error":true`))) ||
+		(priorError != "" && !strings.Contains(strings.ToLower(priorError), "phantom_or_superseded")) ||
+		(priorFailCat != "" && priorFailCat != FailureCategoryNone) ||
+		priorFailSummary != ""
+	if priorLooksFailed {
+		stderrTail := priorResult
+		if stderrTail == "" {
+			stderrTail = firstNonEmptyTrimmed(priorError, priorFailSummary, priorFailCat)
+		}
+		job.AttemptHistory = append(job.AttemptHistory, AttemptFailure{
+			AttemptNumber:   len(job.AttemptHistory) + 1,
+			Host:            priorHost,
+			Workspace:       priorWorkspace,
+			Tool:            priorTool,
+			FailureCategory: priorFailCat,
+			FailureStage:    priorFailStage,
+			Reason:          "pre_supersede_failure",
+			StderrTail:      stderrTail,
+			Timestamp:       now.UTC().Format(time.RFC3339),
+			TriggerReason:   "superseded_by_completed_replacement_child",
+			OutcomeSummary:  firstNonEmptyTrimmed(priorError, priorFailSummary, "pre_supersede_failure"),
+		})
+	}
+
 	job.Status = JobStatusCompleted
 	job.Error = ""
 	job.FailureCategory = ""
@@ -1234,29 +1293,6 @@ func completeSupersededParentLocked(job *Job, child *Job, now time.Time) {
 	if job.CompletedAt == nil {
 		completedAt := now
 		job.CompletedAt = &completedAt
-	}
-	// Preserve prior failure telemetry on AttemptHistory so run-comparison baselines
-	// (CompareJobWithBaseline) still see RESOLVED_ERRORS after the parent is superseded.
-	priorResult := strings.TrimSpace(string(job.Result))
-	priorLooksFailed := priorResult != "" &&
-		(strings.Contains(priorResult, "test_failure_count") ||
-			strings.Contains(priorResult, "failed_tests") ||
-			strings.Contains(priorResult, `"has_error":true`) ||
-			(job.Error != "" && !strings.Contains(strings.ToLower(job.Error), "phantom_or_superseded")))
-	if priorLooksFailed {
-		job.AttemptHistory = append(job.AttemptHistory, AttemptFailure{
-			AttemptNumber:  len(job.AttemptHistory) + 1,
-			Host:           job.HostID,
-			Workspace:      job.Repo,
-			Tool:           job.TargetAgent,
-			FailureCategory: job.FailureCategory,
-			FailureStage:   job.FailureStage,
-			Reason:         "pre_supersede_failure",
-			StderrTail:     priorResult,
-			Timestamp:      now.UTC().Format(time.RFC3339),
-			TriggerReason:  "superseded_by_completed_replacement_child",
-			OutcomeSummary: firstNonEmptyTrimmed(job.Error, job.FailureReasonSummary, "pre_supersede_failure"),
-		})
 	}
 	if child != nil && len(child.Result) > 0 {
 		job.Result = append(json.RawMessage(nil), child.Result...)
@@ -1291,8 +1327,8 @@ func (q *InMemoryQueue) latestReplacementChildLocked(parentID string) *Job {
 			if cand == nil || cand.ID == currID {
 				continue
 			}
-			// STORY-IAZIO-0202: ignore completed/canceled/failed children.
-			if !isActiveReplacementStatus(cand.Status) {
+			// STORY-IAZIO-0202: only completed/canceled release the parent; failed still parks.
+			if !isActiveReplacementChild(cand) {
 				continue
 			}
 			if strings.TrimSpace(cand.ParentID) == currID {
@@ -2007,7 +2043,7 @@ func (q *InMemoryQueue) reconcileQueueIntegrityLocked(now time.Time) []string {
 		if parentID == "" || parentID == j.ID || q.jobs[parentID] == nil {
 			continue
 		}
-		if isActiveReplacementStatus(j.Status) {
+		if isActiveReplacementChild(j) {
 			hasActiveReplacementChild[parentID] = true
 		}
 	}

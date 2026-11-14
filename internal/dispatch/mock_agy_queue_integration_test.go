@@ -519,6 +519,87 @@ func TestMockAgy_RequeuedParentsWithCompletedChildrenSuperseded(t *testing.T) {
 	if !found {
 		t.Fatalf("expected RetryRetriable to process superseded parent %s", stuck.ID)
 	}
+
+	// F1: remediable failed child must keep parent parked (no duplicate pending dispatch).
+	failParent := &Job{
+		ID:     "job_failed_child_parent_0202",
+		Type:   JobTypePromptExecute,
+		Status: JobStatusRequeued,
+		doneCh: make(chan struct{}),
+	}
+	q.jobs[failParent.ID] = failParent
+	q.jobs["job_failed_child_0202"] = &Job{
+		ID:              "job_failed_child_0202",
+		ParentID:        failParent.ID,
+		Type:            JobTypePromptExecute,
+		Status:          JobStatusFailed,
+		Retriable:       true,
+		FailureCategory: FailureCategoryASEGateIncomplete,
+		Error:           "ASE_GATE_INCOMPLETE: unmerged",
+		CreatedAt:       now.Add(-5 * time.Minute),
+		doneCh:          make(chan struct{}),
+	}
+	_ = q.reconcileQueueIntegrityLocked(now)
+	gotFailParent, _ := q.Get(failParent.ID)
+	if gotFailParent.Status != JobStatusRequeued {
+		t.Fatalf("parent with remediable failed child must stay requeued, got %s", gotFailParent.Status)
+	}
+
+	// F1: terminal-stop failed child must also keep parent parked (no credits bypass).
+	termParent := &Job{
+		ID:     "job_terminal_child_parent_0202",
+		Type:   JobTypePromptExecute,
+		Status: JobStatusRequeued,
+		doneCh: make(chan struct{}),
+	}
+	q.jobs[termParent.ID] = termParent
+	q.jobs["job_terminal_child_0202"] = &Job{
+		ID:              "job_terminal_child_0202",
+		ParentID:        termParent.ID,
+		Type:            JobTypePromptExecute,
+		Status:          JobStatusFailed,
+		Retriable:       false,
+		FailureCategory: FailureCategoryToolQuotaOrAuth,
+		Error:           "quota exhausted: no AI credits",
+		CreatedAt:       now.Add(-5 * time.Minute),
+		doneCh:          make(chan struct{}),
+	}
+	_ = q.reconcileQueueIntegrityLocked(now)
+	gotTermParent, _ := q.Get(termParent.ID)
+	if gotTermParent.Status != JobStatusRequeued {
+		t.Fatalf("parent with terminal-stop failed child must stay requeued, got %s", gotTermParent.Status)
+	}
+
+	// F2: superseded parent with BACKGROUND_DRAIN / Error must preserve AttemptHistory.
+	histParent := &Job{
+		ID:                   "job_hist_supersede_0202",
+		Type:                 JobTypePromptExecute,
+		Status:               JobStatusRequeued,
+		HostID:               "debian",
+		ClaimedHost:          "debian",
+		TargetAgent:          "agy",
+		FailureCategory:      FailureCategoryBackgroundDrainTimeout,
+		FailureStage:         "BACKGROUND_DRAIN",
+		FailureReasonSummary: "LEASE_EXPIRED: execution lease expired without completion",
+		Error:                "LEASE_EXPIRED: execution lease expired without completion",
+		CreatedAt:            now.Add(-time.Hour),
+		doneCh:               make(chan struct{}),
+	}
+	q.jobs[histParent.ID] = histParent
+	seedCompletedChild("job_hist_child_0202", histParent.ID, "STORY-IAZIO-0202")
+	_ = q.reconcileQueueIntegrityLocked(now)
+	gotHist, _ := q.Get(histParent.ID)
+	if gotHist.Status != JobStatusCompleted {
+		t.Fatalf("hist parent must complete superseded, got %s", gotHist.Status)
+	}
+	if len(gotHist.AttemptHistory) == 0 {
+		t.Fatal("expected AttemptHistory entry preserving pre-supersede failure telemetry")
+	}
+	last := gotHist.AttemptHistory[len(gotHist.AttemptHistory)-1]
+	if last.FailureCategory != FailureCategoryBackgroundDrainTimeout || last.Host != "debian" ||
+		!strings.Contains(last.OutcomeSummary, "LEASE_EXPIRED") {
+		t.Fatalf("AttemptHistory hollow: %+v", last)
+	}
 }
 
 func TestRetryRetriable_DoesNotReviveCanceledOrParentWithReplacementChild(t *testing.T) {
