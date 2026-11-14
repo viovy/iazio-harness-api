@@ -3518,5 +3518,165 @@ func TestStoryGov5264_LeaseHeartbeatTransientTimeoutResilience(t *testing.T) {
 	}
 }
 
+func TestIsPrematureCraftCloseout(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		summary string
+		output  string
+		want    bool
+	}{
+		{
+			name:    "craft_plus_waiting_for",
+			summary: "## CRAFT Closeout\nLaunched autopilot-git-flow land; waiting for CI.",
+			want:    true,
+		},
+		{
+			name:    "craft_plus_awaiting_completion",
+			summary: "## CRAFT Closeout\nAwaiting completion of Phase 5 land.",
+			want:    true,
+		},
+		{
+			name:    "craft_plus_will_wait_for",
+			output:  "## CRAFT Closeout\nWill wait for git-flow assert.",
+			want:    true,
+		},
+		{
+			name:    "craft_plus_launched_backticked_autopilot_git_flow",
+			summary: "## CRAFT Closeout\nLaunched `autopilot-git-flow land` for STORY-GOV-5282.",
+			want:    true,
+		},
+		{
+			name:    "craft_plus_launched_autopilot_space_git_flow",
+			summary: "## CRAFT Closeout\nLaunched `autopilot git-flow` land and waiting.",
+			want:    true,
+		},
+		{
+			name:    "midflow_only_without_craft",
+			summary: "Launched autopilot-git-flow land; awaiting completion of PR checks.",
+			want:    true,
+		},
+		{
+			name:    "case_insensitive_markers",
+			summary: "## craft closeout\nWAITING FOR merge queue.",
+			want:    true,
+		},
+		{
+			name:    "legitimate_craft_without_midflow",
+			summary: "## CRAFT Closeout\nAll PRs merged; assert-git-flow-complete PASS.",
+			want:    false,
+		},
+		{
+			name:    "empty",
+			summary: "",
+			output:  "",
+			want:    false,
+		},
+		{
+			name:    "midflow_with_terminal_assert_proof_no_craft",
+			summary: "waiting for nothing — assert-git-flow-complete PASS; Autonomous story execution is complete.",
+			want:    false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := IsPrematureCraftCloseout(tc.summary, tc.output)
+			if got != tc.want {
+				t.Fatalf("IsPrematureCraftCloseout(%q, %q) = %v, want %v", tc.summary, tc.output, got, tc.want)
+			}
+		})
+	}
+
+	cat, stage, _, _, _, retriable := ClassifyDispatchFailureWithDirection(PrematureCraftCloseoutMessage)
+	if cat != FailureCategoryASEGateIncomplete || stage != FailureStageCompletionGate || !retriable {
+		t.Fatalf("premature craft message must map to ASE_GATE_INCOMPLETE/COMPLETION_GATE/retriable, got cat=%s stage=%s retriable=%v", cat, stage, retriable)
+	}
+	if PrematureCraftCloseoutMessage != "ASE_GATE_INCOMPLETE: premature_craft_closeout" {
+		t.Fatalf("unexpected message constant: %q", PrematureCraftCloseoutMessage)
+	}
+}
+
+func TestCompleteWithFencing_RejectsPrematureCraftCloseout(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 14, 6, 0, 0, 0, time.UTC)
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+
+	job, err := q.Enqueue(ctx, &Job{
+		ID:          "job_premature_craft_unit",
+		Type:        JobTypePromptExecute,
+		Repo:        "meta-repo",
+		StoryID:     "STORY-GOV-5282",
+		TargetAgent: "agy",
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	claimed, err := q.Claim(ctx, "mac-mini", []string{JobTypePromptExecute})
+	if err != nil || claimed == nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := q.AckLease(ctx, claimed.ID, claimed.LeaseToken, 4242, "conv-premature"); err != nil {
+		t.Fatalf("AckLease: %v", err)
+	}
+
+	prematureResult := json.RawMessage(`{
+		"status":"completed",
+		"exit_code":0,
+		"summary":"## CRAFT Closeout\nLaunched autopilot-git-flow land; waiting for CI green.",
+		"story_id":"STORY-GOV-5282"
+	}`)
+	if err := q.CompleteWithFencing(ctx, claimed.ID, claimed.FencingToken, prematureResult, ""); err != nil {
+		t.Fatalf("CompleteWithFencing: %v", err)
+	}
+
+	got, ok := q.Get(job.ID)
+	if !ok {
+		t.Fatal("job missing after complete")
+	}
+	if got.Status != JobStatusPending {
+		t.Fatalf("expected premature CRAFT completion remediable to pending, got %s", got.Status)
+	}
+	if len(got.AttemptHistory) == 0 {
+		t.Fatal("expected attempt history for premature craft remediation")
+	}
+	last := got.AttemptHistory[len(got.AttemptHistory)-1]
+	if last.FailureCategory != FailureCategoryASEGateIncomplete {
+		t.Fatalf("expected ASE_GATE_INCOMPLETE attempt, got %q", last.FailureCategory)
+	}
+	if !strings.Contains(last.StderrTail, "premature_craft_closeout") {
+		t.Fatalf("expected premature_craft_closeout in stderr tail, got %q", last.StderrTail)
+	}
+
+	// Clean completion without mid-flow markers must still succeed.
+	job2, err := q.Enqueue(ctx, &Job{
+		ID:          "job_clean_craft_unit",
+		Type:        JobTypePromptExecute,
+		Repo:        "meta-repo",
+		StoryID:     "STORY-IAZIO-0204",
+		TargetAgent: "agy",
+	})
+	if err != nil {
+		t.Fatalf("enqueue job2: %v", err)
+	}
+	claimed2, err := q.Claim(ctx, "mac-mini", []string{JobTypePromptExecute})
+	if err != nil || claimed2 == nil || claimed2.ID != job2.ID {
+		t.Fatalf("claim job2: job=%v err=%v", claimed2, err)
+	}
+	cleanResult := json.RawMessage(`{
+		"status":"completed",
+		"exit_code":0,
+		"ase_complete":true,
+		"summary":"## CRAFT Closeout\nAll acceptance criteria verified; assert-git-flow-complete PASS."
+	}`)
+	if err := q.CompleteWithFencing(ctx, claimed2.ID, claimed2.FencingToken, cleanResult, ""); err != nil {
+		t.Fatalf("clean CompleteWithFencing: %v", err)
+	}
+	done2, _ := q.Get(job2.ID)
+	if done2.Status != JobStatusCompleted {
+		t.Fatalf("expected clean CRAFT to complete, got %s", done2.Status)
+	}
+}
 
 

@@ -716,3 +716,119 @@ func TestClassifyDispatchFailure_TerminalStopOnlyCreditsAndInfra(t *testing.T) {
 		t.Fatalf("circuit breaker must be remediable, got cat=%s retriable=%v", cat, ret)
 	}
 }
+
+// TestMockAgy_PrematureCraftCloseoutRejected (STORY-IAZIO-0204 RC-7) seeds live Global Queue
+// job IDs that completed with mid-flow CRAFT prose and asserts Complete remediates them to
+// pending with ASE_GATE_INCOMPLETE instead of accepting terminal completed.
+func TestMockAgy_PrematureCraftCloseoutRejected(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	mockAgyBin := buildMockAgyBinary(t, tmpDir)
+	now := time.Date(2026, 11, 14, 7, 0, 0, 0, time.UTC)
+
+	fixtures := []struct {
+		id      string
+		storyID string
+		summary string
+	}{
+		{
+			id:      "job_5b4dc7312a463143",
+			storyID: "STORY-GOV-5282",
+			summary: "## CRAFT Closeout\nLaunched autopilot-git-flow land; waiting for CI and assert gates.",
+		},
+		{
+			id:      "job_dc382538188a9a54",
+			storyID: "STORY-VIGO-0309",
+			summary: "## CRAFT Closeout\nAwaiting completion of Phase 5 land for STORY-VIGO-0309.",
+		},
+		{
+			id:      "job_83c6be4ec792fbab",
+			storyID: "STORY-GOV-5265",
+			summary: "## CRAFT Closeout\nLaunched `autopilot-git-flow` land; will wait for merge queue green.",
+		},
+	}
+
+	var lastRemediatedID string
+	for _, fx := range fixtures {
+		q := NewInMemoryQueue()
+		q.nowFunc = func() time.Time { return now }
+
+		job := &Job{
+			ID:               fx.id,
+			Type:             "agent.prompt",
+			Repo:             "meta-repo",
+			StoryID:          fx.storyID,
+			AllocationSource: "global_queue_tool_priority",
+			Status:           JobStatusPending,
+			TargetAgent:      "agy",
+			CreatedAt:        now.Add(-time.Hour),
+			Payload:          json.RawMessage(`{"prompt":"/autonomous-story-execution ` + fx.storyID + `"}`),
+			doneCh:           make(chan struct{}),
+		}
+		q.jobs[job.ID] = job
+
+		claimed, err := q.Claim(ctx, "mac-mini", []string{"agent.prompt"})
+		if err != nil || claimed == nil || claimed.ID != fx.id {
+			t.Fatalf("claim %s: job=%v err=%v", fx.id, claimed, err)
+		}
+		if _, err := q.AckLease(ctx, claimed.ID, claimed.LeaseToken, 4242, "conv-"+fx.id); err != nil {
+			t.Fatalf("AckLease(%s): %v", fx.id, err)
+		}
+
+		result, err := json.Marshal(map[string]any{
+			"status":   "completed",
+			"runner":   "mock-agy",
+			"job_id":   fx.id,
+			"host_id":  "mac-mini",
+			"story_id": fx.storyID,
+			"summary":  fx.summary,
+		})
+		if err != nil {
+			t.Fatalf("marshal result: %v", err)
+		}
+		if err := q.Complete(ctx, claimed.ID, result, ""); err != nil {
+			t.Fatalf("Complete(%s): %v", fx.id, err)
+		}
+
+		got, ok := q.Get(fx.id)
+		if !ok {
+			t.Fatalf("Get(%s): missing", fx.id)
+		}
+		if got.Status == JobStatusCompleted {
+			t.Fatalf("%s must not stay completed with premature CRAFT summary", fx.id)
+		}
+		if got.Status != JobStatusPending && got.Status != JobStatusRequeued {
+			t.Fatalf("%s expected pending/requeued after premature CRAFT, got %s", fx.id, got.Status)
+		}
+		if len(got.AttemptHistory) == 0 {
+			t.Fatalf("%s expected attempt history with ASE_GATE_INCOMPLETE", fx.id)
+		}
+		last := got.AttemptHistory[len(got.AttemptHistory)-1]
+		if last.FailureCategory != FailureCategoryASEGateIncomplete {
+			t.Fatalf("%s expected ASE_GATE_INCOMPLETE, got %q", fx.id, last.FailureCategory)
+		}
+		if !strings.Contains(last.StderrTail, "premature_craft_closeout") &&
+			!strings.Contains(last.StderrTail, PrematureCraftCloseoutMessage) {
+			t.Fatalf("%s expected premature_craft_closeout error, got %q", fx.id, last.StderrTail)
+		}
+		lastRemediatedID = fx.id
+
+		// mock-agy reclaim + clean completion on the remediated same job ID.
+		reclaimed, err := q.Claim(ctx, "pc1-wsl", []string{"agent.prompt"})
+		if err != nil || reclaimed == nil || reclaimed.ID != fx.id {
+			// ASE closeout remediation may pin TargetHost to the original host.
+			reclaimed, err = q.Claim(ctx, "mac-mini", []string{"agent.prompt"})
+		}
+		if err != nil || reclaimed == nil || reclaimed.ID != fx.id {
+			t.Fatalf("expected reclaim of remediable %s, got job=%v err=%v", fx.id, reclaimed, err)
+		}
+		runMockAgyForClaimedJob(t, ctx, mockAgyBin, q, reclaimed, reclaimed.HostID)
+		done, _ := q.Get(fx.id)
+		if done.Status != JobStatusCompleted {
+			t.Fatalf("mock-agy clean completion of %s should succeed, got %s", fx.id, done.Status)
+		}
+	}
+	if lastRemediatedID == "" {
+		t.Fatal("expected at least one RC-7 fixture to remediate")
+	}
+}
