@@ -3229,7 +3229,15 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 
 	now := q.now()
 	job.CompletedAt = &now
+	// Capture summary/output before sanitize so RC-7 mid-flow markers are not lost.
+	var rawResultSummary, rawResultOutput, rawResultStatus string
 	if len(result) > 0 {
+		var rawMap map[string]any
+		if json.Unmarshal(result, &rawMap) == nil && rawMap != nil {
+			rawResultSummary, _ = rawMap["summary"].(string)
+			rawResultOutput, _ = rawMap["output"].(string)
+			rawResultStatus, _ = rawMap["status"].(string)
+		}
 		result = SanitizeJobResultSummary(result)
 	}
 
@@ -3324,8 +3332,25 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 		}
 	}
 
-	if strings.Contains(string(result), "completed_via_eager_readiness") {
+	isEagerReadiness := strings.Contains(string(result), "completed_via_eager_readiness")
+	if isEagerReadiness {
 		errStr = ""
+	}
+
+	// STORY-IAZIO-0204 RC-7: reject premature CRAFT / mid-flow "completed" results.
+	if errStr == "" && !isEagerReadiness {
+		resStatus := rawResultStatus
+		if resMap != nil {
+			if s, ok := resMap["status"].(string); ok && strings.TrimSpace(s) != "" {
+				resStatus = s
+			}
+		}
+		looksCompletedOrSuccess := resStatus == "" ||
+			strings.EqualFold(resStatus, "completed") ||
+			strings.EqualFold(resStatus, "success")
+		if looksCompletedOrSuccess && IsPrematureCraftCloseout(rawResultSummary, rawResultOutput) {
+			errStr = PrematureCraftCloseoutMessage
+		}
 	}
 
 	if errStr != "" {
