@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3718,5 +3719,264 @@ func TestAbandonJob_ProcessDisappearedOnHost_RequeuesAndResumesFailedDirtyStory(
 		t.Fatalf("expected reclaimed worktree=/Users/romeo/work/meta-repo-03, got %q", reclaimed.WorktreePath)
 	}
 }
+
+func TestStoryGov5281_HostHarnessCountExcludesToolsUpdateAndMatchesSubmoduleWorktree(t *testing.T) {
+	now := time.Now().UTC()
+	eng := control.NewEngine(func() time.Time { return now })
+	_ = eng.RegisterHost("mac-mini", "permanent")
+	_ = eng.RegisterHost("pc1", "permanent")
+	_ = eng.Heartbeat("mac-mini", nil, false)
+	_ = eng.Heartbeat("pc1", nil, false)
+	_ = eng.UpsertRepo(control.Repo{
+		HostID:                       "mac-mini",
+		WorktreePath:                 "/Users/romeo/work/meta-repo-03",
+		Queue:                        control.QueueOpen,
+		Lock:                         control.LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+	_ = eng.UpsertRepo(control.Repo{
+		HostID:                       "pc1",
+		WorktreePath:                 `C:\work\meta-repo-02`,
+		Queue:                        control.QueueOpen,
+		Lock:                         control.LockIdle,
+		GlobalQueueAllocationEnabled: true,
+	})
+
+	queue := dispatch.NewInMemoryQueue()
+	eng.BindDispatchQueue(queue)
+	srv := &Server{
+		Engine: eng,
+		Queue:  queue,
+	}
+	handler := srv.Handler()
+
+	// 1. Active agent.tools.update ("fleet") dispatch job on mac-mini must NOT inflate harness_executions or harness_active.
+	toolsJob, err := queue.Enqueue(context.Background(), &dispatch.Job{
+		ID:          "job_tools_update_1",
+		Type:        "agent.tools.update",
+		Repo:        "fleet",
+		TargetHost:  "mac-mini",
+		TargetAgent: "agy",
+	})
+	if err != nil {
+		t.Fatalf("enqueue tools job failed: %v", err)
+	}
+	claimedTools, err := queue.ClaimWithWorktrees(context.Background(), "mac-mini", nil, []string{"/Users/romeo/work/meta-repo-03"})
+	if err != nil || claimedTools == nil {
+		t.Fatalf("claim tools job failed: %v", err)
+	}
+	_, _ = queue.AckLease(context.Background(), toolsJob.ID, claimedTools.LeaseToken, 41201, "")
+	_ = eng.HeartbeatDetailed("mac-mini", "ONLINE", nil, false, control.ActiveJob{
+		JobID:        toolsJob.ID,
+		WorktreePath: "fleet",
+	})
+
+	// 2. Active prompt.execute dispatch job in submodule C:\work\meta-repo-02\vigo-api on pc1 must count as 1 AND lock C:\work\meta-repo-02.
+	subJob, err := queue.Enqueue(context.Background(), &dispatch.Job{
+		ID:           "job_sub_vigo_api_1",
+		Type:         dispatch.JobTypePromptExecute,
+		Repo:         "vigo-api",
+		WorktreePath: `C:\work\meta-repo-02\vigo-api`,
+		TargetHost:   "pc1",
+		TargetAgent:  "agy",
+	})
+	if err != nil {
+		t.Fatalf("enqueue submodule job failed: %v", err)
+	}
+	claimedSub, err := queue.ClaimWithWorktrees(context.Background(), "pc1", nil, []string{`C:\work\meta-repo-02`, `C:\work\meta-repo-02\vigo-api`})
+	if err != nil || claimedSub == nil {
+		t.Fatalf("claim submodule job failed: %v", err)
+	}
+	_, _ = queue.AckLease(context.Background(), subJob.ID, claimedSub.LeaseToken, 51202, "")
+
+	reqHosts := httptest.NewRequest(http.MethodGet, "/v1/hosts", nil)
+	rrHosts := httptest.NewRecorder()
+	handler.ServeHTTP(rrHosts, reqHosts)
+	if rrHosts.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /v1/hosts, got %d: %s", rrHosts.Code, rrHosts.Body.String())
+	}
+	var hostsPayload struct {
+		Hosts []map[string]any `json:"hosts"`
+	}
+	if err := json.Unmarshal(rrHosts.Body.Bytes(), &hostsPayload); err != nil {
+		t.Fatalf("unmarshal /v1/hosts failed: %v", err)
+	}
+	hostsByID := map[string]map[string]any{}
+	for _, h := range hostsPayload.Hosts {
+		if id, ok := h["id"].(string); ok {
+			hostsByID[id] = h
+		}
+	}
+	macHost := hostsByID["mac-mini"]
+	if macHost == nil {
+		t.Fatalf("expected mac-mini in /v1/hosts")
+	}
+	if int(macHost["harness_executions"].(float64)) != 0 || macHost["harness_active"] != false {
+		t.Fatalf("expected mac-mini harness_executions=0 and harness_active=false for agent.tools.update, got %v / %v", macHost["harness_executions"], macHost["harness_active"])
+	}
+	pc1Host := hostsByID["pc1"]
+	if pc1Host == nil {
+		t.Fatalf("expected pc1 in /v1/hosts")
+	}
+	if int(pc1Host["harness_executions"].(float64)) != 1 || pc1Host["harness_active"] != true {
+		t.Fatalf("expected pc1 harness_executions=1 and harness_active=true for submodule prompt.execute, got %v / %v", pc1Host["harness_executions"], pc1Host["harness_active"])
+	}
+
+	reqMacDetail := httptest.NewRequest(http.MethodGet, "/v1/hosts/mac-mini", nil)
+	rrMacDetail := httptest.NewRecorder()
+	handler.ServeHTTP(rrMacDetail, reqMacDetail)
+	if rrMacDetail.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /v1/hosts/mac-mini, got %d", rrMacDetail.Code)
+	}
+	var macDetail struct {
+		Host map[string]any `json:"host"`
+	}
+	_ = json.Unmarshal(rrMacDetail.Body.Bytes(), &macDetail)
+	if int(macDetail.Host["harness_executions"].(float64)) != 0 || macDetail.Host["harness_active"] != false {
+		t.Fatalf("expected /v1/hosts/mac-mini harness_executions=0, got %v", macDetail.Host)
+	}
+
+	reqPC1Detail := httptest.NewRequest(http.MethodGet, "/v1/hosts/pc1", nil)
+	rrPC1Detail := httptest.NewRecorder()
+	handler.ServeHTTP(rrPC1Detail, reqPC1Detail)
+	if rrPC1Detail.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /v1/hosts/pc1, got %d", rrPC1Detail.Code)
+	}
+	var pc1Detail struct {
+		Repos []map[string]any `json:"repos"`
+	}
+	if err := json.Unmarshal(rrPC1Detail.Body.Bytes(), &pc1Detail); err != nil {
+		t.Fatalf("unmarshal /v1/hosts/pc1 failed: %v", err)
+	}
+	if len(pc1Detail.Repos) != 1 {
+		t.Fatalf("expected 1 repo on pc1, got %d", len(pc1Detail.Repos))
+	}
+	if pc1Detail.Repos[0]["lock"] != string(control.LockRunning) || pc1Detail.Repos[0]["running_job_id"] != subJob.ID {
+		t.Fatalf("expected superproject meta-repo-02 on pc1 to enrich to RUNNING_HARNESS with job %s, got lock=%v running_job_id=%v", subJob.ID, pc1Detail.Repos[0]["lock"], pc1Detail.Repos[0]["running_job_id"])
+	}
+}
+
+type spyListQueue struct {
+	dispatch.Queue
+	listCalls atomic.Int32
+}
+
+func (s *spyListQueue) List(ctx context.Context, filter dispatch.JobFilter) ([]*dispatch.Job, error) {
+	s.listCalls.Add(1)
+	return s.Queue.List(ctx, filter)
+}
+
+func TestServer_HostsEndpointsSingleQueueListAndAdhocASE(t *testing.T) {
+	eng := control.NewEngine(nil)
+	_ = eng.RegisterHost("mac-mini", "permanent")
+	_ = eng.RegisterHost("pc1", "permanent")
+	_ = eng.RegisterHost("linux-1", "permanent")
+	_ = eng.Heartbeat("mac-mini", nil, false)
+	_ = eng.Heartbeat("pc1", nil, false)
+	_ = eng.Heartbeat("linux-1", nil, false)
+
+	for i, wt := range []string{
+		"/Users/romeo/work/meta-repo-01",
+		"/Users/romeo/work/meta-repo-02",
+		"/Users/romeo/work/meta-repo-03",
+		"/Users/romeo/work/meta-repo-04",
+	} {
+		repo := control.Repo{
+			HostID:       "mac-mini",
+			WorktreePath: wt,
+			Queue:        control.QueueOpen,
+			Lock:         control.LockIdle,
+		}
+		if i == 2 {
+			repo.Queue = control.QueuePaused
+			repo.Reason = control.ReasonAdhocASE
+			repo.DirtyStoryID = "STORY-GOV-5281"
+			repo.ExecutionProvenance = "ADHOC_CLI"
+			repo.ToolLiveness = "ALIVE"
+			repo.ASEState = "RUNNING"
+			repo.ActiveTool = "agy"
+			repo.DetectedConversationID = "ea854a37-959c-4886-bf7f-d3ab255ffde1"
+		}
+		_ = eng.UpsertRepo(repo)
+	}
+	_ = eng.UpsertRepo(control.Repo{
+		HostID:       "pc1",
+		WorktreePath: `C:\work\meta-repo-02`,
+		Queue:        control.QueueOpen,
+		Lock:         control.LockIdle,
+	})
+
+	baseQueue := dispatch.NewInMemoryQueue()
+	spyQ := &spyListQueue{Queue: baseQueue}
+	eng.BindDispatchQueue(spyQ)
+	srv := &Server{Engine: eng, Queue: spyQ}
+	handler := srv.Handler()
+
+	// 1. GET /v1/hosts across 3 hosts must invoke Queue.List exactly once and keep adhoc_ase_executions=1.
+	spyQ.listCalls.Store(0)
+	reqHosts := httptest.NewRequest(http.MethodGet, "/v1/hosts", nil)
+	rrHosts := httptest.NewRecorder()
+	handler.ServeHTTP(rrHosts, reqHosts)
+	if rrHosts.Code != http.StatusOK {
+		t.Fatalf("GET /v1/hosts status=%d body=%s", rrHosts.Code, rrHosts.Body.String())
+	}
+	if calls := spyQ.listCalls.Load(); calls != 1 {
+		t.Fatalf("expected GET /v1/hosts to invoke Queue.List once across 3 hosts, got %d", calls)
+	}
+	var hostsResp struct {
+		Hosts []map[string]any `json:"hosts"`
+	}
+	if err := json.Unmarshal(rrHosts.Body.Bytes(), &hostsResp); err != nil {
+		t.Fatalf("unmarshal /v1/hosts failed: %v", err)
+	}
+	var macHost map[string]any
+	for _, h := range hostsResp.Hosts {
+		if h["id"] == "mac-mini" {
+			macHost = h
+			break
+		}
+	}
+	if macHost == nil {
+		t.Fatalf("missing mac-mini in /v1/hosts")
+	}
+	if got := int(macHost["adhoc_ase_executions"].(float64)); got != 1 {
+		t.Fatalf("expected mac-mini adhoc_ase_executions=1, got %d", got)
+	}
+
+	// 2. GET /v1/hosts/mac-mini across 4 repos + host summary must invoke Queue.List exactly once and preserve adhoc_ase_active.
+	spyQ.listCalls.Store(0)
+	reqDetail := httptest.NewRequest(http.MethodGet, "/v1/hosts/mac-mini", nil)
+	rrDetail := httptest.NewRecorder()
+	handler.ServeHTTP(rrDetail, reqDetail)
+	if rrDetail.Code != http.StatusOK {
+		t.Fatalf("GET /v1/hosts/mac-mini status=%d body=%s", rrDetail.Code, rrDetail.Body.String())
+	}
+	if calls := spyQ.listCalls.Load(); calls != 1 {
+		t.Fatalf("expected GET /v1/hosts/mac-mini to invoke Queue.List once across 4 repos, got %d", calls)
+	}
+	var detailResp struct {
+		Host  map[string]any   `json:"host"`
+		Repos []map[string]any `json:"repos"`
+	}
+	if err := json.Unmarshal(rrDetail.Body.Bytes(), &detailResp); err != nil {
+		t.Fatalf("unmarshal /v1/hosts/mac-mini failed: %v", err)
+	}
+	if got := int(detailResp.Host["adhoc_ase_executions"].(float64)); got != 1 {
+		t.Fatalf("expected detail host adhoc_ase_executions=1, got %d", got)
+	}
+	var foundMeta3 bool
+	for _, r := range detailResp.Repos {
+		if r["worktree_path"] == "/Users/romeo/work/meta-repo-03" {
+			foundMeta3 = true
+			if r["reason"] != string(control.ReasonAdhocASE) || r["dirty_story_id"] != "STORY-GOV-5281" {
+				t.Fatalf("expected meta-repo-03 reason=%q dirty_story_id=STORY-GOV-5281, got %v", control.ReasonAdhocASE, r)
+			}
+		}
+	}
+	if !foundMeta3 {
+		t.Fatalf("meta-repo-03 missing from detail repos")
+	}
+}
+
 
 

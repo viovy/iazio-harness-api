@@ -773,6 +773,8 @@ type Job struct {
 	ClaimedHost             string               `json:"claimed_host,omitempty"`
 	HostID                  string               `json:"host_id,omitempty"`
 	TargetAgent             string               `json:"target_agent,omitempty"`
+	Model                   string               `json:"model,omitempty"`
+	FallbackModels          []string             `json:"fallback_models,omitempty"`
 	StoryID                 string               `json:"story_id,omitempty"`
 	StoryTitle              string               `json:"story_title,omitempty"`
 	StoryPath               string               `json:"story_path,omitempty"`
@@ -906,6 +908,8 @@ type InMemoryQueue struct {
 	jobTimeout             time.Duration
 	startupTime            time.Time
 	startupGrace           time.Duration
+	lastReapAt             time.Time
+	lastReapJobCount       int
 	store                  QueueStore
 	nowFunc                func() time.Time
 	terminalHooks          []func(job *Job, promoted []*Job)
@@ -921,6 +925,7 @@ func isJobStatusActive(status string) bool {
 }
 
 func (q *InMemoryQueue) syncJobActiveStateLocked(j *Job) {
+	q.lastReapAt = time.Time{}
 	if j == nil || strings.TrimSpace(j.ID) == "" {
 		return
 	}
@@ -932,6 +937,7 @@ func (q *InMemoryQueue) syncJobActiveStateLocked(j *Job) {
 }
 
 func (q *InMemoryQueue) rebuildActiveJobsLocked() {
+	q.lastReapAt = time.Time{}
 	activeSet := make(map[string]bool)
 	for id, j := range q.jobs {
 		if j != nil && isJobStatusActive(j.Status) {
@@ -1076,6 +1082,9 @@ func cloneJobSnapshot(j *Job) *Job {
 	if len(j.ConversationIDs) > 0 {
 		cp.ConversationIDs = append([]string(nil), j.ConversationIDs...)
 	}
+	if len(j.FallbackModels) > 0 {
+		cp.FallbackModels = append([]string(nil), j.FallbackModels...)
+	}
 	if len(j.Payload) > 0 {
 		cp.Payload = append(json.RawMessage(nil), j.Payload...)
 	}
@@ -1104,7 +1113,9 @@ func normalizeJobDependencies(job *Job) {
 	if job == nil {
 		return
 	}
-	if len(job.Payload) > 0 && (job.DependsOnJobID == "" && len(job.DependsOnJobIDs) == 0 || job.CallbackURL == "") {
+	if len(job.Payload) > 0 &&
+		((job.DependsOnJobID == "" && len(job.DependsOnJobIDs) == 0 && bytes.Contains(job.Payload, []byte("depends_on_job"))) ||
+			(job.CallbackURL == "" && bytes.Contains(job.Payload, []byte("callback_url")))) {
 		var pm map[string]any
 		if json.Unmarshal(job.Payload, &pm) == nil && pm != nil {
 			if job.DependsOnJobID == "" {
@@ -1182,6 +1193,19 @@ func isActiveReplacementChild(child *Job) bool {
 	}
 }
 
+func (q *InMemoryQueue) buildChildrenByParentLocked() map[string][]*Job {
+	children := make(map[string][]*Job)
+	for _, cand := range q.jobs {
+		if cand == nil {
+			continue
+		}
+		if pid := strings.TrimSpace(cand.ParentID); pid != "" {
+			children[pid] = append(children[pid], cand)
+		}
+	}
+	return children
+}
+
 // hasActiveReplacementDescendantLocked reports whether parentID has any active descendant,
 // walking through completed/canceled intermediate nodes (review N2 / STORY-IAZIO-0202).
 func (q *InMemoryQueue) hasActiveReplacementDescendantLocked(parentID string) bool {
@@ -1189,16 +1213,24 @@ func (q *InMemoryQueue) hasActiveReplacementDescendantLocked(parentID string) bo
 	if cleanID == "" || q.jobs[cleanID] == nil {
 		return false
 	}
+	return q.hasActiveReplacementDescendantWithIndexLocked(cleanID, q.buildChildrenByParentLocked())
+}
+
+func (q *InMemoryQueue) hasActiveReplacementDescendantWithIndexLocked(parentID string, children map[string][]*Job) bool {
+	cleanID := strings.TrimSpace(parentID)
+	if cleanID == "" || q.jobs[cleanID] == nil {
+		return false
+	}
+	if len(children[cleanID]) == 0 {
+		return false
+	}
 	visited := map[string]bool{cleanID: true}
 	queue := []string{cleanID}
 	for len(queue) > 0 {
 		curr := queue[0]
 		queue = queue[1:]
-		for _, cand := range q.jobs {
+		for _, cand := range children[curr] {
 			if cand == nil || visited[cand.ID] {
-				continue
-			}
-			if strings.TrimSpace(cand.ParentID) != curr {
 				continue
 			}
 			visited[cand.ID] = true
@@ -1229,12 +1261,17 @@ func (q *InMemoryQueue) latestSuccessfulCompletedChildLocked(parentID string) *J
 	if cleanID == "" {
 		return nil
 	}
+	return q.latestSuccessfulCompletedChildWithIndexLocked(cleanID, q.buildChildrenByParentLocked())
+}
+
+func (q *InMemoryQueue) latestSuccessfulCompletedChildWithIndexLocked(parentID string, children map[string][]*Job) *Job {
+	cleanID := strings.TrimSpace(parentID)
+	if cleanID == "" {
+		return nil
+	}
 	var latest *Job
-	for _, cand := range q.jobs {
+	for _, cand := range children[cleanID] {
 		if cand == nil || !isSuccessfulCompletedChild(cand) {
-			continue
-		}
-		if strings.TrimSpace(cand.ParentID) != cleanID {
 			continue
 		}
 		if latest == nil || cand.CreatedAt.After(latest.CreatedAt) {
@@ -1332,6 +1369,10 @@ func completeSupersededParentLocked(job *Job, child *Job, now time.Time) {
 }
 
 func (q *InMemoryQueue) latestReplacementChildLocked(parentID string) *Job {
+	return q.latestReplacementChildWithIndexLocked(parentID, q.buildChildrenByParentLocked())
+}
+
+func (q *InMemoryQueue) latestReplacementChildWithIndexLocked(parentID string, children map[string][]*Job) *Job {
 	cleanID := strings.TrimSpace(parentID)
 	if cleanID == "" || q.jobs[cleanID] == nil {
 		return nil
@@ -1342,11 +1383,8 @@ func (q *InMemoryQueue) latestReplacementChildLocked(parentID string) *Job {
 	for {
 		var nextActive *Job
 		var nextBridge *Job // completed/canceled bridge toward an active descendant
-		for _, cand := range q.jobs {
+		for _, cand := range children[currID] {
 			if cand == nil || cand.ID == currID || visited[cand.ID] {
-				continue
-			}
-			if strings.TrimSpace(cand.ParentID) != currID {
 				continue
 			}
 			if isActiveReplacementChild(cand) {
@@ -1407,7 +1445,31 @@ func isJobTerminalCompleted(dep *Job) (satisfied bool, failedJob *Job) {
 	return true, nil
 }
 
+func (q *InMemoryQueue) buildLatestCompletedByStoryLocked() map[string]*Job {
+	bestByStory := make(map[string]*Job)
+	for _, cand := range q.jobs {
+		if cand == nil {
+			continue
+		}
+		storyID := strings.ToLower(strings.TrimSpace(cand.StoryID))
+		if storyID == "" || storyID == "pending-allocation" || storyID == "pending_harness_creation" {
+			continue
+		}
+		if ok, _ := isJobTerminalCompleted(cand); !ok {
+			continue
+		}
+		if prev := bestByStory[storyID]; prev == nil || cand.CreatedAt.After(prev.CreatedAt) {
+			bestByStory[storyID] = cand
+		}
+	}
+	return bestByStory
+}
+
 func (q *InMemoryQueue) resolveEffectiveDependencyJobLocked(depID string) (*Job, bool) {
+	return q.resolveEffectiveDependencyJobWithIndexLocked(depID, nil, nil)
+}
+
+func (q *InMemoryQueue) resolveEffectiveDependencyJobWithIndexLocked(depID string, children map[string][]*Job, bestByStory map[string]*Job) (*Job, bool) {
 	dep, exists := q.jobs[depID]
 	if !exists || dep == nil {
 		return nil, false
@@ -1415,23 +1477,18 @@ func (q *InMemoryQueue) resolveEffectiveDependencyJobLocked(depID string) (*Job,
 	if dep.Status == JobStatusCompleted {
 		return dep, true
 	}
-	if rep := q.latestReplacementChildLocked(dep.ID); rep != nil {
+	if children == nil {
+		children = q.buildChildrenByParentLocked()
+	}
+	if rep := q.latestReplacementChildWithIndexLocked(dep.ID, children); rep != nil {
 		return rep, true
 	}
-	storyID := strings.TrimSpace(dep.StoryID)
-	if storyID != "" && !strings.EqualFold(storyID, "pending-allocation") && !strings.EqualFold(storyID, "pending_harness_creation") {
-		var bestCompleted *Job
-		for _, cand := range q.jobs {
-			if cand == nil || cand.ID == dep.ID || !strings.EqualFold(strings.TrimSpace(cand.StoryID), storyID) {
-				continue
-			}
-			if ok, _ := isJobTerminalCompleted(cand); ok {
-				if bestCompleted == nil || cand.CreatedAt.After(bestCompleted.CreatedAt) {
-					bestCompleted = cand
-				}
-			}
+	storyID := strings.ToLower(strings.TrimSpace(dep.StoryID))
+	if storyID != "" && storyID != "pending-allocation" && storyID != "pending_harness_creation" {
+		if bestByStory == nil {
+			bestByStory = q.buildLatestCompletedByStoryLocked()
 		}
-		if bestCompleted != nil {
+		if bestCompleted := bestByStory[storyID]; bestCompleted != nil && bestCompleted.ID != dep.ID {
 			return bestCompleted, true
 		}
 	}
@@ -1439,6 +1496,10 @@ func (q *InMemoryQueue) resolveEffectiveDependencyJobLocked(depID string) (*Job,
 }
 
 func (q *InMemoryQueue) areDependenciesSatisfiedLocked(job *Job) (satisfied bool, failedDep *Job) {
+	return q.areDependenciesSatisfiedWithIndexLocked(job, nil, nil)
+}
+
+func (q *InMemoryQueue) areDependenciesSatisfiedWithIndexLocked(job *Job, children map[string][]*Job, bestByStory map[string]*Job) (satisfied bool, failedDep *Job) {
 	if job == nil {
 		return true, nil
 	}
@@ -1447,7 +1508,7 @@ func (q *InMemoryQueue) areDependenciesSatisfiedLocked(job *Job) (satisfied bool
 		return true, nil
 	}
 	for i, depID := range job.DependsOnJobIDs {
-		dep, exists := q.resolveEffectiveDependencyJobLocked(depID)
+		dep, exists := q.resolveEffectiveDependencyJobWithIndexLocked(depID, children, bestByStory)
 		if !exists || dep == nil {
 			if q.externalDepChecker != nil {
 				extExists, extSatisfied, extFailed, extReason := q.externalDepChecker(depID)
@@ -1486,19 +1547,35 @@ func (q *InMemoryQueue) resolveDependentJobsLocked(ctx context.Context, now time
 	if now.IsZero() {
 		now = q.now()
 	}
+	var depChildren []*Job
+	dependentsByDepID := make(map[string][]*Job)
+	for _, j := range q.jobs {
+		if j == nil {
+			continue
+		}
+		normalizeJobDependencies(j)
+		if len(j.DependsOnJobIDs) == 0 {
+			continue
+		}
+		depChildren = append(depChildren, j)
+		for _, depID := range j.DependsOnJobIDs {
+			dependentsByDepID[depID] = append(dependentsByDepID[depID], j)
+		}
+	}
+	if len(depChildren) == 0 {
+		return nil, nil, nil
+	}
+	children := q.buildChildrenByParentLocked()
+	bestByStory := q.buildLatestCompletedByStoryLocked()
 	for {
 		changed := false
-		for _, child := range q.jobs {
+		for _, child := range depChildren {
 			if child == nil {
 				continue
 			}
-			normalizeJobDependencies(child)
-			if len(child.DependsOnJobIDs) == 0 {
-				continue
-			}
-			if child.Status == JobStatusRequeued && q.hasActiveReplacementChildLocked(child.ID) {
-				if rep := q.latestReplacementChildLocked(child.ID); rep != nil {
-					for _, grandChild := range q.jobs {
+			if child.Status == JobStatusRequeued && q.hasActiveReplacementDescendantWithIndexLocked(child.ID, children) {
+				if rep := q.latestReplacementChildWithIndexLocked(child.ID, children); rep != nil {
+					for _, grandChild := range dependentsByDepID[child.ID] {
 						if grandChild == nil || grandChild.ID == child.ID || grandChild.ID == rep.ID {
 							continue
 						}
@@ -1513,8 +1590,11 @@ func (q *InMemoryQueue) resolveDependentJobsLocked(ctx context.Context, now time
 								reb = true
 							}
 						}
-						if reb && q.store != nil {
-							_ = q.store.SaveQueueJob(ctx, grandChild)
+						if reb {
+							dependentsByDepID[rep.ID] = append(dependentsByDepID[rep.ID], grandChild)
+							if q.store != nil {
+								_ = q.store.SaveQueueJob(ctx, grandChild)
+							}
 						}
 					}
 				}
@@ -1536,7 +1616,7 @@ func (q *InMemoryQueue) resolveDependentJobsLocked(ctx context.Context, now time
 			if child.Status != JobStatusBlockedByDependency && child.Status != JobStatusPending && child.Status != JobStatusRequeued && !(child.Status == JobStatusFailed && isDepFailedState) {
 				continue
 			}
-			satisfied, failedDep := q.areDependenciesSatisfiedLocked(child)
+			satisfied, failedDep := q.areDependenciesSatisfiedWithIndexLocked(child, children, bestByStory)
 			if failedDep != nil {
 				reason := strings.TrimSpace(failedDep.Error)
 				var depErr string
@@ -1627,6 +1707,7 @@ func (q *InMemoryQueue) resolveDependentJobsLocked(ctx context.Context, now time
 func (q *InMemoryQueue) SetStore(s QueueStore) error {
 	q.mu.Lock()
 	q.store = s
+	q.lastReapAt = time.Time{}
 	q.mu.Unlock()
 
 	if s != nil {
@@ -1727,6 +1808,7 @@ func (q *InMemoryQueue) SetAttributionConfig(apiURL string, client *http.Client)
 func (q *InMemoryQueue) SetStartupGrace(d time.Duration) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	q.lastReapAt = time.Time{}
 	q.startupGrace = d
 	q.startupTime = q.now()
 	if d > 0 {
@@ -1758,6 +1840,7 @@ func NewInMemoryQueue() *InMemoryQueue {
 func (q *InMemoryQueue) SetTimeouts(claimTimeout, jobTimeout time.Duration) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	q.lastReapAt = time.Time{}
 	if claimTimeout > 0 {
 		q.claimTimeout = claimTimeout
 	}
@@ -1770,6 +1853,7 @@ func (q *InMemoryQueue) SetTimeouts(claimTimeout, jobTimeout time.Duration) {
 func (q *InMemoryQueue) SetNowFunc(fn func() time.Time) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	q.lastReapAt = time.Time{}
 	if fn != nil {
 		q.nowFunc = fn
 	}
@@ -1797,9 +1881,10 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 			continue
 		}
 
-		// 1. Max execution timeout: from CreatedAt (0 = unbounded, stories immune)
+		// 1. Max execution timeout: from CreatedAt (0 = unbounded, stories immune; skip already-remediated EXECUTION_TIMEOUT pending jobs to stop ping-pong)
 		isStory := j.StoryID != "" || j.Type == "story" || j.Type == "refinement"
-		if !isStory && q.jobTimeout > 0 && !j.CreatedAt.IsZero() && now.Sub(j.CreatedAt) > q.jobTimeout {
+		if !isStory && q.jobTimeout > 0 && !j.CreatedAt.IsZero() && now.Sub(j.CreatedAt) > q.jobTimeout &&
+			(j.Status != JobStatusPending || !strings.HasPrefix(strings.TrimSpace(j.Error), "EXECUTION_TIMEOUT:")) {
 			j.Status = JobStatusFailed
 			j.Error = "EXECUTION_TIMEOUT: job exceeded max execution duration"
 			j.FailureCategory = FailureCategoryBackgroundDrainTimeout
@@ -1940,7 +2025,12 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 	if len(expiredIDs) > 0 || len(promoted) > 0 {
 		q.rebuildActiveJobsLocked()
 	}
+	var reconciledSet map[string]bool
 	if reconciledIDs := q.reconcileQueueIntegrityLocked(now); len(reconciledIDs) > 0 {
+		reconciledSet = make(map[string]bool, len(reconciledIDs))
+		for _, id := range reconciledIDs {
+			reconciledSet[id] = true
+		}
 		expiredIDs = append(expiredIDs, reconciledIDs...)
 		_, _, postDoneChs := q.resolveDependentJobsLocked(context.Background(), now)
 		doneChannels = append(doneChannels, postDoneChs...)
@@ -1956,7 +2046,12 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 	}
 
 	if q.store != nil && len(expiredIDs) > 0 {
+		savedSet := make(map[string]bool, len(expiredIDs))
 		for _, id := range expiredIDs {
+			if reconciledSet[id] || savedSet[id] {
+				continue
+			}
+			savedSet[id] = true
 			if j, ok := q.jobs[id]; ok && j != nil {
 				sctx, cancel := storeContext(context.Background())
 				_ = q.store.SaveQueueJob(sctx, j)
@@ -1965,6 +2060,8 @@ func (q *InMemoryQueue) reapExpiredLocked(now time.Time) []string {
 		}
 	}
 
+	q.lastReapAt = now
+	q.lastReapJobCount = len(q.jobs)
 	return expiredIDs
 }
 
@@ -2064,13 +2161,15 @@ func (q *InMemoryQueue) reconcileQueueIntegrityLocked(now time.Time) []string {
 	if now.IsZero() {
 		now = q.now()
 	}
+	children := q.buildChildrenByParentLocked()
+	var bestByStory map[string]*Job
 	// STORY-IAZIO-0202: ACTIVE descendants (incl. through completed bridges) park a parent.
 	hasActiveReplacementChild := make(map[string]bool)
 	for id, j := range q.jobs {
 		if j == nil {
 			continue
 		}
-		if q.hasActiveReplacementDescendantLocked(id) {
+		if q.hasActiveReplacementDescendantWithIndexLocked(id, children) {
 			hasActiveReplacementChild[id] = true
 		}
 	}
@@ -2125,7 +2224,7 @@ func (q *InMemoryQueue) reconcileQueueIntegrityLocked(now time.Time) []string {
 			j.LeaseAckDeadlineAt = nil
 			mutated = true
 		} else if j.Status == JobStatusRequeued && !hasActiveReplacementChild[j.ID] {
-			if completedChild := q.latestSuccessfulCompletedChildLocked(j.ID); completedChild != nil {
+			if completedChild := q.latestSuccessfulCompletedChildWithIndexLocked(j.ID, children); completedChild != nil {
 				// STORY-IAZIO-0202 RC-6: replacement already succeeded — complete parent, do not re-dequeue.
 				completeSupersededParentLocked(j, completedChild, now)
 				if q.store != nil && j.CompletedAt != nil {
@@ -2137,7 +2236,10 @@ func (q *InMemoryQueue) reconcileQueueIntegrityLocked(now time.Time) []string {
 			} else {
 				// STORY-GOV-5275: orphan requeued jobs (no active replacement child) must become claimable again.
 				if len(j.DependsOnJobIDs) > 0 {
-					satisfied, failedDep := q.areDependenciesSatisfiedLocked(j)
+					if bestByStory == nil {
+						bestByStory = q.buildLatestCompletedByStoryLocked()
+					}
+					satisfied, failedDep := q.areDependenciesSatisfiedWithIndexLocked(j, children, bestByStory)
 					if satisfied {
 						resetJobPendingInPlaceLocked(j, "")
 						mutated = true
@@ -2175,7 +2277,7 @@ func (q *InMemoryQueue) reconcileQueueIntegrityLocked(now time.Time) []string {
 			applyASECloseoutRemediationLocked(j, j.Error)
 			mutated = true
 		} else if j.Status == JobStatusPending {
-			if completedChild := q.latestSuccessfulCompletedChildLocked(j.ID); completedChild != nil &&
+			if completedChild := q.latestSuccessfulCompletedChildWithIndexLocked(j.ID, children); completedChild != nil &&
 				(strings.Contains(strings.ToLower(j.Error), "phantom_or_superseded") ||
 					strings.Contains(string(j.Result), "phantom_or_superseded")) {
 				completeSupersededParentLocked(j, completedChild, now)
@@ -2763,6 +2865,7 @@ func (q *InMemoryQueue) HeartbeatWithStory(ctx context.Context, jobID string, fe
 	job.LeaseExpiresAt = &expires
 	PopulateJobConversationFields(job)
 	q.syncJobActiveStateLocked(job)
+	q.lastReapAt = time.Time{}
 	if q.store != nil {
 		sctx, cancel := storeContext(ctx)
 		defer cancel()
@@ -3392,6 +3495,7 @@ func (q *InMemoryQueue) CompleteWithFencing(ctx context.Context, jobID string, f
 			} else {
 				resetJobPendingInPlaceLocked(job, errStr)
 			}
+			advanceJobModelOnFailureRetry(job)
 			q.syncJobActiveStateLocked(job)
 			if q.store != nil {
 				sctx, cancel := storeContext(ctx)
@@ -3710,7 +3814,15 @@ func (q *InMemoryQueue) List(ctx context.Context, filter JobFilter) ([]*Job, err
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	q.reapExpiredLocked(q.now())
+	now := q.now()
+	if (q.claimTimeout > 0 && q.claimTimeout < time.Second) ||
+		(q.jobTimeout > 0 && q.jobTimeout < time.Second) ||
+		q.lastReapAt.IsZero() ||
+		len(q.jobs) != q.lastReapJobCount ||
+		now.Before(q.lastReapAt) ||
+		now.Sub(q.lastReapAt) >= time.Second {
+		q.reapExpiredLocked(now)
+	}
 
 	limit := filter.Limit
 	if limit <= 0 {
@@ -3733,8 +3845,7 @@ func (q *InMemoryQueue) List(ctx context.Context, filter JobFilter) ([]*Job, err
 		if filter.Type != "" && j.Type != filter.Type {
 			continue
 		}
-		PopulateJobConversationFields(j)
-		matched = append(matched, cloneJobSnapshot(j))
+		matched = append(matched, j)
 	}
 
 	sort.Slice(matched, func(i, j int) bool {
@@ -3744,7 +3855,13 @@ func (q *InMemoryQueue) List(ctx context.Context, filter JobFilter) ([]*Job, err
 	if len(matched) > limit {
 		matched = matched[:limit]
 	}
-	return matched, nil
+
+	out := make([]*Job, len(matched))
+	for i, j := range matched {
+		PopulateJobConversationFields(j)
+		out[i] = cloneJobSnapshot(j)
+	}
+	return out, nil
 }
 
 // Cancel terminates a pending or claimed job.
@@ -3874,7 +3991,11 @@ func (q *InMemoryQueue) Retry(ctx context.Context, jobID string) (*Job, error) {
 		q.mu.Unlock()
 		return nil, fmt.Errorf("job %s is terminal-stop (%s): not retriable", orig.ID, orig.FailureCategory)
 	}
+	wasFailed := orig.Status == JobStatusFailed
 	resetJobPendingInPlaceLocked(orig, "")
+	if wasFailed {
+		advanceJobModelOnFailureRetry(orig)
+	}
 	q.syncJobActiveStateLocked(orig)
 	if q.store != nil {
 		_ = q.store.SaveQueueJob(ctx, orig)
@@ -3944,6 +4065,7 @@ func (q *InMemoryQueue) AckLease(ctx context.Context, jobID, leaseToken string, 
 	job.LeaseExpiresAt = &expires
 	PopulateJobConversationFields(job)
 	q.syncJobActiveStateLocked(job)
+	q.lastReapAt = time.Time{}
 	if q.store != nil {
 		sctx, cancel := storeContext(ctx)
 		defer cancel()
@@ -4311,6 +4433,9 @@ func (q *InMemoryQueue) RetryRetriable(ctx context.Context) ([]*Job, error) {
 
 		// Remediable retry keeps the SAME job ID claimable (no orphan requeued parent).
 		resetJobPendingInPlaceLocked(job, "")
+		if remediableFailed {
+			advanceJobModelOnFailureRetry(job)
+		}
 		if len(job.DependsOnJobIDs) > 0 {
 			if satisfied, _ := q.areDependenciesSatisfiedLocked(job); !satisfied {
 				job.Status = JobStatusBlockedByDependency
@@ -4615,4 +4740,155 @@ func generateJobID() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
 	return fmt.Sprintf("job_%s", hex.EncodeToString(b))
+}
+
+var defaultModelEscalationChain = []string{
+	"gemini-3.8-flash-high",
+	"gemini-4-carbon-high",
+	"gemini-4-hydrogen-high",
+}
+
+// SelectStoryExecutionModel selects the execution model and effort tier for a story or prompt
+// based on attempt number, target file count, and repository/submodule scope.
+func SelectStoryExecutionModel(repo, submodule, promptText string, targetFilesCount, attempt int) (model, effort string) {
+	r := strings.TrimSpace(repo)
+	sub := strings.TrimSpace(submodule)
+	isUmbrellaOrRoot := isUmbrellaOrRootRepo(r) || isUmbrellaOrRootRepo(sub)
+	switch {
+	case attempt >= 2:
+		return "gemini-4-hydrogen-high", "xhigh"
+	case attempt == 1 || targetFilesCount > 5 || isUmbrellaOrRoot:
+		return "gemini-4-carbon-high", "high"
+	default:
+		return "gemini-3.8-flash-high", "high"
+	}
+}
+
+func isUmbrellaOrRootRepo(name string) bool {
+	return name == "." ||
+		strings.EqualFold(name, "meta-repo") ||
+		strings.EqualFold(name, "autopilot-umbrella") ||
+		strings.EqualFold(name, "iazio-infra")
+}
+
+// FallbackModelsForModel returns remaining default escalation tiers after the selected model.
+func FallbackModelsForModel(model string) []string {
+	m := strings.TrimSpace(model)
+	for i, tier := range defaultModelEscalationChain {
+		if strings.EqualFold(m, tier) {
+			if i+1 < len(defaultModelEscalationChain) {
+				out := make([]string, len(defaultModelEscalationChain)-(i+1))
+				copy(out, defaultModelEscalationChain[i+1:])
+				return out
+			}
+			return nil
+		}
+	}
+	out := make([]string, len(defaultModelEscalationChain))
+	copy(out, defaultModelEscalationChain)
+	return out
+}
+
+// ResolveJobModelSelection resolves the effective model, effort, and fallback ladder for enqueueing a job.
+func ResolveJobModelSelection(explicitModel, explicitEffort, repo, submodule, promptText string, targetFilesCount int) (model, effort string, fallbackModels []string) {
+	m := strings.TrimSpace(explicitModel)
+	if m == "" || strings.EqualFold(m, "auto") {
+		model, effort = SelectStoryExecutionModel(repo, submodule, promptText, targetFilesCount, 0)
+	} else {
+		model = m
+		effort = defaultEffortForSelectedModel(m)
+	}
+	if e := strings.ToLower(strings.TrimSpace(explicitEffort)); e != "" {
+		effort = e
+	}
+	fallbackModels = FallbackModelsForModel(model)
+	return model, effort, fallbackModels
+}
+
+// DefaultEffortForSelectedModel maps a selected model identifier to its canonical reasoning effort.
+func DefaultEffortForSelectedModel(model string) string {
+	return defaultEffortForSelectedModel(model)
+}
+
+func defaultEffortForSelectedModel(model string) string {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case lower == "gemini-4-hydrogen-high" || strings.HasSuffix(lower, "-xhigh"):
+		return "xhigh"
+	case strings.HasSuffix(lower, "-medium"):
+		return "medium"
+	case strings.HasSuffix(lower, "-low"):
+		return "low"
+	case strings.HasSuffix(lower, "-max"):
+		return "max"
+	case lower == "":
+		return ""
+	default:
+		return "high"
+	}
+}
+
+func advanceJobModelOnFailureRetry(job *Job) bool {
+	if job == nil || (len(job.FallbackModels) == 0 && strings.TrimSpace(job.Model) == "") {
+		return false
+	}
+	return AdvanceJobModelFallback(job)
+}
+
+// AdvanceJobModelFallback shifts job.Model to the next entry in job.FallbackModels
+// (or next tier in the default escalation chain), returning false when exhausted.
+func AdvanceJobModelFallback(job *Job) bool {
+	if job == nil {
+		return false
+	}
+	cur := strings.TrimSpace(job.Model)
+	if job.FallbackModels != nil {
+		for i, cand := range job.FallbackModels {
+			next := strings.TrimSpace(cand)
+			if next != "" && !strings.EqualFold(next, cur) {
+				job.Model = next
+				rest := make([]string, len(job.FallbackModels)-(i+1))
+				copy(rest, job.FallbackModels[i+1:])
+				job.FallbackModels = rest
+				syncJobPayloadModel(job)
+				return true
+			}
+		}
+		job.FallbackModels = []string{}
+		return false
+	}
+
+	if cur == "" {
+		job.Model = defaultModelEscalationChain[0]
+		syncJobPayloadModel(job)
+		return true
+	}
+	for i, tier := range defaultModelEscalationChain {
+		if strings.EqualFold(cur, tier) {
+			if i+1 < len(defaultModelEscalationChain) {
+				job.Model = defaultModelEscalationChain[i+1]
+				syncJobPayloadModel(job)
+				return true
+			}
+			return false
+		}
+	}
+	return false
+}
+
+func syncJobPayloadModel(job *Job) {
+	if job == nil || len(job.Payload) == 0 {
+		return
+	}
+	var pm map[string]any
+	if err := json.Unmarshal(job.Payload, &pm); err != nil || pm == nil {
+		return
+	}
+	pm["model"] = job.Model
+	if eff := defaultEffortForSelectedModel(job.Model); eff != "" {
+		pm["effort"] = eff
+	}
+	if updated, err := json.Marshal(pm); err == nil {
+		job.Payload = updated
+	}
 }

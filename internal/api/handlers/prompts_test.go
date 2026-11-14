@@ -240,3 +240,86 @@ func TestPromptsHandlerPreservesBranchAndAllocatesTool(t *testing.T) {
 		t.Fatalf("expected alphabetical prompt order, got %+v", listResp.Prompts)
 	}
 }
+
+func TestPromptsHandler_ModelSelectionAndOverride(t *testing.T) {
+	store := setupTestStore(t)
+	q := dispatch.NewInMemoryQueue()
+	handler := NewPromptsHandler(store, q, nil)
+
+	cases := []struct {
+		name       string
+		body       map[string]any
+		wantModel  string
+		wantEffort string
+	}{
+		{
+			name: "leaf repo defaults to flash-high",
+			body: map[string]any{
+				"repo":    "iazio-mcp",
+				"title":   "Leaf prompt",
+				"prompt":  "fix bug",
+				"enqueue": true,
+			},
+			wantModel:  "gemini-3.8-flash-high",
+			wantEffort: "high",
+		},
+		{
+			name: "root dot repo with auto model escalates to carbon-high",
+			body: map[string]any{
+				"repo":    ".",
+				"title":   "Root prompt",
+				"prompt":  "coordinate root",
+				"model":   "auto",
+				"enqueue": true,
+			},
+			wantModel:  "gemini-4-carbon-high",
+			wantEffort: "high",
+		},
+		{
+			name: "explicit model and effort preserved",
+			body: map[string]any{
+				"repo":    "iazio-mcp",
+				"title":   "Hard prompt",
+				"prompt":  "complex refactor",
+				"model":   "gemini-4-hydrogen-high",
+				"effort":  "xhigh",
+				"enqueue": true,
+			},
+			wantModel:  "gemini-4-hydrogen-high",
+			wantEffort: "xhigh",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, _ := json.Marshal(tc.body)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/prompts", bytes.NewReader(b))
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+			if w.Code != http.StatusCreated {
+				t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+			}
+			var resp CreatePromptResponse
+			if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if resp.Model != tc.wantModel || resp.Effort != tc.wantEffort {
+				t.Fatalf("response got (%q, %q), want (%q, %q)", resp.Model, resp.Effort, tc.wantModel, tc.wantEffort)
+			}
+			job, ok := q.Get(resp.HarnessJobID)
+			if !ok || job == nil {
+				t.Fatalf("expected job %q in queue", resp.HarnessJobID)
+			}
+			if job.Model != tc.wantModel {
+				t.Fatalf("job.Model got %q, want %q", job.Model, tc.wantModel)
+			}
+			var savedPayload CreatePromptRequest
+			if err := json.Unmarshal(job.Payload, &savedPayload); err != nil {
+				t.Fatalf("unmarshal payload: %v", err)
+			}
+			if savedPayload.Model != tc.wantModel || savedPayload.Effort != tc.wantEffort {
+				t.Fatalf("job payload got (%q, %q), want (%q, %q)", savedPayload.Model, savedPayload.Effort, tc.wantModel, tc.wantEffort)
+			}
+		})
+	}
+}

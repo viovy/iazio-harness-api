@@ -3780,4 +3780,427 @@ func TestIsControlPlaneScheduleJobID(t *testing.T) {
 	}
 }
 
+func TestSelectStoryExecutionModel_TiersAndScopes(t *testing.T) {
+	tests := []struct {
+		name             string
+		repo             string
+		submodule        string
+		targetFilesCount int
+		attempt          int
+		wantModel        string
+		wantEffort       string
+	}{
+		{
+			name:             "initial leaf small target files",
+			repo:             "iazio-harness",
+			submodule:        "iazio-harness",
+			targetFilesCount: 3,
+			attempt:          0,
+			wantModel:        "gemini-3.8-flash-high",
+			wantEffort:       "high",
+		},
+		{
+			name:             "wide change target files > 5",
+			repo:             "iazio-harness",
+			submodule:        "iazio-harness",
+			targetFilesCount: 6,
+			attempt:          0,
+			wantModel:        "gemini-4-carbon-high",
+			wantEffort:       "high",
+		},
+		{
+			name:             "root dot repo",
+			repo:             ".",
+			targetFilesCount: 1,
+			attempt:          0,
+			wantModel:        "gemini-4-carbon-high",
+			wantEffort:       "high",
+		},
+		{
+			name:             "meta-repo umbrella",
+			repo:             "meta-repo",
+			targetFilesCount: 1,
+			attempt:          0,
+			wantModel:        "gemini-4-carbon-high",
+			wantEffort:       "high",
+		},
+		{
+			name:             "autopilot-umbrella repo",
+			repo:             "autopilot-umbrella",
+			targetFilesCount: 1,
+			attempt:          0,
+			wantModel:        "gemini-4-carbon-high",
+			wantEffort:       "high",
+		},
+		{
+			name:             "iazio-infra submodule",
+			repo:             "leaf",
+			submodule:        "iazio-infra",
+			targetFilesCount: 1,
+			attempt:          0,
+			wantModel:        "gemini-4-carbon-high",
+			wantEffort:       "high",
+		},
+		{
+			name:             "attempt 1 escalates to carbon-high",
+			repo:             "iazio-harness",
+			targetFilesCount: 1,
+			attempt:          1,
+			wantModel:        "gemini-4-carbon-high",
+			wantEffort:       "high",
+		},
+		{
+			name:             "attempt 2 escalates to hydrogen-high xhigh",
+			repo:             "iazio-harness",
+			targetFilesCount: 1,
+			attempt:          2,
+			wantModel:        "gemini-4-hydrogen-high",
+			wantEffort:       "xhigh",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotModel, gotEffort := SelectStoryExecutionModel(tc.repo, tc.submodule, "run story", tc.targetFilesCount, tc.attempt)
+			if gotModel != tc.wantModel || gotEffort != tc.wantEffort {
+				t.Fatalf("got (%q, %q), want (%q, %q)", gotModel, gotEffort, tc.wantModel, tc.wantEffort)
+			}
+		})
+	}
+}
+
+func TestAdvanceJobModelFallback_AndCloneSnapshot(t *testing.T) {
+	// Explicit FallbackModels list shifts step-by-step and syncs payload.
+	job := &Job{
+		ID:             "job_fb_1",
+		Model:          "gemini-3.8-flash-high",
+		FallbackModels: []string{"gemini-4-carbon-high", "gemini-4-hydrogen-high"},
+		Payload:        json.RawMessage(`{"prompt":"fix","model":"gemini-3.8-flash-high"}`),
+	}
+	if !AdvanceJobModelFallback(job) || job.Model != "gemini-4-carbon-high" {
+		t.Fatalf("first fallback shift failed: model=%q fallback=%v", job.Model, job.FallbackModels)
+	}
+	var pm map[string]any
+	if err := json.Unmarshal(job.Payload, &pm); err != nil || pm["model"] != "gemini-4-carbon-high" {
+		t.Fatalf("expected payload model updated to gemini-4-carbon-high, got %v (err=%v)", pm["model"], err)
+	}
+	if !AdvanceJobModelFallback(job) || job.Model != "gemini-4-hydrogen-high" {
+		t.Fatalf("second fallback shift failed: model=%q fallback=%v", job.Model, job.FallbackModels)
+	}
+	if AdvanceJobModelFallback(job) {
+		t.Fatalf("expected exhausted fallback list to return false, still got model=%q", job.Model)
+	}
+
+	// Default chain fallback when FallbackModels is nil.
+	defaultJob := &Job{Model: "gemini-3.8-flash-high"}
+	if !AdvanceJobModelFallback(defaultJob) || defaultJob.Model != "gemini-4-carbon-high" {
+		t.Fatalf("default tier 1 failed: got %q", defaultJob.Model)
+	}
+	if !AdvanceJobModelFallback(defaultJob) || defaultJob.Model != "gemini-4-hydrogen-high" {
+		t.Fatalf("default tier 2 failed: got %q", defaultJob.Model)
+	}
+	if AdvanceJobModelFallback(defaultJob) {
+		t.Fatalf("expected top default tier exhausted to return false")
+	}
+
+	// cloneJobSnapshot deep-copies FallbackModels.
+	orig := &Job{ID: "j1", Model: "gemini-3.8-flash-high", FallbackModels: []string{"gemini-4-carbon-high"}}
+	cp := cloneJobSnapshot(orig)
+	cp.FallbackModels[0] = "mutated"
+	if orig.FallbackModels[0] != "gemini-4-carbon-high" {
+		t.Fatalf("cloneJobSnapshot mutated original FallbackModels slice")
+	}
+
+	// Preserve STORY-GOV-5275 terminal-stop invariant for quota/auth errors.
+	if !IsTerminalStopFailure(FailureCategoryToolQuotaOrAuth, "quota exhausted") {
+		t.Fatalf("expected TOOL_QUOTA_OR_AUTH to remain terminal stop")
+	}
+}
+
+func TestQueue_FailureAutoremediateAndRetry_AdvancesFallbackModel(t *testing.T) {
+	ctx := context.Background()
+	q := NewInMemoryQueue()
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type:           JobTypePromptExecute,
+		Repo:           "iazio-agent",
+		TargetHost:     "mac-mini",
+		TargetAgent:    "agy",
+		Model:          "gemini-3.8-flash-high",
+		FallbackModels: []string{"gemini-4-carbon-high", "gemini-4-hydrogen-high"},
+		Payload:        json.RawMessage(`{"prompt":"fix unit test","model":"gemini-3.8-flash-high","effort":"high"}`),
+		Retriable:      true,
+	})
+	if err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
+
+	// Non-terminal failure in Complete auto-remediates in-place to pending and advances Model -> Carbon High.
+	if err := q.Complete(ctx, job.ID, nil, "transient test failure"); err != nil {
+		t.Fatalf("Complete failure returned error: %v", err)
+	}
+	afterAuto, ok := q.Get(job.ID)
+	if !ok {
+		t.Fatalf("Get failed")
+	}
+	if afterAuto.Status != JobStatusPending {
+		t.Fatalf("expected in-place auto-remediation status pending, got %s", afterAuto.Status)
+	}
+	if afterAuto.Model != "gemini-4-carbon-high" {
+		t.Fatalf("expected Model advanced to gemini-4-carbon-high, got %q", afterAuto.Model)
+	}
+	if len(afterAuto.FallbackModels) != 1 || afterAuto.FallbackModels[0] != "gemini-4-hydrogen-high" {
+		t.Fatalf("expected remaining FallbackModels=[gemini-4-hydrogen-high], got %v", afterAuto.FallbackModels)
+	}
+	var pm1 map[string]any
+	if err := json.Unmarshal(afterAuto.Payload, &pm1); err != nil || pm1["model"] != "gemini-4-carbon-high" || pm1["effort"] != "high" {
+		t.Fatalf("expected synced payload model/effort, got %v (err=%v)", pm1, err)
+	}
+
+	// Explicit Retry on already-pending job must not double-advance.
+	afterNoopRetry, err := q.Retry(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("Retry on pending job failed: %v", err)
+	}
+	if afterNoopRetry.Model != "gemini-4-carbon-high" {
+		t.Fatalf("Retry on pending job double-advanced model to %q", afterNoopRetry.Model)
+	}
+
+	// Explicit Retry from FAILED advances Model -> Hydrogen High (xhigh effort).
+	q.mu.Lock()
+	q.jobs[job.ID].Status = JobStatusFailed
+	q.jobs[job.ID].Retriable = true
+	q.mu.Unlock()
+
+	afterFailedRetry, err := q.Retry(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("Retry from failed state error: %v", err)
+	}
+	if afterFailedRetry.Model != "gemini-4-hydrogen-high" || len(afterFailedRetry.FallbackModels) != 0 {
+		t.Fatalf("expected Retry from failed to advance to gemini-4-hydrogen-high, got model=%q fallbacks=%v", afterFailedRetry.Model, afterFailedRetry.FallbackModels)
+	}
+	var pm2 map[string]any
+	if err := json.Unmarshal(afterFailedRetry.Payload, &pm2); err != nil || pm2["model"] != "gemini-4-hydrogen-high" || pm2["effort"] != "xhigh" {
+		t.Fatalf("expected synced payload gemini-4-hydrogen-high/xhigh, got %v (err=%v)", pm2, err)
+	}
+
+	// RetryRetriable advances a FAILED default-chain job onto its next tier.
+	defJob, err := q.Enqueue(ctx, &Job{
+		Type:      JobTypePromptExecute,
+		Repo:      "iazio-web",
+		Model:     "gemini-3.8-flash-high",
+		Retriable: true,
+	})
+	if err != nil {
+		t.Fatalf("Enqueue defJob failed: %v", err)
+	}
+	q.mu.Lock()
+	q.jobs[defJob.ID].Status = JobStatusFailed
+	q.mu.Unlock()
+
+	retriedList, err := q.RetryRetriable(ctx)
+	if err != nil {
+		t.Fatalf("RetryRetriable failed: %v", err)
+	}
+	var found bool
+	for _, rj := range retriedList {
+		if rj.ID == defJob.ID {
+			found = true
+			if rj.Model != "gemini-4-carbon-high" {
+				t.Fatalf("expected RetryRetriable to advance default chain to gemini-4-carbon-high, got %q", rj.Model)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected defJob %s in RetryRetriable result", defJob.ID)
+	}
+}
+
+type countingSaveQueueStore struct {
+	*mockQueueStore
+	saveCalls map[string]int
+}
+
+func (c *countingSaveQueueStore) SaveQueueJob(ctx context.Context, job *Job) error {
+	c.mu.Lock()
+	if c.saveCalls == nil {
+		c.saveCalls = make(map[string]int)
+	}
+	c.saveCalls[job.ID]++
+	c.mu.Unlock()
+	return c.mockQueueStore.SaveQueueJob(ctx, job)
+}
+
+func TestQueue_ExecutionTimeoutNoPingPong(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+	q.SetStartupGrace(0)
+	q.SetTimeouts(10*time.Second, 20*time.Second)
+
+	cs := &countingSaveQueueStore{
+		mockQueueStore: newMockQueueStore(),
+		saveCalls:      make(map[string]int),
+	}
+	if err := q.SetStore(cs); err != nil {
+		t.Fatalf("SetStore failed: %v", err)
+	}
+
+	job, err := q.Enqueue(ctx, &Job{
+		Type: JobTypePromptExecute,
+		Repo: "meta-repo-03",
+	})
+	if err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
+
+	cs.mu.Lock()
+	cs.saveCalls[job.ID] = 0
+	cs.mu.Unlock()
+
+	// Exceed jobTimeout -> remediates once to Pending with EXECUTION_TIMEOUT prefix and single SaveQueueJob.
+	now = now.Add(25 * time.Second)
+	q.ReapExpired(now)
+
+	got, ok := q.Get(job.ID)
+	if !ok || got == nil {
+		t.Fatalf("expected job %s to remain in queue", job.ID)
+	}
+	if got.Status != JobStatusPending || !strings.HasPrefix(got.Error, "EXECUTION_TIMEOUT:") {
+		t.Fatalf("expected in-place Pending EXECUTION_TIMEOUT remediation, got status=%q err=%q", got.Status, got.Error)
+	}
+	if got.InfraRequeueCount != 1 {
+		t.Fatalf("expected InfraRequeueCount=1, got %d", got.InfraRequeueCount)
+	}
+	cs.mu.Lock()
+	firstSaves := cs.saveCalls[job.ID]
+	cs.mu.Unlock()
+	if firstSaves != 1 {
+		t.Fatalf("expected exactly 1 SaveQueueJob call on first remediation reap, got %d", firstSaves)
+	}
+
+	// Subsequent ReapExpired and List sweeps must not ping-pong or re-save the job.
+	for i := 0; i < 3; i++ {
+		now = now.Add(2 * time.Second)
+		q.ReapExpired(now)
+		if _, err := q.List(ctx, JobFilter{Limit: 50}); err != nil {
+			t.Fatalf("List failed: %v", err)
+		}
+	}
+
+	gotAfter, _ := q.Get(job.ID)
+	if gotAfter.InfraRequeueCount != 1 || gotAfter.Status != JobStatusPending {
+		t.Fatalf("expected no EXECUTION_TIMEOUT ping-pong, got status=%q requeues=%d", gotAfter.Status, gotAfter.InfraRequeueCount)
+	}
+	cs.mu.Lock()
+	totalSaves := cs.saveCalls[job.ID]
+	cs.mu.Unlock()
+	if totalSaves != 1 {
+		t.Fatalf("expected SaveQueueJob count to remain 1 across follow-up sweeps, got %d", totalSaves)
+	}
+}
+
+func TestQueue_ListCoalesceAndScalePerformance(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
+	q := NewInMemoryQueue()
+	q.SetNowFunc(func() time.Time { return now })
+	q.SetStartupGrace(0)
+	q.SetTimeouts(10*time.Second, 0)
+
+	for i := 0; i < 600; i++ {
+		parentID := ""
+		status := JobStatusCompleted
+		if i%3 == 1 {
+			parentID = fmt.Sprintf("job_scale_%04d", i-1)
+			status = JobStatusRequeued
+		} else if i%3 == 2 {
+			parentID = fmt.Sprintf("job_scale_%04d", i-1)
+			status = JobStatusCompleted
+		}
+		j := &Job{
+			ID:        fmt.Sprintf("job_scale_%04d", i),
+			ParentID:  parentID,
+			Type:      JobTypePromptExecute,
+			Repo:      "meta-repo-03",
+			Status:    status,
+			CreatedAt: now.Add(time.Duration(i) * time.Millisecond),
+		}
+		if i%10 == 0 && i > 0 {
+			j.DependsOnJobID = fmt.Sprintf("job_scale_%04d", i-1)
+			j.DependsOnJobIDs = []string{j.DependsOnJobID}
+			j.Status = JobStatusBlockedByDependency
+		}
+		q.mu.Lock()
+		q.jobs[j.ID] = j
+		q.mu.Unlock()
+	}
+
+	// Add a leased job whose handshake ack deadline will expire at now+10s to observe 1s coalesce behavior.
+	exp := now.Add(10 * time.Second)
+	leased := &Job{
+		ID:                 "job_leased_coalesce",
+		Type:               JobTypePromptExecute,
+		Repo:               "meta-repo-03",
+		Status:             JobStatusLeased,
+		CreatedAt:          now,
+		LeaseAckDeadlineAt: &exp,
+	}
+	q.mu.Lock()
+	q.jobs[leased.ID] = leased
+	q.mu.Unlock()
+
+	// Advance to 9.8s and call List -> stamps lastReapAt = now+9.8s.
+	now = now.Add(9800 * time.Millisecond)
+	if _, err := q.List(ctx, JobFilter{Limit: 250}); err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	q.mu.Lock()
+	firstReapAt := q.lastReapAt
+	q.mu.Unlock()
+	if !firstReapAt.Equal(now) {
+		t.Fatalf("expected lastReapAt=%v, got %v", now, firstReapAt)
+	}
+
+	// Advance 400ms -> 10.2s (past lease expiry, <1s since firstReapAt): List should coalesce.
+	now = now.Add(400 * time.Millisecond)
+	if _, err := q.List(ctx, JobFilter{Limit: 250}); err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	q.mu.Lock()
+	coalescedReapAt := q.lastReapAt
+	coalescedStatus := q.jobs[leased.ID].Status
+	q.mu.Unlock()
+	if !coalescedReapAt.Equal(firstReapAt) || coalescedStatus != JobStatusLeased {
+		t.Fatalf("expected List within 1s to coalesce reap, got reapAt=%v status=%s", coalescedReapAt, coalescedStatus)
+	}
+
+	// Advance 700ms more -> 10.9s (>=1s since firstReapAt): List triggers reap.
+	now = now.Add(700 * time.Millisecond)
+	if _, err := q.List(ctx, JobFilter{Limit: 250}); err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	q.mu.Lock()
+	postReapAt := q.lastReapAt
+	postStatus := q.jobs[leased.ID].Status
+	q.mu.Unlock()
+	if !postReapAt.Equal(now) || postStatus == JobStatusLeased {
+		t.Fatalf("expected List after 1s to reap expired lease, got reapAt=%v status=%s", postReapAt, postStatus)
+	}
+
+	// Benchmark 20 uncoalesced List sweeps over 600 parent/child/dependent jobs.
+	startWall := time.Now()
+	for i := 0; i < 20; i++ {
+		now = now.Add(2 * time.Second)
+		if _, err := q.List(ctx, JobFilter{Limit: 250}); err != nil {
+			t.Fatalf("benchmark List %d failed: %v", i, err)
+		}
+	}
+	if elapsed := time.Since(startWall); elapsed > 500*time.Millisecond {
+		t.Fatalf("expected 20 uncoalesced List calls over 600 jobs under 500ms, took %v", elapsed)
+	}
+}
+
+
 

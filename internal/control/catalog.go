@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/viovy/iazio-harness-api/internal/dispatch"
 )
 
 const (
@@ -331,7 +333,7 @@ func (e *Engine) HeartbeatWithCapabilities(id, presence string, tools []Tool, fe
 	e.enrichToolsWithProfileLocked(h.DistributionProfile, mergedTools)
 	h.Tools = mergedTools
 	h.ActiveJobs = append([]ActiveJob(nil), activeJobs...)
-	h.HarnessActive = len(activeJobs) > 0
+	h.HarnessActive = CountWorktreeActiveJobs(activeJobs) > 0
 	if len(supportedCaps) > 0 {
 		h.SupportedCapabilities = append([]string(nil), supportedCaps...)
 	} else if len(h.SupportedCapabilities) == 0 {
@@ -350,20 +352,30 @@ func (e *Engine) HeartbeatWithCapabilities(id, presence string, tools []Tool, fe
 		h.CommitSHA = commitSHA
 	}
 
+	hostRepos := make([]*Repo, 0)
+	for _, r := range e.repos {
+		if r != nil && r.HostID == id {
+			hostRepos = append(hostRepos, r)
+		}
+	}
+
 	activeMap := make(map[string]bool)
 	for _, aj := range activeJobs {
 		cleanJobID := strings.TrimSpace(aj.JobID)
+		jobKind := ""
+		if cleanJobID != "" {
+			if j, ok := e.jobs[cleanJobID]; ok && j != nil {
+				jobKind = j.Kind
+			}
+		}
+		if dispatch.IsHostLevelNonWorktreeJob(jobKind, aj.WorktreePath) {
+			continue
+		}
 		if cleanJobID != "" {
 			activeMap[cleanJobID] = true
 			wt := strings.TrimSpace(aj.WorktreePath)
 			if wt != "" && wt != "." && wt != "root" {
-				var matchedRepo *Repo
-				for _, r := range e.repos {
-					if r != nil && r.HostID == id && repoExactPathOrAliasMatch(r, wt) {
-						matchedRepo = r
-						break
-					}
-				}
+				matchedRepo := MatchHostRepoSlot(hostRepos, wt)
 				if matchedRepo != nil && (matchedRepo.RunningJobID == "" || matchedRepo.RunningJobID == cleanJobID) {
 					for _, other := range e.repos {
 						if other != nil && other != matchedRepo && (other.RunningJobID == cleanJobID || other.LockHolder == cleanJobID) {
