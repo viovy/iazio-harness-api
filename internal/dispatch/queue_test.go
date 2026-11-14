@@ -3677,6 +3677,107 @@ func TestCompleteWithFencing_RejectsPrematureCraftCloseout(t *testing.T) {
 	if done2.Status != JobStatusCompleted {
 		t.Fatalf("expected clean CRAFT to complete, got %s", done2.Status)
 	}
+
+	// Fresh queue: status=success + output-only mid-flow markers must remediable-reject.
+	q3 := NewInMemoryQueue()
+	q3.SetNowFunc(func() time.Time { return now })
+	job3, err := q3.Enqueue(ctx, &Job{
+		ID:          "job_premature_success_output",
+		Type:        JobTypePromptExecute,
+		Repo:        "meta-repo",
+		StoryID:     "STORY-IAZIO-0204",
+		TargetAgent: "agy",
+	})
+	if err != nil {
+		t.Fatalf("enqueue job3: %v", err)
+	}
+	claimed3, err := q3.Claim(ctx, "mac-mini", []string{JobTypePromptExecute})
+	if err != nil || claimed3 == nil || claimed3.ID != job3.ID {
+		t.Fatalf("claim job3: job=%v err=%v", claimed3, err)
+	}
+	successPremature := json.RawMessage(`{
+		"status":"success",
+		"exit_code":0,
+		"output":"Launched autopilot-git-flow land; waiting for Phase 5 merge."
+	}`)
+	if err := q3.CompleteWithFencing(ctx, claimed3.ID, claimed3.FencingToken, successPremature, ""); err != nil {
+		t.Fatalf("success premature CompleteWithFencing: %v", err)
+	}
+	got3, _ := q3.Get(job3.ID)
+	if got3.Status != JobStatusPending {
+		t.Fatalf("expected success+output premature CRAFT remediable to pending, got %s", got3.Status)
+	}
+}
+
+func TestStripJobResultOutputForQueueList(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "empty", in: "", want: ""},
+		{name: "whitespace", in: "   ", want: "   "},
+		{name: "invalid_json", in: "{not-json", want: "{not-json"},
+		{name: "no_output_key", in: `{"status":"completed","summary":"ok"}`, want: `{"status":"completed","summary":"ok"}`},
+		{name: "strips_output", in: `{"status":"completed","output":"huge","summary":"ok"}`, want: `{"status":"completed","summary":"ok"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := StripJobResultOutputForQueueList(json.RawMessage(tc.in))
+			if string(got) != tc.want {
+				// Allow key-order variance for stripped JSON.
+				if tc.name == "strips_output" || tc.name == "no_output_key" {
+					var gotM, wantM map[string]any
+					if err := json.Unmarshal(got, &gotM); err != nil {
+						t.Fatalf("got unmarshal: %v (%q)", err, got)
+					}
+					if err := json.Unmarshal([]byte(tc.want), &wantM); err != nil {
+						t.Fatalf("want unmarshal: %v", err)
+					}
+					if len(gotM) != len(wantM) {
+						t.Fatalf("map len got=%d want=%d got=%q", len(gotM), len(wantM), got)
+					}
+					for k, v := range wantM {
+						if gotM[k] != v {
+							t.Fatalf("key %s: got=%v want=%v full=%q", k, gotM[k], v, got)
+						}
+					}
+					if _, ok := gotM["output"]; ok && tc.name == "strips_output" {
+						t.Fatalf("output key should be stripped: %q", got)
+					}
+					return
+				}
+				t.Fatalf("StripJobResultOutputForQueueList(%q)=%q want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsControlPlaneScheduleJobID(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		id   string
+		want bool
+	}{
+		{id: "", want: false},
+		{id: "job-", want: false},
+		{id: "job-1", want: true},
+		{id: "job-12345", want: true},
+		{id: "job-12a", want: false},
+		{id: "JOB-12", want: false},
+		{id: "job_12", want: false},
+		{id: "  job-9  ", want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.id, func(t *testing.T) {
+			t.Parallel()
+			if got := IsControlPlaneScheduleJobID(tc.id); got != tc.want {
+				t.Fatalf("IsControlPlaneScheduleJobID(%q)=%v want %v", tc.id, got, tc.want)
+			}
+		})
+	}
 }
 
 
