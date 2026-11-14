@@ -43,6 +43,8 @@ type CreateStoryRequest struct {
 	Prompt               string   `json:"prompt,omitempty"`
 	Enqueue              bool     `json:"enqueue,omitempty"`
 	TargetAgent          string   `json:"target_agent,omitempty"`
+	Model                string   `json:"model,omitempty"`
+	Effort               string   `json:"effort,omitempty"`
 	TraceID              string   `json:"trace_id,omitempty"`
 	SearchID             string   `json:"search_id,omitempty"`
 	DependsOnJobID       string   `json:"depends_on_job_id,omitempty"`
@@ -372,6 +374,7 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			title = fmt.Sprintf("Execute story %s: %s", storyID, req.Title)
 		}
 		targetRepo := req.Submodule
+		resolvedModel, resolvedEffort, fallbackModels := dispatch.ResolveJobModelSelection(req.Model, req.Effort, req.Repo, req.Submodule, normalizedPrompt, len(req.TargetFiles))
 		execPayload, _ := json.Marshal(map[string]any{
 			"prompt_id":             promptID,
 			"repo":                  targetRepo,
@@ -382,6 +385,8 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"prompt":                normalizedPrompt,
 			"normalized_prompt":     normalizedPrompt,
 			"target_agent":          targetAgent,
+			"model":                 resolvedModel,
+			"effort":                resolvedEffort,
 			"target_host":           "",
 			"priority":              req.Priority,
 			"problem":               req.Problem,
@@ -406,6 +411,8 @@ func (h *StoriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				WorktreePath:          "",
 				TargetHost:            "",
 				TargetAgent:           targetAgent,
+				Model:                 resolvedModel,
+				FallbackModels:        fallbackModels,
 				StoryID:               storyID,
 				StoryTitle:            req.Title,
 				StoryPath:             strings.TrimSpace(req.ContentPath),

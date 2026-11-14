@@ -496,4 +496,89 @@ func TestSanitizeProfileTools_AndAdhocASEQueuePause(t *testing.T) {
 	if strandedRepo.DirtyStoryID != "STORY-VIGO-0289" {
 		t.Fatalf("expected DirtyStoryID=STORY-VIGO-0289, got %q", strandedRepo.DirtyStoryID)
 	}
+
+	// 6. STORY-GOV-5281: Multiple repos on mac-mini (LockASE / ReasonAdhocASE) are all reflected in GetHostExecutionCounts
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: "/Users/romeo/work/meta-repo-02",
+		Queue:        QueuePaused,
+		Reason:       ReasonAdhocASE,
+		Lock:         LockIdle,
+		ASEState:     "RUNNING",
+		ToolLiveness: "LIVE",
+	})
+	_ = e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: "/Users/romeo/work/meta-repo-03",
+		Queue:        QueueOpen,
+		Lock:         LockASE,
+	})
+	_, adhocExecsMulti, _ := e.GetHostExecutionCounts("mac-mini")
+	if adhocExecsMulti != 2 {
+		t.Fatalf("expected adhocExecs=2 across meta-repo-02 and meta-repo-03, got %d", adhocExecsMulti)
+	}
+}
+
+func TestStoryGov5281_UncoordinatedHarnessProvenanceAndHostLevelCounts(t *testing.T) {
+	e := NewEngine(time.Now)
+	e.RegisterHost("mac-mini", "mac-mini", "permanent")
+	if err := e.UpsertRepo(Repo{
+		HostID:       "mac-mini",
+		WorktreePath: "/Users/romeo/work/meta-repo-02",
+		Queue:        QueueOpen,
+		Lock:         LockIdle,
+	}); err != nil {
+		t.Fatalf("UpsertRepo failed: %v", err)
+	}
+
+	// 1. Stale/uncoordinated COORDINATED_HARNESS on an IDLE / maintenance repo must normalize to NONE/IDLE.
+	e.UpdateRepoRuntimeStatus("mac-mini", []RepoRuntimeStatus{
+		{
+			RepoPath:            "/Users/romeo/work/meta-repo-02",
+			Branch:              "chore/governance-pointers-20261114",
+			IsClean:             true,
+			SubmodulesClean:     true,
+			ASEState:            "IDLE",
+			ActiveTool:          "iazio-harness",
+			ToolLiveness:        "LIVE",
+			ExecutionProvenance: "COORDINATED_HARNESS",
+		},
+	})
+	repo, ok := e.GetRepo("mac-mini", "/Users/romeo/work/meta-repo-02")
+	if !ok {
+		t.Fatalf("expected repo to exist")
+	}
+	if repo.ExecutionProvenance != "NONE" || repo.ASEState != "IDLE" || repo.ToolLiveness != "NONE" {
+		t.Fatalf("expected uncoordinated maintenance COORDINATED_HARNESS to normalize to NONE/IDLE, got prov=%q ase=%q liveness=%q", repo.ExecutionProvenance, repo.ASEState, repo.ToolLiveness)
+	}
+
+	// 2. Host-level non-worktree job ("fleet") must NOT count as harness execution or mark HarnessActive=true.
+	_ = e.HeartbeatDetailed("mac-mini", "ONLINE", nil, false, ActiveJob{
+		JobID:        "job_tools_1",
+		WorktreePath: "fleet",
+	})
+	e.mu.Lock()
+	harnessActiveFleet := e.hosts["mac-mini"].HarnessActive
+	e.mu.Unlock()
+	if harnessActiveFleet {
+		t.Fatalf("expected HarnessActive=false for host-level 'fleet' job")
+	}
+	harnessExecsFleet, _, _ := e.GetHostExecutionCounts("mac-mini")
+	if harnessExecsFleet != 0 {
+		t.Fatalf("expected harnessExecs=0 for host-level 'fleet' job, got %d", harnessExecsFleet)
+	}
+
+	// 3. Submodule active job (/Users/romeo/work/meta-repo-02/vigo-api) must bind parent superproject (/Users/romeo/work/meta-repo-02).
+	_ = e.HeartbeatDetailed("mac-mini", "ONLINE", nil, false, ActiveJob{
+		JobID:        "job_sub_1",
+		WorktreePath: "/Users/romeo/work/meta-repo-02/vigo-api",
+	})
+	repoSub, _ := e.GetRepo("mac-mini", "/Users/romeo/work/meta-repo-02")
+	if repoSub.Lock != LockRunning || repoSub.RunningJobID != "job_sub_1" {
+		t.Fatalf("expected submodule ActiveJob to lock parent superproject with job_sub_1, got lock=%q running_job_id=%q", repoSub.Lock, repoSub.RunningJobID)
+	}
+	harnessExecsSub, _, _ := e.GetHostExecutionCounts("mac-mini")
+	if harnessExecsSub != 1 {
+		t.Fatalf("expected harnessExecs=1 for submodule active job, got %d", harnessExecsSub)
+	}
 }

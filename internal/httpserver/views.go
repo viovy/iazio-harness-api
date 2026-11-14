@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -127,9 +126,13 @@ func hostView(h control.Host, paused int) map[string]any {
 	adhocExecs := 0
 	for _, rs := range h.RepoStatuses {
 		isCoordinated := false
-		cleanRS := filepath.Clean(strings.TrimSpace(rs.RepoPath))
+		cleanRS := control.NormalizeWorktreePathForSlotMatch(rs.RepoPath)
 		for _, aj := range h.ActiveJobs {
-			if cleanRS != "" && cleanRS != "." && filepath.Clean(strings.TrimSpace(aj.WorktreePath)) == cleanRS {
+			if !control.IsWorktreeActiveJob(aj) {
+				continue
+			}
+			cleanAJ := control.NormalizeWorktreePathForSlotMatch(aj.WorktreePath)
+			if cleanRS != "" && cleanAJ != "" && (cleanAJ == cleanRS || strings.HasPrefix(cleanAJ, cleanRS+"/")) {
 				isCoordinated = true
 				break
 			}
@@ -138,8 +141,8 @@ func hostView(h control.Host, paused int) map[string]any {
 			adhocExecs++
 		}
 	}
-	harnessExecs := len(h.ActiveJobs)
-	harnessActive := h.HarnessActive || harnessExecs > 0
+	harnessExecs := control.CountWorktreeActiveJobs(h.ActiveJobs)
+	harnessActive := harnessExecs > 0
 	res := map[string]any{
 		"id":                   h.ID,
 		"name":                 name,

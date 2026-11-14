@@ -682,3 +682,67 @@ func TestV4_StoriesHandler_PriorityFilterGetStoryFrontmatterAndDeferredStatus(t 
 		}
 	}
 }
+
+func TestStoriesHandler_ModelSelectionAndOverride(t *testing.T) {
+	store := setupTestStore(t)
+	q := dispatch.NewInMemoryQueue()
+	handler := NewStoriesHandler(store, q, nil)
+
+	// 1. Small leaf story -> gemini-3.8-flash-high
+	smallPayload := validStoryPayload()
+	smallPayload["enqueue"] = true
+	b1, _ := json.Marshal(smallPayload)
+	w1 := httptest.NewRecorder()
+	handler.ServeHTTP(w1, httptest.NewRequest(http.MethodPost, "/api/v1/stories", bytes.NewReader(b1)))
+	if w1.Code != http.StatusCreated {
+		t.Fatalf("small story expected 201, got %d: %s", w1.Code, w1.Body.String())
+	}
+	var resp1 CreateStoryResponse
+	_ = json.NewDecoder(w1.Body).Decode(&resp1)
+	job1, ok := q.Get(resp1.HarnessJobID)
+	if !ok || job1 == nil || job1.Model != "gemini-3.8-flash-high" {
+		t.Fatalf("expected small leaf story job.Model=gemini-3.8-flash-high, got %+v", job1)
+	}
+
+	// 2. Wide story (> 5 target files) -> gemini-4-carbon-high
+	widePayload := validStoryPayload()
+	widePayload["enqueue"] = true
+	widePayload["target_files"] = []string{"a.go", "b.go", "c.go", "d.go", "e.go", "f.go"}
+	b2, _ := json.Marshal(widePayload)
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, httptest.NewRequest(http.MethodPost, "/api/v1/stories", bytes.NewReader(b2)))
+	if w2.Code != http.StatusCreated {
+		t.Fatalf("wide story expected 201, got %d: %s", w2.Code, w2.Body.String())
+	}
+	var resp2 CreateStoryResponse
+	_ = json.NewDecoder(w2.Body).Decode(&resp2)
+	job2, ok := q.Get(resp2.HarnessJobID)
+	if !ok || job2 == nil || job2.Model != "gemini-4-carbon-high" {
+		t.Fatalf("expected wide story job.Model=gemini-4-carbon-high, got %+v", job2)
+	}
+
+	// 3. Explicit override preserved in job & payload
+	overridePayload := validStoryPayload()
+	overridePayload["enqueue"] = true
+	overridePayload["model"] = "gemini-4-hydrogen-high"
+	overridePayload["effort"] = "xhigh"
+	b3, _ := json.Marshal(overridePayload)
+	w3 := httptest.NewRecorder()
+	handler.ServeHTTP(w3, httptest.NewRequest(http.MethodPost, "/api/v1/stories", bytes.NewReader(b3)))
+	if w3.Code != http.StatusCreated {
+		t.Fatalf("override story expected 201, got %d: %s", w3.Code, w3.Body.String())
+	}
+	var resp3 CreateStoryResponse
+	_ = json.NewDecoder(w3.Body).Decode(&resp3)
+	job3, ok := q.Get(resp3.HarnessJobID)
+	if !ok || job3 == nil || job3.Model != "gemini-4-hydrogen-high" {
+		t.Fatalf("expected override job.Model=gemini-4-hydrogen-high, got %+v", job3)
+	}
+	var p3 struct {
+		Model  string `json:"model"`
+		Effort string `json:"effort"`
+	}
+	if err := json.Unmarshal(job3.Payload, &p3); err != nil || p3.Model != "gemini-4-hydrogen-high" || p3.Effort != "xhigh" {
+		t.Fatalf("expected override payload (gemini-4-hydrogen-high, xhigh), got %+v (err=%v)", p3, err)
+	}
+}

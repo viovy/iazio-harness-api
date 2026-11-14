@@ -24,6 +24,8 @@ type CreatePromptRequest struct {
 	Prompt          string   `json:"prompt"`
 	TargetAgent     string   `json:"target_agent,omitempty"`
 	TargetHost      string   `json:"target_host,omitempty"`
+	Model           string   `json:"model,omitempty"`
+	Effort          string   `json:"effort,omitempty"`
 	Enqueue         bool     `json:"enqueue,omitempty"`
 	TraceID         string   `json:"trace_id,omitempty"`
 	SearchID        string   `json:"search_id,omitempty"`
@@ -37,6 +39,8 @@ type CreatePromptResponse struct {
 	PromptID         string   `json:"prompt_id"`
 	Repo             string   `json:"repo"`
 	HarnessJobID     string   `json:"harness_job_id,omitempty"`
+	Model            string   `json:"model,omitempty"`
+	Effort           string   `json:"effort,omitempty"`
 	Status           string   `json:"status"`
 	DependsOnJobID   string   `json:"depends_on_job_id,omitempty"`
 	DependsOnJobIDs  []string `json:"depends_on_job_ids,omitempty"`
@@ -192,12 +196,18 @@ func (h *PromptsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	status := "created"
 	harnessJobID := ""
+	var outModel string
+	var outEffort string
 	var outDependsOnID string
 	var outDependsOnIDs []string
 	var outCallbackURL string
 
 	if req.Enqueue && h.queue != nil {
-		payloadBytes, err := json.Marshal(req)
+		resolvedModel, resolvedEffort, fallbackModels := dispatch.ResolveJobModelSelection(req.Model, req.Effort, req.Repo, "", req.Prompt, 0)
+		dispatchReq := req
+		dispatchReq.Model = resolvedModel
+		dispatchReq.Effort = resolvedEffort
+		payloadBytes, err := json.Marshal(dispatchReq)
 		if err != nil {
 			payloadBytes = bodyBytes
 		}
@@ -210,6 +220,8 @@ func (h *PromptsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Repo:                 req.Repo,
 			TargetHost:           req.TargetHost,
 			TargetAgent:          req.TargetAgent,
+			Model:                resolvedModel,
+			FallbackModels:       fallbackModels,
 			NormalizedPrompt:     req.Prompt,
 			AllocationSource:     alloc.AllocationSource,
 			PriorityRankSelected: alloc.PriorityRankSelected,
@@ -231,6 +243,8 @@ func (h *PromptsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			status = "queued"
 		}
 		harnessJobID = job.ID
+		outModel = resolvedModel
+		outEffort = resolvedEffort
 		outDependsOnID = job.DependsOnJobID
 		outDependsOnIDs = job.DependsOnJobIDs
 		outCallbackURL = job.CallbackURL
@@ -240,6 +254,8 @@ func (h *PromptsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		PromptID:         promptID,
 		Repo:             req.Repo,
 		HarnessJobID:     harnessJobID,
+		Model:            outModel,
+		Effort:           outEffort,
 		Status:           status,
 		DependsOnJobID:   outDependsOnID,
 		DependsOnJobIDs:  outDependsOnIDs,

@@ -4827,6 +4827,43 @@ func TestEngine_AckLease_Heartbeat_Failover_RetryRetriable(t *testing.T) {
 	_ = e.ReconcileHistoricalFailureTaxonomy()
 }
 
+func TestRetryRetriableJobs_AdvancesScheduleModelTier(t *testing.T) {
+	e := NewEngine(nil)
+
+	e.mu.Lock()
+	e.schedules["sch-model-1"] = &Schedule{
+		ID:        "sch-model-1",
+		Status:    "FAILED",
+		Retriable: true,
+		EnvVars: map[string]string{
+			"MODEL":  "gemini-3.8-flash-high",
+			"EFFORT": "high",
+		},
+	}
+	e.mu.Unlock()
+
+	retried1, err := e.RetryRetriableJobs()
+	if err != nil {
+		t.Fatalf("first RetryRetriableJobs failed: %v", err)
+	}
+	if len(retried1) != 1 || retried1[0].EnvVars["MODEL"] != "gemini-4-carbon-high" || retried1[0].EnvVars["EFFORT"] != "high" {
+		t.Fatalf("expected first retry to escalate to gemini-4-carbon-high/high, got %+v", retried1)
+	}
+
+	e.mu.Lock()
+	e.schedules["sch-model-1"].Status = "FAILED"
+	e.schedules["sch-model-1"].Retriable = true
+	e.mu.Unlock()
+
+	retried2, err := e.RetryRetriableJobs()
+	if err != nil {
+		t.Fatalf("second RetryRetriableJobs failed: %v", err)
+	}
+	if len(retried2) != 1 || retried2[0].EnvVars["MODEL"] != "gemini-4-hydrogen-high" || retried2[0].EnvVars["EFFORT"] != "xhigh" {
+		t.Fatalf("expected second retry to escalate to gemini-4-hydrogen-high/xhigh, got %+v", retried2)
+	}
+}
+
 func TestReconcileHistoricalFailureTaxonomy_ReconcilesJob1506AndCompletedSuccess(t *testing.T) {
 	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
 	e := NewEngine(func() time.Time { return now })

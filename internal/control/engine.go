@@ -1624,6 +1624,59 @@ func (e *Engine) areScheduleDependenciesSatisfiedLocked(sch *Schedule) bool {
 	return true
 }
 
+func NormalizeWorktreePathForSlotMatch(p string) string {
+	return normalizeWorktreePathForSlotMatch(p)
+}
+
+// IsWorktreeActiveJob returns true when an ActiveJob targets a git worktree rather than
+// a host-level binary/tool maintenance operation ("fleet" or "tools").
+func IsWorktreeActiveJob(aj ActiveJob) bool {
+	return !dispatch.IsHostLevelNonWorktreeJob("", aj.WorktreePath)
+}
+
+// CountWorktreeActiveJobs returns the count of ActiveJob entries that target a git worktree.
+func CountWorktreeActiveJobs(jobs []ActiveJob) int {
+	count := 0
+	for _, aj := range jobs {
+		if IsWorktreeActiveJob(aj) {
+			count++
+		}
+	}
+	return count
+}
+
+// MatchHostRepoSlot resolves target (an exact repo path, alias, or submodule path inside a superproject)
+// to the best matching Repo slot on the host: exact/alias matches take precedence over longest-parent
+// directory boundary matches. Returns nil for empty/non-worktree targets.
+func MatchHostRepoSlot(repos []*Repo, target string) *Repo {
+	cleanTarget := strings.TrimSpace(target)
+	if cleanTarget == "" || cleanTarget == "." || strings.EqualFold(cleanTarget, "root") || dispatch.IsHostLevelNonWorktreeJob("", cleanTarget) {
+		return nil
+	}
+	for _, r := range repos {
+		if r != nil && repoExactPathOrAliasMatch(r, cleanTarget) {
+			return r
+		}
+	}
+	normTarget := normalizeWorktreePathForSlotMatch(cleanTarget)
+	if normTarget == "" {
+		return nil
+	}
+	var best *Repo
+	bestLen := 0
+	for _, r := range repos {
+		if r == nil {
+			continue
+		}
+		normRepo := normalizeWorktreePathForSlotMatch(r.WorktreePath)
+		if normRepo != "" && len(normRepo) > bestLen && strings.HasPrefix(normTarget, normRepo+"/") {
+			best = r
+			bestLen = len(normRepo)
+		}
+	}
+	return best
+}
+
 func normalizeWorktreePathForSlotMatch(p string) string {
 	trimmed := strings.TrimSpace(p)
 	if trimmed == "" {
@@ -2440,23 +2493,48 @@ func (e *Engine) GetHostExecutionCounts(hostID string) (int, int, int) {
 	adhocRepoPaths := make(map[string]bool)
 	queuedCount := 0
 
-	if h, ok := e.hosts[hostID]; ok && h != nil {
-		for _, aj := range h.ActiveJobs {
-			if id := strings.TrimSpace(aj.JobID); id != "" {
-				runningIDs[id] = true
-			}
-			if wp := strings.TrimSpace(aj.WorktreePath); wp != "" {
-				coordinatedRepoPaths[filepath.Clean(wp)] = true
+	hostRepos := make([]*Repo, 0)
+	for _, r := range e.repos {
+		if r != nil && r.HostID == hostID {
+			hostRepos = append(hostRepos, r)
+			cleanPath := filepath.Clean(r.WorktreePath)
+			normPath := normalizeWorktreePathForSlotMatch(r.WorktreePath)
+			if r.Lock == LockRunning && strings.TrimSpace(r.RunningJobID) != "" {
+				runningIDs[strings.TrimSpace(r.RunningJobID)] = true
+				coordinatedRepoPaths[cleanPath] = true
+				if normPath != "" {
+					coordinatedRepoPaths[normPath] = true
+				}
 			}
 		}
 	}
 
-	for _, r := range e.repos {
-		if r != nil && r.HostID == hostID {
-			cleanPath := filepath.Clean(r.WorktreePath)
-			if r.Lock == LockRunning && strings.TrimSpace(r.RunningJobID) != "" {
-				runningIDs[strings.TrimSpace(r.RunningJobID)] = true
-				coordinatedRepoPaths[cleanPath] = true
+	if h, ok := e.hosts[hostID]; ok && h != nil {
+		for _, aj := range h.ActiveJobs {
+			id := strings.TrimSpace(aj.JobID)
+			jobKind := ""
+			if id != "" {
+				if j, okJob := e.jobs[id]; okJob && j != nil {
+					jobKind = j.Kind
+				}
+			}
+			if dispatch.IsHostLevelNonWorktreeJob(jobKind, aj.WorktreePath) {
+				continue
+			}
+			if id != "" {
+				runningIDs[id] = true
+			}
+			if wp := strings.TrimSpace(aj.WorktreePath); wp != "" {
+				coordinatedRepoPaths[filepath.Clean(wp)] = true
+				if normWP := normalizeWorktreePathForSlotMatch(wp); normWP != "" {
+					coordinatedRepoPaths[normWP] = true
+				}
+				if matched := MatchHostRepoSlot(hostRepos, wp); matched != nil {
+					coordinatedRepoPaths[filepath.Clean(matched.WorktreePath)] = true
+					if normM := normalizeWorktreePathForSlotMatch(matched.WorktreePath); normM != "" {
+						coordinatedRepoPaths[normM] = true
+					}
+				}
 			}
 		}
 	}
@@ -2464,26 +2542,47 @@ func (e *Engine) GetHostExecutionCounts(hostID string) (int, int, int) {
 	if h, ok := e.hosts[hostID]; ok && h != nil {
 		for path, rs := range h.RepoStatuses {
 			cleanPath := filepath.Clean(path)
+			rawPath := path
 			if rs.RepoPath != "" {
 				cleanPath = filepath.Clean(rs.RepoPath)
+				rawPath = rs.RepoPath
 			}
-			if IsAdhocASEActive(rs.ExecutionProvenance, rs.ToolLiveness, rs.ASEState, coordinatedRepoPaths[cleanPath]) {
+			normPath := normalizeWorktreePathForSlotMatch(rawPath)
+			isCoord := coordinatedRepoPaths[cleanPath] || (normPath != "" && coordinatedRepoPaths[normPath])
+			if !isCoord {
+				if matched := MatchHostRepoSlot(hostRepos, rawPath); matched != nil {
+					mNorm := normalizeWorktreePathForSlotMatch(matched.WorktreePath)
+					isCoord = coordinatedRepoPaths[filepath.Clean(matched.WorktreePath)] || (mNorm != "" && coordinatedRepoPaths[mNorm])
+				}
+			}
+			if IsAdhocASEActive(rs.ExecutionProvenance, rs.ToolLiveness, rs.ASEState, isCoord) {
 				adhocRepoPaths[cleanPath] = true
 			}
 		}
 	}
 
-	for _, r := range e.repos {
-		if r != nil && r.HostID == hostID {
-			cleanPath := filepath.Clean(r.WorktreePath)
-			if IsAdhocASEActive(r.ExecutionProvenance, r.ToolLiveness, r.ASEState, coordinatedRepoPaths[cleanPath]) {
-				adhocRepoPaths[cleanPath] = true
-			}
+	for _, r := range hostRepos {
+		cleanPath := filepath.Clean(r.WorktreePath)
+		normPath := normalizeWorktreePathForSlotMatch(r.WorktreePath)
+		isCoordinated := coordinatedRepoPaths[cleanPath] || (normPath != "" && coordinatedRepoPaths[normPath]) || r.Lock == LockRunning || strings.TrimSpace(r.RunningJobID) != ""
+		adhocByStatus := IsAdhocASEActive(r.ExecutionProvenance, r.ToolLiveness, r.ASEState, isCoordinated)
+		liveUpper := strings.ToUpper(strings.TrimSpace(r.ToolLiveness))
+		aseUpper := strings.ToUpper(strings.TrimSpace(r.ASEState))
+		adhocByLockOrReason := !isCoordinated &&
+			(r.Lock == LockASE || r.Lock == LockAutopilot ||
+				(r.Queue == QueuePaused && r.Reason == ReasonAdhocASE &&
+					liveUpper != "TERMINATED" && liveUpper != "DEAD" && liveUpper != "KILLED" &&
+					aseUpper != "FAILED_DIRTY" && aseUpper != "IDLE"))
+		if adhocByStatus || adhocByLockOrReason {
+			adhocRepoPaths[cleanPath] = true
 		}
 	}
 
 	for _, j := range e.jobs {
 		if j != nil && j.LeaseHolder == hostID && strings.EqualFold(j.Status, "RUNNING") {
+			if dispatch.IsHostLevelNonWorktreeJob(j.Kind, "") {
+				continue
+			}
 			runningIDs[j.ID] = true
 		}
 	}
@@ -3329,8 +3428,18 @@ func (e *Engine) FailoverJob(jobID string, req AttemptFailure) (*Schedule, error
 				}
 			}
 		}
+		sameEngineRetry := nextTool == "" || strings.EqualFold(nextTool, sch.Engine)
 		if nextTool != "" {
 			sch.Engine = nextTool
+		}
+		if sameEngineRetry && sch.EnvVars != nil && strings.TrimSpace(sch.EnvVars["MODEL"]) != "" {
+			tmp := dispatch.Job{Model: sch.EnvVars["MODEL"]}
+			if dispatch.AdvanceJobModelFallback(&tmp) {
+				sch.EnvVars["MODEL"] = tmp.Model
+				if eff := dispatch.DefaultEffortForSelectedModel(tmp.Model); eff != "" {
+					sch.EnvVars["EFFORT"] = eff
+				}
+			}
 		}
 		sch.Status = "QUEUED"
 		sch.HostID = "global"
@@ -3366,6 +3475,15 @@ func (e *Engine) RetryRetriableJobs() ([]Schedule, error) {
 	for _, sch := range e.schedules {
 		if sch.Status == "FAILED" || sch.Status == "ABANDONED" || sch.Status == "CANCELLED" {
 			if sch.Retriable || sch.FailureCategory != FailureCategoryASEGateIncomplete {
+				if sch.EnvVars != nil && strings.TrimSpace(sch.EnvVars["MODEL"]) != "" {
+					tmp := dispatch.Job{Model: sch.EnvVars["MODEL"]}
+					if dispatch.AdvanceJobModelFallback(&tmp) {
+						sch.EnvVars["MODEL"] = tmp.Model
+						if eff := dispatch.DefaultEffortForSelectedModel(tmp.Model); eff != "" {
+							sch.EnvVars["EFFORT"] = eff
+						}
+					}
+				}
 				sch.Status = "QUEUED"
 				sch.HostID = "global"
 				sch.IterationsRemaining = 1
@@ -4203,17 +4321,84 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 		}
 	}
 
+	hostRepos := make([]*Repo, 0)
+	coordinatedPaths := make(map[string]bool)
+	for _, r := range e.repos {
+		if r == nil || r.HostID != hostID {
+			continue
+		}
+		hostRepos = append(hostRepos, r)
+		if r.Lock == LockRunning || strings.TrimSpace(r.RunningJobID) != "" {
+			if norm := normalizeWorktreePathForSlotMatch(r.WorktreePath); norm != "" {
+				coordinatedPaths[norm] = true
+			}
+		}
+	}
+	if hasHost && h != nil {
+		for _, aj := range h.ActiveJobs {
+			jobID := strings.TrimSpace(aj.JobID)
+			jobKind := ""
+			if jobID != "" {
+				if j, okJob := e.jobs[jobID]; okJob && j != nil {
+					jobKind = j.Kind
+				}
+			}
+			if dispatch.IsHostLevelNonWorktreeJob(jobKind, aj.WorktreePath) {
+				continue
+			}
+			if normAJ := normalizeWorktreePathForSlotMatch(aj.WorktreePath); normAJ != "" {
+				coordinatedPaths[normAJ] = true
+			}
+			if m := MatchHostRepoSlot(hostRepos, aj.WorktreePath); m != nil {
+				if normM := normalizeWorktreePathForSlotMatch(m.WorktreePath); normM != "" {
+					coordinatedPaths[normM] = true
+				}
+			}
+		}
+	}
+
+	isStatusCoordinated := func(repoPath string) bool {
+		if norm := normalizeWorktreePathForSlotMatch(repoPath); norm != "" && coordinatedPaths[norm] {
+			return true
+		}
+		if m := MatchHostRepoSlot(hostRepos, repoPath); m != nil {
+			if normM := normalizeWorktreePathForSlotMatch(m.WorktreePath); normM != "" && coordinatedPaths[normM] {
+				return true
+			}
+		}
+		return false
+	}
+
 	for i := range statuses {
 		st := statuses[i]
+		isCoord := isStatusCoordinated(st.RepoPath)
+		brLower := strings.ToLower(strings.TrimSpace(st.Branch))
+		sidUpper := strings.ToUpper(strings.TrimSpace(st.ActiveStoryID))
+		toolLower := strings.ToLower(strings.TrimSpace(st.ActiveTool))
+		aseUpper := strings.ToUpper(strings.TrimSpace(st.ASEState))
+		isRunningASE := aseUpper == "RUNNING" || aseUpper == "IN_PROGRESS"
+		isMaintBranch := strings.HasPrefix(brLower, "chore/governance-pointers-") ||
+			strings.HasPrefix(brLower, "chore/submodule-pointers-") ||
+			strings.HasPrefix(brLower, "chore/auto-sync-")
+		isMaintStory := strings.HasPrefix(sidUpper, "STORY-GOV-POINTERS-") || sidUpper == "STORY-GOV-POINTERS"
+		isPromptRunWrapper := toolLower == "iazio-harness" && sidUpper == ""
+		if strings.EqualFold(strings.TrimSpace(st.ExecutionProvenance), "COORDINATED_HARNESS") && !isCoord {
+			if isMaintBranch || isMaintStory || isPromptRunWrapper || !isRunningASE || !isStoryID(sidUpper) {
+				st.ExecutionProvenance = "NONE"
+				if !isRunningASE || isMaintBranch || isMaintStory || isPromptRunWrapper {
+					st.ASEState = "IDLE"
+					st.ToolLiveness = "NONE"
+				}
+				if isMaintBranch || isMaintStory || isPromptRunWrapper {
+					st.ActiveStoryID = ""
+					if isPromptRunWrapper {
+						st.ActiveTool = "NONE"
+					}
+				}
+				statuses[i] = st
+			}
+		}
 		if !strings.EqualFold(strings.TrimSpace(st.ExecutionProvenance), "COORDINATED_HARNESS") {
-			brLower := strings.ToLower(strings.TrimSpace(st.Branch))
-			sidUpper := strings.ToUpper(strings.TrimSpace(st.ActiveStoryID))
-			toolLower := strings.ToLower(strings.TrimSpace(st.ActiveTool))
-			isMaintBranch := strings.HasPrefix(brLower, "chore/governance-pointers-") ||
-				strings.HasPrefix(brLower, "chore/submodule-pointers-") ||
-				strings.HasPrefix(brLower, "chore/auto-sync-")
-			isMaintStory := strings.HasPrefix(sidUpper, "STORY-GOV-POINTERS-") || sidUpper == "STORY-GOV-POINTERS"
-			isPromptRunWrapper := toolLower == "iazio-harness" && sidUpper == ""
 			if isMaintBranch || isMaintStory || isPromptRunWrapper {
 				st.ActiveStoryID = ""
 				st.ASEState = "IDLE"
@@ -4348,7 +4533,17 @@ func (e *Engine) UpdateRepoRuntimeStatus(hostID string, statuses []RepoRuntimeSt
 					r.GitVersion = st.GitVersion
 				}
 
-				isCoordinated := r.Lock == LockRunning || strings.TrimSpace(r.RunningJobID) != ""
+				isCoordinated := r.Lock == LockRunning || strings.TrimSpace(r.RunningJobID) != "" || coordinatedPaths[normalizeWorktreePathForSlotMatch(r.WorktreePath)]
+				if !isCoordinated && strings.EqualFold(strings.TrimSpace(r.ExecutionProvenance), "COORDINATED_HARNESS") {
+					rASE := strings.ToUpper(strings.TrimSpace(r.ASEState))
+					if (rASE != "RUNNING" && rASE != "IN_PROGRESS") || !isStoryID(strings.TrimSpace(r.DirtyStoryID)) {
+						r.ExecutionProvenance = "NONE"
+						if rASE != "RUNNING" && rASE != "IN_PROGRESS" {
+							r.ASEState = "IDLE"
+							r.ToolLiveness = "NONE"
+						}
+					}
+				}
 				adhocActive := IsAdhocASEActive(r.ExecutionProvenance, r.ToolLiveness, r.ASEState, isCoordinated)
 
 				if isCoordinated {

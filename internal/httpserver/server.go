@@ -1891,7 +1891,25 @@ func (s *Server) declineJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+func (s *Server) listQueueJobsForEnrichment(ctx context.Context) []*dispatch.Job {
+	if s.Queue == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	jobs, err := s.Queue.List(ctx, dispatch.JobFilter{Limit: 250})
+	if err != nil {
+		return nil
+	}
+	return jobs
+}
+
 func (s *Server) enrichHostView(hv map[string]any, host control.Host) map[string]any {
+	return s.enrichHostViewWithJobs(hv, host, s.listQueueJobsForEnrichment(context.Background()))
+}
+
+func (s *Server) enrichHostViewWithJobs(hv map[string]any, host control.Host, qJobs []*dispatch.Job) map[string]any {
 	if hv == nil {
 		return hv
 	}
@@ -1901,28 +1919,47 @@ func (s *Server) enrichHostView(hv map[string]any, host control.Host) map[string
 	}
 	if s.Queue != nil {
 		runningSet := make(map[string]bool)
+		if s.Engine != nil {
+			if detail, ok := s.Engine.GetHostDetail(host.ID); ok {
+				for _, r := range detail.Repos {
+					if r.Lock == control.LockRunning && strings.TrimSpace(r.RunningJobID) != "" {
+						runningSet[strings.TrimSpace(r.RunningJobID)] = true
+					}
+				}
+			}
+		}
 		for _, aj := range host.ActiveJobs {
+			if !control.IsWorktreeActiveJob(aj) {
+				continue
+			}
 			if id := strings.TrimSpace(aj.JobID); id != "" {
 				runningSet[id] = true
 			}
 		}
-		if qJobs, err := s.Queue.List(context.Background(), dispatch.JobFilter{Limit: 100}); err == nil {
-			for _, j := range qJobs {
-				if j == nil {
-					continue
-				}
-				switch j.Status {
-				case dispatch.JobStatusRunning, dispatch.JobStatusClaimed, dispatch.JobStatusLeased:
-					if j.ClaimedHost == host.ID || j.HostID == host.ID {
-						if !runningSet[j.ID] {
-							runningSet[j.ID] = true
-							harnessExecs++
+		for _, j := range qJobs {
+			if j == nil {
+				continue
+			}
+			switch j.Status {
+			case dispatch.JobStatusRunning, dispatch.JobStatusClaimed, dispatch.JobStatusLeased:
+				if j.ClaimedHost == host.ID || j.HostID == host.ID {
+					if dispatch.IsHostLevelNonWorktreeJob(j.Type, j.Repo) {
+						if runningSet[j.ID] {
+							delete(runningSet, j.ID)
+							if harnessExecs > 0 {
+								harnessExecs--
+							}
 						}
+						continue
 					}
-				case dispatch.JobStatusPending:
-					if j.TargetHost == host.ID || j.HostID == host.ID {
-						queuedExecs++
+					if !runningSet[j.ID] {
+						runningSet[j.ID] = true
+						harnessExecs++
 					}
+				}
+			case dispatch.JobStatusPending:
+				if j.TargetHost == host.ID || j.HostID == host.ID {
+					queuedExecs++
 				}
 			}
 		}
@@ -1930,17 +1967,16 @@ func (s *Server) enrichHostView(hv map[string]any, host control.Host) map[string
 	hv["harness_executions"] = harnessExecs
 	hv["adhoc_ase_executions"] = adhocExecs
 	hv["queued_executions"] = queuedExecs
-	if harnessExecs > 0 {
-		hv["harness_active"] = true
-	}
+	hv["harness_active"] = harnessExecs > 0
 	return hv
 }
 
-func (s *Server) listHosts(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) listHosts(w http.ResponseWriter, r *http.Request) {
 	hosts := s.Engine.ListHosts()
+	qJobs := s.listQueueJobsForEnrichment(r.Context())
 	rows := make([]map[string]any, 0, len(hosts))
 	for _, h := range hosts {
-		rows = append(rows, s.enrichHostView(hostView(h.Host, h.ReposPaused), h.Host))
+		rows = append(rows, s.enrichHostViewWithJobs(hostView(h.Host, h.ReposPaused), h.Host, qJobs))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"hosts": rows})
 }
@@ -1951,10 +1987,11 @@ func (s *Server) hostDetail(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, control.ErrNotFound)
 		return
 	}
+	qJobs := s.listQueueJobsForEnrichment(r.Context())
 	paused := 0
 	repos := make([]map[string]any, 0, len(detail.Repos))
 	for _, repo := range detail.Repos {
-		s.enrichRepoWithDispatch(&repo)
+		s.enrichRepoWithDispatchJobs(&repo, qJobs)
 		if repo.Queue == control.QueuePaused {
 			paused++
 		}
@@ -1965,7 +2002,7 @@ func (s *Server) hostDetail(w http.ResponseWriter, r *http.Request) {
 		tools = append(tools, toolView(tool))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"host":  s.enrichHostView(hostView(detail.Host, paused), detail.Host),
+		"host":  s.enrichHostViewWithJobs(hostView(detail.Host, paused), detail.Host, qJobs),
 		"repos": repos,
 		"tools": tools,
 	})
@@ -3620,22 +3657,12 @@ func (s *Server) isDispatchJobBoundToOtherHostRepo(repo control.Repo, qJob *disp
 	}
 	repoPath := strings.TrimRight(strings.TrimSpace(repo.WorktreePath), "/")
 	repoAlias := strings.TrimSpace(repo.EffectiveAlias())
+	selectBestMatchingHostRepo := func(hostRepos []control.Repo, target string) (string, bool) {
+		return matchHostRepoSlotForQueue(hostRepos, target)
+	}
 	matchesRepoSlot := func(r control.Repo, target string) bool {
-		clean := strings.TrimRight(strings.TrimSpace(target), "/")
-		if clean == "" || clean == "." || strings.EqualFold(clean, "root") {
-			return false
-		}
-		rPath := strings.TrimRight(strings.TrimSpace(r.WorktreePath), "/")
-		rAlias := strings.TrimSpace(r.EffectiveAlias())
-		if rPath != "" && rPath == clean {
-			return true
-		}
-		family := dispatch.NormalizeToSuperprojectSlotFamily(clean)
-		isNumberedSlot := !strings.Contains(clean, "/") && family != "" && !strings.EqualFold(clean, family)
-		if isNumberedSlot && ((rAlias != "" && rAlias == clean) || (rPath != "" && strings.HasSuffix(rPath, "/"+clean))) {
-			return true
-		}
-		return false
+		matchedWT, ok := selectBestMatchingHostRepo(detail.Repos, target)
+		return ok && matchedWT == r.WorktreePath
 	}
 	for _, aj := range detail.Host.ActiveJobs {
 		if strings.TrimSpace(aj.JobID) == qJob.ID {
@@ -3669,7 +3696,40 @@ func (s *Server) isDispatchJobBoundToOtherHostRepo(repo control.Repo, qJob *disp
 	return false
 }
 
-func (s *Server) findActiveDispatchJobForRepo(repo control.Repo) *dispatch.Job {
+func matchHostRepoSlotForQueue(hostRepos []control.Repo, target string) (string, bool) {
+	clean := strings.TrimRight(strings.TrimSpace(target), "/\\")
+	if clean == "" || clean == "." || strings.EqualFold(clean, "root") || dispatch.IsHostLevelNonWorktreeJob("", clean) {
+		return "", false
+	}
+	normTarget := control.NormalizeWorktreePathForSlotMatch(clean)
+	family := dispatch.NormalizeToSuperprojectSlotFamily(clean)
+	isNumberedSlot := !strings.Contains(clean, "/") && !strings.Contains(clean, `\`) && family != "" && !strings.EqualFold(clean, family)
+	for _, r := range hostRepos {
+		normR := control.NormalizeWorktreePathForSlotMatch(r.WorktreePath)
+		rAlias := strings.TrimSpace(r.EffectiveAlias())
+		if normR != "" && normR == normTarget {
+			return r.WorktreePath, true
+		}
+		if isNumberedSlot && ((rAlias != "" && rAlias == clean) || (normR != "" && strings.HasSuffix(normR, "/"+clean))) {
+			return r.WorktreePath, true
+		}
+	}
+	bestWT := ""
+	bestLen := 0
+	for _, r := range hostRepos {
+		normR := control.NormalizeWorktreePathForSlotMatch(r.WorktreePath)
+		if normR != "" && normTarget != "" && len(normR) > bestLen && strings.HasPrefix(normTarget, normR+"/") {
+			bestWT = r.WorktreePath
+			bestLen = len(normR)
+		}
+	}
+	if bestLen > 0 {
+		return bestWT, true
+	}
+	return "", false
+}
+
+func (s *Server) findActiveDispatchJobForRepoByID(repo control.Repo) *dispatch.Job {
 	if s.Queue == nil {
 		return nil
 	}
@@ -3688,9 +3748,31 @@ func (s *Server) findActiveDispatchJobForRepo(repo control.Repo) *dispatch.Job {
 			}
 		}
 	}
-	jobs, err := s.Queue.List(context.Background(), dispatch.JobFilter{Limit: 100})
-	if err != nil {
+	return nil
+}
+
+func (s *Server) findActiveDispatchJobForRepo(repo control.Repo) *dispatch.Job {
+	if s.Queue == nil {
 		return nil
+	}
+	if qJob := s.findActiveDispatchJobForRepoByID(repo); qJob != nil {
+		return qJob
+	}
+	return s.findActiveDispatchJobForRepoWithJobs(repo, s.listQueueJobsForEnrichment(context.Background()))
+}
+
+func (s *Server) findActiveDispatchJobForRepoWithJobs(repo control.Repo, jobs []*dispatch.Job) *dispatch.Job {
+	if s.Queue == nil {
+		return nil
+	}
+	if qJob := s.findActiveDispatchJobForRepoByID(repo); qJob != nil {
+		return qJob
+	}
+	var hostRepos []control.Repo
+	if repo.HostID != "" && s.Engine != nil {
+		if detail, ok := s.Engine.GetHostDetail(repo.HostID); ok {
+			hostRepos = detail.Repos
+		}
 	}
 	repoPath := strings.TrimRight(strings.TrimSpace(repo.WorktreePath), "/")
 	repoAlias := strings.TrimSpace(repo.EffectiveAlias())
@@ -3700,6 +3782,9 @@ func (s *Server) findActiveDispatchJobForRepo(repo control.Repo) *dispatch.Job {
 		}
 		st := strings.ToLower(strings.TrimSpace(qJob.Status))
 		if st != dispatch.JobStatusRunning && st != dispatch.JobStatusClaimed && st != dispatch.JobStatusLeased {
+			continue
+		}
+		if dispatch.IsHostLevelNonWorktreeJob(qJob.Type, qJob.Repo) {
 			continue
 		}
 		jobHost := qJob.ClaimedHost
@@ -3715,18 +3800,32 @@ func (s *Server) findActiveDispatchJobForRepo(repo control.Repo) *dispatch.Job {
 		if s.isDispatchJobBoundToOtherHostRepo(repo, qJob) {
 			continue
 		}
-		qWT := strings.TrimRight(strings.TrimSpace(qJob.WorktreePath), "/")
+		qWT := strings.TrimRight(strings.TrimSpace(qJob.WorktreePath), "/\\")
 		if qWT != "" && qWT != "." && !strings.EqualFold(qWT, "root") {
+			if matchedWT, ok := matchHostRepoSlotForQueue(hostRepos, qWT); ok {
+				if matchedWT == repo.WorktreePath {
+					return qJob
+				}
+				continue
+			}
 			if qWT == repoPath || (repoAlias != "" && qWT == repoAlias) {
 				return qJob
 			}
-			if strings.HasPrefix(qWT, "/") || strings.Contains(qWT, ":\\") {
+			if strings.HasPrefix(qWT, "/") || strings.Contains(qWT, `:\`) {
 				continue
 			}
 		}
-		qRepo := strings.TrimRight(strings.TrimSpace(qJob.Repo), "/")
-		if qRepo != "" && (qRepo == repoPath || (repoAlias != "" && (qRepo == repoAlias || (!strings.HasPrefix(qRepo, "/") && strings.HasSuffix(qRepo, "/"+repoAlias))))) {
-			return qJob
+		qRepo := strings.TrimRight(strings.TrimSpace(qJob.Repo), "/\\")
+		if qRepo != "" {
+			if matchedWT, ok := matchHostRepoSlotForQueue(hostRepos, qRepo); ok {
+				if matchedWT == repo.WorktreePath {
+					return qJob
+				}
+				continue
+			}
+			if qRepo == repoPath || (repoAlias != "" && (qRepo == repoAlias || (!strings.HasPrefix(qRepo, "/") && strings.HasSuffix(qRepo, "/"+repoAlias)))) {
+				return qJob
+			}
 		}
 	}
 	return nil
@@ -3736,7 +3835,20 @@ func (s *Server) enrichRepoWithDispatch(repo *control.Repo) *dispatch.Job {
 	if repo == nil {
 		return nil
 	}
-	qJob := s.findActiveDispatchJobForRepo(*repo)
+	return s.applyActiveDispatchJobToRepo(repo, s.findActiveDispatchJobForRepo(*repo))
+}
+
+func (s *Server) enrichRepoWithDispatchJobs(repo *control.Repo, jobs []*dispatch.Job) *dispatch.Job {
+	if repo == nil {
+		return nil
+	}
+	return s.applyActiveDispatchJobToRepo(repo, s.findActiveDispatchJobForRepoWithJobs(*repo, jobs))
+}
+
+func (s *Server) applyActiveDispatchJobToRepo(repo *control.Repo, qJob *dispatch.Job) *dispatch.Job {
+	if repo == nil {
+		return nil
+	}
 	if qJob == nil {
 		if strings.HasPrefix(strings.TrimSpace(repo.RunningJobID), "job_") {
 			repo.Lock = control.LockIdle
