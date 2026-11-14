@@ -1157,43 +1157,61 @@ func normalizeJobDependencies(job *Job) {
 }
 
 func (q *InMemoryQueue) hasActiveReplacementChildLocked(parentID string) bool {
-	return q.latestReplacementChildLocked(parentID) != nil
+	return q.hasActiveReplacementDescendantLocked(parentID)
 }
 
-// isActiveReplacementStatus reports whether a child status still parks its parent.
-// Completed/canceled never park (STORY-IAZIO-0202 RC-6). Failed children are handled by
-// isActiveReplacementChild (remediable failed parks; terminal-stop failed does not un-park
-// the parent into pending — see reconcile / RetryRetriable).
+// isActiveReplacementStatus is retained as a thin status-only helper for callers/tests;
+// authoritative parking semantics live in isActiveReplacementChild (STORY-IAZIO-0202).
 func isActiveReplacementStatus(status string) bool {
-	switch strings.TrimSpace(status) {
-	case JobStatusPending, JobStatusLeased, JobStatusClaimed, JobStatusRunning,
-		JobStatusBlockedByDependency, JobStatusRequeued, JobStatusFailed:
-		return true
-	default:
-		// completed / canceled must not eternally park the parent (STORY-IAZIO-0202).
-		return false
-	}
+	return isActiveReplacementChild(&Job{Status: status})
 }
 
 // isActiveReplacementChild reports whether child still supersedes parent for claim/reconcile.
-// Remediable failed children park the parent (avoid duplicate dispatch). Terminal-stop failed
-// children also keep the parent parked (do not bypass credits/infra stop one generation up).
-// Only completed/canceled children release the parent for superseded-completion or orphan promote.
+// Active = pending/leased/claimed/running/blocked/requeued/failed. Only completed/canceled
+// children release the parent for superseded-completion or orphan promote (STORY-IAZIO-0202).
 func isActiveReplacementChild(child *Job) bool {
 	if child == nil {
 		return false
 	}
-	st := strings.TrimSpace(child.Status)
-	switch st {
+	switch strings.TrimSpace(child.Status) {
 	case JobStatusPending, JobStatusLeased, JobStatusClaimed, JobStatusRunning,
-		JobStatusBlockedByDependency, JobStatusRequeued:
-		return true
-	case JobStatusFailed:
-		// Both remediable and terminal-stop failed children park the parent.
+		JobStatusBlockedByDependency, JobStatusRequeued, JobStatusFailed:
 		return true
 	default:
 		return false
 	}
+}
+
+// hasActiveReplacementDescendantLocked reports whether parentID has any active descendant,
+// walking through completed/canceled intermediate nodes (review N2 / STORY-IAZIO-0202).
+func (q *InMemoryQueue) hasActiveReplacementDescendantLocked(parentID string) bool {
+	cleanID := strings.TrimSpace(parentID)
+	if cleanID == "" || q.jobs[cleanID] == nil {
+		return false
+	}
+	visited := map[string]bool{cleanID: true}
+	queue := []string{cleanID}
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+		for _, cand := range q.jobs {
+			if cand == nil || visited[cand.ID] {
+				continue
+			}
+			if strings.TrimSpace(cand.ParentID) != curr {
+				continue
+			}
+			visited[cand.ID] = true
+			if isActiveReplacementChild(cand) {
+				return true
+			}
+			// Traverse completed/canceled so active grandchildren still park the root.
+			if cand.Status == JobStatusCompleted || cand.Status == JobStatusCanceled {
+				queue = append(queue, cand.ID)
+			}
+		}
+	}
+	return false
 }
 
 func isSuccessfulCompletedChild(job *Job) bool {
@@ -1322,26 +1340,39 @@ func (q *InMemoryQueue) latestReplacementChildLocked(parentID string) *Job {
 	currID := cleanID
 	var latest *Job
 	for {
-		var next *Job
+		var nextActive *Job
+		var nextBridge *Job // completed/canceled bridge toward an active descendant
 		for _, cand := range q.jobs {
-			if cand == nil || cand.ID == currID {
+			if cand == nil || cand.ID == currID || visited[cand.ID] {
 				continue
 			}
-			// STORY-IAZIO-0202: only completed/canceled release the parent; failed still parks.
-			if !isActiveReplacementChild(cand) {
+			if strings.TrimSpace(cand.ParentID) != currID {
 				continue
 			}
-			if strings.TrimSpace(cand.ParentID) == currID {
-				if next == nil || cand.CreatedAt.After(next.CreatedAt) {
-					next = cand
+			if isActiveReplacementChild(cand) {
+				if nextActive == nil || cand.CreatedAt.After(nextActive.CreatedAt) {
+					nextActive = cand
+				}
+				continue
+			}
+			// Walk through completed/canceled bridges so active grandchildren park the root (N2).
+			if cand.Status == JobStatusCompleted || cand.Status == JobStatusCanceled {
+				if nextBridge == nil || cand.CreatedAt.After(nextBridge.CreatedAt) {
+					nextBridge = cand
 				}
 			}
 		}
-		if next == nil || visited[next.ID] {
+		next := nextActive
+		if next == nil {
+			next = nextBridge
+		}
+		if next == nil {
 			break
 		}
 		visited[next.ID] = true
-		latest = next
+		if isActiveReplacementChild(next) {
+			latest = next
+		}
 		currID = next.ID
 	}
 	return latest
@@ -2033,18 +2064,14 @@ func (q *InMemoryQueue) reconcileQueueIntegrityLocked(now time.Time) []string {
 	if now.IsZero() {
 		now = q.now()
 	}
-	// STORY-IAZIO-0202: only ACTIVE children park a parent; completed children must not.
+	// STORY-IAZIO-0202: ACTIVE descendants (incl. through completed bridges) park a parent.
 	hasActiveReplacementChild := make(map[string]bool)
-	for _, j := range q.jobs {
+	for id, j := range q.jobs {
 		if j == nil {
 			continue
 		}
-		parentID := strings.TrimSpace(j.ParentID)
-		if parentID == "" || parentID == j.ID || q.jobs[parentID] == nil {
-			continue
-		}
-		if isActiveReplacementChild(j) {
-			hasActiveReplacementChild[parentID] = true
+		if q.hasActiveReplacementDescendantLocked(id) {
+			hasActiveReplacementChild[id] = true
 		}
 	}
 

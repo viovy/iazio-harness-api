@@ -195,6 +195,60 @@ func TestRunComparisonService_RemediationVerifiedVerdict(t *testing.T) {
 	}
 }
 
+func TestCompareJobWithBaseline_SupersededParentAttemptHistoryFallback(t *testing.T) {
+	// STORY-IAZIO-0202 N3: superseded parent Result is clean child success, but AttemptHistory
+	// carries pre-supersede Result JSON in StderrTail — CompareJobWithBaseline must still
+	// surface RESOLVED_ERRORS via snapshotLooksClean fallback.
+	failJSON, _ := json.Marshal(map[string]any{
+		"test_failure_count": 2,
+		"failed_tests":       []string{"TestAlpha", "TestBeta"},
+		"span_latencies": []SpanLatencyItem{
+			{SpanName: "run_tests", DurationMs: 400, HasError: true, ErrorTag: "exit_code=1"},
+		},
+	})
+	okJSON, _ := json.Marshal(map[string]any{
+		"test_failure_count": 0,
+		"test_pass_count":    12,
+		"status":             "completed",
+	})
+	baseline := &Job{
+		ID:      "job_parent_superseded_0202",
+		StoryID: "STORY-IAZIO-0202",
+		Status:  JobStatusCompleted,
+		Result:  okJSON,
+		AttemptHistory: []AttemptFailure{
+			{
+				AttemptNumber:   1,
+				FailureCategory: "TEST_FAILURE",
+				Reason:          "pre_supersede_failure",
+				StderrTail:      string(failJSON),
+				OutcomeSummary:  "unit tests failed",
+				TriggerReason:   "superseded_by_completed_replacement_child",
+			},
+		},
+	}
+	target := &Job{
+		ID:       "job_child_ok_0202",
+		ParentID: baseline.ID,
+		StoryID:  "STORY-IAZIO-0202",
+		Status:   JobStatusCompleted,
+		Result:   okJSON,
+	}
+	diff := CompareJobWithBaseline(target, baseline, nil, nil)
+	if diff == nil {
+		t.Fatal("expected CompareJobWithBaseline diff")
+	}
+	if diff.Verdict != VerdictRemediationVerified {
+		t.Fatalf("expected REMEDIATION_VERIFIED, got %s", diff.Verdict)
+	}
+	if diff.TestFailureDelta.BaselineFailures != 2 || diff.TestFailureDelta.CurrentFailures != 0 {
+		t.Fatalf("unexpected test failure delta: %+v", diff.TestFailureDelta)
+	}
+	if len(diff.Buckets.ResolvedErrors) == 0 {
+		t.Fatal("expected RESOLVED_ERRORS from StderrTail JSON parse")
+	}
+}
+
 func TestCompareJobWithBaseline_AttemptHistoryAndResultJSON(t *testing.T) {
 	t0 := time.Now().Add(-5 * time.Minute).UTC()
 	t1 := t0.Add(45 * time.Second)

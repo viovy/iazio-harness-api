@@ -600,6 +600,56 @@ func TestMockAgy_RequeuedParentsWithCompletedChildrenSuperseded(t *testing.T) {
 		!strings.Contains(last.OutcomeSummary, "LEASE_EXPIRED") {
 		t.Fatalf("AttemptHistory hollow: %+v", last)
 	}
+
+	// N2: completed bridge with active grandchild must keep root parked.
+	bridgeParent := &Job{
+		ID:     "job_bridge_parent_0202",
+		Type:   JobTypePromptExecute,
+		Status: JobStatusRequeued,
+		doneCh: make(chan struct{}),
+	}
+	q.jobs[bridgeParent.ID] = bridgeParent
+	completedAtBridge := now.Add(-30 * time.Minute)
+	q.jobs["job_bridge_completed_0202"] = &Job{
+		ID:          "job_bridge_completed_0202",
+		ParentID:    bridgeParent.ID,
+		Type:        JobTypePromptExecute,
+		Status:      JobStatusCompleted,
+		Result:      json.RawMessage(`{"status":"completed","exit_code":0}`),
+		CreatedAt:   now.Add(-40 * time.Minute),
+		CompletedAt: &completedAtBridge,
+		doneCh:      make(chan struct{}),
+	}
+	close(q.jobs["job_bridge_completed_0202"].doneCh)
+	q.jobs["job_bridge_grandchild_0202"] = &Job{
+		ID:        "job_bridge_grandchild_0202",
+		ParentID:  "job_bridge_completed_0202",
+		Type:      JobTypePromptExecute,
+		Status:    JobStatusPending,
+		CreatedAt: now.Add(-10 * time.Minute),
+		doneCh:    make(chan struct{}),
+	}
+	_ = q.reconcileQueueIntegrityLocked(now)
+	gotBridge, _ := q.Get(bridgeParent.ID)
+	if gotBridge.Status != JobStatusRequeued {
+		t.Fatalf("root with active grandchild behind completed bridge must stay requeued, got %s", gotBridge.Status)
+	}
+
+	// N3: pending + phantom_or_superseded + completed child → superseded completed.
+	phantomPending := &Job{
+		ID:     "job_phantom_pending_0202",
+		Type:   JobTypePromptExecute,
+		Status: JobStatusPending,
+		Error:  "phantom_or_superseded_remediation_STORY_IAZIO_0192",
+		doneCh: make(chan struct{}),
+	}
+	q.jobs[phantomPending.ID] = phantomPending
+	seedCompletedChild("job_phantom_child_0202", phantomPending.ID, "STORY-IAZIO-0202")
+	_ = q.reconcileQueueIntegrityLocked(now)
+	gotPhantom, _ := q.Get(phantomPending.ID)
+	if gotPhantom.Status != JobStatusCompleted {
+		t.Fatalf("pending phantom parent with completed child must supersede to completed, got %s", gotPhantom.Status)
+	}
 }
 
 func TestRetryRetriable_DoesNotReviveCanceledOrParentWithReplacementChild(t *testing.T) {
