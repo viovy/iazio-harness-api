@@ -1160,6 +1160,123 @@ func (q *InMemoryQueue) hasActiveReplacementChildLocked(parentID string) bool {
 	return q.latestReplacementChildLocked(parentID) != nil
 }
 
+// isActiveReplacementStatus reports whether a child job still supersedes its parent for
+// claim/reconcile purposes (STORY-IAZIO-0202). Completed/canceled/terminal-failed children
+// must NOT block parent promotion or superseded-parent completion — otherwise parents stay
+// eternal requeued after historical child-spawn retries finish (job_3ffa5d0be1649f0e et al.).
+func isActiveReplacementStatus(status string) bool {
+	switch strings.TrimSpace(status) {
+	case JobStatusPending, JobStatusLeased, JobStatusClaimed, JobStatusRunning,
+		JobStatusBlockedByDependency, JobStatusRequeued:
+		return true
+	default:
+		// completed / canceled / failed are terminal-or-own-remediation states and must not
+		// eternally park the parent as unclaimable requeued (STORY-IAZIO-0202).
+		return false
+	}
+}
+
+func isSuccessfulCompletedChild(job *Job) bool {
+	if job == nil || job.Status != JobStatusCompleted {
+		return false
+	}
+	if ok, failed := isJobTerminalCompleted(job); !ok || failed != nil {
+		return false
+	}
+	return true
+}
+
+func (q *InMemoryQueue) latestSuccessfulCompletedChildLocked(parentID string) *Job {
+	cleanID := strings.TrimSpace(parentID)
+	if cleanID == "" {
+		return nil
+	}
+	var latest *Job
+	for _, cand := range q.jobs {
+		if cand == nil || !isSuccessfulCompletedChild(cand) {
+			continue
+		}
+		if strings.TrimSpace(cand.ParentID) != cleanID {
+			continue
+		}
+		if latest == nil || cand.CreatedAt.After(latest.CreatedAt) {
+			latest = cand
+		}
+	}
+	return latest
+}
+
+// completeSupersededParentLocked marks a requeued/pending parent completed when its
+// replacement child already finished successfully (STORY-IAZIO-0202 RC-6).
+func completeSupersededParentLocked(job *Job, child *Job, now time.Time) {
+	if job == nil {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	job.Status = JobStatusCompleted
+	job.Error = ""
+	job.FailureCategory = ""
+	job.FailureStage = ""
+	job.FailureDirection = ""
+	job.FailureService = ""
+	job.FailureReasonSummary = ""
+	job.Retriable = false
+	job.ClaimedHost = ""
+	job.HostID = ""
+	job.LeaseOwner = ""
+	job.LeaseToken = ""
+	job.ClaimedAt = nil
+	job.HeartbeatAt = nil
+	job.LeaseExpiresAt = nil
+	job.LeaseAckDeadlineAt = nil
+	if job.CompletedAt == nil {
+		completedAt := now
+		job.CompletedAt = &completedAt
+	}
+	// Preserve prior failure telemetry on AttemptHistory so run-comparison baselines
+	// (CompareJobWithBaseline) still see RESOLVED_ERRORS after the parent is superseded.
+	priorResult := strings.TrimSpace(string(job.Result))
+	priorLooksFailed := priorResult != "" &&
+		(strings.Contains(priorResult, "test_failure_count") ||
+			strings.Contains(priorResult, "failed_tests") ||
+			strings.Contains(priorResult, `"has_error":true`) ||
+			(job.Error != "" && !strings.Contains(strings.ToLower(job.Error), "phantom_or_superseded")))
+	if priorLooksFailed {
+		job.AttemptHistory = append(job.AttemptHistory, AttemptFailure{
+			AttemptNumber:  len(job.AttemptHistory) + 1,
+			Host:           job.HostID,
+			Workspace:      job.Repo,
+			Tool:           job.TargetAgent,
+			FailureCategory: job.FailureCategory,
+			FailureStage:   job.FailureStage,
+			Reason:         "pre_supersede_failure",
+			StderrTail:     priorResult,
+			Timestamp:      now.UTC().Format(time.RFC3339),
+			TriggerReason:  "superseded_by_completed_replacement_child",
+			OutcomeSummary: firstNonEmptyTrimmed(job.Error, job.FailureReasonSummary, "pre_supersede_failure"),
+		})
+	}
+	if child != nil && len(child.Result) > 0 {
+		job.Result = append(json.RawMessage(nil), child.Result...)
+	} else if len(job.Result) == 0 || !strings.Contains(string(job.Result), "completed") {
+		job.Result = json.RawMessage(`{"status":"completed_via_eager_readiness","superseded_by_completed_replacement_child":true}`)
+	}
+	if job.DispatchDiagnostics != nil {
+		job.DispatchDiagnostics.QueueState = "completed"
+	} else {
+		job.DispatchDiagnostics = &DispatchDiagnostics{QueueState: "completed"}
+	}
+	if job.doneCh != nil {
+		select {
+		case <-job.doneCh:
+		default:
+			close(job.doneCh)
+		}
+	}
+}
+
 func (q *InMemoryQueue) latestReplacementChildLocked(parentID string) *Job {
 	cleanID := strings.TrimSpace(parentID)
 	if cleanID == "" || q.jobs[cleanID] == nil {
@@ -1171,7 +1288,11 @@ func (q *InMemoryQueue) latestReplacementChildLocked(parentID string) *Job {
 	for {
 		var next *Job
 		for _, cand := range q.jobs {
-			if cand == nil || cand.ID == currID || cand.Status == JobStatusCanceled {
+			if cand == nil || cand.ID == currID {
+				continue
+			}
+			// STORY-IAZIO-0202: ignore completed/canceled/failed children.
+			if !isActiveReplacementStatus(cand.Status) {
 				continue
 			}
 			if strings.TrimSpace(cand.ParentID) == currID {
@@ -1876,14 +1997,18 @@ func (q *InMemoryQueue) reconcileQueueIntegrityLocked(now time.Time) []string {
 	if now.IsZero() {
 		now = q.now()
 	}
-	hasReplacementChild := make(map[string]bool)
+	// STORY-IAZIO-0202: only ACTIVE children park a parent; completed children must not.
+	hasActiveReplacementChild := make(map[string]bool)
 	for _, j := range q.jobs {
 		if j == nil {
 			continue
 		}
 		parentID := strings.TrimSpace(j.ParentID)
-		if parentID != "" && parentID != j.ID && q.jobs[parentID] != nil && j.Status != JobStatusCanceled {
-			hasReplacementChild[parentID] = true
+		if parentID == "" || parentID == j.ID || q.jobs[parentID] == nil {
+			continue
+		}
+		if isActiveReplacementStatus(j.Status) {
+			hasActiveReplacementChild[parentID] = true
 		}
 	}
 
@@ -1924,7 +2049,7 @@ func (q *InMemoryQueue) reconcileQueueIntegrityLocked(now time.Time) []string {
 				cancel()
 			}
 			mutated = true
-		} else if j.Status == JobStatusPending && hasReplacementChild[j.ID] {
+		} else if j.Status == JobStatusPending && hasActiveReplacementChild[j.ID] {
 			j.Status = JobStatusRequeued
 			j.HostID = ""
 			j.ClaimedHost = ""
@@ -1936,71 +2061,94 @@ func (q *InMemoryQueue) reconcileQueueIntegrityLocked(now time.Time) []string {
 			j.LeaseExpiresAt = nil
 			j.LeaseAckDeadlineAt = nil
 			mutated = true
-		} else if j.Status == JobStatusRequeued && !hasReplacementChild[j.ID] {
-			// STORY-GOV-5275: orphan requeued jobs (no replacement child) must become claimable again.
-			if len(j.DependsOnJobIDs) > 0 {
-				satisfied, failedDep := q.areDependenciesSatisfiedLocked(j)
-				if satisfied {
+		} else if j.Status == JobStatusRequeued && !hasActiveReplacementChild[j.ID] {
+			if completedChild := q.latestSuccessfulCompletedChildLocked(j.ID); completedChild != nil {
+				// STORY-IAZIO-0202 RC-6: replacement already succeeded — complete parent, do not re-dequeue.
+				completeSupersededParentLocked(j, completedChild, now)
+				if q.store != nil && j.CompletedAt != nil {
+					sctx, cancel := storeContext(context.Background())
+					_ = q.store.CompleteQueueJob(sctx, j.ID, JobStatusCompleted, j.Result, "", *j.CompletedAt)
+					cancel()
+				}
+				mutated = true
+			} else {
+				// STORY-GOV-5275: orphan requeued jobs (no active replacement child) must become claimable again.
+				if len(j.DependsOnJobIDs) > 0 {
+					satisfied, failedDep := q.areDependenciesSatisfiedLocked(j)
+					if satisfied {
+						resetJobPendingInPlaceLocked(j, "")
+						mutated = true
+					} else {
+						j.Status = JobStatusBlockedByDependency
+						j.CompletedAt = nil
+						if failedDep == nil {
+							j.Error = ""
+							j.FailureCategory = ""
+							j.FailureStage = ""
+							j.FailureDirection = ""
+							j.FailureService = ""
+							j.FailureReasonSummary = ""
+						}
+						j.doneCh = make(chan struct{})
+						if j.DispatchDiagnostics != nil {
+							j.DispatchDiagnostics.QueueState = JobStatusBlockedByDependency
+						} else {
+							j.DispatchDiagnostics = &DispatchDiagnostics{QueueState: JobStatusBlockedByDependency}
+						}
+						mutated = true
+					}
+				} else {
 					resetJobPendingInPlaceLocked(j, "")
 					mutated = true
-				} else {
-					j.Status = JobStatusBlockedByDependency
-					j.CompletedAt = nil
-					if failedDep == nil {
-						j.Error = ""
-						j.FailureCategory = ""
-						j.FailureStage = ""
-						j.FailureDirection = ""
-						j.FailureService = ""
-						j.FailureReasonSummary = ""
-					}
-					j.doneCh = make(chan struct{})
-					if j.DispatchDiagnostics != nil {
-						j.DispatchDiagnostics.QueueState = JobStatusBlockedByDependency
-					} else {
-						j.DispatchDiagnostics = &DispatchDiagnostics{QueueState: JobStatusBlockedByDependency}
-					}
-					mutated = true
 				}
-			} else {
-				resetJobPendingInPlaceLocked(j, "")
-				mutated = true
 			}
-		} else if j.Status == JobStatusFailed && !hasReplacementChild[j.ID] && !IsTerminalStopFailure(j.FailureCategory, j.Error+" "+j.FailureReasonSummary) {
+		} else if j.Status == JobStatusFailed && !hasActiveReplacementChild[j.ID] && !IsTerminalStopFailure(j.FailureCategory, j.Error+" "+j.FailureReasonSummary) {
 			// Remediable failed jobs without a replacement child: promote in-place to pending.
 			resetJobPendingInPlaceLocked(j, j.Error)
 			mutated = true
-		} else if j.Status == JobStatusFailed && !hasReplacementChild[j.ID] && j.InfraRequeueCount == 0 &&
+		} else if j.Status == JobStatusFailed && !hasActiveReplacementChild[j.ID] && j.InfraRequeueCount == 0 &&
 			(strings.TrimSpace(j.ActiveConversationID) != "" || strings.TrimSpace(j.ResumeConversationID) != "" || strings.TrimSpace(j.ConversationID) != "") &&
 			(j.FailureCategory == FailureCategoryASEGateIncomplete || strings.HasPrefix(strings.TrimSpace(j.Error), "LEASE_EXPIRED")) {
 			applyASECloseoutRemediationLocked(j, j.Error)
 			mutated = true
 		} else if j.Status == JobStatusPending {
-			if j.HostID != "" || j.ClaimedHost != "" || j.LeaseOwner != "" || j.LeaseToken != "" {
-				j.HostID = ""
-				j.ClaimedHost = ""
-				j.LeaseOwner = ""
-				j.LeaseToken = ""
+			if completedChild := q.latestSuccessfulCompletedChildLocked(j.ID); completedChild != nil &&
+				(strings.Contains(strings.ToLower(j.Error), "phantom_or_superseded") ||
+					strings.Contains(string(j.Result), "phantom_or_superseded")) {
+				completeSupersededParentLocked(j, completedChild, now)
+				if q.store != nil && j.CompletedAt != nil {
+					sctx, cancel := storeContext(context.Background())
+					_ = q.store.CompleteQueueJob(sctx, j.ID, JobStatusCompleted, j.Result, "", *j.CompletedAt)
+					cancel()
+				}
 				mutated = true
-			}
-			if strings.EqualFold(strings.TrimSpace(j.AllocationSource), "global_queue_tool_priority") &&
-				(strings.TrimSpace(j.ParentID) != "" || j.Attempts > 0 || j.InfraRequeueCount > 0) &&
-				strings.TrimSpace(j.ResumeConversationID) == "" &&
-				strings.TrimSpace(j.ActiveConversationID) == "" &&
-				strings.TrimSpace(j.TargetHost) != "" {
-				j.TargetHost = ""
-				if len(j.Payload) > 0 {
-					var pm map[string]any
-					if json.Unmarshal(j.Payload, &pm) == nil && pm != nil {
-						if _, hasTH := pm["target_host"]; hasTH {
-							pm["target_host"] = ""
-							if updated, err := json.Marshal(pm); err == nil {
-								j.Payload = updated
+			} else {
+				if j.HostID != "" || j.ClaimedHost != "" || j.LeaseOwner != "" || j.LeaseToken != "" {
+					j.HostID = ""
+					j.ClaimedHost = ""
+					j.LeaseOwner = ""
+					j.LeaseToken = ""
+					mutated = true
+				}
+				if strings.EqualFold(strings.TrimSpace(j.AllocationSource), "global_queue_tool_priority") &&
+					(strings.TrimSpace(j.ParentID) != "" || j.Attempts > 0 || j.InfraRequeueCount > 0) &&
+					strings.TrimSpace(j.ResumeConversationID) == "" &&
+					strings.TrimSpace(j.ActiveConversationID) == "" &&
+					strings.TrimSpace(j.TargetHost) != "" {
+					j.TargetHost = ""
+					if len(j.Payload) > 0 {
+						var pm map[string]any
+						if json.Unmarshal(j.Payload, &pm) == nil && pm != nil {
+							if _, hasTH := pm["target_host"]; hasTH {
+								pm["target_host"] = ""
+								if updated, err := json.Marshal(pm); err == nil {
+									j.Payload = updated
+								}
 							}
 						}
 					}
+					mutated = true
 				}
-				mutated = true
 			}
 		}
 		if mutated {
@@ -4036,6 +4184,26 @@ func (q *InMemoryQueue) RetryRetriable(ctx context.Context) ([]*Job, error) {
 		}
 		if IsTerminalStopFailure(job.FailureCategory, job.Error+" "+job.FailureReasonSummary) {
 			continue
+		}
+		// STORY-IAZIO-0202: requeued parent whose replacement child already completed must
+		// become completed (superseded), not pending — avoids re-dequeue of finished work
+		// (job_3ffa5d0be1649f0e / job_985bc2111a0944cd / job_97d33fd156a88144).
+		if orphanRequeued {
+			if completedChild := q.latestSuccessfulCompletedChildLocked(job.ID); completedChild != nil {
+				completeSupersededParentLocked(job, completedChild, q.now())
+				q.syncJobActiveStateLocked(job)
+				if q.store != nil {
+					sctx, cancel := storeContext(ctx)
+					if job.CompletedAt != nil {
+						_ = q.store.CompleteQueueJob(sctx, job.ID, JobStatusCompleted, job.Result, "", *job.CompletedAt)
+					} else {
+						_ = q.store.SaveQueueJob(sctx, job)
+					}
+					cancel()
+				}
+				retried = append(retried, cloneJobSnapshot(job))
+				continue
+			}
 		}
 		if strings.EqualFold(strings.TrimSpace(job.FailureCategory), string(FailureCategoryDependencyFailed)) ||
 			strings.Contains(strings.ToUpper(job.Error), "DEPENDENCY_FAILED") {

@@ -956,8 +956,12 @@ func ExtractBaselineSnapshotFromAttemptHistory(job *Job) (RunTelemetrySnapshot, 
 		RawError:      rawErr,
 		FailedTests:   extractFailedTestsFromText(nil, rawErr),
 	}
-	snap.TestFailureCount = len(snap.FailedTests)
-	if rawErr != "" {
+	// STORY-IAZIO-0202: StderrTail may hold a preserved pre-supersede Result JSON envelope.
+	if strings.TrimSpace(prev.StderrTail) != "" {
+		applyJobResultTelemetry(&snap, []byte(prev.StderrTail))
+	}
+	snap.TestFailureCount = maxInt(snap.TestFailureCount, len(snap.FailedTests))
+	if rawErr != "" && len(snap.ErrorClusters) == 0 {
 		snap.ErrorClusters = []ErrorClusterItem{
 			{
 				Signature:     NormalizeErrorSignature(rawErr),
@@ -972,6 +976,11 @@ func ExtractBaselineSnapshotFromAttemptHistory(job *Job) (RunTelemetrySnapshot, 
 	return snap, true
 }
 
+func snapshotLooksClean(snap RunTelemetrySnapshot) bool {
+	return snap.TestFailureCount == 0 && len(snap.FailedTests) == 0 &&
+		len(snap.ErrorClusters) == 0 && strings.TrimSpace(snap.RawError) == ""
+}
+
 // CompareJobWithBaseline automatically computes a RunComparisonDiff for a job if a baseline job or prior retry attempt exists.
 func CompareJobWithBaseline(target *Job, baselineJob *Job, targetLogs, baselineLogs []string) *RunComparisonDiff {
 	if target == nil {
@@ -981,6 +990,13 @@ func CompareJobWithBaseline(target *Job, baselineJob *Job, targetLogs, baselineL
 	currSnap := ExtractJobSnapshot(target, targetLogs)
 	if baselineJob != nil && baselineJob.ID != "" && baselineJob.ID != target.ID {
 		baseSnap := ExtractJobSnapshot(baselineJob, baselineLogs)
+		// After STORY-IAZIO-0202 supersede, parent Result may be the child's clean success —
+		// fall back to preserved pre-supersede AttemptHistory on the baseline job.
+		if snapshotLooksClean(baseSnap) {
+			if histSnap, ok := ExtractBaselineSnapshotFromAttemptHistory(baselineJob); ok {
+				baseSnap = histSnap
+			}
+		}
 		return svc.CompareRuns(baseSnap, currSnap)
 	}
 	if baseSnap, ok := ExtractBaselineSnapshotFromAttemptHistory(target); ok {

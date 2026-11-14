@@ -303,6 +303,224 @@ func TestMockAgy_NeverAbandonSameJobIDAutoremediate(t *testing.T) {
 	}
 }
 
+// TestMockAgy_RequeuedParentsWithCompletedChildrenSuperseded (STORY-IAZIO-0202 / RC-6)
+// reproduces live jobs job_3ffa5d0be1649f0e, job_985bc2111a0944cd, job_97d33fd156a88144:
+// parents stuck in requeued because completed replacement children were wrongly treated as
+// "active". After reconcile they must become completed (superseded). True orphans without
+// any child still promote to pending and are claimable by mock-agy through completion.
+func TestMockAgy_RequeuedParentsWithCompletedChildrenSuperseded(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	mockAgyBin := buildMockAgyBinary(t, tmpDir)
+	now := time.Date(2026, 11, 14, 6, 0, 0, 0, time.UTC)
+	q := NewInMemoryQueue()
+	q.nowFunc = func() time.Time { return now }
+
+	seedCompletedChild := func(id, parentID, storyID string) {
+		completedAt := now.Add(-time.Hour)
+		q.jobs[id] = &Job{
+			ID:         id,
+			ParentID:   parentID,
+			Type:       JobTypePromptExecute,
+			Repo:       "/home/romeo/work/meta-repo-02",
+			StoryID:    storyID,
+			Status:     JobStatusCompleted,
+			Result:     json.RawMessage(`{"status":"completed","story_id":"` + storyID + `"}`),
+			CreatedAt:  now.Add(-2 * time.Hour),
+			CompletedAt: &completedAt,
+			doneCh:     make(chan struct{}),
+		}
+		close(q.jobs[id].doneCh)
+	}
+
+	// Live job_3ffa5d0be1649f0e: requeued + BACKGROUND_DRAIN + two completed children.
+	parent3ffa := &Job{
+		ID:                   "job_3ffa5d0be1649f0e",
+		Type:                 JobTypePromptExecute,
+		Repo:                 "/home/romeo/work/meta-repo-02",
+		StoryID:              "STORY-GOV-3850",
+		TargetHost:           "debian",
+		ClaimedHost:          "debian",
+		HostID:               "debian",
+		TargetAgent:          "agy",
+		AllocationSource:     "global_queue_tool_priority",
+		StoryAllocationStatus: "allocated",
+		Status:               JobStatusRequeued,
+		Retriable:            true,
+		FailureCategory:      FailureCategoryBackgroundDrainTimeout,
+		FailureStage:         "BACKGROUND_DRAIN",
+		FailureReasonSummary: "LEASE_EXPIRED: execution lease expired without completion",
+		Error:                "phantom_or_superseded_remediation_STORY_IAZIO_0192",
+		CreatedAt:            now.Add(-14 * 24 * time.Hour),
+		doneCh:               make(chan struct{}),
+	}
+	q.jobs[parent3ffa.ID] = parent3ffa
+	seedCompletedChild("job_ad7d90d13dc1d719", parent3ffa.ID, "STORY-GOV-3850")
+	seedCompletedChild("job_fec606cb5ad138a4", parent3ffa.ID, "STORY-GOV-3850")
+
+	// Live job_985bc2111a0944cd: requeued, pending_harness_creation, deps satisfied, completed child.
+	depAFD := &Job{
+		ID:          "job_afddead322e5bee9",
+		Type:        JobTypePromptExecute,
+		Status:      JobStatusCompleted,
+		Result:      json.RawMessage(`{"status":"completed"}`),
+		CreatedAt:   now.Add(-3 * time.Hour),
+		CompletedAt: func() *time.Time { t := now.Add(-90 * time.Minute); return &t }(),
+		doneCh:      make(chan struct{}),
+	}
+	close(depAFD.doneCh)
+	q.jobs[depAFD.ID] = depAFD
+	parent985 := &Job{
+		ID:                    "job_985bc2111a0944cd",
+		Type:                  JobTypePromptExecute,
+		Repo:                  ".",
+		TargetAgent:           "agy",
+		AllocationSource:      "global_queue_tool_priority",
+		StoryAllocationStatus: "pending_harness_creation",
+		DependsOnJobIDs:       []string{depAFD.ID},
+		Status:                JobStatusRequeued,
+		Retriable:             true,
+		CreatedAt:             now.Add(-2 * 24 * time.Hour),
+		DispatchDiagnostics:   &DispatchDiagnostics{QueueState: "queued"},
+		doneCh:                make(chan struct{}),
+	}
+	q.jobs[parent985.ID] = parent985
+	seedCompletedChild("job_d6e1c7fef4bf5e32", parent985.ID, "STORY-GOV-5264")
+
+	// Live job_97d33fd156a88144: same pattern with completed Wave-4 child.
+	depBF10 := &Job{
+		ID:          "job_bf10a230d00d38df",
+		Type:        JobTypePromptExecute,
+		Status:      JobStatusCompleted,
+		Result:      json.RawMessage(`{"status":"completed"}`),
+		CreatedAt:   now.Add(-3 * time.Hour),
+		CompletedAt: func() *time.Time { t := now.Add(-80 * time.Minute); return &t }(),
+		doneCh:      make(chan struct{}),
+	}
+	close(depBF10.doneCh)
+	q.jobs[depBF10.ID] = depBF10
+	parent97d := &Job{
+		ID:                    "job_97d33fd156a88144",
+		Type:                  JobTypePromptExecute,
+		Repo:                  ".",
+		TargetAgent:           "agy",
+		AllocationSource:      "global_queue_tool_priority",
+		StoryAllocationStatus: "pending_harness_creation",
+		DependsOnJobIDs:       []string{depBF10.ID},
+		Status:                JobStatusRequeued,
+		Error:                 "Re-binding depends_on_job_id to active Wave 3 job",
+		CreatedAt:             now.Add(-2 * 24 * time.Hour),
+		doneCh:                make(chan struct{}),
+	}
+	q.jobs[parent97d.ID] = parent97d
+	seedCompletedChild("job_6a95cf152ce8039d", parent97d.ID, "STORY-GOV-5271")
+
+	// True orphan (no children) must still promote to pending and complete via mock-agy.
+	orphanID := "job_orphan_iazio_0202"
+	q.jobs[orphanID] = &Job{
+		ID:               orphanID,
+		Type:             JobTypePromptExecute,
+		Repo:             "meta-repo",
+		StoryID:          "STORY-IAZIO-0202",
+		AllocationSource: "global_queue_tool_priority",
+		TargetAgent:      "agy",
+		Status:           JobStatusRequeued,
+		CreatedAt:        now.Add(-time.Hour),
+		doneCh:           make(chan struct{}),
+	}
+
+	// Active pending child must still park its parent as requeued (not superseded).
+	activeParent := &Job{
+		ID:     "job_active_parent_0202",
+		Type:   JobTypePromptExecute,
+		Status: JobStatusRequeued,
+		doneCh: make(chan struct{}),
+	}
+	q.jobs[activeParent.ID] = activeParent
+	q.jobs["job_active_child_0202"] = &Job{
+		ID:       "job_active_child_0202",
+		ParentID: activeParent.ID,
+		Type:     JobTypePromptExecute,
+		Status:   JobStatusPending,
+		CreatedAt: now.Add(-10 * time.Minute),
+		doneCh:   make(chan struct{}),
+	}
+
+	_ = q.reconcileQueueIntegrityLocked(now)
+
+	for _, id := range []string{"job_3ffa5d0be1649f0e", "job_985bc2111a0944cd", "job_97d33fd156a88144"} {
+		got, ok := q.Get(id)
+		if !ok || got.Status != JobStatusCompleted {
+			t.Fatalf("expected %s completed (superseded by completed child), ok=%v status=%v", id, ok, got)
+		}
+		if got.DispatchDiagnostics == nil || got.DispatchDiagnostics.QueueState != "completed" {
+			t.Fatalf("expected %s dispatch_diagnostics.queue_state=completed, got %+v", id, got.DispatchDiagnostics)
+		}
+	}
+	gotActive, _ := q.Get(activeParent.ID)
+	if gotActive.Status != JobStatusRequeued {
+		t.Fatalf("parent with ACTIVE pending child must stay requeued, got %s", gotActive.Status)
+	}
+	gotOrphan, _ := q.Get(orphanID)
+	if gotOrphan.Status != JobStatusPending {
+		t.Fatalf("true orphan requeued must promote to pending, got %s", gotOrphan.Status)
+	}
+
+	// Claim path must not return the superseded parents; orphan is claimable and mock-agy completes it.
+	claimed, err := q.Claim(ctx, "mac-mini", []string{JobTypePromptExecute})
+	if err != nil || claimed == nil {
+		t.Fatalf("expected claim of orphan or active child, got job=%v err=%v", claimed, err)
+	}
+	if claimed.ID == "job_3ffa5d0be1649f0e" || claimed.ID == "job_985bc2111a0944cd" || claimed.ID == "job_97d33fd156a88144" {
+		t.Fatalf("must not reclaim superseded completed parents, got %s", claimed.ID)
+	}
+	if claimed.ID == orphanID {
+		runMockAgyForClaimedJob(t, ctx, mockAgyBin, q, claimed, "mac-mini")
+		done, _ := q.Get(orphanID)
+		if done.Status != JobStatusCompleted {
+			t.Fatalf("expected mock-agy to complete orphan %s, got %s", orphanID, done.Status)
+		}
+	} else {
+		// Active child claimed first — complete it, then orphan must be claimable.
+		runMockAgyForClaimedJob(t, ctx, mockAgyBin, q, claimed, "mac-mini")
+		claimed2, err2 := q.Claim(ctx, "pc1-wsl", []string{JobTypePromptExecute})
+		if err2 != nil || claimed2 == nil || claimed2.ID != orphanID {
+			t.Fatalf("expected second claim of orphan %s, got job=%v err=%v", orphanID, claimed2, err2)
+		}
+		runMockAgyForClaimedJob(t, ctx, mockAgyBin, q, claimed2, "pc1-wsl")
+		done, _ := q.Get(orphanID)
+		if done.Status != JobStatusCompleted {
+			t.Fatalf("expected mock-agy to complete orphan %s, got %s", orphanID, done.Status)
+		}
+	}
+
+	// RetryRetriable must also supersede (not re-pending) when reconcile was skipped.
+	stuck := &Job{
+		ID:     "job_retry_supersede_0202",
+		Type:   JobTypePromptExecute,
+		Status: JobStatusRequeued,
+		doneCh: make(chan struct{}),
+	}
+	q.jobs[stuck.ID] = stuck
+	seedCompletedChild("job_retry_child_0202", stuck.ID, "STORY-IAZIO-0202")
+	retried, err := q.RetryRetriable(ctx)
+	if err != nil {
+		t.Fatalf("RetryRetriable: %v", err)
+	}
+	found := false
+	for _, j := range retried {
+		if j.ID == stuck.ID {
+			found = true
+			if j.Status != JobStatusCompleted {
+				t.Fatalf("RetryRetriable must supersede completed-child parent to completed, got %s", j.Status)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected RetryRetriable to process superseded parent %s", stuck.ID)
+	}
+}
+
 func TestRetryRetriable_DoesNotReviveCanceledOrParentWithReplacementChild(t *testing.T) {
 	ctx := context.Background()
 	q := NewInMemoryQueue()
